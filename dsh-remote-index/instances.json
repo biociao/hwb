@@ -1,0 +1,18 @@
+{
+  "instances": [
+    {
+      "id": "mac",
+      "host": null,
+      "sessionsRoot": "/Users/ciao/.dsh/sessions",
+      "cacheRoot": "/Users/ciao/.dsh/storages/session_projcache/sessions",
+      "nodeBin": "node"
+    },
+    {
+      "id": "c4g.tun",
+      "host": "bot@c4g.tun",
+      "sessionsRoot": "/home/bot/.dsh/sessions",
+      "cacheRoot": "/home/bot/.dsh/storages/session_projcache/sessions",
+      "nodeBin": "/home/bot/.nvm/versions/node/v24.15.0/bin/node"
+    }
+  ]
+}

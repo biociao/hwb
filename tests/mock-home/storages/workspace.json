@@ -1,0 +1,55 @@
+{
+  "unit": {
+    "name": "workspace",
+    "version": 2
+  },
+  "global": {
+    "initialized": true,
+    "workspaceIds": [
+      "ws-alpha",
+      "ws-beta",
+      "ws-gamma"
+    ],
+    "archivedSessionIds": []
+  },
+  "tables": {
+    "workspaces": {
+      "ws-alpha": {
+        "title": "hwb",
+        "path": "/Users/dev/repo/hwb",
+        "sessionIds": [
+          "sess-001",
+          "sess-002"
+        ],
+        "createdAt": 1785926827154,
+        "updatedAt": 1788513127154
+      },
+      "ws-beta": {
+        "title": "quota-axi",
+        "path": "/Users/dev/repo/quota-axi",
+        "sessionIds": [
+          "sess-003"
+        ],
+        "createdAt": 1786790827154,
+        "updatedAt": 1788518407154
+      },
+      "ws-gamma": {
+        "title": "cc-switch",
+        "path": "/Users/dev/repo/cc-switch",
+        "sessionIds": [
+          "sess-004",
+          "sess-005"
+        ],
+        "createdAt": 1787222827154,
+        "updatedAt": 1788086827154
+      },
+      "ws-old": {
+        "title": "Remote_DSH_Center",
+        "path": "/Users/dev/repo/Remote_DSH_Center",
+        "sessionIds": [],
+        "createdAt": 1780742827154,
+        "updatedAt": 1783334827154
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "hwb",
+  "version": "0.1.0",
+  "description": "hwb (harness workbench) — 面向 dsh home 的数据平面工作台：跨实例聚合项目 / 会话 / Token 用量，并托管本机与远程 dsh web（控制平面）",
+  "type": "module",
+  "bin": {
+    "hwb": "src/server.js"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "dsh-remote-index",
+    "dsh-static-cache",
+    "tests",
+    "README.md",
+    "CHANGELOG.md",
+    "DSH_Workbench_Fusion_Architecture.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "workbench",
+    "dashboard",
+    "sqlite",
+    "data-plane",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "author": "hwb contributors",
+  "license": "MIT"
+}

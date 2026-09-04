@@ -1,0 +1,26 @@
+# Node
+node_modules/
+*.log
+
+# macOS
+.DS_Store
+
+# Runtime DB (per-user hwb index)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Generated / cache artifacts
+dsh-remote-index/dsh-sessions.html
+.dsh/remotes/
+
+# Emacs / Vim / editor
+*.swp
+*~
+.idea/
+.vscode/
+
+# Tests / tmp
+*.tmp
+coverage/

@@ -1,0 +1,49 @@
+# dsh-web-cached.service — 用 systemd 管理远程服务器上的 `dsh web`,自动注入本地缓存。
+#
+# 在脚本版 (`nohup bash dsh-web-cached.sh web &`) 之外, 这是更"托管"的替代:
+#   - 开机自启 (User 服务), 崩溃自动重启
+#   - 启动前用 vmtouch 预热页面缓存
+#   - 环境变量集中在 unit 里, 不用改 ~/.bashrc
+#
+# 部署 (在远程服务器上, 以 dsh 运行用户执行):
+#   1) 把 dsh-web-cached.sh 放到远程任意路径, 例如 $HOME/scripts/dsh-web-cached.sh, 并 chmod +x
+#   2) 把本文件放到 $HOME/.config/systemd/user/dsh-web-cached.service
+#      mkdir -p ~/.config/systemd/user && cp dsh-web-cached.service ~/.config/systemd/user/
+#   3) 替换下面 %h 占位符 (或直接用 %h, systemd 会展开为 HOME)
+#   4) 启用并启动:
+#      systemctl --user daemon-reload
+#      systemctl --user enable --now dsh-web-cached
+#   5) 查看日志:
+#      journalctl --user -u dsh-web-cached -f
+#   允许用户服务在登出后继续运行:
+#      loginctl enable-linger "$USER"
+
+[Unit]
+Description=dsh web (本地缓存加速)
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 用包装脚本: 它负责 NODE_COMPILE_CACHE + 关闭遥测 + vmtouch 预热 + exec dsh web
+ExecStart=/usr/bin/bash %h/scripts/dsh-web-cached.sh web
+
+# 兜底再显式声明一遍环境 (双保险, 与脚本一致)
+Environment=NODE_COMPILE_CACHE=%h/.cache/dsh/node-compile
+Environment=DSH_TELEMETRY_DISABLED=1
+# 让缓存目录可写 (若无此目录 systemd 不会自动建; 脚本里已 mkdir -p)
+
+# 崩溃自动重启, 限频防抖
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 长驻服务, 资源给足
+Nice=0
+# dsh web 监听 3080 (web profile 默认端口)
+# 如需日志旋转, 交给 journald 即可, 无需 --redirect
+
+[Install]
+WantedBy=default.target

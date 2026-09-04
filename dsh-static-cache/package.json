@@ -1,0 +1,34 @@
+{
+  "name": "dsh-static-cache",
+  "version": "0.1.0",
+  "description": "给 dsh web 前端静态资源加 HTTP 缓存头，解决远程打开页面/实例慢（Cache-Control immutable）｜ 只注册 /assets/ 前缀路由，不影响 /api、WebSocket 与 index 注入",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "static",
+    "cache",
+    "http-cache",
+    "web-ui"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

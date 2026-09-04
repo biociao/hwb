@@ -1,0 +1,25 @@
+{
+  "schema": 2,
+  "enabled": true,
+  "activeId": "scheme-mock",
+  "schemes": [
+    {
+      "id": "scheme-mock",
+      "name": "mock",
+      "tiers": {
+        "strong": {
+          "provider": "kimi",
+          "model": "kimi-k2"
+        },
+        "default": {
+          "provider": "deepseek",
+          "model": "deepseek-chat"
+        },
+        "light": {
+          "provider": "zai",
+          "model": "glm-4.5-air"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# dsh-static-cache 的 bundle patch：向 web 组合挂载本插件。
+# 它只在 webServer 上注册一个 /assets/ 前缀路由，用于给前端静态资源加
+# immutable 缓存头；/api、WebSocket(/api/events.mux) 与 index 注入仍由默认逻辑处理。
+# 若自动定位前端 dist 失败，可在下面 config 里显式给 distRoot：
+#   config:
+#     distRoot: /home/bot/.nvm/versions/node/v24.15.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist
+- insert:
+    - id: dsh-static-cache
+      name: dsh-static-cache

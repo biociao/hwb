@@ -1,0 +1,217 @@
+{
+  "unit": {
+    "name": "session_projcache",
+    "version": 3
+  },
+  "global": null,
+  "tables": {
+    "sessions": {
+      "sess-001": {
+        "identity": {
+          "createdAt": 1788518107154,
+          "cwd": "/Users/dev/repo/hwb"
+        },
+        "rows": {
+          "title": {
+            "ver": 1,
+            "seq": 1,
+            "val": "构建第一个 demo"
+          },
+          "tokenUsage": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "totals": {
+                "uncachedInputTokens": 12400,
+                "outputTokens": 3200,
+                "cacheReadTokens": 88100,
+                "cacheWriteTokens": 5400
+              },
+              "last": null
+            }
+          },
+          "contextPressure": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "surfaceTokens": 900,
+              "pressureTokens": 45200,
+              "contextWindow": 128000
+            }
+          },
+          "sessionListMetadata": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "blank": false,
+              "lastPromptAt": 1788518107154
+            }
+          }
+        }
+      },
+      "sess-002": {
+        "identity": {
+          "createdAt": 1788513127155,
+          "cwd": "/Users/dev/repo/hwb"
+        },
+        "rows": {
+          "title": {
+            "ver": 1,
+            "seq": 1,
+            "val": "阅读架构文档"
+          },
+          "tokenUsage": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "totals": {
+                "uncachedInputTokens": 8100,
+                "outputTokens": 1950,
+                "cacheReadTokens": 40200,
+                "cacheWriteTokens": 2100
+              },
+              "last": null
+            }
+          },
+          "contextPressure": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "surfaceTokens": 700,
+              "pressureTokens": 18800,
+              "contextWindow": 128000
+            }
+          },
+          "sessionListMetadata": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "blank": false,
+              "lastPromptAt": 1788513127155
+            }
+          }
+        }
+      },
+      "sess-003": {
+        "identity": {
+          "createdAt": 1788518407155,
+          "cwd": "/Users/dev/repo/quota-axi"
+        },
+        "rows": {
+          "title": {
+            "ver": 1,
+            "seq": 1,
+            "val": "额度适配器框架"
+          },
+          "tokenUsage": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "totals": {
+                "uncachedInputTokens": 230000,
+                "outputTokens": 41200,
+                "cacheReadTokens": 610000,
+                "cacheWriteTokens": 18800
+              },
+              "last": null
+            }
+          },
+          "contextPressure": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "surfaceTokens": 1200,
+              "pressureTokens": 121000,
+              "contextWindow": 160000
+            }
+          },
+          "sessionListMetadata": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "blank": false,
+              "lastPromptAt": 1788518407155
+            }
+          }
+        }
+      },
+      "sess-004": {
+        "identity": {
+          "createdAt": 1788425227155,
+          "cwd": "/Users/dev/repo/cc-switch"
+        },
+        "rows": {
+          "title": {
+            "ver": 1,
+            "seq": 1,
+            "val": ""
+          },
+          "tokenUsage": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "totals": {
+                "uncachedInputTokens": 4300,
+                "outputTokens": 900,
+                "cacheReadTokens": 15600,
+                "cacheWriteTokens": 700
+              },
+              "last": null
+            }
+          },
+          "sessionListMetadata": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "blank": false,
+              "lastPromptAt": 1788425227155
+            }
+          }
+        }
+      },
+      "sess-005": {
+        "identity": {
+          "createdAt": 1788086827155,
+          "cwd": "/Users/dev/repo/cc-switch"
+        },
+        "rows": {
+          "title": {
+            "ver": 1,
+            "seq": 1,
+            "val": "多 provider 额度查询"
+          },
+          "tokenUsage": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "totals": {
+                "uncachedInputTokens": 96400,
+                "outputTokens": 22100,
+                "cacheReadTokens": 310000,
+                "cacheWriteTokens": 9100
+              },
+              "last": null
+            }
+          },
+          "contextPressure": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "surfaceTokens": 1500,
+              "pressureTokens": 96000,
+              "contextWindow": 128000
+            }
+          },
+          "sessionListMetadata": {
+            "ver": 1,
+            "seq": 1,
+            "val": {
+              "blank": false,
+              "lastPromptAt": 1788086827155
+            }
+          }
+        }
+      }
+    }
+  }
+}

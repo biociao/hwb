@@ -1,0 +1,44 @@
+# dsh-http-cache.Caddyfile — 用 Caddy 给 dsh web 加 HTTP 本地缓存
+#
+# 作用: 在 dsh web(:3080)前加一层缓存反向代理, 解决"打开页面/实例时
+#       前端 4.5MB 静态资源被浏览器反复重新下载"的问题。
+#   - /assets/* 资源文件名带 hash(内容寻址、不可变) -> 浏览器本地强缓存 1 年
+#   - 其余入口(index/favicon/manifest) -> no-cache(避免旧的注入残留)
+#   - 开启 brotli+zstd+gzip 压缩, 首屏传输量再降 ~6x (尤其大到 624KB 的 lang chunk)
+#   - WebSocket(/api/events.mux 等)自动透传, 页面功能不受影响
+#
+# 前提: 你的 dsh web 仍按原来的方式在 127.0.0.1:3080 跑着:
+#   nohup dsh web >/dev/null 2>&1 &
+# (如果 dsh 绑在别的主机/端口, 把 reverse_proxy 里的地址改掉即可)
+#
+# 部署 (在远程服务器上, 以能读写 3081 端口的用户执行):
+#   1) 安装 caddy:  https://caddyserver.com/docs/install
+#      或 Debian/Ubuntu:  sudo apt install -y debian-keyring ... (见官网)
+#      (本机无 caddy 时也可先 docker: docker run -d -p 3081:3081 ... 见下)
+#   2) 把本文件拷到 /etc/caddy/Caddyfile (或使用 caddy 的配置路径)
+#      cp dsh-http-cache.Caddyfile /etc/caddy/Caddyfile
+#      (若用已有 Caddyfile, 把下面的 server 块追加进去)
+#   3) 启动:
+#      sudo systemctl enable --now caddy
+#   4) 浏览器改用新入口:  http://<服务器IP>:3081
+#      第一次仍会下载资源(填充缓存), 之后再打开本页/本实例就秒开。
+#
+# 若 3081 被占用或不想要新端口, 把第一行改成 :80 或别的端口;
+# 若想让 3081 走 https, 改成你的域名并加 tls 指令(自动证书)。
+
+:3081 {
+	# 压缩: zstd / gzip 自动按 Accept-Encoding 协商
+	encode zstd gzip
+
+	# 静态资源: 文件名为 hash 后缀, 内容不可变 -> 浏览器本地强缓存 1 年
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	# 入口文档/图标/清单: 不能强缓存(无 hash, 且 index 每次要注入), 只做校验
+	header /index.html  Cache-Control "no-cache"
+	header /favicon.svg Cache-Control "no-cache"
+	header /manifest.webmanifest Cache-Control "no-cache"
+
+	# 反向代理到 dsh web(WebSocket 自动 upgrade)
+	reverse_proxy 127.0.0.1:3080
+}
