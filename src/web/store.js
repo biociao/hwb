@@ -15,11 +15,14 @@ export async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
-export function subscribe(cb, onState) {
+export function subscribe(cb, onState, onLog) {
   const es = new EventSource('/api/events');
   es.addEventListener('index:updated', () => cb());
   es.addEventListener('instance:status', () => cb());
   es.addEventListener('quota:updated', () => cb());
+  es.addEventListener('log:event', (e) => {
+    try { onLog?.(JSON.parse(e.data)); } catch { /* 忽略无法解析的日志事件 */ }
+  });
   es.onopen = () => onState?.(true);
   es.onerror = () => onState?.(false);
   return es;

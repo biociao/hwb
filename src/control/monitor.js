@@ -1,6 +1,9 @@
 import { existsSync } from 'node:fs';
 import { httpProbe } from './prober.js';
 import { InstanceRegistry } from './registry.js';
+import { logger } from '../lib/logger.js';
+
+const log = logger('monitor');
 
 // 控制循环（M6 §6）：30s 心跳，探测进程存活/端口响应/隧道健康，推进状态机并广播。
 // 状态机（§5.2）：unknown → probing → running → degraded（退避重连）→ stopped/gone。
@@ -80,6 +83,7 @@ export class Monitor {
       if (!this.store.getHome(e.homeId)) {
         this.registry.delete(e.homeId);
         this.#clearReconnect(e.homeId);
+        log.info('实例已移除', { homeId: e.homeId });
         this.broadcast('instance:status', { homeId: e.homeId, runtime: 'removed' });
       }
     }
@@ -107,6 +111,17 @@ export class Monitor {
     const attempts = phase === 'degraded' ? prev.attempts + 1 : 0;
     const next = this.registry.set(homeId, { phase, attempts, ...patch });
     if (prev.phase !== next.phase || prev.url !== next.url || prev.port !== next.port) {
+      // 仅在状态迁移/URL 变化时记录，避免每 30s 心跳刷屏。
+      if (next.phase === 'degraded') {
+        log.warn('实例降级（unreachable），安排退避重连', {
+          homeId, prev: prev.phase, phase: next.phase, attempts,
+          backoffMs: this.registry.nextBackoffMs(homeId), url: next.url, lastError: next.lastError,
+        });
+      } else if (next.phase === 'running' && prev.phase === 'degraded') {
+        log.info('实例恢复可用', { homeId, prev: prev.phase, phase: next.phase, url: next.url });
+      } else {
+        log.debug('实例状态变更', { homeId, prev: prev.phase, phase: next.phase, url: next.url });
+      }
       this.broadcast('instance:status', {
         homeId,
         runtime: PHASE_RUNTIME[next.phase] ?? next.phase,

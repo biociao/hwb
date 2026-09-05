@@ -2,6 +2,9 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createRouter } from './routes.js';
+import { logger } from '../lib/logger.js';
+
+const log = logger('api');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -29,12 +32,14 @@ async function serveStatic(webRoot, pathname, res) {
 }
 
 // Listens on 127.0.0.1 only, no auth (§11).
-export function createApiServer({ store, indexer, hub, launcher, monitor, quota, webRoot }) {
-  const route = createRouter({ store, indexer, hub, launcher, monitor, quota });
+export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot }) {
+  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {
       route(req, res, url).catch((e) => {
+        // API 处理抛错：记录请求路径 + 错误栈，返回 500；前端能拿到 message，日志能还原根因。
+        log.error('API 请求处理失败', e, { method: req.method, path: url.pathname });
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
       });

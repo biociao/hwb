@@ -1,11 +1,16 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
+import { logger } from '../lib/logger.js';
+
+const log = logger('tunnel');
 
 // SSH 按需隧道（§5.3）：`ssh -L 127.0.0.1:{local}:127.0.0.1:{remote} {host}`，
 // 把远程 dsh web 的端口安全地映射到本地回环，供 hwb 的 iframe 本地访问。
 export async function openTunnel({ host, remotePort }) {
   if (!host || !Number.isInteger(remotePort) || remotePort <= 0) {
-    throw new Error(`invalid remote instance (host=${host}, remotePort=${remotePort})`);
+    const e = new Error(`invalid remote instance (host=${host}, remotePort=${remotePort})`);
+    log.error('创建隧道被拒绝：远程实例参数非法', e, { host, remotePort });
+    throw e;
   }
   const localPort = await freePort();
   const proc = spawn('ssh', [

@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Monitor } from '../src/control/monitor.js';
 import { InstanceRegistry } from '../src/control/registry.js';
+import { initLogger } from '../src/lib/logger.js';
+
+// 单元测试静默日志，避免 degraded/removed 等路径把 warn/info 打进测试输出。
+initLogger({ level: 'error', file: false, color: false, silent: true });
 
 function fixture({ launcherInst = null, exists = true, probeOk = true } = {}) {
   const home = { homeId: 'a1b2c3d4e5f60708', homePath: '/mock/home', hostType: 'local' };
