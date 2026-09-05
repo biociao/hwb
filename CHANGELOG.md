@@ -6,7 +6,36 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+#### 工作台静态资源补上缓存头：no-cache + ETag/Last-Modified 强 revalidate（src/api/server.js）
+- **根因**：工作台（`index.html` / `app.js` / 组件模块）由 `serveStatic` 直接提供，只设 `Content-Type`，
+  没有 `Cache-Control`/`ETag`/`Last-Modified`。这与反代（`proxy.js`）无关——反代只是把 dsh web 的
+  上游响应头**原样透传**（`res.writeHead(upRes.statusCode, upRes.headers)`），本身不添加任何缓存头，
+  且只服务内嵌的 dsh web 实例，不服务工作台页面。因此改完源码后刷新是否存在缓存陈旧不可控。
+- **修复**：`serveStatic` 为每个静态响应补 `Cache-Control: no-cache` + 弱 `ETag`(size-mtime) + `Last-Modified`，
+  并支持 `If-None-Match` / `If-Modified-Since` 条件请求（命中回 `304` 空响应）。
+  因资源路径不带内容哈希，故不宜用 `max-age` 长缓存（否则改源码后浏览器拿陈旧副本）；
+  `no-cache` 每次仅做一次轻量 revalidate，未变 304、变了立即回全新内容——刷新即见改动、不重复传输。
+- **验证**：`node --test tests/*.test.js` 全量 102 例通过；另做了端到端探测——首次 200(no-cache/etag) →
+  带 `If-None-Match` 命中 304 → 文件改后 etag 变化返回 200 新内容 → `If-Modified-Since` 同秒命中 304。
+
+#### 运行日志面板高度翻倍（src/web/index.html）
+- **背景**：日志区 `max-height: 260px` 一次只能看到约 10 行，信息量偏少。
+- **修复**：`.log-body` 的 `max-height` 由 `260px` 提升到 `520px`，一次可见行数约翻倍；仍 `overflow-y: auto`
+  内部滚动，配合「跟随到底」+ 级别过滤，长日志不必频繁滚动。
+
 ### Fixed
+
+#### 实例卡不再展示「当前项目/当前会话」块（src/web/components/instance-grid.js）
+- **根因**：实例卡里的 `currentBlock`（当前项目 / 当前会话 + 状态 chip / token / 最近活动）与
+  Recent Projects / Recent Sessions 两栏所呈现的信息重复——这两栏已把实例的当前项目与最近会话
+  跨实例聚合展示，实例卡再放一份属冗余，且让卡片纵向堆叠、更显拥挤。
+- **修复**：删除 `instance-grid.js` 的 `statusChip` / `currentBlock` 两个函数及其在卡片中的调用，
+  卡片恢复为「名称 + 运行态 chip + 索引/类型/workspace/会话数 + 操作按钮」。顺带清理
+  `index.html` 中不再使用的 `.current-block` 样式；`store.listHomes()` 仍保留每实例的
+  `current` 字段（数据层语义不变，Recent Projects / Recent Sessions 消费同一会话元数据）。
+- **验证**：`node --test tests/*.test.js` 通过（`current` 字段断言在 store/remote-reader 层，未受影响）。
 
 #### 本地实例「在外部浏览器打开」改走原始服务连接，不再经 hwb 反代（src/control/launcher.js）
 - **根因**：`Launcher.#openLocal` 在拿到 `dsh web` 的 token 后，又包了一层 hwb 自己的**反向代理**

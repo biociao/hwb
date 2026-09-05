@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 需要 node:sqlite（Node ≥22.5）。setup-node 装的是 22.x 最新版。
+          node-version: 22
+      # 零 npm 依赖，无需 install —— 直接跑测试即可。
+      - run: npm test

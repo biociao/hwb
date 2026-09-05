@@ -1,10 +1,18 @@
+![hwb](/Users/ciao/Downloads/hwb.png)
+
 # hwb — harness workbench
 
-> 数据平面 over dsh homes（M1 + M2 已落地）
 > 版本：**v0.1.0** ｜ Node.js 22+ ｜ 原生 ESM ｜ **零 npm 依赖**（用 `node:sqlite`）
 
-`hwb`（harness workbench）是一个面向 `dsh`（DeepSeek Harness）的**本地工作台**：它读取
-你的 dsh home 目录（项目、会话、模型 tier、provider 凭证），构建一份本地 SQLite 索引，
+
+[![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
+[![version](https://img.shields.io/badge/version-v0.1.0-blue)](CHANGELOG.md)
+[![milestones](https://img.shields.io/badge/milestones-M1%E2%80%93M7-brightgreen)](DSH_Workbench_Fusion_Architecture.md)
+[![node](https://img.shields.io/badge/node-%E2%89%A522-blue)](package.json)
+[![npm deps](https://img.shields.io/badge/npm_deps-0-blue)](package.json)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+`hwb`（harness workbench）是一个面向 harness工具（目前主要支持的是DeepSeek Harness，即dsh）的**本地工作台**，用于应付需要开启多个dsh实例：它会构建一份本地 SQLite 索引，
 在一个纯元数据仪表盘里跨实例展示**最近项目 / 会话 / 实例状态 / Token 用量**，并通过一个
 **控制平面**去启动、停止、重启 dsh web 进程（本机），或经 SSH 隧道接入**远端** dsh 实例。
 
@@ -63,7 +71,7 @@
 | 能力 | 说明 |
 |------|------|
 | **多实例聚合** | 一张工作台看全本机 + 所有 SSH 远程 dsh 实例的项目 / 会话 / 用量 |
-| **当前项目 / 当前会话** | 每个实例（本地 + 远程）缓存「最近活跃会话 + 其所属项目」的元数据与状态（标题 / 状态 chip / token / 上下文 / 最近活动），显示在实例卡 |
+| **当前项目 / 当前会话** | 每个实例（本地 + 远程）缓存「最近活跃会话 + 其所属项目」的元数据与状态（标题 / 状态 chip / token / 上下文 / 最近活动），并在 Recent Projects / Recent Sessions 中跨实例聚合展示 |
 | **零 I/O 读取层** | 只读投影缓存 `session_projcache.json`（`projection cache` 层），**不下探 `.zstd`** |
 | **远程只读索引** | 经一次 `ssh host bash -s` 在远端 cat 出 dsh home 的 4 个元数据文件，与本地共用同一套 schema 验证 / 域降级——远程实例的当前项目/会话与本地同构 |
 | **版本降级** | 每个文件按 `unit.version` 校验；主版本不兼容时该域标 `degraded`，其余照常，不白屏 |
@@ -79,7 +87,7 @@
 ## 环境要求
 
 - **Node.js ≥ 22**（需要 `node:sqlite`，Node 22.5+；建议 22.x 或更新，实测 v22.21.1）。
-- 本机需可用 `dsh` 命令（起本地 dsh web 时；`--profile web` 写法兼容新旧版）。
+- 本机需可用 `dsh` 命令（起本地 dsh web 时；用**裸 `dsh web --port <n> [--no-open]`**，新旧版 dsh 均兼容）。
 - 远端实例需可通过 SSH 别名/密钥连接（`~/.ssh/config` 的 `Host` 或 `user@host`）。
 
 ---
@@ -90,9 +98,13 @@
 
 ```bash
 # 安装依赖：无（零 npm 依赖）。直接用 Node 运行即可。
-node src/server.js --home ~/.dsh
+node src/server.js
 # 默认监听 http://127.0.0.1:4310
 ```
+
+> **不需要 `--home`**：实例（本机 dsh home / SSH 远程）统一在**工作台 UI** 里添加、管理
+> （见下文「添加实例」），首次启动的 onboarding 会自动检测 `~/.dsh` 并提示添加。
+> `--home` 只是**可选**的启动时预注册捷径，不传完全正常。
 
 命令用 npm 脚本：
 
@@ -105,7 +117,7 @@ npm test           # node --test tests/*.test.js
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `--home <path>` | — | 注册一个 dsh home（可重复传，注册多个实例） |
+| `--home <path>` | — | **可选**：启动时预注册一个 dsh home（可重复传，注册多个实例）。缺省不传，靠 onboarding 自动检测 `~/.dsh` 或经 UI 添加 |
 | `--port <n>` | `4310` | hwb 监听端口（仅绑定 `127.0.0.1`） |
 | `--db <path>` | `~/.hwb/hwb.db` | SQLite 索引库；传 `:memory:` 用内存库 |
 | `--interval-ms <n>` | `60000` | 数据索引循环基线周期（毫秒） |
@@ -134,8 +146,9 @@ npm test           # node --test tests/*.test.js
 1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
 2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
 3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip、索引状态、workspace/会话数，
-   **当前项目/当前会话**块（最近活跃会话的项目、标题、状态 chip、token、上下文、最近活动），以及
-   open / stop / restart / reindex / remove 等操作按钮。远程实例经 SSH 只读索引入库后同样显示。
+   **连接（连接到 / 必要时拉起 dsh web）** / stop / restart / reindex / remove 等操作按钮。
+   远程实例经 SSH 只读索引入库后同样显示。
+   （实例卡不再重复展示「当前项目/当前会话」——该信息已由 Recent Projects / Recent Sessions 聚合呈现。）
 4. **Token 用量** —— 汇总卡 + 分时趋势堆叠柱状图（支持 24h / 3天 / 7天 / 14天 / 30天 周期，
    按 合计 / 项目 / LLM provider / 实例 维度切换）+ 按项目拆分。
 5. **运行日志** —— 后端结构化日志实时面板：分级着色（debug/info/warn/error）、按级别过滤、
@@ -148,9 +161,15 @@ npm test           # node --test tests/*.test.js
 （本地直连端口，或远端经 SSH 隧道 + 反代）。退出时只隐藏，再次进入不重载。
 
 **添加实例**（工作台 Instances 区块「＋ 添加」）：
-- **本机**：填 dsh home 路径，如 `~/.dsh`。
+- **本机**：填 dsh home 路径，如 `~/.dsh`；可选填「本机 dsh web 端口」+「鉴权 token」直接接入
+  已在跑的那台实例（**同机直连、无端口转发、不新拉起**；端口留空则按需拉起一台）。
 - **SSH 远程**：填 SSH 主机（别名 / `user@host`）+ 远端 dsh web 监听端口（默认 `3080`），
-  可选填远端 home 路径、远端启动命令、token 日志路径。hwb 会代管远端 dsh web 的启停。
+  可选填远端 home 路径、远端启动命令、token 日志路径，以及**鉴权 token**（填入则跳过远端抓取）。
+  远程实例经 hwb 的 1:1 根路径反代接入（浏览器无法直达 ssh 隧道）。
+
+> **打开 = 连接（稳定第一）**：实例卡的默认动作是**连接**到已有实例——本地复用已在跑的进程，
+> 远程重建一条 ssh 隧道接入**已运行**的 dsh web；**绝不**因连接问题重启或杀掉一个健康实例。
+> `stop / restart` 是需二次确认的最后手段，远端自更新 dsh 后填入新 token 即可直连。
 
 ---
 
