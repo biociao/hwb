@@ -1,6 +1,6 @@
 {
   "name": "hwb",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "hwb (harness workbench) — 面向 dsh home 的数据平面工作台：跨实例聚合项目 / 会话 / Token 用量，并托管本机与远程 dsh web（控制平面）",
   "type": "module",
   "bin": {

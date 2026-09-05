@@ -2,11 +2,11 @@
 
 # hwb — harness workbench
 
-> 版本：**v0.1.0** ｜ Node.js 22+ ｜ 原生 ESM ｜ **零 npm 依赖**（用 `node:sqlite`）
+> 版本：**v0.1.1** ｜ Node.js 22+ ｜ 原生 ESM ｜ **零 npm 依赖**（用 `node:sqlite`）
 
 
 [![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.1.1-blue)](CHANGELOG.md)
 [![milestones](https://img.shields.io/badge/milestones-M1%E2%80%93M7-brightgreen)](DSH_Workbench_Fusion_Architecture.md)
 [![node](https://img.shields.io/badge/node-%E2%89%A522-blue)](package.json)
 [![npm deps](https://img.shields.io/badge/npm_deps-0-blue)](package.json)
@@ -351,7 +351,7 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
 
 ## 已知限制
 
-> 这些是 v0.1.0 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
+> 这些是 v0.1.1 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
 
 - **额度卡片未接通仪表盘**：`src/web/components/quota-card.js` 的 `renderQuotaCards` 已实现，
   后端 `/api/quota` ✓、`/api/events` 的 `quota:updated` ✓、`QuotaService` + 各 provider 适配器 ✓、
@@ -366,7 +366,7 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
   `dsh plugin --profile web add dsh-session-deeplink` 安装；未装插件的 home 深链不触发
   （框架已保证「装了插件」能正确探测 + 保留 `?session=`）。
 - **新 dsh 鉴权 token**（≥`0.1.2-rc.1`）：`dsh web` 每次启动打印带 `?token=` 的 URL，
-  hwb 会抓取并拼进入口 URL；**旧版 dsh（不打印 token，如 `v0.1.1`）自动回退裸 URL**。
+  hwb 会抓取并拼进入口 URL；**旧版 dsh（不打印 token，如 `v0.1.0`）自动回退裸 URL**。
   向下兼容做得足够稳：远端「ensure」对已在监听但没有 token 的旧版实例**绝不 killport/重启**
   （避免打断一个健康的旧版 web）；启动后一出现不带 token 的 URL 行就**立即**用裸 URL 兜底，
   而不是白等满 40s 的 poll 窗口；默认远端启动命令用**裸 `dsh web --port <n>`**
@@ -396,7 +396,7 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
 | M4 — Quota Balancer | 🟡 后端 + 单测完成（UI 接线池） |
 | M5 — Drill-in Pane | ✅ 完成 |
 | M6 — Re-own Control | ✅ 完成 |
-| M7 — Publish | 🎯 v0.1.0（本版） |
+| M7 — Publish | 🎯 v0.1.1（本版） |
 
 后续方向（见架构文档 §14 开放问题）：远程钻入方式、会话标题来源、首批额度 provider 的取舍等。
 

@@ -4,7 +4,9 @@ All notable changes to **hwb** are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), this project adheres to
 Semantic Versioning.
 
-## [Unreleased]
+## [0.1.1] — 2026-09-06
+
+**第一个补丁版本。** 修复/增强工作台 UI 与静态资源服务，去掉实例 tab 上的「本机/远程」标签。
 
 ### Changed
 

@@ -2,7 +2,7 @@
 
 > 基于真实 `~/.dsh` 目录 inspection 的 greenfield 重建
 > 技术栈: Node.js 22+ · 原生 ESM · `node:sqlite` · 零 npm 依赖
-> 版本: v0.1.0 | 2026-09-04
+> 版本: v0.1.1 | 2026-09-04
 
 ---
 

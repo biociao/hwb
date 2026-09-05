@@ -2,7 +2,7 @@
 
 > 本文档固化了 hwb 实现「多 dsh 实例统一管理」的拓扑结构，作为 `README.md` 与
 > `DSH_Workbench_Fusion_Architecture.md` 的可视化附录。
-> 版本：v0.1.0 ｜ 2026-09-05
+> 版本：v0.1.1 ｜ 2026-09-05
 
 ## 1. 总览拓扑
 
