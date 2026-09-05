@@ -72,11 +72,7 @@ function saveView() {
 }
 
 function tabLabel(h) {
-  const name = esc(h.alias || h.homePath);
-  const tag = h.hostType === 'local'
-    ? '<span class="local-tag">本机</span>'
-    : '<span class="tag-remote">远程</span>';
-  return `${name}${tag}`;
+  return esc(h.alias || h.homePath);
 }
 
 function renderTabs() {
