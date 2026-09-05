@@ -11,16 +11,15 @@
       --ok: #3fb96f; --warn: #e0a13c; --bad: #d9534f;
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
     body { margin: 0; background: var(--bg); color: var(--fg); display: flex; flex-direction: column;
-           font: 14px/1.5 -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; }
+           min-height: 100vh; font: 14px/1.5 -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; }
 
     /* 顶部 bar：品牌 + 实例 tab 卡（可拖动排序） */
     #topbar { display: flex; align-items: center; gap: 16px; padding: 0 14px; height: 46px;
               border-bottom: 1px solid var(--border); background: var(--panel);
               flex-shrink: 0; position: sticky; top: 0; z-index: 10; }
     #topbar .brand { font-size: 16px; font-weight: 700; display: flex; gap: 10px; align-items: baseline;
-                     flex-shrink: 0; }
+                     flex-shrink: 0; font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; }
     #topbar .brand .live { font-size: 12px; font-weight: 400; color: var(--dim); }
     #topbar .brand .live.on { color: var(--ok); }
     .tabbar { display: flex; align-items: stretch; gap: 2px; overflow-x: auto; min-width: 0; flex: 1; }
@@ -94,6 +93,12 @@
     section > h2 button.add { float: right; text-transform: none; letter-spacing: 0; }
     .meta.actions button { padding: 0 8px; font-size: 11px; }
     .degraded-detail { color: var(--warn); word-break: break-all; }
+    /* 实例卡里的「当前项目/当前会话」块（本地 + 远程，见 §4.6） */
+    .current-block { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+    .current-block .t { display: flex; align-items: center; gap: 8px; }
+    .current-block .label { color: var(--dim); font-size: 11px; width: 52px; flex: none; }
+    .current-block .name2 { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .current-block .meta { margin-top: 4px; }
     .home-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px;
                  border-bottom: 1px solid var(--border); }
     .home-form input, .home-form select { flex: 1 1 160px; font: inherit; font-size: 12px; padding: 5px 8px;
@@ -114,40 +119,51 @@
     .usage-big .num { display: block; font-size: 20px; font-weight: 700; color: var(--fg); }
     .usage-big .cap, .usage-stat .c { font-size: 11px; color: var(--dim); }
     .usage-stat .n { display: block; font-size: 15px; font-weight: 600; color: var(--accent); }
-    .usage-lines { padding: 6px 14px; display: flex; flex-direction: column; gap: 5px; }
-    .usage-line { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-    .usage-line .u-label { width: 62px; color: var(--dim); flex-shrink: 0; }
-    .usage-line .u-bar { flex: 1; height: 8px; background: #10131c; border-radius: 4px; overflow: hidden; }
-    .usage-line .u-bar i { display: block; height: 100%; border-radius: 4px; }
-    .usage-line .u-bar i.b-in { background: var(--accent); }
-    .usage-line .u-bar i.b-out { background: #7bd88f; }
-    .usage-line .u-bar i.b-hit { background: #5fd0d0; }
-    .usage-line .u-bar i.b-write { background: #e0a13c; }
-    .usage-line .u-val { width: 64px; text-align: right; color: var(--fg); flex-shrink: 0; }
-    .usage-line .u-val { font-variant-numeric: tabular-nums; }
+    /* 单条构成线：输入/缓存/输出按占比分段，不同颜色，悬停显示用量与占比 */
+    .usage-stream { display: flex; height: 16px; margin: 4px 14px 2px; border-radius: 8px; overflow: hidden;
+                    background: #10131c; box-shadow: inset 0 0 0 1px var(--border); }
+    .usage-stream .seg { height: 100%; min-width: 6px; cursor: pointer; transition: filter .12s, opacity .12s; }
+    .usage-stream .seg:hover { filter: brightness(1.3); }
+    .usage-stream .seg.s-in { background: var(--accent); }
+    .usage-stream .seg.s-out { background: #7bd88f; }
+    .usage-stream .seg.s-hit { background: #5fd0d0; }
+    .usage-stream .seg.s-write { background: #e0a13c; }
+    .usage-stream-cap { margin: 0 14px 6px; font-size: 11px; color: var(--dim); }
+    /* 悬停 tooltip：fixed 定位到 body，绝不溢出/被裁剪 */
+    .usage-stream-tip { position: fixed; z-index: 100; max-width: 280px; padding: 5px 9px; border-radius: 6px;
+                        background: rgba(8,10,16,.96); border: 1px solid var(--border); color: var(--fg);
+                        font-size: 12px; line-height: 1.4; pointer-events: none; display: flex; gap: 12px; align-items: baseline;
+                        box-shadow: 0 8px 24px rgba(0,0,0,.4); white-space: nowrap; }
+    .usage-stream-tip[hidden] { display: none !important; }
+    .usage-stream-tip b { color: var(--fg); font-weight: 600; }
+    .usage-stream-tip .t { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+    .usage-stream-tip .p { color: var(--dim); }
     .usage-trend-block { padding: 6px 14px 10px; border-top: 1px solid var(--border); }
-    .usage-trend-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
-    .usage-trend-title { font-size: 12px; color: var(--dim); }
-    .trend-toggle { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-    .trend-toggle .usage-dim-btn { padding: 2px 9px; font-size: 11px; }
+    .usage-trend-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .usage-trend-title { font-size: 12px; color: var(--dim); flex-shrink: 0; }
+    .trend-toggle { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; }
+    /* 维度切换：占满中间、横向滚动而非换行；范围说明固定右侧，避免被挤压/遮挡 */
+    .trend-toggle.trend-dim { flex: 1 1 auto; min-width: 0; overflow-x: auto; padding-bottom: 2px; }
+    .trend-toggle .usage-dim-btn { padding: 2px 9px; font-size: 11px; flex-shrink: 0; }
     .trend-toggle .usage-dim-btn.active { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
-    .trend-toggle .trend-range { margin-left: auto; font-size: 11px; color: var(--dim); }
+    .trend-range { flex-shrink: 0; font-size: 11px; color: var(--dim); white-space: nowrap; }
     .trend-toggle .usage-dim-btn, .trend-toggle .usage-period-btn { background: transparent; border: 1px solid var(--border); border-radius: 4px; color: var(--dim); cursor: pointer; transition: background .15s, border-color .15s, color .15s; }
     .trend-toggle .usage-dim-btn:hover, .trend-toggle .usage-period-btn:hover { border-color: var(--accent); color: var(--fg); }
     .trend-toggle .usage-period-btn.active { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
-    .usage-period-toggle { margin-top: 4px; gap: 6px; }
-    /* 堆叠柱状图：左 Y 轴 + 主绘图区（水平网格线/柱体）+ 底部 X 轴 */
+    /* 周期切换：单行不换行，过宽横向滚动，避免遮挡/折行 */
+    .usage-period-toggle { margin-top: 2px; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+    .usage-period-toggle .usage-period-btn { flex-shrink: 0; }
+    /* 点图：左 Y 轴 + 主绘图区（水平网格线/平滑拟合曲线/数据点）+ 底部 X 轴 */
     .trend-chart { display: flex; gap: 6px; width: 100%; }
     .trend-y { position: relative; flex: 0 0 52px; height: 130px; }
     .trend-ytick { position: absolute; right: 2px; transform: translateY(50%); font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums; }
     .trend-main { flex: 1; min-width: 0; }
-    .trend-plotarea { position: relative; height: 130px; }
+    .trend-plot { position: relative; height: 130px; }
     .trend-gridline { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--border); }
-    .trend-bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; }
-    .trend-col { position: relative; flex: 1; height: 100%; }
-    .trend-stack { position: absolute; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; }
-    .trend-stack i { width: 100%; flex: none; border-radius: 1px 1px 0 0; }
-    .trend-stack i:hover { filter: brightness(1.25); }
+    .trend-line { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .trend-dot { position: absolute; width: 8px; height: 8px; border-radius: 50%; transform: translate(-50%, 50%);
+                 border: 1px solid rgba(15,17,23,.85); box-shadow: 0 0 0 1px rgba(15,17,23,.3); cursor: pointer; transition: transform .12s; }
+    .trend-dot:hover { transform: translate(-50%, 50%) scale(1.5); }
     .trend-x { display: flex; gap: 2px; margin-top: 2px; }
     .trend-xcell { flex: 1; text-align: center; font-size: 10px; color: var(--dim); overflow: hidden; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .trend-caption { margin-top: 6px; font-size: 11px; color: var(--dim); }
@@ -156,7 +172,42 @@
     .trend-legend-item i { width: 10px; height: 10px; border-radius: 2px; flex: none; }
     .usage-projects { padding: 2px 14px 10px; }
     .usage-projects .up-row { justify-content: space-between; }
-    .usage-grid + .meta, .usage .meta + .usage-lines { padding-left: 14px; }
+    .usage-grid + .meta { padding-left: 14px; }
+
+    /* 运行日志面板（grid 内跨整行） */
+    .logs { grid-column: 1 / -1; }
+    .logs > h2 { display: flex; align-items: center; gap: 8px; }
+    .logs .log-live { margin-left: auto; font-size: 11px; font-weight: 400; color: var(--dim);
+                      display: inline-flex; align-items: center; gap: 5px; }
+    .logs .log-live i { width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
+                        animation: logpulse 2s infinite; }
+    @keyframes logpulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+    .logs .log-tools { display: flex; gap: 4px; }
+    .log-fbtn { padding: 1px 8px; font-size: 11px; border-radius: 4px; background: transparent;
+                border: 1px solid var(--border); color: var(--dim); cursor: pointer; }
+    .log-fbtn:hover { border-color: var(--accent); color: var(--fg); }
+    .log-fbtn.active { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
+    .log-body { max-height: 260px; overflow-y: auto; padding: 6px 10px; font-size: 12px; line-height: 1.45;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .log-body::-webkit-scrollbar { width: 8px; }
+    .log-body::-webkit-scrollbar-thumb { background: #2b3350; border-radius: 4px; }
+    .log-body::-webkit-scrollbar-track { background: transparent; }
+    .log-row { padding: 2px 4px; border-bottom: 1px solid var(--border); white-space: pre-wrap;
+               word-break: break-all; cursor: default; }
+    .log-row:hover { background: #1d2130; }
+    .log-row .log-ts { color: var(--dim); margin-right: 8px; }
+    .log-row .log-lvl { display: inline-block; width: 46px; font-weight: 600; }
+    .log-row.debug .log-lvl { color: var(--dim); }
+    .log-row.info .log-lvl { color: var(--accent); }
+    .log-row.warn .log-lvl { color: var(--warn); }
+    .log-row.error .log-lvl { color: var(--bad); }
+    .log-row .log-scope { color: #7fd0c0; margin-right: 8px; }
+    .log-row.warn .log-msg { color: #f0c07a; }
+    .log-row.error .log-msg { color: #ffb0ac; }
+    .log-row .log-fields { color: var(--dim); }
+    .log-stack { margin: 4px 0 0 54px; padding: 6px 8px; background: #10131c; border: 1px solid var(--border);
+                 border-radius: 4px; color: #b8bfd0; font-family: inherit; font-size: 11px;
+                 overflow-x: auto; white-space: pre; }
 
     /* 实例视图：全高 iframe（去掉顶部条，切回工作台走顶部 tab）。右上角浮层仅悬停可见。 */
     .iframe-pane { position: relative; display: flex; flex-direction: column; overflow: hidden; }
@@ -181,13 +232,16 @@
     .modal-card h3 { margin: 0 0 12px; font-size: 15px; color: var(--fg); }
     .modal-card .home-form { border: none; padding: 0; margin-bottom: 6px; }
     .modal-card .meta.readonly { flex-basis: 100%; font-size: 12px; color: var(--dim); word-break: break-all; }
+    .home-form .meta.readonly code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+                                     background: #10131c; padding: 1px 4px; border-radius: 4px; color: var(--accent); }
+    .home-form .meta.readonly .hint-strong { display: block; margin-top: 4px; color: var(--warn); }
     .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
     .modal-actions button.primary { color: #0b1020; }
   </style>
 </head>
 <body>
   <header id="topbar">
-    <div class="brand">hwb <span id="live" class="live">connecting…</span></div>
+    <div class="brand">(=hωb=) <span id="live" class="live">connecting…</span></div>
     <div id="tabs" class="tabbar"></div>
   </header>
   <main id="main">
