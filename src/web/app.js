@@ -5,6 +5,7 @@ import { renderRecentSessions } from './components/recent-sessions.js';
 import { renderInstanceGrid } from './components/instance-grid.js';
 import { renderUsageCard, usageTrendHtml, USAGE_PERIODS } from './components/usage-card.js';
 import { renderHomeForm, renderOnboarding, renderSettingsForm } from './components/add-home.js';
+import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLogView, logPanelHtml } from './components/log-panel.js';
 
 const main = document.getElementById('main');
 const dashboardEl = document.getElementById('dashboard');
@@ -14,7 +15,7 @@ const modalEl = document.getElementById('modal');
 
 let showAddForm = false;
 let lastHomes = [];
-// Token 用量趋势：当前按哪个维度堆叠（total|project|provider|instance）+ 最新 /api/usage 数据。
+// Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
 let lastUsage = null;
 let usageDim = 'total';
 // 当前统计周期（过去 24h / 3天 / 7天 / 14天 / 30天）。hours 驱动趋势图，days 驱动汇总/按项目。
@@ -26,6 +27,49 @@ const panes = new Map();
 // 拖拽排序后短暂抑制紧随其后的 click（避免拖完就切换实例）
 let suppressNavClick = false;
 let dragHomeId = null;
+
+// —— 持久化：浏览器刷新后仍保持「当前位置 / Token 用量筛选」——
+// 视图位置（工作台 or 某实例）用 sessionStorage：同标签页内跨刷新保持，关标签即清，
+// 避免把「正在看哪个实例」误存成跨会话偏好；Token 用量筛选（统计周期 + 维度）用
+// localStorage：这是用户偏好，理应跨会话保留。
+const VIEW_KEY = 'hwb:view';
+const USAGE_KEY = 'hwb:usage';
+const USAGE_DIMS = ['total', 'project', 'provider', 'model', 'instance'];
+
+function loadUsagePrefs() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(USAGE_KEY) || 'null');
+    if (!raw) return;
+    if (USAGE_DIMS.includes(raw.dim)) usageDim = raw.dim;
+    const p = USAGE_PERIODS.find((x) => x.key === raw.period);
+    if (p) usagePeriod = p;
+  } catch { /* storage 不可用/损坏时静默回退默认值 */ }
+}
+function saveUsagePrefs() {
+  try { localStorage.setItem(USAGE_KEY, JSON.stringify({ dim: usageDim, period: usagePeriod.key })); } catch { /* 忽略 */ }
+}
+function loadView() {
+  try {
+    const raw = JSON.parse(sessionStorage.getItem(VIEW_KEY) || 'null');
+    if (raw && raw.kind === 'instance' && typeof raw.homeId === 'string') return raw;
+  } catch { /* 忽略 */ }
+  return null;
+}
+function saveView() {
+  try {
+    if (view.kind === 'instance') {
+      sessionStorage.setItem(VIEW_KEY, JSON.stringify({
+        kind: 'instance',
+        homeId: view.homeId,
+        sessionId: view.sessionId || null,
+        sessionTitle: view.sessionTitle || null,
+        project: view.project || null,
+      }));
+    } else {
+      sessionStorage.removeItem(VIEW_KEY);
+    }
+  } catch { /* 忽略 */ }
+}
 
 function tabLabel(h) {
   const name = esc(h.alias || h.homePath);
@@ -88,7 +132,9 @@ async function renderDashboard() {
     sessions: renderRecentSessions(sessions),
     homes: renderInstanceGrid(lastHomes),
     usage: renderUsageCard(usage, usageDim, usagePeriod.key),
+    logs: logPanelHtml(),
   });
+  logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
   if (showAddForm) {
     dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm());
     dashboardEl.querySelector('#add-home input[name=homePath]').focus();
@@ -98,6 +144,7 @@ async function renderDashboard() {
 
 function goDashboard() {
   view = { kind: 'dashboard' };
+  saveView();
   renderTabs();
   showView();
   refresh();
@@ -120,6 +167,52 @@ async function refreshUsageCard() {
   if (el) el.innerHTML = renderUsageCard(usage, usageDim, usagePeriod.key);
 }
 
+// —— Token 构成线（新增输入/缓存命中/缓存创建/输出）与趋势图数据点的悬停 tooltip ——
+// 单条构成线的不同颜色分段、趋势图上的圆形数据点：悬停均用 fixed tooltip 展示详细信息
+// （名称 · 实际用量 · 占比）。fixed 定位到 body，绝不溢出/被裁剪。
+function usageTipEl() {
+  let t = document.getElementById('usage-stream-tip');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'usage-stream-tip';
+    t.className = 'usage-stream-tip';
+    t.hidden = true;
+    document.body.appendChild(t);
+  }
+  return t;
+}
+function positionUsageTip(el, tip) {
+  const er = el.getBoundingClientRect();
+  const tr = tip.getBoundingClientRect();
+  let left = er.left + er.width / 2 - tr.width / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - tr.width - 6));
+  let top = er.top - tr.height - 8;
+  if (top < 6) top = er.bottom + 8;
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+const USAGE_TIP_TARGET = '.usage-stream .seg, .trend-dot';
+document.addEventListener('mouseover', (e) => {
+  const target = e.target.closest(USAGE_TIP_TARGET);
+  if (!target) return;
+  const tip = usageTipEl();
+  tip.innerHTML = `<b>${esc(target.dataset.name)}</b><span class="t">${esc(target.dataset.tok)}</span><span class="p">${esc(target.dataset.pct)}%</span>`;
+  tip.hidden = false;
+  positionUsageTip(target, tip);
+});
+document.addEventListener('mousemove', (e) => {
+  const tip = document.getElementById('usage-stream-tip');
+  if (!tip || tip.hidden) return;
+  const target = e.target.closest(USAGE_TIP_TARGET);
+  if (target) positionUsageTip(target, tip);
+});
+document.addEventListener('mouseout', (e) => {
+  const target = e.target.closest(USAGE_TIP_TARGET);
+  if (!target) return;
+  const tip = document.getElementById('usage-stream-tip');
+  if (tip) tip.hidden = true;
+});
+
 // —— 持久实例面板 ——
 function paneFor(homeId) {
   let pane = panes.get(homeId);
@@ -129,7 +222,7 @@ function paneFor(homeId) {
   el.dataset.homeId = homeId;
   el.hidden = true;
   el.innerHTML = `
-    <div class="frame-loading">dsh web 启动中…</div>
+    <div class="frame-loading">连接 dsh web…</div>
     <div class="float-actions" hidden></div>
     <div class="frame-cover" hidden><span class="frame-cover-label">加载中…</span></div>`;
   main.appendChild(el);
@@ -238,6 +331,7 @@ function stripToken(url) {
 async function enterInstance(homeId, extra = {}) {
   const token = Symbol('view');
   view = { kind: 'instance', homeId, token, ...extra };
+  saveView();
   renderTabs();
   const pane = paneFor(homeId);
   showView(); // 懒创建：先 loading，进程就绪后才挂 iframe
@@ -253,7 +347,7 @@ async function enterInstance(homeId, extra = {}) {
   } catch (e) {
     if (view.token === token) {
       const loading = pane.el.querySelector('.frame-loading');
-      if (loading) loading.textContent = `启动失败: ${e.message}`;
+      if (loading) loading.textContent = `连接失败: ${e.message}`;
     }
   }
   refresh(); // runtime 状态已变，更新 tab 圆点
@@ -299,8 +393,11 @@ async function saveSettings(homeId) {
     body.remoteHome = form.remoteHome.value.trim() || null;
     body.remoteCmd = form.remoteCmd.value.trim() || null;
     body.remoteLog = form.remoteLog.value.trim() || null;
+    body.token = form.token.value.trim() || null;
   } else {
     body.homePath = form.homePath.value.trim();
+    body.localPort = form.localPort.value.trim() || null;
+    body.token = form.token.value.trim() || null;
   }
   await api(`/api/homes/${homeId}`, { method: 'PUT', body });
   closeModal();
@@ -313,10 +410,10 @@ async function saveSettings(homeId) {
   await refresh();
 }
 
-async function addHome({ homePath, alias, hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog }, form) {
+async function addHome({ homePath, alias, hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort }, form) {
   const body = hostType === 'remote'
-    ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, alias }
-    : { homePath, alias };
+    ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, token: token || undefined, alias }
+    : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
   const data = await api('/api/homes', { method: 'POST', body });
   if (form && data.warning && data.warning !== null) formMsg(form, data.warning, false);
   showAddForm = false;
@@ -349,6 +446,7 @@ async function handleAction(e) {
         window.open(btn.dataset.url, '_blank');
         break;
       case 'stop-instance':
+        if (!confirm('停止该 dsh web 实例？（会打断正在运行的实例，仅作最后手段；也可考虑在远端自行处理。）')) return;
         btn.disabled = true;
         await api(`/api/homes/${btn.dataset.homeId}/stop`, { method: 'POST' });
         destroyPane(btn.dataset.homeId);
@@ -365,6 +463,8 @@ async function handleAction(e) {
         await enterInstance(btn.dataset.homeId);
         break;
       case 'restart':
+        // 稳定第一：重启会打断远端实例并换发新 token，属用户主动的最后手段，需要明确授权。
+        if (!confirm('重启该 dsh web 实例？（会打断正在运行的实例、换发新 token。若只是更新了远端 dsh，建议在设置里直接填 token 以直连，而不要重启。）')) return;
         btn.disabled = true;
         await api(`/api/homes/${btn.dataset.homeId}/restart`, { method: 'POST' });
         await enterInstance(btn.dataset.homeId); // 用新 token URL 重新挂载面板
@@ -375,6 +475,8 @@ async function handleAction(e) {
         await refresh();
         break;
       case 'stop':
+        // 稳定第一：停止会打断实例，属用户主动的最后手段，需明确授权。
+        if (!confirm('停止该实例？（会打断正在运行的 dsh web；仅作最后手段。）')) return;
         btn.disabled = true;
         await api(`/api/homes/${btn.dataset.homeId}/stop`, { method: 'POST' });
         await refresh();
@@ -382,7 +484,10 @@ async function handleAction(e) {
       case 'remove-home':
         if (confirm(`移除 ${btn.dataset.name}？（只删除 hwb 索引，不碰 dsh 文件）`)) {
           const id = btn.dataset.homeId;
-          if (view.kind === 'instance' && view.homeId === id) view = { kind: 'dashboard' };
+          if (view.kind === 'instance' && view.homeId === id) {
+            view = { kind: 'dashboard' };
+            saveView();
+          }
           await api(`/api/homes/${id}`, { method: 'DELETE' });
           destroyPane(id);
           await refresh();
@@ -400,10 +505,21 @@ async function handleAction(e) {
       case 'usage-dim':
         usageDim = btn.dataset.dim || 'total';
         renderUsageTrend();
+        saveUsagePrefs();
         break;
       case 'usage-period':
         usagePeriod = USAGE_PERIODS.find((p) => p.key === btn.dataset.period) || usagePeriod;
         await refreshUsageCard();
+        saveUsagePrefs();
+        break;
+      case 'log-filter':
+        setLogFilter(btn.dataset.level);
+        break;
+      case 'log-follow':
+        toggleLogFollow();
+        break;
+      case 'log-clear':
+        clearLogView();
         break;
     }
   } catch (err) {
@@ -497,10 +613,16 @@ main.addEventListener('submit', async (e) => {
         remoteHome: form.remoteHome.value.trim(),
         remoteCmd: form.remoteCmd.value.trim() || null,
         remoteLog: form.remoteLog.value.trim() || null,
+        token: form.token.value.trim() || null,
         alias,
       }, form);
     } else {
-      await addHome({ homePath: form.homePath.value.trim(), alias }, form);
+      await addHome({
+        homePath: form.homePath.value.trim(),
+        localPort: form.localPort.value.trim() || null,
+        token: form.token.value.trim() || null,
+        alias,
+      }, form);
     }
   } catch (err) {
     formMsg(form, err.message, true);
@@ -518,6 +640,8 @@ dashboardEl.addEventListener('change', (e) => {
   form.remoteHome.hidden = !remote;
   form.remoteCmd.hidden = !remote;
   form.remoteLog.hidden = !remote;
+  form.token.hidden = false;        // 手填 token：本机/远程直连通用
+  form.localPort.hidden = remote;   // 本机直连端口：仅本机模式
   form.homePath.required = !remote;
   form.host.required = remote;
   form.remotePort.required = remote;
@@ -575,9 +699,32 @@ subscribe(
   (on) => {
     live.textContent = on ? 'live' : 'reconnecting…';
     live.classList.toggle('on', on);
-  }
+  },
+  (entry) => appendLog(entry) // 实时日志推送到「运行日志」面板
 );
 
-refresh().catch((e) => {
+// 预载日志环缓冲快照，让「运行日志」面板打开即有历史。
+logInit().catch(() => {});
+
+// 启动：先恢复「Token 用量筛选」偏好，再拉取实例列表，最后按需恢复到上次所在的实例视图。
+async function boot() {
+  loadUsagePrefs(); // 在首次 renderDashboard 之前恢复周期/维度，让首屏就用回用户上次的选择
+  const restored = loadView(); // 上次刷新前停留在哪个实例（若有）
+  await refresh();
+  if (restored?.kind === 'instance') {
+    if (lastHomes.some((h) => h.homeId === restored.homeId)) {
+      // 重新挂载该实例的持久 iframe（含会话深链），刷新后位置保持不变。
+      await enterInstance(restored.homeId, {
+        sessionId: restored.sessionId || null,
+        sessionTitle: restored.sessionTitle || null,
+        project: restored.project || null,
+      });
+    } else {
+      saveView(); // 该实例已被移除：清掉残留位置，回到工作台。
+    }
+  }
+}
+
+boot().catch((e) => {
   dashboardEl.innerHTML = `<div class="empty">failed to load: ${e.message}</div>`;
 });

@@ -55,6 +55,13 @@ test('store upsert + query: homes, recent sessions, recent projects', () => {
   // workspace without sessions still appears as a project
   assert.ok(projects.some((p) => p.project === 'empty-proj' && p.sessionCount === 0));
 
+  // 每个 home 的「当前项目/当前会话」= 最近活跃 session（s1 比 s2 新）及其所属项目。
+  assert.equal(homes[0].current.sessionId, 's1');
+  assert.equal(homes[0].current.project, 'alpha');
+  assert.equal(homes[0].current.workspaceId, 'ws-1');
+  assert.deepEqual(homes[0].current.status, { kind: 'running', label: '运行中', subagents: 1, approval: 'ask' });
+  assert.equal(homes[0].current.tokenUsage.outputTokens, 20);
+
   store.close();
 });
 
@@ -155,6 +162,19 @@ test('store updateHomeConfig edits alias/remote config and preserves unspecified
   store.close();
 });
 
+test('store persists hand-set token on remote homes (register + update + clear)', () => {
+  const store = new IndexStore(':memory:');
+  const id = store.registerHome({ homePath: 'ssh://c4g:3080', hostType: 'remote', host: 'c4g', remotePort: 3080, token: '?token=AbC-xyz_123' });
+  assert.equal(store.getHome(id).token, '?token=AbC-xyz_123');
+  // 更新其它字段不丢 token
+  store.updateHomeConfig(id, { remotePort: 4444 });
+  assert.equal(store.getHome(id).token, '?token=AbC-xyz_123');
+  // 显式清空 token（回到远端抓取流程）
+  store.updateHomeConfig(id, { token: null });
+  assert.equal(store.getHome(id).token, null);
+  store.close();
+});
+
 test('store updateHomeConfig re-keys a local home when homePath changes', () => {
   const store = new IndexStore(':memory:');
   const id = store.registerHome({ homePath: '/mock/a', alias: 'A' });
@@ -247,14 +267,18 @@ test('store usageTrendGrouped buckets by dimension (total/project/instance/provi
 
   const total = store.usageTrendGrouped({ dimension: 'total', hours: 24 });
   assert.deepEqual(Object.keys(nonEmpty(total).groups), ['合计']);
-  // 自适应粒度：24h → 每 30 分钟一桶，共 48 桶（比固定 1 小时更细）。
-  assert.equal(total.buckets.length, 48);
-  assert.equal(total.stepMs, 30 * 60_000);
+  // 自适应粒度：24h → 每 15 分钟一桶，共 96 桶（比固定 1 小时更细）。
+  assert.equal(total.buckets.length, 96);
+  assert.equal(total.stepMs, 15 * 60_000);
 
   const provider = store.usageTrendGrouped({ dimension: 'provider', hours: 24 });
   const pr = groupsOf(provider);
   assert.ok(pr.has('deepseek'), 'provider groups include deepseek');
   assert.ok(pr.has('kimi'), 'provider groups include kimi');
+
+  const model = store.usageTrendGrouped({ dimension: 'model', hours: 24 });
+  const mg = groupsOf(model);
+  assert.ok(mg.has('m'), 'model groups include the home default-tier model (m)');
 
   const instance = store.usageTrendGrouped({ dimension: 'instance', hours: 24 });
   const ig = groupsOf(instance);
@@ -277,7 +301,7 @@ test('store usageTrendGrouped auto-adjusts bucket granularity by period (hours)'
   store.upsertRows(rows);
 
   const cases = [
-    { hours: 24, stepMs: 30 * 60_000, buckets: 48 }, // 过去 24h
+    { hours: 24, stepMs: 15 * 60_000, buckets: 96 }, // 过去 24h（每 15 分钟）
     { hours: 72, stepMs: 60 * 60_000, buckets: 72 }, // 3 天
     { hours: 168, stepMs: 3 * 60 * 60_000, buckets: 56 }, // 7 天
     { hours: 336, stepMs: 6 * 60 * 60_000, buckets: 56 }, // 14 天
@@ -314,3 +338,23 @@ test('store recentProjects carry jump targets (homeId/sessionId/workspaceId)', (
   store.close();
 });
 
+
+test('store localPort: 本机直连端口 round-trip（register/list/update/clear）', () => {
+  const store = new IndexStore(':memory:');
+  // 注册时带 localPort + token
+  const homeId = store.registerHome({ homePath: '/mock/local', hostType: 'local', localPort: 3080, token: 'token=abc' });
+  let h = store.getHome(homeId);
+  assert.equal(h.localPort, 3080);
+  assert.equal(h.token, 'token=abc');
+  // listHomes 也带出 localPort
+  assert.equal(store.listHomes()[0].localPort, 3080);
+  // 更新 localPort / 清空
+  store.updateHomeConfig(homeId, { localPort: 60761, token: 'token=xyz' });
+  h = store.getHome(homeId);
+  assert.equal(h.localPort, 60761);
+  assert.equal(h.token, 'token=xyz');
+  // 清空（null）→ 回到「新拉起」语义
+  store.updateHomeConfig(homeId, { localPort: null });
+  assert.equal(store.getHome(homeId).localPort, null);
+  store.close();
+});

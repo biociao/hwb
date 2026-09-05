@@ -14,9 +14,11 @@ CREATE TABLE IF NOT EXISTS homes (
   sortIndex INTEGER,
   host TEXT,
   remotePort INTEGER,
+  localPort INTEGER,
   remoteHome TEXT,
   remoteCmd TEXT,
-  remoteLog TEXT
+  remoteLog TEXT,
+  token TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,10 +72,10 @@ const int = (v, dflt) => {
   return Number.isInteger(n) && n > 0 ? n : dflt;
 };
 
-// 依据统计周期自动选择分桶粒度：短周期更细、长周期更粗，使柱状图柱数保持在合理范围。
-// hours → 每桶毫秒。24h=30分钟(48柱) / 3d=1小时(72柱) / 7d=3小时(56柱) / 14d=6小时(56柱) / 30d=12小时(60柱)。
+// 依据统计周期自动选择分桶粒度：短周期更细、长周期更粗，使点图数据点保持在合理范围。
+// hours → 每桶毫秒。24h=15分钟(96点) / 3d=1小时(72点) / 7d=3小时(56点) / 14d=6小时(56点) / 30d=12小时(60点)。
 function bucketStepMs(hours) {
-  if (hours <= 24) return 30 * 60_000;       // 30 分钟
+  if (hours <= 24) return 15 * 60_000;       // 15 分钟
   if (hours <= 72) return 60 * 60_000;       // 1 小时
   if (hours <= 168) return 3 * 60 * 60_000;  // 3 小时
   if (hours <= 336) return 6 * 60 * 60_000;  // 6 小时
@@ -105,6 +107,9 @@ export class IndexStore {
     if (!homes.includes('remotePort')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remotePort INTEGER');
     }
+    if (!homes.includes('localPort')) {
+      this.db.exec('ALTER TABLE homes ADD COLUMN localPort INTEGER');
+    }
     if (!homes.includes('remoteHome')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteHome TEXT');
     }
@@ -114,25 +119,29 @@ export class IndexStore {
     if (!homes.includes('remoteLog')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteLog TEXT');
     }
+    if (!homes.includes('token')) {
+      this.db.exec('ALTER TABLE homes ADD COLUMN token TEXT');
+    }
   }
 
   close() {
     this.db.close();
   }
 
-  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null }) {
+  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null }) {
     const homeId = homeIdOf(homePath);
     // 新 home 排在末尾；已存在（冲突）只更新路径/别名/远程配置，保留原 sortIndex。
     const { n } = this.db.prepare('SELECT COALESCE(MAX(sortIndex), -1) + 1 AS n FROM homes').get();
     this.db.prepare(
-      `INSERT INTO homes (homeId, homePath, alias, hostType, status, sortIndex, host, remotePort, remoteHome, remoteCmd, remoteLog)
-       VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?)
+      `INSERT INTO homes (homeId, homePath, alias, hostType, status, sortIndex, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort)
+       VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(homeId) DO UPDATE SET
          homePath = excluded.homePath, alias = excluded.alias,
          hostType = excluded.hostType, host = excluded.host,
          remotePort = excluded.remotePort, remoteHome = excluded.remoteHome,
-         remoteCmd = excluded.remoteCmd, remoteLog = excluded.remoteLog`
-    ).run(homeId, homePath, alias, hostType, n, host, remotePort, remoteHome, remoteCmd, remoteLog);
+         remoteCmd = excluded.remoteCmd, remoteLog = excluded.remoteLog,
+         token = excluded.token, localPort = excluded.localPort`
+    ).run(homeId, homePath, alias, hostType, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
     return homeId;
   }
 
@@ -210,8 +219,10 @@ export class IndexStore {
     const remoteHome = patch.remoteHome !== undefined ? patch.remoteHome : cur2.remoteHome;
     const remoteCmd = patch.remoteCmd !== undefined ? patch.remoteCmd : cur2.remoteCmd;
     const remoteLog = patch.remoteLog !== undefined ? patch.remoteLog : cur2.remoteLog;
-    this.db.prepare('UPDATE homes SET alias = ?, host = ?, remotePort = ?, remoteHome = ?, remoteCmd = ?, remoteLog = ? WHERE homeId = ?')
-      .run(alias, host, remotePort, remoteHome, remoteCmd, remoteLog, homeId);
+    const token = patch.token !== undefined ? patch.token : cur2.token;
+    const localPort = patch.localPort !== undefined ? patch.localPort : cur2.localPort;
+    this.db.prepare('UPDATE homes SET alias = ?, host = ?, remotePort = ?, localPort = ?, remoteHome = ?, remoteCmd = ?, remoteLog = ?, token = ? WHERE homeId = ?')
+      .run(alias, host, remotePort, localPort, remoteHome, remoteCmd, remoteLog, token, homeId);
     return this.getHome(homeId);
   }
 
@@ -298,10 +309,32 @@ export class IndexStore {
     }
   }
 
+  // 每个 home 的「当前项目/当前会话」——取最近活跃（lastActivity 最大）的 session 及其所属 workspace。
+  // 这是 hwb 的「当前」语义：与 recentProjects/recentSessions（时间窗内聚合）不同，它是每个实例的单一当前项。
+  #currentSession(homeId) {
+    const r = this.db.prepare(
+      `SELECT sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
+       FROM sessions WHERE homeId = ?
+       ORDER BY (lastActivity IS NULL), lastActivity DESC, rowid DESC LIMIT 1`
+    ).get(homeId);
+    if (!r) return null;
+    return {
+      sessionId: r.sessionId,
+      workspaceId: r.workspaceId,
+      workspaceTitle: r.workspaceTitle,
+      project: r.project,
+      title: r.title ?? null,
+      lastActivity: r.lastActivity,
+      tokenUsage: r.tokenUsage ? JSON.parse(r.tokenUsage) : null,
+      contextPressure: r.contextPressure ? JSON.parse(r.contextPressure) : null,
+      status: r.status ? JSON.parse(r.status) : null,
+    };
+  }
+
   listHomes() {
     const homes = this.db.prepare(
       `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
-              h.host, h.remotePort, h.remoteHome, h.remoteCmd, h.remoteLog,
+              h.host, h.remotePort, h.localPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
               (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
               (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
        FROM homes h ORDER BY (h.sortIndex IS NULL), h.sortIndex, h.homeId`
@@ -313,6 +346,7 @@ export class IndexStore {
       degraded: JSON.parse(h.degraded || '[]'),
       providers: providers.all(h.homeId),
       activeTier: tiers.get(h.homeId) ?? null,
+      current: this.#currentSession(h.homeId),
     }));
   }
 
@@ -455,7 +489,7 @@ export class IndexStore {
     ).all(since);
   }
 
-  // 分维度（total|project|instance|provider）、按周期自适应粒度的 token 聚合，供堆叠柱状图。
+  // 分维度（total|project|instance|provider|model）、按周期自适应粒度的 token 聚合，供堆叠柱状图。
   // 每个 bucket 的 groups 是与维度对应的 { 标签: tokens }；total 维度只有一个「合计」组。
   // 返回 { dimension, hours, stepMs, buckets }；stepMs 为每桶毫秒（提示前端按此格式化 X 轴标签）。
   usageTrendGrouped({ dimension = 'total', hours = 24 } = {}) {
@@ -475,9 +509,15 @@ export class IndexStore {
                ORDER BY CASE WHEN t.tierId = 'default' THEN 0 ELSE 1 END LIMIT 1),
              (SELECT provider FROM providers p WHERE p.homeId = s.homeId ORDER BY p.rowid LIMIT 1),
              'unknown')`
-        : dimension === 'total'
-          ? "'合计'"
-          : `COALESCE(s.project, '(未分类)')`;
+        : dimension === 'model'
+          ? `COALESCE(
+               (SELECT NULLIF(model, '') FROM model_tiers t
+                 WHERE t.homeId = s.homeId AND t.active = 1
+                 ORDER BY CASE WHEN t.tierId = 'default' THEN 0 ELSE 1 END LIMIT 1),
+               'unknown')`
+          : dimension === 'total'
+            ? "'合计'"
+            : `COALESCE(s.project, '(未分类)')`;
     const rows = this.db.prepare(
       `SELECT CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER) AS h,
               ${groupExpr} AS grp,

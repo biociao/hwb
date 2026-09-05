@@ -24,7 +24,7 @@ function dshHomeInfo(homePath) {
   };
 }
 
-export function createRouter({ store, indexer, hub, launcher, monitor, quota }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi }) {
   return async function route(req, res, url) {
     const { pathname, searchParams } = url;
 
@@ -62,8 +62,10 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota }) 
         const remoteHome = typeof body.remoteHome === 'string' && body.remoteHome.trim() ? body.remoteHome.trim() : null;
         const remoteCmd = typeof body.remoteCmd === 'string' && body.remoteCmd.trim() ? body.remoteCmd.trim() : null;
         const remoteLog = typeof body.remoteLog === 'string' && body.remoteLog.trim() ? body.remoteLog.trim() : null;
+        // 手填 token（自服务直连）：用户已更新远端 dsh 后把 token 填进配置，hwb 直接连接。
+        const token = typeof body.token === 'string' && body.token.trim() ? body.token.trim() : null;
         const homePath = `ssh://${host}:${remotePort}`;
-        const homeId = store.registerHome({ homePath, alias, hostType: 'remote', host, remotePort, remoteHome, remoteCmd, remoteLog });
+        const homeId = store.registerHome({ homePath, alias, hostType: 'remote', host, remotePort, remoteHome, remoteCmd, remoteLog, token });
         send(res, 200, { homeId, warning: null, result: null });
         return;
       }
@@ -79,7 +81,11 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota }) 
         send(res, 400, { error: `not a directory: ${homePath}` });
         return;
       }
-      const homeId = store.registerHome({ homePath, alias, hostType: 'local' });
+      // 本机 dsh web 端口（直连已有实例，可选）+ 手填 token：都有值时「打开」直接接入该实例而非新拉起。
+      const lp = body.localPort;
+      const localPort = (lp === '' || lp == null) ? null : (Number.isInteger(Number(lp)) && Number(lp) > 0 ? Number(lp) : null);
+      const token = typeof body.token === 'string' && body.token.trim() ? body.token.trim() : null;
+      const homeId = store.registerHome({ homePath, alias, hostType: 'local', localPort, token });
       const results = await indexer.reindexNow(homeId);
       send(res, info.looksLikeDshHome ? 200 : 202, {
         homeId,
@@ -115,6 +121,12 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota }) 
           }
           patch.homePath = hp;
         }
+        // 本机直连端口 + token：配置了 localPort 则「打开」接入已有实例；为空则回到「新拉起」。
+        if (body.localPort !== undefined) {
+          const lp = body.localPort;
+          patch.localPort = (lp === '' || lp == null) ? null : (Number.isInteger(Number(lp)) && Number(lp) > 0 ? Number(lp) : null);
+        }
+        if (body.token !== undefined) patch.token = typeof body.token === 'string' ? body.token.trim() || null : null;
       } else if (home.hostType === 'remote') {
         if (body.host !== undefined) {
           if (typeof body.host !== 'string' || !body.host.trim()) {
@@ -134,6 +146,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota }) 
         if (typeof body.remoteHome === 'string') patch.remoteHome = body.remoteHome.trim() || null;
         if (body.remoteCmd !== undefined) patch.remoteCmd = typeof body.remoteCmd === 'string' ? body.remoteCmd.trim() || null : null;
         if (body.remoteLog !== undefined) patch.remoteLog = typeof body.remoteLog === 'string' ? body.remoteLog.trim() || null : null;
+        // 手填 token：允许清空（''→null）以回到「远端抓取 / 自动启动」的流程。
+        if (body.token !== undefined) patch.token = typeof body.token === 'string' ? body.token.trim() || null : null;
       }
       const updated = store.updateHomeConfig(home.homeId, patch);
       send(res, 200, { home: { ...updated, runtime: monitor.get(home.homeId) } });
@@ -204,8 +218,16 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota }) 
           project: store.usageTrendGrouped({ dimension: 'project', hours }),
           instance: store.usageTrendGrouped({ dimension: 'instance', hours }),
           provider: store.usageTrendGrouped({ dimension: 'provider', hours }),
+          model: store.usageTrendGrouped({ dimension: 'model', hours }),
         },
       });
+      return;
+    }
+    if (req.method === 'GET' && pathname === '/api/logs') {
+      // 日志区域：返回环缓冲中（可按最低级别过滤）的最近日志。
+      const level = searchParams.get('level') || undefined;
+      const limit = Math.min(Math.max(Number(searchParams.get('limit')) || 200, 1), 1000);
+      send(res, 200, { logs: logApi.getLogs({ level, limit }) });
       return;
     }
 

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
-import { captureDshToken, authFetch, probeDeeplink } from '../src/control/launcher.js';
+import { captureDshToken, authFetch, probeDeeplink, isTokenFragment, localWebUrl, Launcher } from '../src/control/launcher.js';
+import { InstanceRegistry } from '../src/control/registry.js';
 
 // 构造一个伪造的子进程: stdout 为 PassThrough, 并支持 exit 事件。
 function fakeProc() {
@@ -59,6 +60,35 @@ test('captureDshToken: 超时(无任何 dsh web 行) → 返回 null', async () 
   proc.stdout.write('some unrelated output\n');
   assert.equal(await p, null);
 });
+
+// —— isTokenFragment: 远端 token 判定（决定拼 ?token= 还是回退裸 URL）——
+test('isTokenFragment: 真 token 片段 → true', () => {
+  assert.equal(isTokenFragment('?token=AbC-xyz_123'), true);
+});
+
+test('isTokenFragment: 旧版哨兵 __NO_TOKEN__ / null / 空串 → false（回退裸 URL，向下兼容）', () => {
+  assert.equal(isTokenFragment('__NO_TOKEN__'), false);
+  assert.equal(isTokenFragment(null), false);
+  assert.equal(isTokenFragment(''), false);
+  assert.equal(isTokenFragment(undefined), false);
+});
+
+// —— localWebUrl: 本地实例「原始服务连接」——不经 hwb 反代，token 可见、可跨 hwb 生命周期复用 ——
+test('localWebUrl: 带 token → 本机直连 `http://127.0.0.1:<port>/?token=<x>`', () => {
+  assert.equal(localWebUrl('http://127.0.0.1:5678', '?token=AbC-xyz_123'), 'http://127.0.0.1:5678/?token=AbC-xyz_123');
+});
+
+test('localWebUrl: 无 token（旧版 dsh null / 哨兵 __NO_TOKEN__ / 空串）→ 回退裸 URL', () => {
+  assert.equal(localWebUrl('http://127.0.0.1:5678', null), 'http://127.0.0.1:5678');
+  assert.equal(localWebUrl('http://127.0.0.1:5678', '__NO_TOKEN__'), 'http://127.0.0.1:5678');
+  assert.equal(localWebUrl('http://127.0.0.1:5678', ''), 'http://127.0.0.1:5678');
+});
+
+test('localWebUrl: 仅拼本机直连地址，绝不引入反代/隧道端口', () => {
+  // 关键回归：URL host 就是 dsh web 自身端口（无 hwb proxy 端口、无转发）。
+  assert.equal(localWebUrl('http://127.0.0.1:5678', '?token=tok').startsWith('http://127.0.0.1:5678/'), true);
+});
+
 
 // —— authFetch / probeDeeplink: 模拟新版 dsh 的 token→cookie 交接 ——
 // 请求 `/?token=good` → 303 + set-cookie;带 cookie 请求 `/` → 200 index.html;无 cookie → 401。
@@ -128,6 +158,37 @@ test('probeDeeplink: 原厂无插件(index.html 无 session-deeplink)→ false; 
     assert.equal(await probeDeeplink(`${base}/?token=good`), false);
     assert.equal(await probeDeeplink(`${base}/`), false); // 裸 URL(401)也安全返回 false
   } finally {
+    server.close();
+  }
+});
+
+// —— 连接已运行的本机 dsh web（§5.x·本地直连已有实例）——
+// 配置了 localPort+token 时，「打开」直接接入该实例：同机直连 URL、无 hwb 反代、无子进程（pid null），
+// 且 hwb 不持有/不 kill 它（stop 拆状态但不动进程）。关键回归：返回的 URL host 就是 dsh 本体端口，
+// 绝不出现第二个「代理/转发」端口。
+test('connect-existing: 配置 localPort+token → 直连 URL、无反代、无子进程', async () => {
+  const server = createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end('<html>ok</html>'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const launcher = new Launcher({ registry: new InstanceRegistry() });
+  const home = { homeId: 'abcd'.repeat(4), homePath: '/mock/home', hostType: 'local', localPort: port, token: 'token=abc' };
+  try {
+    const inst = await launcher.open(home);
+    // 直连：URL 端口 = 假 dsh 端口；pid null（不持子进程）；dsh 无插件 → deeplink false。
+    assert.equal(inst.url, `http://127.0.0.1:${port}/?token=abc`);
+    assert.equal(inst.port, port);
+    assert.equal(inst.pid, null);
+    assert.equal(inst.deeplink, false);
+    // URL 一切以 dsh 本体端口为准，不引入 hwb 代理/隧道端口。
+    assert.equal(inst.url.startsWith(`http://127.0.0.1:${port}/`), true);
+    // status() 对无子进程的直连实例不崩，返回同一直连 URL。
+    const st = launcher.status(home.homeId);
+    assert.equal(st.url, `http://127.0.0.1:${port}/?token=abc`);
+    assert.equal(st.port, port);
+  } finally {
+    // stop：直连实例无子进程可 kill → 返回 false，且不再持有该实例。
+    assert.equal(await launcher.stop(home), false);
+    assert.equal(launcher.status(home.homeId), null);
     server.close();
   }
 });

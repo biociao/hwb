@@ -1,4 +1,7 @@
 import http from 'node:http';
+import { logger } from '../lib/logger.js';
+
+const log = logger('proxy');
 
 // —— dsh web 反向代理（hwb 侧, §5.5）——
 // 以「根路径 1:1 转发」的方式为一个 dsh web 实例提供 hwb 自有的代理入口。
@@ -25,12 +28,16 @@ export function createProxy({ target, host = '127.0.0.1' }) {
     try {
       targetUrl = new URL(target);
     } catch {
-      reject(new Error(`proxy: invalid target ${target}`));
+      const e = new Error(`proxy: invalid target ${target}`);
+      log.error('创建代理失败：目标 URL 非法', e, { target });
+      reject(e);
       return;
     }
     const { hostname, port } = targetUrl;
     if (targetUrl.protocol !== 'http:') {
-      reject(new Error(`proxy: only http target supported, got ${targetUrl.protocol}`));
+      const e = new Error(`proxy: only http target supported, got ${targetUrl.protocol}`);
+      log.error('创建代理失败：目标协议不支持', e, { target, protocol: targetUrl.protocol });
+      reject(e);
       return;
     }
 
@@ -70,6 +77,8 @@ function forwardRequest(req, res, hostname, port) {
     upRes.pipe(res);
   });
   upstream.on('error', (e) => {
+    // 上游（dsh web 或 ssh 隧道）不可达/断开：记录上下文，便于定位健康检查失败原因。
+    log.debug('代理上游请求失败', e, { target: `${hostname}:${port}`, path: req.url });
     if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
     res.end(`proxy: upstream error — ${e.message}`);
   });
@@ -88,12 +97,30 @@ function forwardUpgrade(req, socket, head, hostname, port) {
     headers,
   });
   upstream.on('upgrade', (upRes, upSocket, upHead) => {
+    // 对端（浏览器 / SSH 隧道）可能在升级握手中途断开：此时向已关闭的 socket 写入会抛 EPIPE。
+    // 若不挂 error 监听，EPIPE 会以 uncaughtException 打穿整个 hwb 进程——曾在写响应头时
+    // （@proxy.js:103）触发并连带杀掉本地 dsh web 子进程（见 hwb.log 14:53:26 uncaughtException）。
+    // 连接没了本就不该崩，这里是代理最常见的退化路径：吞掉 error、静默拆除即可。
+    const noop = () => {};
+    let closed = false;
+    const teardown = () => {
+      if (closed) return;
+      closed = true;
+      socket.destroy();
+      upSocket.destroy();
+    };
+    socket.on('error', noop);
+    upSocket.on('error', noop);
+    const safeWrite = (sock, chunk) => {
+      if (closed) return;
+      try { sock.write(chunk); } catch { teardown(); }
+    };
     // 回写 101 + 上游响应头,再双向 pipe。
-    socket.write('HTTP/1.1 101 Switching Protocols\r\n');
+    safeWrite(socket, 'HTTP/1.1 101 Switching Protocols\r\n');
     const rHeaders = upRes.rawHeaders;
-    for (let i = 0; i < rHeaders.length; i += 2) socket.write(`${rHeaders[i]}: ${rHeaders[i + 1]}\r\n`);
-    socket.write('\r\n');
-    if (upHead && upHead.length) upSocket.write(upHead);
+    for (let i = 0; i < rHeaders.length; i += 2) safeWrite(socket, `${rHeaders[i]}: ${rHeaders[i + 1]}\r\n`);
+    safeWrite(socket, '\r\n');
+    if (upHead && upHead.length) safeWrite(upSocket, upHead);
     upSocket.pipe(socket);
     socket.pipe(upSocket);
   });

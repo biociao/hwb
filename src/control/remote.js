@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { logger } from '../lib/logger.js';
+
+const log = logger('remote');
 
 // —— 远程 dsh web 生命周期(§5.4):「启动 / 重启 / 停止」 + 抓取新版 token ——
 // 把 dsh-remote-web.sh 的算法原样搬进 Node:用一次 `ssh host bash -s -- args`
@@ -39,6 +42,13 @@ function sshBash(host, script, args = [], timeoutMs = DEFAULT_TIMEOUT) {
 
 // 远端启动脚本(驻留于远端 shell 自身变量,避免与 JS 模板插值冲突)。
 // 参数顺序:$1=port $2=log $3=cmd $4=pollSeconds $5=mode(ensure|restart)
+//
+// 向下兼容说明(旧版 dsh 不打印 token,如 v0.1.1):
+//   · ensure + 端口已监听但日志里抓不到 token → 直接返回 __NO_TOKEN__ 让上层用「裸 URL」兜底,
+//     绝不像旧逻辑那样 killport 再重启——那会打断一个健康的旧版实例,且重启后可能起不来
+//     (这正是「远程连 v0.1.1 反而报错」的根因)。
+//   · 启动后若日志出现「带 http 但不带 ?token=」的 URL 行 → 判定为旧版,立即返回 __NO_TOKEN__,
+//     而不是干等满整个 poll 窗口(旧逻辑会白等 40s,前端若设了更短的 timeout 就会报错)。
 const REMOTE_START = String.raw`
 log="$2"; port="$1"; cmd="$3"; t="$4"; mode="$5"
 # SSH 非交互会话往往缺少 nvm/本地 bin 目录(如 dsh 装在 v24.15.0/bin 而 PATH 指向旧版本),
@@ -49,10 +59,11 @@ for d in "$HOME/.nvm/versions/node/"*/bin "$HOME/.npm-global/bin" "$HOME/.local/
 done
 listening() { { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E "[.:]$port[[:space:]]" >/dev/null 2>&1; }
 killport() { if command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; sleep 1; fi; }
-# ensure + 已在跑且日志有 token -> 直接复用,不动它
+# ensure + 已在跑:若日志有 token 则复用;否则(旧版 dsh / 日志未写 token)不动它,返回裸 URL 哨兵。
 if [ "$mode" = "ensure" ] && listening; then
-  tok="$(grep -o '?token=[^ ]*' "$log" 2>/dev/null | tail -1 || true)"
+  tok="$(grep -oE '\?token=[A-Za-z0-9_-]+' "$log" 2>/dev/null | tail -1 || true)"
   if [ -n "$tok" ]; then printf '%s' "$tok"; exit 0; fi
+  printf '__NO_TOKEN__'; exit 0
 fi
 start_line=0
 [ -f "$log" ] && start_line="$(wc -l < "$log" 2>/dev/null || echo 0)"
@@ -61,47 +72,105 @@ if [ "$mode" = "restart" ] || listening; then killport; fi
 # 用 eval 让 $cmd 里的 $HOME(用户填的 wrapper 路径)在远端展开
 eval "nohup $cmd >> \"$log\" 2>&1 < /dev/null &"
 for i in $(seq 1 "$t"); do
-  tok="$(tail -n +$((start_line+1)) "$log" 2>/dev/null | grep -o '?token=[^ ]*' | tail -1 || true)"
+  new_lines="$(tail -n +$((start_line+1)) "$log" 2>/dev/null || true)"
+  # 新版本:抓到带 token 的 URL 行 → 直接返回 token 片段(优先判定)。
+  # 注意 charset 必须与本地 captureDshToken 对齐([A-Za-z0-9_-]),否则会把行尾的右括号等
+  # 标点误并进 token(如 ?token=xxx)),导致拼出的 URL 鉴权失败。
+  tok="$(printf '%s' "$new_lines" | grep -oE '\?token=[A-Za-z0-9_-]+' | tail -1 || true)"
   if [ -n "$tok" ]; then printf '%s' "$tok"; exit 0; fi
+  # 向下兼容:出现「带 http 但不带 ?token=」的 URL 行 → 旧版 dsh,立即用裸 URL 兜底,不再等满窗口。
+  if printf '%s' "$new_lines" | grep -q 'dsh web: .*http'; then printf '__NO_TOKEN__'; exit 0; fi
   sleep 1
 done
-# 未抓到 token(旧版 dsh 不打印 token):仍返回 0,让上层用无 token 的 URL 兜底
+# 未抓到 token(旧版 dsh 不打印 URL 行):仍返回 0,让上层用无 token 的 URL 兜底
 printf '__NO_TOKEN__'
 `;
 
 // 抓取/保证远端 dsh web 在跑并带回 token(或 __NO_TOKEN__)。home: { host, remotePort, remoteLog?, remoteCmd? }
 async function ensureRemoteToken(home) {
   const r = await sshBash(home.host, REMOTE_START, remoteArgs(home, 'ensure'));
-  return r.code === 0 ? r.stdout : throwSsh(r, '启动远程 dsh web');
+  return r.code === 0 ? r.stdout : throwSsh(r, '启动远程 dsh web', home);
 }
 
 // 重启远端 dsh web 并带回新 token。
 async function restartRemoteToken(home) {
   const r = await sshBash(home.host, REMOTE_START, remoteArgs(home, 'restart'));
-  return r.code === 0 ? r.stdout : throwSsh(r, '重启远程 dsh web');
+  return r.code === 0 ? r.stdout : throwSsh(r, '重启远程 dsh web', home);
 }
 
 // 停止远端 dsh web(按端口 kill,尽力而为)。
 async function stopRemote(home) {
   const script = `#!/bin/bash\nport="$1"\nif command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; echo killed; exit 0; fi\necho "no-fuser"`;
   const r = await sshBash(home.host, script, [String(home.remotePort)], 20_000);
-  if (r.code !== 0) throw new Error(`停止远程 dsh web 失败(${home.host}:${home.remotePort}): ${r.stderr || r.stdout}`);
+  if (r.code !== 0) {
+    log.error('停止远程 dsh web 失败', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, code: r.code, stderr: r.stderr, stdout: r.stdout });
+    throw new Error(`停止远程 dsh web 失败(${home.host}:${home.remotePort}): ${r.stderr || r.stdout}`);
+  }
   return r.stdout;
+}
+
+// 默认远端启动命令。向下兼容：用「裸 `dsh web` 别名」(新版等价于 `--profile web`，旧版 v0.1.x
+// 原生支持)，并显式 `--port` 绑定到隧道目标端口。不传 `--profile` 与 `--no-open`，原因：
+//   · `--profile web` 是 ≥0.1.2-rc.1 的新写法；旧版 v0.1.1 会把它当成未知选项直接退场，
+//     导致 web 起不来 → 远端 dsh web 不可达（这正是「远程连 v0.1.1 反而报错」的另一个根因）。
+//   · `--no-open` 同样是新旗标；远端经 SSH 拉起时 web 对无 TTY 会话会自动抑制浏览器打开，
+//     所以不必依赖它（旧版没有它反而因未知选项而失败）。
+export function defaultRemoteCmd(port) {
+  return `dsh web --port ${port}`;
 }
 
 function remoteArgs(home, mode) {
   const port = String(home.remotePort);
   // 日志路径:把开头的 ~ 换成 $HOME——双引号传参时 $HOME 会在远端展开,~ 不会。
   const log = (home.remoteLog || '~/.dsh/web.log').replace(/^~(?=\/|$)/, '$HOME');
-  // 新版 dsh 要求显式 `--profile web`(不再接受裸 `dsh web`);旧版也兼容该写法。
-  const cmd = home.remoteCmd || `dsh --profile web --port ${home.remotePort} --no-open`;
+  // 默认用向下兼容的 `dsh web --port N`；用户显式配置的 remoteCmd 优先（原样交给远端）。
+  const cmd = home.remoteCmd || defaultRemoteCmd(home.remotePort);
   return [port, log, cmd, String(TOKEN_WAIT_SECONDS), mode];
 }
 
-function throwSsh(r, what) {
+function throwSsh(r, what, home) {
   const reason = (r.stderr || r.stdout || '').trim().split('\n').pop();
+  // 记录完整 ssh stderr/stdout + 目标 host，便于排查认证/可达性问题。
+  log.error(`${what} 失败`, {
+    host: home?.host, remotePort: home?.remotePort, code: r.code,
+    stderr: r.stderr, stdout: r.stdout, msg: what,
+  });
   throw new Error(`${what} 失败(${r.code}): ${reason || 'ssh 返回异常'}`);
 }
 
-// —— 暴露(供 Launcher 使用)——
-export { ensureRemoteToken, restartRemoteToken, stopRemote };
+// —— 实例配置手填 token 规范化（稳定第一·自服务直连，见「token 栏」原则）——
+// 用户已更新远端 dsh web 后，往往已经拿到新 token；在此把手填的 token 规范化成拼 URL 用的
+// `?token=...` 片段。兼容三种粘贴形态：
+//   · 完整 URL：`http://host:port/?token=xyz (LAN: ...)` → 截取 `?token=xyz`；
+//   · `token=xyz` 或 `?token=xyz` → 原样形式，取 `?token=xyz`；
+//   · 裸 `xyz` → 补成 `?token=xyz`。
+// 空 / 空白 / `__NO_TOKEN__`（旧版哨兵）→ null，表示「无手填 token，走远程抓取兜底」。
+// 只接受 `[A-Za-z0-9_-]` 字符集（与本地 captureDshToken / 远端 grep 正则一致）。
+export function normalizeWebToken(input) {
+  if (typeof input !== 'string') return null;
+  const s = input.trim();
+  if (!s || s === '__NO_TOKEN__') return null;
+  const m = s.match(/(?:\?token=|token=)([A-Za-z0-9_-]+)/);
+  if (m) return `?token=${m[1]}`;
+  if (/^[A-Za-z0-9_-]+$/.test(s)) return `?token=${s}`;
+  return null; // 无法识别（可能含噪音/换行），不猜，交给远端抓取流程
+}
+
+// —— 用户自助命令提示（稳定第一·hwb 不主动打断远端实例）——
+// 当远端 dsh web 不可达 / 远端 home 不可访问时，把【自服务】命令拼进报错，让用户自行在远端
+// 检查/更新/重启实例，而不是由 hwb 去 killport/重启。cmd/log 缺省用与 remoteArgs 相同的兜底，
+// 保证提示与实际连接参数一致。
+export function selfServiceHint({ host, remotePort, remoteCmd, remoteLog }) {
+  if (!host) return '';
+  const port = Number(remotePort) || 0;
+  const log = (remoteLog || '~/.dsh/web.log').replace(/^~(?=\/|$)/, '$HOME');
+  const cmd = remoteCmd || (port ? `dsh web --port ${port}` : 'dsh web');
+  const lines = [];
+  if (port) lines.push(`ssh ${host} "${cmd}"            # 在远端手动启动/重启 dsh web`);
+  lines.push(`ssh ${host} "grep -oE 'token=[A-Za-z0-9_-]+' ${log} | tail -1"   # 读取最新鉴权 token`);
+  lines.push(`ssh ${host} "test -d ~/.dsh && echo ok"     # 确认远端 dsh home 存在（或改 remoteHome）`);
+  return `\n可自行在远端执行（hwb 不会主动打断实例）：\n  ${lines.join('\n  ')}`;
+}
+
+// —— 暴露(供 Launcher 使用)—— REMOTE_START / defaultRemoteCmd 亦导出,便于做回归测试。
+export { ensureRemoteToken, restartRemoteToken, stopRemote, REMOTE_START, sshBash };
