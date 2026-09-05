@@ -42,11 +42,10 @@ export function parseCredentialsYaml(text) {
   return providers;
 }
 
-function readJson(file) {
-  return JSON.parse(readFileSync(file, 'utf8'));
-}
-
-export function readHome(homePath) {
+// dsh 存储文件的统一读取抽象：本地用 fs（readHome），远程用 SSH cat（remote-reader）。
+// `readText(relPath)` 返回文件文本（缺失时抛错，对应本地 ENOENT）；`exists(relPath)` 判断可选文件是否在。
+// 二者决定哪个域的 degraded 判定与本地逐文件读取行为完全一致（§4.2/4.3）。
+export function buildSnapshot({ homePath, readText, exists }) {
   const degraded = [];
   const snapshot = {
     homeId: homeIdOf(homePath),
@@ -60,9 +59,10 @@ export function readHome(homePath) {
     providers: [],
     degraded,
   };
+  const readJson = (rel) => JSON.parse(readText(rel));
 
   try {
-    const v = validateWorkspaceJson(readJson(path.join(homePath, 'storages', 'workspace.json')));
+    const v = validateWorkspaceJson(readJson('storages/workspace.json'));
     if (v.ok) {
       snapshot.wsVersion = v.version;
       snapshot.workspaces = v.workspaces;
@@ -74,7 +74,7 @@ export function readHome(homePath) {
   }
 
   try {
-    const v = validateProjcacheJson(readJson(path.join(homePath, 'storages', 'session_projcache.json')));
+    const v = validateProjcacheJson(readJson('storages/session_projcache.json'));
     if (v.ok) {
       snapshot.pcVersion = v.version;
       snapshot.sessions = v.sessions;
@@ -87,9 +87,9 @@ export function readHome(homePath) {
 
   // model-tier.json 是可选的：未配置模型分层的 dsh home 没有此文件。
   // 缺失 → 保持 modelTier=null，不判定 degraded；存在但校验失败（版本/结构）→ degraded。
-  if (existsSync(path.join(homePath, 'model-tier.json'))) {
+  if (exists('model-tier.json')) {
     try {
-      const v = validateModelTierJson(readJson(path.join(homePath, 'model-tier.json')));
+      const v = validateModelTierJson(readJson('model-tier.json'));
       if (v.ok) {
         snapshot.modelTier = v.modelTier;
       } else {
@@ -102,9 +102,9 @@ export function readHome(homePath) {
 
   // .credentials.yaml 是可选的：未配置 provider key 时缺失。
   // 缺失 → providers=[]，不判定 degraded。
-  if (existsSync(path.join(homePath, '.credentials.yaml'))) {
+  if (exists('.credentials.yaml')) {
     try {
-      const v = validateCredentials(parseCredentialsYaml(readFileSync(path.join(homePath, '.credentials.yaml'), 'utf8')));
+      const v = validateCredentials(parseCredentialsYaml(readText('.credentials.yaml')));
       if (v.ok) {
         snapshot.providers = v.providers;
       } else {
@@ -116,4 +116,12 @@ export function readHome(homePath) {
   }
 
   return snapshot;
+}
+
+export function readHome(homePath) {
+  return buildSnapshot({
+    homePath,
+    readText: (rel) => readFileSync(path.join(homePath, rel), 'utf8'),
+    exists: (rel) => existsSync(path.join(homePath, rel)),
+  });
 }

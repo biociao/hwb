@@ -1,15 +1,22 @@
 import { homeIdOf } from '../lib/read-home.js';
-import { indexHome } from './reader.js';
+import { indexHome, indexRemoteHome } from './reader.js';
+import { logger } from '../lib/logger.js';
+
+const log = logger('indexer');
 
 const DOMAINS = ['workspace', 'projcache', 'modelTier', 'credentials'];
 
 // Data Index Loop (§6): 60s baseline, failure ×2 capped at 5min,
 // consecutive successes ÷1.5 back toward baseline.
+// 同时索引【本地 + 远程】实例：本地走 fs（readHome），远程走 SSH 只读 cat（readHomeRemote），
+// 使远程 dsh 实例的「当前项目/当前会话」也能入库并出现在工作台（§6/§7 语义扩展）。
 export class Indexer {
-  constructor({ store, homePaths, broadcast = () => {}, baseMs = 60_000, maxMs = 300_000 }) {
+  // `homes` 返回完整实例列表（含 homeId/homePath/hostType/host/remoteHome），`remoteExec` 可注入测试用假 SSH。
+  constructor({ store, homes, broadcast = () => {}, baseMs = 60_000, maxMs = 300_000, remoteExec }) {
     this.store = store;
-    this.homePaths = homePaths;
+    this.homes = homes;
     this.broadcast = broadcast;
+    this.remoteExec = remoteExec;
     this.baseMs = baseMs;
     this.maxMs = maxMs;
     this.intervalMs = baseMs;
@@ -52,11 +59,14 @@ export class Indexer {
 
   async #runAll(onlyHomeId) {
     const results = [];
-    for (const homePath of this.homePaths()) {
-      const homeId = homeIdOf(homePath);
+    for (const home of this.homes()) {
+      const homeId = home.homeId || homeIdOf(home.homePath);
       if (onlyHomeId && homeId !== onlyHomeId) continue;
       try {
-        const { snapshot, rows } = indexHome(this.store, homePath);
+        // 按 hostType 分流：远程经 SSH 只读索引，本地走 fs。
+        const { snapshot, rows } = home.hostType === 'remote'
+          ? await indexRemoteHome(this.store, home, this.remoteExec)
+          : indexHome(this.store, home.homePath);
         const failed = DOMAINS.every((d) => snapshot.degraded.some((x) => x.domain === d));
         const payload = {
           homeId,
@@ -66,10 +76,16 @@ export class Indexer {
           degraded: snapshot.degraded,
           indexedAt: snapshot.generatedAt,
         };
+        if (failed) {
+          log.warn('索引失败：全部域降级', { homeId, homePath: home.homePath, host: home.host, degraded: snapshot.degraded });
+        } else if (snapshot.degraded.length) {
+          log.debug('部分域降级（其余照常索引）', { homeId, degraded: snapshot.degraded });
+        }
         this.broadcast('index:updated', payload);
         results.push({ homeId, ok: !failed, ...payload });
       } catch (e) {
         this.store.markHomeError(homeId, e.message);
+        log.error('索引该 home 失败', e, { homeId, host: home.host, homePath: home.homePath });
         results.push({ homeId, ok: false, error: e.message });
       }
     }
