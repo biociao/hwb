@@ -1,40 +1,4 @@
-import { esc, timeAgo, chipColor, fmtTokens } from '../store.js';
-
-function statusChip(status) {
-  const st = status ?? { kind: 'idle', label: '空闲', subagents: 0 };
-  const cls = st.kind === 'running' ? 'run' : st.kind === 'completed' ? 'done' : 'idle';
-  const sub = st.subagents > 0 ? ` · ${st.subagents} 子agent` : '';
-  const approve = st.approval ? ` · 审批 ${st.approval}` : '';
-  return `<span class="chip status ${cls}"
-      title="状态: ${esc(st.label)}${approve}${sub}">${esc(st.label)}${sub}</span>`;
-}
-
-// 当前项目/会话（最近活跃）——远程实例经 SSH 只读索引入库后同样展示，见 §4.6。
-function currentBlock(h) {
-  const c = h.current;
-  if (!c) return '';
-  const projColor = c.project ? chipColor(c.project) : null;
-  const tok = c.tokenUsage
-    ? c.tokenUsage.uncachedInputTokens + c.tokenUsage.cacheReadTokens + c.tokenUsage.cacheWriteTokens + c.tokenUsage.outputTokens
-    : null;
-  return `
-    <div class="current-block" title="当前项目/会话（最近活跃会话 + 其所属项目）">
-      <div class="t">
-        <span class="label">当前项目</span>
-        <span class="name">${esc(c.project || c.workspaceTitle || '—')}</span>
-      </div>
-      <div class="t">
-        <span class="label">当前会话</span>
-        ${statusChip(c.status)}
-      </div>
-      <div class="meta">
-        ${c.title ? `<span class="name2">${esc(c.title)}</span>` : ''}
-        ${projColor ? `<span class="chip proj-chip" style="background:${projColor.bg};color:${projColor.fg}">${esc(c.project)}</span>` : ''}
-        <span>${fmtTokens(tok)} tok</span>
-        <span>${timeAgo(c.lastActivity)}</span>
-      </div>
-    </div>`;
-}
+import { esc, timeAgo } from '../store.js';
 
 function indexChip(h) {
   if (h.hostType === 'remote') return '<span class="chip">remote</span>';
@@ -116,7 +80,6 @@ export function renderInstanceGrid(homes) {
           : ''}
       </div>
       ${degradedDetail(h)}
-      ${currentBlock(h)}
       <div class="meta actions">
         <span>indexed ${timeAgo(h.lastIndexedAt)}</span>
         ${actions(h)}
