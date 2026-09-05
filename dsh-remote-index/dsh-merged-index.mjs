@@ -34,7 +34,10 @@ async function collectInstance(inst) {
     res = spawnSync("ssh", [inst.host, inst.nodeBin || "node", "-", ...args], { input: indexerSource, encoding: "utf8" });
   }
   if (res.status !== 0) {
-    throw new Error(`[${inst.id}] indexer failed (${res.status}): ${(res.stderr || "").trim().slice(0, 500)}`);
+    // Mark the instance as unreachable rather than throwing: a transient SSH
+    // drop must not kill the whole dashboard. The caller keeps the last good
+    // snapshot for this instance and flags it offline.
+    return { instance: inst.id, error: (res.stderr || "").trim().slice(0, 300) || `exit ${res.status}` };
   }
   const data = JSON.parse(res.stdout);
   return { instance: inst.id, ...data };
@@ -58,7 +61,7 @@ function merge(raws) {
   sessions.sort(byUp);
   for (const p of projects) p.sessions.sort(byUp);
   projects.sort((a, b) => Math.max(...b.sessions.map((s) => s.updatedAt), 0) - Math.max(...a.sessions.map((s) => s.updatedAt), 0));
-  return { mergedAt: Date.now(), resources: raws.map((r) => r.instance), projects, sessions };
+  return { mergedAt: Date.now(), resources: raws.map((r) => r.instance), projects, sessions, offline: raws.filter((r) => r.error).map((r) => ({ instance: r.instance, error: r.error })) };
 }
 
 function esc(s) {
@@ -121,7 +124,11 @@ function renderHtml(data, showHost) {
     )
     .join("");
 
-  return `<!doctype html>
+  const offNote = data.offline && data.offline.length
+  ? ` · <span class="off">离线实例：${data.offline.map((o) => `${esc(o.instance)}${o.staleSince ? "（上次快照 " + when(o.staleSince) + "）" : "（无可展示快照）"}`).join("；")}</span>`
+  : "";
+const sub = `资源：${data.resources.map(esc).join(" / ")} · 生成于 ${when(data.mergedAt)}${offNote}`;
+return `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DSh 实例会话总览</title>
@@ -142,29 +149,49 @@ h1{font-size:16px;margin:0 0 4px}h1 small{color:var(--mut);font-weight:400}.sub{
 .meta{display:flex;gap:10px;color:var(--mut);font-size:11px;flex-wrap:wrap}.meta .ago{color:#b7c1cc}
 .foot{display:flex;gap:8px;color:var(--mut);font-size:11px;margin-top:6px;flex-wrap:wrap}
 .path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
+.off{color:#e06c6c}
 </style></head><body>
 <h1>DSh 实例会话总览 <small>全部实例 · 按最近活动排序</small></h1>
-<div class="sub">资源：${data.resources.map(esc).join(" / ")} · 生成于 ${when(data.mergedAt)}</div>
+<div class="sub">${sub}</div>
 ${sections}
 </body></html>`;
-}
-
-async function runOnce() {
-  const cfg = JSON.parse(await readFile(arg("--instances", join(here, "instances.json")), "utf8"));
-  const raws = [];
-  for (const inst of cfg.instances) raws.push(await collectInstance(inst));
-  return merge(raws);
 }
 
 const htmlPath = arg("--html", null);
 const watchSec = Number(arg("--watch", "0"));
 const showHost = process.argv.includes("--host-chip");
 
+// Retain the last good index per instance across ticks, so a transient SSH
+// drop keeps the previous snapshot on screen (flagged offline) instead of
+// wiping the dashboard; recovery is automatic once the host is reachable.
+const lastGood = new Map();
+
+async function runOnce(cfg) {
+  const raws = [];
+  const offline = [];
+  for (const inst of cfg.instances) {
+    const res = await collectInstance(inst);
+    if (res.error) {
+      const prev = lastGood.get(inst.id);
+      if (prev) raws.push({ instance: inst.id, ...prev });
+      offline.push({ instance: inst.id, error: res.error, staleSince: prev ? prev.generatedAt : null });
+      continue;
+    }
+    lastGood.set(inst.id, res);
+    raws.push(res);
+  }
+  const data = merge(raws);
+  data.offline = offline;
+  return data;
+}
+
 async function tick() {
-  const data = await runOnce();
+  const cfg = JSON.parse(await readFile(arg("--instances", join(here, "instances.json")), "utf8"));
+  const data = await runOnce(cfg);
   if (htmlPath) {
     await writeFile(htmlPath, renderHtml(data, showHost), "utf8");
-    process.stdout.write(`[${when(data.mergedAt)}] ${data.resources.join("+")}: ${data.projects.length} projects / ${data.sessions.length} sessions -> ${htmlPath}\n`);
+    const off = data.offline.length ? ` (离线: ${data.offline.map((o) => o.instance).join(",")})` : "";
+    process.stdout.write(`[${when(data.mergedAt)}] ${data.resources.join("+")}: ${data.projects.length} projects / ${data.sessions.length} sessions${off} -> ${htmlPath}\n`);
   } else {
     process.stdout.write(JSON.stringify(data));
   }

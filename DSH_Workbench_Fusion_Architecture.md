@@ -306,33 +306,57 @@ hwb 的「钻入某会话」靠 `probeDeeplink`（检测 `?session=` 深链能�
   （首次的 token 握手 → `/` → `?session=`,或切换的 1 次 `?session=`)全程保持,直到最终目标
   `iframe.src === 目标` 的 `load` 才收起——把白闪遮成面板色「连接会话…」加载态。
 
-### 5.5 反向代理（hwb 侧, 根路径 1:1）
+#### 连接机制原则：稳定第一 + 手填 token 直连
 
-每个实例的 iframe 现已统一走 hwb 自有的**反向代理**入口（`src/control/proxy.js`）,不为浏览器暴露原始
-dsh 端口或隧道端口:
+hwb 连接机制的核心原则（已落地）：**dsh 实例以稳定运行为第一优先**。
+
+1. **绝不因 hwb 自身连接问题去打断实例**。隧道断连 / 探测失败 / 远端不可达只会让实例进入
+   `degraded`（未达）并按退避重连**再探测**（见 §5.2），不会触发 killport / 重启远端 dsh web。
+   `ensureRemoteToken` 的 `ensure` 模式在端口已监听时**直接复用**（日志有 token）或返回
+   `__NO_TOKEN__`（旧版无 token），**不做 kill/restart**。
+2. **「启停」是用户显式授权的最后手段**。前端对 `stop` / `stop-instance` / `restart`（远程）加
+   `confirm()` 二次确认，文案注明会打断实例、建议改用 token 直连。
+3. **可自服务时交给用户自行操作**。远端 dsh web 不可达 / home 不可访问时，报错文案自带
+   `selfServiceHint(home)`——一组用户在远端可直接执行的 ssh 命令：启动 / 读最新 token / 确认
+   home 存在。设置表单里也给出读 token 的 ssh 命令与「稳定第一」说明。
+4. **手填 token 直连（最后手段的替代）**。实例设置 / 添加表单新增 `token` 栏。用户在远端自行更新
+   dsh 并取到新 token 后填入，`#openRemote` 便**直接用该 token 建隧道接入，完全不在远端启动 /
+   重启 / 杀进程**——避免「为拿新 token 而重启实例」。
+   - 存储：`homes.token` 列（含迁移），`routes` POST/PUT 接受 `token`。
+   - 规范化：`normalizeWebToken(input)` 兼容 `?token=x` / `token=x` / 裸 `x` / 完整 URL（含 LAN
+     尾部），统一为 `?token=x`；空 / `__NO_TOKEN__` / 无法识别 → null（回退远端抓取兜底）。
+
+### 5.5 反向代理（hwb 侧, 根路径 1:1）——仅远程 home 使用
+
+> **变更**：本地 home 的 `Launcher.#openLocal` **不再创建反代**。本机 dsh web 与浏览器同机可达，
+> iframe 与「在外部浏览器打开」一律给**原始服务连接**
+> `http://127.0.0.1:<dshPort>/?token=<x>`——token 可见、不依赖 hwb 进程存活的反代入口。反代
+> （`src/control/proxy.js`）**只保留给远程 home**（ssh -L 隧道本身不可被浏览器直达）。
+
+各实例的 iframe 走固定可寻址入口；仅**远程 home** 走 hwb 自有的**反向代理**入口
+（`src/control/proxy.js`）,不为浏览器暴露隧道端口:
 
 ```
-浏览器 ──► hwb 代理 127.0.0.1:<proxyPort> ──(1:1 根路径转发)──► 127.0.0.1:<dshPort>        本地 home
-                                                        └──► 127.0.0.1:<ssh -L 隧道端口>   远程 home
+本地 home:  浏览器 ──(直连原始服务连接)──► 127.0.0.1:<dshPort>       √ 主机直接可达，无代理
+远程 home:  浏览器 ──► hwb 代理 127.0.0.1:<proxyPort> ──(1:1 根路径转发)──► 127.0.0.1:<ssh -L 隧道端口>
 ```
 
-**为什么必须根路径**：dsh web 的 `index.html` 用**根绝对路径**（`<base href="/">`、`<script src="/plugins/...">`、
-`/assets/...`、`/api/...`）。若挂在 hwb 的子路径（`/proxy/<id>/`）下,这些绝对路径会解析到 hwb 自己的根而 404。
-因此代理独立监听一个本地端口,把根路径**原样 1:1 转发**（不重写路径）,让资源/插件/API/WebSocket 全部走通。
+**为什么必须根路径**（远程代理）：dsh web 的 `index.html` 用**根绝对路径**（`<base href="/">`、
+`<script src="/plugins/...">`、`/assets/...`、`/api/...`）。若挂在 hwb 的子路径（`/proxy/<id>/`）下,
+这些绝对路径会解析到 hwb 自己的根而 404。因此代理独立监听一个本地端口,把根路径**原样 1:1 转发**
+（不重写路径）,让资源/插件/API/WebSocket 全部走通。
 
-**代理职责**（`createProxy`）:
+**代理职责**（`createProxy`, 远程分支）:
 - `Host` 头**原样透传**（浏览器访问代理的 Host）——dsh 的鉴权 cookie 按 `authority=Host` 绑定,
   这样 cookie 在「代理 origin」上稳定有效;
 - 透传所有方法 + 请求体,流式回传（含 SSE 分块）;
 - 处理 `upgrade`（WebSocket）升级,让实时通道也走代理;
-- 与实例同生命周期: `Launcher.#openLocal`/`#connectRemote` 在拿到 token 后创建代理,
-  `stop` 时一并关闭。
+- 与实例同生命周期: `Launcher.#connectRemote` 在拿到 token 后创建代理, `stop` 时一并关闭。
 
-> ⚠️ **同源边界**：代理在**独立本地端口**(差异化 origin),所以代理后的 dsh web 与 hwb 自己的 UI
+> ⚠️ **同源边界**：远程代理在**独立本地端口**(差异化 origin),所以代理后的 dsh web 与 hwb 自己的 UI
 > 页面（4310）**不同源**。因此代理本身并不直接实现「hwb 同源驱动 SPA」——它提供的是统一、干净的入口
 > 与稳健的传输（+ 为后续 hwb 侧注入做铺垫）。若要做到「会话在当前页原地打开、零重载」,仍需一个跨源
 > 机制（`postMessage`）去驱动已加载的 SPA——可在此代理基础上再接入。
-
 ---
 
 ## 6. 双循环刷新架构

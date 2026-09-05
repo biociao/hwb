@@ -45,8 +45,9 @@
 - 为每个实例展示 **Token 用量**：总量、输入/输出、缓存命中/创建、缓存命中率，以及
   按 **维度**（合计 / 项目 / LLM provider / 实例）**堆叠**的分时趋势柱状图。
 - **托管** dsh web：本机直接拉起子进程，远端经 `ssh -L` 按需隧道接入。
-- 每个实例提供一个 **1:1 根路径反向代理** 入口，让 dsh web 的 `/plugins/*`、`/assets/*`、
-  WebSocket 全部走通，浏览器无需直接暴露原始端口。
+- 每个实例给浏览器一个**直接可寻址**的入口：**本地** home 用原始服务连接
+  `http://127.0.0.1:<port>/?token=<x>`（同机直连，无需转发）；**远程** home 经 hwb 的
+  **1:1 根路径反向代理** 提供（`/plugins/*`、`/assets/*`、WebSocket 全部走通，不暴露隧道端口）。
 
 **不做（显式非目标，见架构文档 §12）：**
 
@@ -62,10 +63,13 @@
 | 能力 | 说明 |
 |------|------|
 | **多实例聚合** | 一张工作台看全本机 + 所有 SSH 远程 dsh 实例的项目 / 会话 / 用量 |
+| **当前项目 / 当前会话** | 每个实例（本地 + 远程）缓存「最近活跃会话 + 其所属项目」的元数据与状态（标题 / 状态 chip / token / 上下文 / 最近活动），显示在实例卡 |
 | **零 I/O 读取层** | 只读投影缓存 `session_projcache.json`（`projection cache` 层），**不下探 `.zstd`** |
+| **远程只读索引** | 经一次 `ssh host bash -s` 在远端 cat 出 dsh home 的 4 个元数据文件，与本地共用同一套 schema 验证 / 域降级——远程实例的当前项目/会话与本地同构 |
 | **版本降级** | 每个文件按 `unit.version` 校验；主版本不兼容时该域标 `degraded`，其余照常，不白屏 |
-| **进程管理** | 30s 心跳探测 + 状态机（stopped/running/degraded/gone）+ 退避重连 + 进程指纹防误杀 |
+| **进程管理** | 30s 心跳探测 + 状态机（stopped/running/degraded/gone）+ 退避重连 + 进程指纹防误杀；**稳定第一**——连接问题只降级重探测，不重启/杀实例，启停需确认 |
 | **按需隧道** | 远端点「打开」才建 `ssh -L`，关闭后不复用长期隧道，省端口与连接 |
+| **手填 token 直连** | 实例设置/添加表单 `token` 栏——远端自行更新 dsh 后填入新 token 即直连，**不重启实例**；不可达时自带可自行执行的 ssh 命令提示 |
 | **Token 用量面板** | 汇总 + 分时堆叠趋势（自适应桶粒度）+ 按项目拆分 |
 | **会话深链** | 客户端装有 `dsh-session-deeplink` 插件时，可二段跳转直达单个会话，且有加载遮罩防白闪 |
 | **SSH 远程生命周期** | 远端点按钮即可启动 / 重启 / 关闭远端 dsh web（把 `dsh-remote-web.sh` 算法搬进 Node） |
@@ -90,6 +94,13 @@ node src/server.js --home ~/.dsh
 # 默认监听 http://127.0.0.1:4310
 ```
 
+命令用 npm 脚本：
+
+```bash
+npm start          # node src/server.js
+npm test           # node --test tests/*.test.js
+```
+
 命令行选项：
 
 | 选项 | 默认 | 说明 |
@@ -98,13 +109,16 @@ node src/server.js --home ~/.dsh
 | `--port <n>` | `4310` | hwb 监听端口（仅绑定 `127.0.0.1`） |
 | `--db <path>` | `~/.hwb/hwb.db` | SQLite 索引库；传 `:memory:` 用内存库 |
 | `--interval-ms <n>` | `60000` | 数据索引循环基线周期（毫秒） |
+| `-v` / `--verbose` | `info` | 输出调试级日志（含每个实例状态迁移、子进程生命周期等细节） |
+| `--silent` | 关 | 完全不输出到终端，仅写日志文件（适合作为服务跑） |
+| `--log <file>` | `~/.hwb/hwb.log` | 日志文件路径；出错时排查用 |
+| `--no-log` | — | 不落盘，只输出到终端 |
 
-推荐用 npm 脚本：
-
-```bash
-npm start          # node src/server.js
-npm test           # node --test tests/*.test.js
-```
+> **日志与排查**：所有输出走同一套结构化日志（`src/lib/logger.js`），分级（debug/info/warn/error/fatal）、
+> 带时间戳与作用域（如 `[launcher]`、`[monitor]`），出错时把**上下文字段**（homeId / host / 端口 /
+> 子进程 stderr 尾部 / 退出码）一并带上，Error 对象打印完整堆栈。日志文件默认 `~/.hwb/hwb.log`，
+> 超过 1MiB 自动轮转保留 `.1/.2` 两代。当 dsh web 启动失败、SSH 隧道断连、远端 home 不可达时，
+> 查看该文件即可定位根因。
 
 打开 `http://127.0.0.1:4310`，首次会看到一个 **onboarding 引导**：自动检测 `~/.dsh` 或手动添加。
 
@@ -115,14 +129,18 @@ npm test           # node --test tests/*.test.js
 顶部是一个 **tab 栏**：`◧ 工作台` + 每个实例一个可拖拽排序的 tab。视图切换只 show/hide，
 **绝不销毁重建 iframe**（持久化、不重载）。
 
-**工作台（仪表盘，纯元数据、零 iframe）** 分四块：
+**工作台（仪表盘，纯元数据、零 iframe）** 分五块：
 
 1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
 2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
-3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip、索引状态、workspace/会话数，以及
-   open / stop / restart / reindex / remove 等操作按钮。
+3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip、索引状态、workspace/会话数，
+   **当前项目/当前会话**块（最近活跃会话的项目、标题、状态 chip、token、上下文、最近活动），以及
+   open / stop / restart / reindex / remove 等操作按钮。远程实例经 SSH 只读索引入库后同样显示。
 4. **Token 用量** —— 汇总卡 + 分时趋势堆叠柱状图（支持 24h / 3天 / 7天 / 14天 / 30天 周期，
    按 合计 / 项目 / LLM provider / 实例 维度切换）+ 按项目拆分。
+5. **运行日志** —— 后端结构化日志实时面板：分级着色（debug/info/warn/error）、按级别过滤、
+   自动跟随（滚动到底部）、点击某行展开完整堆栈、清空视图。启动即回填环缓冲历史
+   （分不清级别时可用 `-v` 开启 debug 级；查看磁盘日志见 `--log` 文件）。
 
 > **项目 ↔ 会话联动高亮**：把鼠标悬停在某个项目（或会话）上，会在两栏间同步高亮同名项目。
 
@@ -148,6 +166,8 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 | `.credentials.yaml` | provider 引用（只读 provider 名，**不读 key 值**） | — | 可选；缺失不判定 degraded |
 
 **硬性规则：永不碰 `*.zstd`。** 工作台活在投影缓存（`projection cache`）第一层，绝不下探日志。
+远程实例读取同样的 4 个文件，只是经一次 `ssh host bash -s`（`remote-reader`）在远端 `cat` 抓回再解析——**只读**，
+且与本地共用同一套 schema 验证与域降级，因此远程实例的「当前项目/当前会话」与本地同构。
 
 > 某个文件升级到未支持的主版本时，只把**该域**标记为 `degraded`，其余域照常索引，
 > 前端显示「dsh 已升级 — 索引待适配」提示，而不是白屏。
@@ -171,15 +191,16 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 - **控制平面**只回答三件事：实例在跑吗？dsh web 在哪个端口？远端隧道建好了吗？
   它**不参与**数据展示。
 - **数据平面**是全新设计：Reader → Normalizer（纯函数）→ SQLite 索引。
-  控制平面与数据平面**单向解耦**（Control → Data 只传递实例/隧道状态）。
+  Reader 统一抽象了 `readText/exists`：本地走 fs，远程经一次 SSH cat（`remote-reader`），
+  两者共用同一套 schema 验证与域降级语义。控制平面与数据平面**单向解耦**（Control → Data 只传递实例/隧道状态）。
 - **展示平面**默认渲染本地索引元数据（O(索引行)），**绝不**同时挂 N 个 iframe；
   iframe 只在钻入单个会话时按需创建、退出销毁。
 
 关键设计原则（详见架构文档）：
 
 - 工作台仪表盘**绝不**挂载 N 个 iframe——它从本地 SQLite 读元数据。
-- 每个实例的 iframe 统一走 hwb 的**根路径 1:1 反向代理**，因为它不重写路径，
-  所以 `/plugins/*`、`/assets/*`、WebSocket 全部走通。
+- 每个实例的 iframe 统一走固定可寻址入口：**本地**用原始服务连接（同机直连），**远程**经 hwb 的
+  **根路径 1:1 反向代理**，因为它不重写路径，所以 `/plugins/*`、`/assets/*`、WebSocket 全部走通。
 - 双循环刷新：控制循环 30s + 索引循环 60s（debounced），互不阻塞。
 
 ---
@@ -251,6 +272,7 @@ hwb/
 ├── src/
 │   ├── server.js                # HTTP 入口 + 调度器启动 + 退出清理
 │   ├── lib/                     # 纯内核（零副作用，可单测）
+│   │   ├── logger.js            # 结构化日志（分级/时间戳/作用域/上下文/轮转落盘/crash handler）
 │   │   ├── schema.js            # 4 个文件的手写验证器（unit.version）
 │   │   ├── normalize.js         # HomeSnapshot → IndexedRows（纯函数）
 │   │   ├── read-home.js         # 本地读取 + 最小 YAML 解析（provider 名）
@@ -316,13 +338,20 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
   后端 `/api/quota` ✓、`/api/events` 的 `quota:updated` ✓、`QuotaService` + 各 provider 适配器 ✓、
   单测 ✓ —— 但仪表盘**尚未**把它渲染出来（前端目前用量卡里没有额度区块）。如需启用，把
   `renderQuotaCards` 挂到工作台即可；属**剩余 5% 接线**工作，不影响其余功能。
+- **远程索引读整份 projcache 走 SSH**：远程实例每次索引周期（60s 基线）经一次 `ssh cat` 抓回
+  `session_projcache.json`（可能数百 KB）+ 其余元数据。这是为拿到「当前项目/会话」所必需的只读读；
+  远程不可达时该实例降级（`markHomeError`），**不会**阻塞其它实例索引，也不会去重启/杀实例。
 - **仅 `deepseek`/`kimi` 有公开余额 API**：`zai`/`minimax` 无公开 balance endpoint，
   API 显式降级为「余额不可用」，不会静默失败。
 - **会话 deep-link 依赖客户端插件**：`dsh-session-deeplink` 需经
   `dsh plugin --profile web add dsh-session-deeplink` 安装；未装插件的 home 深链不触发
   （框架已保证「装了插件」能正确探测 + 保留 `?session=`）。
 - **新 dsh 鉴权 token**（≥`0.1.2-rc.1`）：`dsh web` 每次启动打印带 `?token=` 的 URL，
-  hwb 会抓取并拼进入口 URL；旧版 dsh（不打印 token）自动回退裸 URL。
+  hwb 会抓取并拼进入口 URL；**旧版 dsh（不打印 token，如 `v0.1.1`）自动回退裸 URL**。
+  向下兼容做得足够稳：远端「ensure」对已在监听但没有 token 的旧版实例**绝不 killport/重启**
+  （避免打断一个健康的旧版 web）；启动后一出现不带 token 的 URL 行就**立即**用裸 URL 兜底，
+  而不是白等满 40s 的 poll 窗口；默认远端启动命令用**裸 `dsh web --port <n>`**
+  （不传新版才有的 `--profile web`/`--no-open`，旧版会因未知选项起不来 → 不可达）。
 
 ---
 
