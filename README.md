@@ -1,4 +1,4 @@
-![hwb](/Users/ciao/Downloads/hwb.png)
+![hwb](images/hwb.png)
 
 # hwb — harness workbench
 
