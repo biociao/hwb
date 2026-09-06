@@ -2,9 +2,6 @@
 
 # hwb — harness workbench
 
-> 版本：**v0.1.1** ｜ Node.js 22+ ｜ 原生 ESM ｜ **零 npm 依赖**
-
-
 [![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
 [![version](https://img.shields.io/badge/version-v0.1.1-blue)](CHANGELOG.md)
 [![milestones](https://img.shields.io/badge/milestones-M1%E2%80%93M7-brightgreen)](DSH_Workbench_Fusion_Architecture.md)
