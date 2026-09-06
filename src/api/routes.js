@@ -66,6 +66,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         const token = typeof body.token === 'string' && body.token.trim() ? body.token.trim() : null;
         const homePath = `ssh://${host}:${remotePort}`;
         const homeId = store.registerHome({ homePath, alias, hostType: 'remote', host, remotePort, remoteHome, remoteCmd, remoteLog, token });
+        // 注册后立即触发一次该实例的索引（不等结果：远程走 SSH，不可达时要等超时，
+        // 同步等待会卡住注册响应；索引完成后会广播 index:updated，前端经 SSE 自动刷新）。
+        indexer.reindexNow(homeId);
         send(res, 200, { homeId, warning: null, result: null });
         return;
       }
@@ -262,6 +265,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       try {
         const inst = await launcher.open(home);
         await monitor.refresh(home.homeId);
+        // 连接成功后立即索引一次（此时 runtime=running，liveStatus 实时通道可用），
+        // 新会话/状态马上进入工作台，不用等下一个 60s tick。
+        indexer.reindexNow(home.homeId);
         send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });
@@ -292,6 +298,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       try {
         const inst = await launcher.restart(home);
         await monitor.refresh(home.homeId);
+        indexer.reindexNow(home.homeId); // 同 open：重启后立即索引，实时状态即刻入库
         send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });

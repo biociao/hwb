@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { IndexStore } from './dshhome/store.js';
 import { Indexer } from './dshhome/indexer.js';
+import { LiveStatusReader } from './dshhome/live-status.js';
 import { Launcher } from './control/launcher.js';
 import { Monitor } from './control/monitor.js';
 import { InstanceRegistry } from './control/registry.js';
@@ -87,6 +88,7 @@ const quota = new QuotaService({
   store,
   broadcast: (event, data) => hub.broadcast(event, data),
 });
+const liveStatusReader = new LiveStatusReader();
 const indexer = new Indexer({
   store,
   // 本地 + 远程都索引：本地走 fs，远程经 SSH 只读 cat（§4.6），让远程实例的
@@ -94,6 +96,25 @@ const indexer = new Indexer({
   homes: () => store.listHomes(),
   broadcast: (event, data) => hub.broadcast(event, data),
   baseMs: opts.intervalMs,
+  // 读取源扩展：对「运行中且可直达」的实例，从 dsh web 的 /api RPC channel 读取实时会话状态，
+  // 覆盖（可能冻结的）投影缓存推导出的状态。实例不可达 / token 无效 / 端点缺失一律回退（返回 null）。
+  liveStatus: async (home) => {
+    const rt = monitor.get(home.homeId);
+    if (!rt || rt.runtime !== 'running') return null;
+    // 本地实例：直接用 home 配置里的最新 token + localPort 拼实时 URL（不依赖可能过期的 rt.url，
+    // 用户刚在配置里填了新 token 也能立即生效）。远程实例：经隧道反代的 rt.url。
+    let url = rt.url;
+    if (home.hostType === 'local' && home.localPort) {
+      const base = `http://127.0.0.1:${home.localPort}`;
+      url = home.token ? `${base}/?token=${encodeURIComponent(home.token)}` : base;
+    }
+    if (!url) return null;
+    try {
+      return await liveStatusReader.read(url);
+    } catch {
+      return null;
+    }
+  },
 });
 indexer.start();
 monitor.start();
