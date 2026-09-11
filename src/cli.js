@@ -35,6 +35,32 @@ function request(command = 'status') {
     socket.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(Error('服务控制响应无效')); } });
   });
 }
+// 启动失败时，子进程的 stdout/stderr 都进了 service.log —— 用户只看到一句
+// 「启动失败 (2)，查看 …/service.log」就得自己去翻文件。而「为什么失败」往往是一句
+// 已经写好的、能照做的提示（server.js 打的 `hwb: 无法打开数据库（路径）…` 常见原因……）。
+// 这里把那几行直接带回终端：优先取 `hwb:` 开头的提示块（含其缩进续行），否则退回日志尾部。
+// 完整日志仍然是权威，所以两条路径都会把文件位置一并说出来。
+function failureDetail(logFile, maxLines = 8) {
+  let text;
+  try { text = fs.readFileSync(logFile, 'utf8'); } catch { return ''; }
+  const lines = text.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim() !== '');
+  const hint = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('hwb:')) continue;
+    hint.push(lines[i]);
+    // 提示块是「首行 + 若干缩进续行」
+    for (let j = i + 1; j < lines.length && /^\s{2,}\S/.test(lines[j]); j++) hint.push(lines[j]);
+    break;
+  }
+  // 没有提示块时退回日志尾部，但**必须丢掉栈帧**：真实报错往往在栈帧的上一行，
+  // 只截尾 4 行会得到「4 行 at …」而把唯一有用的那行挡在外面（实测过）。
+  const body = hint.length
+    ? hint
+    : lines.filter((l) => !/^\s*at\s/.test(l) && !/^\s*$/.test(l)).slice(-3);
+  return body.slice(0, maxLines)
+    .map((l) => `  ${l.length > 300 ? l.slice(0, 300) + '…' : l}`)
+    .join('\n');
+}
 async function start() {
   const old = await request();
   if (old) { if (!old.ready) throw Error('服务正在启动，请稍后查看状态'); console.log(`已运行 PID ${old.pid}`); return; }
@@ -48,10 +74,15 @@ async function start() {
     env: { ...process.env, HWB_SERVICE_PORT: String(cfg.port) },
   });
   fs.closeSync(fd);
+  // 日志可能因失败而新增内容，所以细节要在失败发生的**那一刻**再读
+  const why = () => {
+    const detail = failureDetail(output);
+    return `\n${detail}${detail ? '\n' : ''}  完整日志: ${output}`;
+  };
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill('SIGTERM'); reject(Error(`启动超时，查看 ${output}`)); }, 15000);
+    const timer = setTimeout(() => { child.kill('SIGTERM'); reject(Error(`启动超时${why()}`)); }, 15000);
     child.once('error', err => { clearTimeout(timer); reject(err); });
-    child.once('exit', code => { clearTimeout(timer); reject(Error(`启动失败 (${code})，查看 ${output}`)); });
+    child.once('exit', code => { clearTimeout(timer); reject(Error(`启动失败 (${code})${why()}`)); });
     child.once('message', msg => { if (msg.ready) { clearTimeout(timer); resolve(); } });
   });
   child.unref();

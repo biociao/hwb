@@ -172,6 +172,23 @@ server.listen(opts.port, '127.0.0.1', () => {
   log.info(`db: ${opts.db}`);
   for (const h of store.listHomePaths()) log.info(`home: ${h}`);
 });
+// 端口被占用是**最常见**的启动失败（另一个 hwb 实例、上次没退干净的进程、或别的程序）。
+// 裸事件会把 `Error: listen EADDRINUSE…` 连同 4 行栈帧写进 service.log，而 CLI 只报
+// 「启动失败 (1)，查看 service.log」—— 用户得翻日志、还得自己在栈帧里找那一行。这里给出
+// 一句能照做的 `hwb:` 提示（CLI 会把 `hwb:` 开头的提示块带回终端）。
+server.on('error', (err) => {
+  const where = '127.0.0.1:' + opts.port;
+  if (err.code === 'EADDRINUSE') {
+    console.error(`hwb: 端口 ${where} 已被占用，无法启动。\n`
+      + '  可能是另一个 hwb 实例（`hwb status` 看当前端口），或上次没退干净的进程，或别的程序。\n'
+      + '  换一个端口：`hwb config set port <新端口>`；或先停掉占用者（macOS/Linux: `lsof -i :'
+      + `${opts.port}` + '`）。');
+  } else {
+    console.error(`hwb: 无法在 ${where} 上启动 HTTP 服务: ${err.message}`);
+  }
+  log.error('HTTP 服务监听失败', err, { port: opts.port });
+  process.exit(3);
+});
 
 let shuttingDown = false;
 function shutdown(reason = 'signal') {

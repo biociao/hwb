@@ -61,10 +61,35 @@ test('CLI refuses occupied ports without stopping the unrelated listener', async
   const server = net.createServer(s => s.end());
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   t.after(() => new Promise(r => server.close(r)));
-  await run('config', 'set', 'port', String(server.address().port));
-  await assert.rejects(run('start'), /启动失败/);
+  const n = server.address().port;
+  await run('config', 'set', 'port', String(n));
+  // 原先只报「启动失败 (1)，查看 …/service.log」—— 真正的原因（EADDRINUSE）在日志里，
+  // 而且尾部还是 4 行栈帧。现在要把原因带回终端，并且绝不能只给栈帧。
+  await assert.rejects(run('start'), (err) => {
+    assert.match(err.stderr, /启动失败/);
+    assert.match(err.stderr, new RegExp(String(n)), '应说出是哪个端口');
+    assert.match(err.stderr, /已被占用/, '应说出原因，而不是只让用户去翻日志');
+    assert.doesNotMatch(err.stderr, /^\s+at /m, '终端输出不该只有栈帧');
+    return true;
+  });
   assert.equal(server.listening, true);
   await assert.rejects(run('status'));
+});
+
+// 数据库打不开是第二常见的启动失败。server.js 早就会打一句能照做的 `hwb:` 提示，
+// 但它只落在 service.log 里，终端上只有「启动失败 (2)」—— 用户必须去翻文件才知道该删哪个路径。
+test('CLI：启动失败的原因（数据库损坏）直接出现在终端上', async t => {
+  const { dir, run } = await fixture(t);
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+  fs.writeFileSync(path.join(dir, 'hwb.db'), 'this is not a sqlite database\n');
+  await assert.rejects(run('start'), (err) => {
+    assert.match(err.stderr, /无法打开数据库/, '应把 server.js 的提示带回终端');
+    assert.match(err.stderr, /hwb\.db/, '提示里应含具体路径');
+    assert.match(err.stderr, /service\.log/, '仍要指出完整日志位置');
+    assert.doesNotMatch(err.stderr, /^\s+at /m);
+    return true;
+  });
 });
 
 test('CLI upgrade uses the tracked Git branch and rejects dirty or failing updates', async t => {
