@@ -154,3 +154,44 @@ test('源码注释里的 §N.M 章节引用都能在设计文档里解析到', a
   assert.deepEqual(missing, [],
     `源码引用了设计文档里不存在的章节：${missing.map((k) => `§${k} (${[...new Set(refs.get(k))].join(',')})`).join('; ')}`);
 });
+
+test('src/web 下没有「谁都不引用」的孤儿文件', async () => {
+  const webRoot = path.join(root, 'src', 'web');
+  const referenced = new Set();
+  async function walk(rel) {
+    if (referenced.has(rel)) return;
+    referenced.add(rel);
+    const src = await readFile(path.join(root, rel), 'utf8');
+    for (const m of src.matchAll(/from\s+'(\.[^']+)'/g)) {
+      const target = path.relative(root, path.resolve(path.dirname(path.join(root, rel)), m[1]));
+      try { await readFile(path.join(root, target)); } catch { continue; }
+      await walk(target);
+    }
+    for (const m of src.matchAll(/(?:src|href)="([^"#?]+)"/g)) {
+      const target = path.relative(root, path.resolve(path.dirname(path.join(root, rel)), m[1].replace(/^\//, '')));
+      try { await readFile(path.join(root, target)); } catch { continue; }
+      await walk(target);
+    }
+  }
+  await walk('src/web/index.html');
+
+  // 服务端也会注入/读取一些前端资源（如预览桥接脚本），把这些显式列出来
+  const proxy = await readFile(path.join(root, 'src', 'control', 'proxy.js'), 'utf8');
+  for (const m of proxy.matchAll(/new URL\('\.\.\/web\/([^']+)'/g)) referenced.add(`src/web/${m[1]}`);
+
+  const all = [];
+  async function collect(dir) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await collect(full);
+      else all.push(path.relative(root, full));
+    }
+  }
+  await collect(webRoot);
+
+  // 已知且**有意**未接线的：额度卡片（见 README「已知限制」）
+  const intentionallyUnwired = new Set(['src/web/components/quota-card.js']);
+  const orphans = all.filter((f) => !referenced.has(f) && !intentionallyUnwired.has(f));
+  assert.deepEqual(orphans, [], `src/web 下存在谁都不引用的文件（死资源）：\n${orphans.join('\n')}`);
+  assert.ok(referenced.size >= 15, `可达文件数异常偏少（${referenced.size}），可达性分析可能失效`);
+});
