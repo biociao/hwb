@@ -57,9 +57,30 @@ async function start() {
   child.unref();
   console.log(`已启动 PID ${child.pid} http://127.0.0.1:${cfg.port}`);
 }
+// 端口上有没有人在监听（不依赖控制 socket）。
+function portInUse(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ port, host: '127.0.0.1' });
+    const done = (v) => { socket.destroy(); resolve(v); };
+    socket.setTimeout(800, () => done(false));
+    socket.once('connect', () => done(true));
+    socket.once('error', () => done(false));
+  });
+}
+
 async function stop() {
   const old = await request('stop');
-  if (!old) { console.log('已停止'); return; }
+  if (!old) {
+    // 没有控制 socket ≠ 服务没在跑：前台 `hwb serve` 不创建 socket，但它占着端口。
+    // 原先直接打印「已停止」并返回 0，用户以为停掉了，下一次 `hwb start` 却只报一句
+    // 难懂的「启动失败 (1)」（其实是 EADDRINUSE）。这里说清楚实际情况。
+    const port = readConfig().port;
+    if (await portInUse(port)) {
+      throw Error(`没有控制 socket，但端口 ${port} 仍被占用 —— 很可能是前台运行的 \`hwb serve\`。`
+        + '请到该终端按 Ctrl-C 停止它。');
+    }
+    console.log('已停止'); return;
+  }
   for (let i = 0; i < 100; i++) {
     await delay(100);
     if (!await request()) { console.log('已停止'); return; }

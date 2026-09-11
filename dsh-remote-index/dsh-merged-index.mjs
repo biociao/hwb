@@ -39,8 +39,25 @@ async function collectInstance(inst) {
     // snapshot for this instance and flags it offline.
     return { instance: inst.id, error: (res.stderr || "").trim().slice(0, 300) || `exit ${res.status}` };
   }
-  const data = JSON.parse(res.stdout);
+  const data = parseIndexOutput(res.stdout);
   return { instance: inst.id, ...data };
+}
+
+// 远端的 stdout 不干净：登录 shell 的 banner（`.bashrc`/profile 里的 echo、motd）、
+// ssh 的告警都会混在 JSON 前面。原生实现直接 JSON.parse(res.stdout)，于是远端一句
+// "Welcome to ..." 就让整份合并索引报 SyntaxError（--watch 模式下每轮都死，HTML 一直是旧的，
+// 而错误信息完全没提到 banner 这个真实原因）。
+// 这里从第一个 `{` 开始解析；仍然失败时把原始输出片段带上，让原因可见。
+function parseIndexOutput(stdout) {
+  const text = String(stdout ?? "");
+  const start = text.indexOf("{");
+  const candidate = start === -1 ? text : text.slice(start);
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const preview = text.trim().split("\n").slice(0, 3).join(" ⏎ ").slice(0, 300);
+    throw new Error(`远端索引输出不是 JSON（可能混入了登录 banner）: ${error.message} — 实际输出开头: ${preview || "(空)"}`);
+  }
 }
 
 function merge(raws) {
@@ -62,6 +79,15 @@ function merge(raws) {
   for (const p of projects) p.sessions.sort(byUp);
   projects.sort((a, b) => Math.max(...b.sessions.map((s) => s.updatedAt), 0) - Math.max(...a.sessions.map((s) => s.updatedAt), 0));
   return { mergedAt: Date.now(), resources: raws.map((r) => r.instance), projects, sessions, offline: raws.filter((r) => r.error).map((r) => ({ instance: r.instance, error: r.error })) };
+}
+
+// 数值字段同样来自**远端**投影缓存（sessionStats.val），不是本地可信数据：
+// 直接 `\${s.turns}` 插进模板就是一个 HTML 注入面（构造缓存即可产出
+// `class="turns"><img src=x onerror=...>`）。这个页面聚合了所有实例的标题与路径，
+// 一旦注入成功就能读走全部内容。统一走数值规范化。
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function esc(s) {
@@ -98,8 +124,8 @@ function renderHtml(data, showHost) {
       <div class="meta">
         <span>${when(s.updatedAt)}</span>
         <span class="ago">${rel(s.updatedAt)}</span>
-        <span class="turns">${s.turns ?? 0} 轮 / ${s.steps ?? 0} 步</span>
-        ${s.llmMs ? `<span>LLM ${(s.llmMs / 1000).toFixed(1)}s</span>` : ""}
+        <span class="turns">${num(s.turns)} 轮 / ${num(s.steps)} 步</span>
+        ${num(s.llmMs) ? `<span>LLM ${(num(s.llmMs) / 1000).toFixed(1)}s</span>` : ""}
       </div>
       <div class="foot">
         <span class="path">${p(s.cwd)}</span>
@@ -197,7 +223,17 @@ async function tick() {
   }
 }
 
-await tick();
+// 单轮失败（远端 banner / SSH 抖动 / 临时读不到 instances.json）不该让整个 watch 进程退出 ——
+// 那会让 HTML 永远停在旧快照上，而且用户看不到任何提示。记录并等下一轮。
+async function tickGuarded() {
+  try {
+    await tick();
+  } catch (error) {
+    process.stderr.write(`[${when(Date.now())}] 本轮刷新失败，等下一轮：${error.message}\n`);
+  }
+}
+
+await tickGuarded();
 if (watchSec > 0) {
-  setInterval(tick, watchSec * 1000);
+  setInterval(tickGuarded, watchSec * 1000);
 }

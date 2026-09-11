@@ -58,6 +58,7 @@ export function initLogger(cfg = {}) {
   if (cfg.silent !== undefined) config.silent = Boolean(cfg.silent);
   if (cfg.color !== undefined) config.color = Boolean(cfg.color);
   if (cfg.rotateBytes !== undefined && cfg.rotateBytes > 0) config.rotateBytes = cfg.rotateBytes;
+  if (cfg.openRetryMs !== undefined && cfg.openRetryMs >= 0) openRetryMs = cfg.openRetryMs;
   // 切换日志文件时关闭旧 fd，避免句柄泄漏/写错文件（生产只 init 一次；测试会多次切换）。
   if (config.file !== prevFile) closeFile();
   if (config.file) openFile();
@@ -314,6 +315,14 @@ function openFile() {
   }
 }
 
+// 打开失败后的重试节流：openFile() 原先只在 initLogger 与 rotate() 里被调用，而 rotate()
+// 又只在 writeFileLine() 里可达 —— 后者在 fileFd === null 时直接 return。也就是说一次
+// **瞬时**失败（EACCES/ENOSPC、日志目录被临时改名）之后，文件日志会在整个进程生命周期里
+// 静默停掉，只留 console 里一行提示；而 help 文案恰恰叫用户去看那个文件。
+const OPEN_RETRY_MS = 30_000;
+let openRetryMs = OPEN_RETRY_MS;   // 可被 initLogger 覆盖（测试用）
+let nextOpenAttemptAt = 0;
+
 function closeFile() {
   if (fileFd !== null) {
     try { fs.closeSync(fileFd); } catch { /* already closed */ }
@@ -322,7 +331,15 @@ function closeFile() {
 }
 
 function writeFileLine(line) {
-  if (fileFd === null) return;
+  // fileFd 为空时按节流重试打开（而不是永久放弃）。打开失败本身不写日志（会递归），
+  // 由 reportFileError 在 console 上提示一次。
+  if (fileFd === null) {
+    const now = Date.now();
+    if (now < nextOpenAttemptAt) return;
+    nextOpenAttemptAt = now + openRetryMs;
+    openFile();
+    if (fileFd === null) return;
+  }
   try {
     // 写前检查体积（同步 stat 开销可忽略：日志量级低）。
     const st = fs.fstatSync(fileFd);

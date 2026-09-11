@@ -87,3 +87,29 @@ test('logger 单例被前一个用例初始化过时，仍能重新指向新文�
   assert.doesNotThrow(() => initLogger({ level: 'error', file: false, color: false, silent: true }));
   assert.doesNotThrow(() => logger('sec').info('noop'));
 });
+
+// 一次**瞬时**的打开失败不该让文件日志永久静默。
+// 原先 openFile() 只在 initLogger 与 rotate() 里被调用，而 rotate() 又只在 writeFileLine()
+// 里可达 —— 后者在 fileFd === null 时直接 return。于是失败一次之后，整个进程生命周期里
+// 日志再也不落盘，只留 console 上一行提示；而 help 文案恰恰叫用户去看那个文件。
+test('文件打开失败后会按节流重试，故障恢复即恢复写入', async (t) => {
+  const { mkdir, writeFile, rmdir } = await import('node:fs/promises');
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-open-retry-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const blocker = path.join(base, 'blocker');
+  await writeFile(blocker, 'x'); // 父路径是个文件 → mkdir/open 必然失败
+  const target = path.join(blocker, 'hwb.log');
+
+  initLogger({ level: 'info', file: target, color: false, openRetryMs: 5 });
+  logger('retry').info('第一次（预期失败）');
+  await assert.rejects(stat(target), '前置条件：此时日志文件不该存在');
+
+  // 故障恢复：把挡路的文件换成目录
+  await rm(blocker, { force: true });
+  await mkdir(blocker, { recursive: true });
+  await new Promise((r) => setTimeout(r, 20)); // 越过节流窗口
+
+  logger('retry').info('恢复之后');
+  const body = await readFile(target, 'utf8');
+  assert.match(body, /恢复之后/, '文件日志必须在故障恢复后自己续上，而不是永久静默');
+});

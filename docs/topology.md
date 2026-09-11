@@ -43,7 +43,7 @@
            │                 │                              │
            │ 数据:fs 只读      │ 数据: 一次 ssh cat 4 文件(只读)│
            │                 │                              │
-           │ 访问: 直连        │ 访问: ssh -L 隧道 + hwb 反代   │
+           │ 访问: 外部打开直连 │ 访问: ssh -L 隧道 + hwb 反代   │
            ▼                 ▼                              ▼
    ┌───────────────┐   ┌──────────────────┐      ┌────────────────┐
    │ http://127.0. │   │ hwb 代理          │      │ 远端 dsh web    │
@@ -65,7 +65,8 @@
 ## 3. 关键拓扑关系
 
 ### 3.1 实例发现与生命周期（控制平面）
-- `registry`：状态机 `unknown → probing → running/degraded/crashed/stopped`，失败退避重连。
+- `registry`：状态机 `unknown → probing → running / degraded（对外 runtime 呈现为 unreachable）/ stopped / gone`，失败退避重连。
+  （`PHASES` 里不再列 `crashed` —— `Monitor.#runCheck` 从不设置它，而实际会产出的 `gone` 之前反而漏了。）
 - `monitor`：探测本机进程存活、HTTP 端口响应、隧道健康。
 - `prober`：SSH 连通性、远端路径、远端 dsh web 可用性探测。
 - `launcher` / `remote`：本机 / 远端 dsh web 的拉起·停止·重启 + 抓取鉴权 token。
@@ -82,7 +83,10 @@
 ### 3.3 访问 / 钻入（展示平面）
 - 工作台仪表盘**零 iframe**，从本地 SQLite 读元数据，渲染成本 O(索引行)。
 - 钻入单个实例/会话才懒建**唯一** iframe：
-  - **本机**：浏览器 → `http://127.0.0.1:<dshPort>/?token=<x>`（同机直连，无代理）。
+  - **本机**：**外部打开**走 `http://127.0.0.1:<dshPort>/?token=<x>`（同机直连，无代理）；
+    **钻入 iframe 走 hwb 的预览反代**（自动分配的本地端口，注入 `preview-bridge.js` 以便
+    工作区/文件点击与父页通信）—— `Launcher.#withPreview` 对本地实例同样会建代理，
+    只有「外部打开」这一条路径是直连。
   - **远程**：浏览器 → hwb 根路径 1:1 反代 `127.0.0.1:<proxyPort>` → `ssh -L` 隧道 → 远端 `:<remotePort>`。
     （代理不重写路径，`/plugins/*`、`/assets/*`、/api、WebSocket 全走通；鉴权 cookie 按 authority=Host 绑定。）
 

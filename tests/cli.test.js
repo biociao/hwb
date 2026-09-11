@@ -99,3 +99,21 @@ test('CLI upgrade uses the tracked Git branch and rejects dirty or failing updat
   await git(upstream, 'commit', '-m', 'bad release');
   await assert.rejects(run(), /失败/);
 });
+
+// `hwb stop` 原先在「没有控制 socket」时无条件打印「已停止」并返回 0。
+// 但前台运行的 `hwb serve` 不创建控制 socket，它占着端口 —— 用户以为停掉了，
+// 下一次 `hwb start` 却只报一句难懂的「启动失败 (1)」（真实原因是 EADDRINUSE）。
+test('CLI stop：没有控制 socket 但端口被占用时如实报错，而不是谎报已停止', async (t) => {
+  const { dir, run } = await fixture(t);
+  const server = net.createServer(s => s.end());
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => server.close(r)));
+  await run('config', 'set', 'port', String(server.address().port));
+
+  await assert.rejects(run('stop'), /端口 \d+ 仍被占用/);
+  assert.equal(server.listening, true, 'CLI 不该去动这个进程');
+
+  // 端口空闲时照常报已停止
+  await new Promise(r => server.close(r));
+  assert.match((await run('stop')).stdout, /已停止/);
+});

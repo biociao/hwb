@@ -471,6 +471,51 @@ Semantic Versioning.
 
 ### Fixed
 
+#### dsh-remote-index / dsh-merged-index 两个独立工具（此前完全没有测试覆盖）
+- **`dsh-instance-index.mjs` 整包解压只为读一行**：`zstdDecompressSync(整个文件)` 与本文件自称的
+  「lightweight / 只读 session header」完全不符。实测一个 19 KB 的 `session.jsonl.zstd`
+  （解压后 200 MB）让峰值内存到 **445 MB / 最大 RSS 495 MB** —— 而这个脚本会经 ssh 在**远端主机**
+  上跑，大会话能把远端 dsh 一起拖下水。改为流式解压、拿到第一个换行就销毁流，并对 header 设 64 KiB
+  硬上限：同一夹具的峰值降到 **19.6 MB**（22×）。
+- **`dsh-instance-index.mjs` 每个项目目录都重读整个投影缓存**：`loadCache()` 写在项目循环里，
+  每个目录都重扫缓存目录并 `JSON.parse` 全部 json（30 项目 × 100 文件 = 3000 次读取；
+  真实 home 214 项目 × 428 文件约 9.1 万次）。缓存是**全局**的，提到循环外只读一次；
+  富化语义不变（回归测试断言 30/30 会话仍被正确富化）。
+- **`dsh-merged-index.mjs` 容忍远端 stdout 噪声**：远端登录 shell 的 banner（`.bashrc` 里的 echo、
+  motd）会让 `JSON.parse(res.stdout)` 直接抛 `SyntaxError: Unexpected token 'W'`，
+  `--watch` 模式下每轮都死、HTML 永远停在旧快照，而错误信息完全没提 banner 这个真实原因。
+  改为从第一个 `{` 开始解析，失败时把输出开头片段带进错误。`--watch` 的单轮失败也改为记录并继续。
+- **`dsh-merged-index.mjs` 数值字段的 HTML 注入**：`${s.turns}` / `${s.steps}` 直接插进模板，
+  而它们来自**远端**投影缓存（`sessionStats.val`），构造缓存即可产出真实标签
+  （`class="turns"><img src=x onerror=…>`）；这个页面聚合了所有实例的标题与路径，
+  注入成功就能读走全部内容。改为数值规范化（无法解析 → 0）。
+- **新增回归测试** `tests/dsh-remote-index.test.js`（7 例）：压缩文件只读第一行（64 MiB 解压量仍在毫秒级）、
+  缓存 hoist 后富化仍生效、header 不可解析时不崩、banner 容忍、数值注入、`--watch` 单轮失败不退出。
+
+#### `hwb stop` 在前台 `hwb serve` 占用端口时谎报「已停止」（src/cli.js）
+- `request('stop')` 在 ENOENT/ECONNREFUSED 时返回 null，而前台 `hwb serve` **不创建**控制 socket，
+  于是 `hwb stop` 打印「已停止」并返回 0；下一次 `hwb start` 只报一句难懂的「启动失败 (1)」
+  （真实原因 EADDRINUSE）。现在会探测配置端口：仍被占用时明确报错并退出 1，并指出「很可能是前台
+  `hwb serve`，请到该终端按 Ctrl-C」。
+
+#### 日志文件打开失败一次后永久静默（src/lib/logger.js）
+- `openFile()` 只在 `initLogger` 与 `rotate()` 里被调用，而 `rotate()` 只在 `writeFileLine()` 里可达 ——
+  后者在 `fileFd === null` 时直接 return。于是**瞬时**失败（EACCES/ENOSPC、日志目录被临时改名）
+  之后，文件日志在整个进程生命周期里静默停掉，只留 console 上一行提示，
+  而 help 文案恰恰叫用户去看那个文件。现在按节流（默认 30s）重试打开，故障恢复即续写。
+
+#### workspace-menu 给「未分组」行也插了一个点了没反应的菜单项（src/control/workspace-menu.js）
+- 注入的菜单数组同时被「未分组」那一行复用，而该行 `row.workspaceId === void 0`
+  （`groupByWorkspace` 里 `buildGroup("", void 0, …)`）。点击时 dispatch 的 `detail` 是 undefined，
+  桥接层按「必须是 string」丢弃 —— 用户看到菜单项但点了没反应。改为按 `row.workspaceId` 条件展开。
+  新增 `tests/workspace-menu.test.js`：含注入锚点、条件展开、注入后仍是合法 JS、锚点缺失时
+  fail-closed，以及**针对本机真实安装的 dsh bundle** 跑一遍（锚点失配会立刻暴露）。
+
+#### docs/topology.md 的两处说法与代码不符
+- §3.1 列了 `crashed` 状态（`Monitor.#runCheck` 从不设置它），且漏了实际会产出的 `gone`。
+- §3.3 说本机「同机直连，无代理」—— 只有「外部打开」是直连；**钻入 iframe 走 hwb 的预览反代**
+  （`Launcher.#withPreview` 对本地实例同样建代理，正是这样才能注入 `preview-bridge.js`）。
+
 #### 回归：草稿恢复后 SSH 表单提交不了（src/web/app.js + components/add-home.js + components/form-draft.js）
 - **现象**（对抗式自审发现）：显隐/必填是**值之外**的状态，只在 `change` 处理器里设置，而
   dashboard 每次 SSE 重建（有实例在跑时约 3s 一次）都会生成一个「本机」布局的新表单。
