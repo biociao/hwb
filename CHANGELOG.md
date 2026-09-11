@@ -149,6 +149,20 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### SSH 主机名里的控制字符能一路走到 spawn，并让 sshBash 变成 rejection（src/lib/endpoints.js + src/control/remote.js）
+- **现象**：主机名校验用的是 `\s`，而 `\s` **不匹配** `\0`（也不匹配 `\x01` 之类），
+  于是 `"bot@x\0y"` 能通过校验并落库。等它被用于 ssh 时，Node 的 `spawn` 因为「参数不能含 NUL」
+  **同步抛** `ERR_INVALID_ARG_VALUE` —— 而 `sshBash` 里只处理了**异步**的 `proc.on('error')`，
+  同步这条会变成一次 **rejection**。所有调用方都只检查返回值里的 `code`，没人接这个 rejection，
+  于是它冒成未处理拒绝（crash handler 记成 fatal 并退出）。
+  实测：`await sshBash('bot@x\u0000y', 'echo hi')` → 抛出 `ERR_INVALID_ARG_VALUE`；
+  作为对照，异步的 ENOENT（没有 ssh 可执行文件）一直是走返回值 -2 的。
+- **修复**：①校验层显式拒绝控制字符（`[\s\u0000-\u001f\u007f]`）—— 主机名里出现控制字符
+  没有任何正当理由，挡在最前面最省事；②`sshBash` 把 `spawnProcess` 包进 try/catch，
+  同步抛错统一成返回值（`code: -2`，与异步 spawn 失败同码），保持「失败也用返回值表达」的约定。
+- **回归测试**：`tests/endpoints.test.js`（NUL/\x01/\x7f/制表符都必须被拒，正常主机名不受影响）
+  与 `tests/remote.test.js`（含 NUL 的主机必须**返回** -2 而不是 reject）。修复前两条都失败。
+
 #### `GET /api/homes` 会把每个实例的 dsh token 回给客户端（src/api/routes.js）
 - **现象**：浏览器（以及任何能连到该端口的东西）请求 `/api/homes` 就能拿到实例的 dsh token 明文。
   实测：注册一个带 token 的实例后，响应里直接出现 `token = "SUPER-SECRET-LAUNCH-TOKEN"`。

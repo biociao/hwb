@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { IndexStore } from '../src/dshhome/store.js';
 import { Launcher } from '../src/control/launcher.js';
 import { createRouter } from '../src/api/routes.js';
-import { normalizeEndpoints } from '../src/lib/endpoints.js';
+import { normalizeEndpoints, assertSshHost } from '../src/lib/endpoints.js';
 
 const endpoints = [
   { id: 'lan', label: '内网', host: 'bot@cms.lo', port: 3080, token: 'lan-token' },
@@ -112,4 +112,16 @@ test('Launcher switches real local HTTP endpoints and keeps original connection 
   assert.equal(launcher.procs.size, 1);
   assert.equal((await fetch(original.url)).status, 200, 'old dsh process remains alive');
   assert.equal(launcher.registry.has(`${home.homeId}:switch`), false);
+});
+
+// `\s` 不匹配 \0（也不匹配 \x01 之类的控制字符），于是 "bot@x\0y" 能过校验，
+// 一直走到 spawn 才抛 ERR_INVALID_ARG_VALUE —— 而那条路径抛的是**同步异常**，
+// 会绕过「失败也用返回值表达」的约定（实测：sshBash 直接 reject）。
+// 主机名里出现控制字符没有任何正当理由，在校验层拒掉最省事。
+test('assertSshHost: 拒绝控制字符（\\0 不在 \\s 的覆盖范围内）', () => {
+  for (const bad of ['bot@x\u0000y', 'bot@x\u0001y', 'x\u007fy', 'a\tb']) {
+    assert.throws(() => assertSshHost(bad), /控制字符|空白/, `${JSON.stringify(bad)} 应被拒绝`);
+  }
+  assert.equal(assertSshHost('bot@cms.lo'), 'bot@cms.lo', '正常主机名不受影响');
+  assert.equal(assertSshHost('user@10.0.0.1'), 'user@10.0.0.1');
 });

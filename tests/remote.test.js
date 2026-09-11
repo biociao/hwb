@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { REMOTE_START, defaultRemoteCmd, normalizeWebToken, selfServiceHint } from '../src/control/remote.js';
+import { REMOTE_START, defaultRemoteCmd, normalizeWebToken, selfServiceHint, sshBash } from '../src/control/remote.js';
 
 test('defaultRemoteCmd: 用向下兼容的 `dsh web --port <n>`（不带 --profile/--no-open）', () => {
   assert.equal(defaultRemoteCmd(3080), 'dsh web --port 3080');
@@ -227,4 +227,13 @@ test('REMOTE_START: endpoint switch never starts a missing remote service', asyn
     assert.notEqual(r.code, 0);
     assert.equal(existsSync(marker), false);
   } finally { cleanup(dir); }
+});
+
+// spawn **同步**抛错时（参数含 NUL → ERR_INVALID_ARG_VALUE）原先会让 sshBash 变成一次
+// rejection：所有调用方都只检查返回值里的 code，rejection 会冒成未处理拒绝（crash handler
+// 会把它记成 fatal 并退出）。异步的 ENOENT 早就走 proc.on('error') 变成返回值了，同步这条漏了。
+test('sshBash: spawn 同步抛错也返回错误码，不把 rejection 抛给调用方', async () => {
+  const result = await sshBash('bot@x\u0000y', 'echo hi', [], 5000);
+  assert.equal(result.code, -2, `应返回 -2（spawn 失败），实际 ${JSON.stringify(result)}`);
+  assert.match(result.stderr, /spawn failed/);
 });

@@ -43,8 +43,13 @@ export function normalizeEndpoints(value, hostType) {
 export function assertSshHost(host) {
   // 长度上限：id/label 都有 100 的上限，host 原先没有 —— 一个 10000 字符的「主机名」会被照单收下。
   // （DNS 名上限 253、SSH 目标可能带 user@，255 足够宽松。）
-  if (!host || typeof host !== 'string' || host.startsWith('-') || /\s/.test(host) || host.length > 255) {
-    throw new Error('请填写有效的主机名（不能以 - 开头、不能含空白、长度 ≤ 255）');
+  // 控制字符必须显式拒绝：`\s` **不匹配** \0（也不匹配 \x01 之类），
+  // 于是 "bot@x\0y" 能过这一关，一直到 spawn 时才抛 ERR_INVALID_ARG_VALUE
+  // （Node 要求参数里不能有 NUL）。那条路径上抛的是**同步异常**，绕过了 sshBash 里
+  // 「把 spawn 失败变成返回值」的约定，调用方只得自己接住 —— 实测就是一次 rejection。
+  // 主机名里出现任何控制字符都没有正当理由。
+  if (!host || typeof host !== 'string' || host.startsWith('-') || /[\s\u0000-\u001f\u007f]/.test(host) || host.length > 255) {
+    throw new Error('请填写有效的主机名（不能以 - 开头、不能含空白或控制字符、长度 ≤ 255）');
   }
   return host;
 }

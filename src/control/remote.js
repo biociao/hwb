@@ -33,9 +33,19 @@ function sshBash(host, script, args = [], timeoutMs = DEFAULT_TIMEOUT, { maxStdo
   const remoteCmd = ['bash', '-s', '--', ...args.map((a) => JSON.stringify(String(a)))].join(' ');
   const attempt = () => new Promise((resolve) => {
     const startedAt = Date.now();
-    const proc = spawnProcess('ssh', [...sshOpts({ host }), host, remoteCmd], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    let proc;
+    try {
+      proc = spawnProcess('ssh', [...sshOpts({ host }), host, remoteCmd], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      // spawn **同步**抛错（例如参数里含 NUL → ERR_INVALID_ARG_VALUE，或 cwd/env 非法）。
+      // 异步的 ENOENT 由下面的 proc.on('error') 处理，但同步抛错会变成一次 rejection：
+      // sshBash 的约定是「失败也用返回值表达」，rejection 会绕过所有调用方的 code 检查，
+      // 冒成未处理拒绝。这里统一成返回值（-2，与 spawn 失败同码）。
+      resolve({ code: -2, stdout: '', stderr: `ssh spawn failed: ${error?.message ?? String(error)}`, elapsedMs: Date.now() - startedAt });
+      return;
+    }
     let stdout = '';
     let stdoutBytes = 0;
     let overflow = false;
