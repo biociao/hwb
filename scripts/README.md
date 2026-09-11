@@ -18,10 +18,13 @@
 
 ## 文件
 
-| 文件 | 用途 |
-|------|------|
-| `dsh-web-cached.sh` | 替换 `nohup dsh web &` 的启动包装脚本(缓存 + 关遥测 + vmtouch 预热 + exec dsh) |
-| `dsh-web-cached.service` | 可选: systemd 用户服务, 托管 dsh web(开机自启 + 崩溃重启 + 启动前预热) |
+| 文件 | 用途 | 详述 |
+|------|------|------|
+| `dsh-web-cached.sh` | 替换 `nohup dsh web &` 的启动包装脚本(缓存 + 关遥测 + vmtouch 预热 + exec dsh) | 本文件 |
+| `dsh-web-cached.service` | 可选: systemd 用户服务, 托管 dsh web(开机自启 + 崩溃重启 + 启动前预热) | 本文件 |
+| `dsh-remote-web.sh` | 在**本地**一键完成: SSH 到远端拉起 `dsh web`、抓回 token、建隧道、打印可直接打开的 URL | [`README-dsh-remote-web.md`](README-dsh-remote-web.md) |
+| `dsh-http-cache.Caddyfile` | 用 Caddy 给远端 dsh web 加一层 HTTP 缓存反代(静态资源强缓存 + 压缩) | [`README-http-cache.md`](README-http-cache.md) |
+| `dsh-http-cache.nginx.conf` | 同上, nginx 版本 | [`README-http-cache.md`](README-http-cache.md) |
 
 ## 快速部署(脚本版, 改动最小)
 

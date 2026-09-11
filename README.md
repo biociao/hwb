@@ -20,7 +20,8 @@
 它也不替代 dsh web——只托管它、显示它，让你在一处看全所有实例。
 
 > 设计文档（三平面架构、数据模型、控制状态机、里程碑）见
-> [`DSH_Workbench_Fusion_Architecture.md`](DSH_Workbench_Fusion_Architecture.md)。
+> [`DSH_Workbench_Fusion_Architecture.md`](DSH_Workbench_Fusion_Architecture.md)；
+> 拓扑可视化附录见 [`docs/topology.md`](docs/topology.md)。
 > 变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
@@ -51,7 +52,7 @@
 
 - 读取多个 dsh home，聚合出**跨实例**的统一视图：最近项目、最近会话、各实例状态与额度。
 - 为每个实例展示 **Token 用量**：总量、输入/输出、缓存命中/创建、缓存命中率，以及
-  按 **维度**（合计 / 项目 / LLM provider / 实例）**堆叠**的分时趋势柱状图。
+  按 **维度**（合计 / 项目 / LLM provider / 按 Model / 实例）**堆叠**的分时趋势柱状图。
 - **托管** dsh web：本机直接拉起子进程，远端经 `ssh -L` 按需隧道接入。
 - 每个实例给浏览器一个**直接可寻址**的入口：**本地** home 用原始服务连接
   `http://127.0.0.1:<port>/?token=<x>`（同机直连，无需转发）；**远程** home 经 hwb 的
@@ -186,12 +187,14 @@ npm test           # node --test tests/*.test.js
 
 1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
 2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
-3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip、索引状态、workspace/会话数，
-   **连接（连接到 / 必要时拉起 dsh web）** / stop / restart / reindex / remove 等操作按钮。
+3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip（已连接 / 连接不可达 / 未连接，域降级时另加
+   「⚠ <域> 降级」chip）、workspace/会话数，以及 **连接（连接到 / 必要时拉起 dsh web）** / **断开** /
+   **切换**（配置了多个连接端点时）/ **⚙ 设置** 按钮。
+   重启 / 停止 / 重新索引 / 移除 在 **⚙ 设置** 弹窗内（不在卡片上，避免误点）。
    远程实例经 SSH 只读索引入库后同样显示。
    （实例卡不再重复展示「当前项目/当前会话」——该信息已由 Recent Projects / Recent Sessions 聚合呈现。）
 4. **Token 用量** —— 汇总卡 + 分时趋势堆叠柱状图（支持 24h / 3天 / 7天 / 14天 / 30天 周期，
-   按 合计 / 项目 / LLM provider / 实例 维度切换）+ 按项目拆分。
+   按 合计 / 项目 / LLM provider / 按 Model / 实例 维度切换）+ 按项目拆分。
 5. **运行日志** —— 后端结构化日志实时面板：分级着色（debug/info/warn/error）、按级别过滤、
    自动跟随（滚动到底部）、点击某行展开完整堆栈、清空视图。启动即回填环缓冲历史
    （分不清级别时可用 `-v` 开启 debug 级；查看磁盘日志见 `--log` 文件）。
@@ -204,7 +207,8 @@ npm test           # node --test tests/*.test.js
 **添加实例**（工作台 Instances 区块「＋ 添加」）：
 - **本机**：填 dsh home 路径，如 `~/.dsh`；可选填「本机 dsh web 端口」+「鉴权 token」直接接入
   已在跑的那台实例（**同机直连、无端口转发、不新拉起**；端口留空则按需拉起一台）。
-- **SSH 远程**：填 SSH 主机（别名 / `user@host`）+ 远端 dsh web 监听端口（默认 `3080`），
+- **SSH 远程**：填 SSH 主机（别名 / `user@host`）+ 远端 dsh web 监听端口（**必填**；
+  常见值是 `3080`，但以远端实际监听端口为准，留空会被服务端拒绝），
   可选填远端 home 路径、远端启动命令、token 日志路径，以及**鉴权 token**（填入则跳过远端抓取）。
   远程实例经 hwb 的 1:1 根路径反代接入（浏览器无法直达 ssh 隧道）。
 
@@ -306,11 +310,12 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 
 ## REST API
 
-`createServer` 仅绑定 `127.0.0.1`，**无鉴权**（§11 安全声明）。
+`createServer` 仅绑定 `127.0.0.1`，**无鉴权**（§11 安全声明）。但**无鉴权 ≠ 任意来源可用**：
+`/api/*` 只接受回环 Host（DNS rebinding 防护），且所有写方法要求同站来源（详见「安全边界」）。
 
 | Method | Path | 说明 |
 |--------|------|------|
-| `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `quota:updated`） |
+| `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `monitor:updated` / `quota:updated` / `log:event`） |
 | `GET` | `/api/homes/{homeId}/preview` | 预览文件/目录（`?sessionId=` 或 `?workspaceId=`，`&path=`），只读 |
 | `GET` | `/api/homes/{homeId}/download` | 下载单个文件（≤64 MiB，不打包目录） |
 | `PUT` | `/api/homes/{homeId}/upload` | 上传文件到当前目录（multipart；`?sessionId=`+`&dir=`，≤256 MiB/文件，同名自动改名，跨站拒绝） |
@@ -330,6 +335,10 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 | `GET` | `/api/usage` | 用量汇总 + 趋势 + 按项目（`?days=30&hours=24`） |
 | `GET` | `/api/quota` | 额度列表（TTL 缓存；只读） |
 | `POST` | `/api/quota/refresh` | 强制刷新额度 |
+| `POST` | `/api/homes/{homeId}/open-workspace` | 在本机 Finder 中打开该实例的工作区目录（仅本机实例、仅 macOS） |
+| `POST` | `/api/homes/{homeId}/switch` | 切换到另一个连接端点（body `{endpointId}`）；先验证新端点再释放旧连接 |
+| `POST` | `/api/homes/{homeId}/disconnect` | 仅断开 hwb 接入（不停止远端 dsh web，也不回收本机受管进程） |
+| `GET` | `/api/logs` | 后端结构化日志环缓冲快照（`?level=&limit=`，limit ≤ 1000） |
 
 > 额度（§8）**只返回** `{ provider, remaining, currency }`；**API key 永不越界**——
 > key 只在服务端内存（读 `.credentials.yaml` 后查余额），浏览器拿不到。
@@ -370,52 +379,77 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 
 ```
 hwb/
-├── package.json                 # type:module, engines:node>=22, 零依赖
+├── package.json                 # type:module, engines:node>=22.5.0, 零 npm 依赖
 ├── src/
+│   ├── cli.js                   # hwb 统一管理命令（start/stop/status/logs/config/doctor/upgrade）
 │   ├── server.js                # HTTP 入口 + 调度器启动 + 退出清理
+│   ├── service.js               # 后台服务进程（私有控制 socket，不用 PID 文件）
 │   ├── lib/                     # 纯内核（零副作用，可单测）
 │   │   ├── logger.js            # 结构化日志（分级/时间戳/作用域/上下文/轮转落盘/crash handler）
 │   │   ├── schema.js            # 4 个文件的手写验证器（unit.version）
 │   │   ├── normalize.js         # HomeSnapshot → IndexedRows（纯函数）
 │   │   ├── read-home.js         # 本地读取 + 最小 YAML 解析（provider 名）
 │   │   ├── balance.js           # Provider 额度适配器（readCredentials/queryBalance）
-│   │   └── status.js            # 会话工作状态推导（纯函数）
+│   │   ├── status.js            # 会话工作状态推导（纯函数）
+│   │   ├── time.js              # 毫秒时间戳 → ISO（越界降级为 null）
+│   │   ├── node-version.js      # Node 版本门槛（engines / doctor / 启动预检 同源）
+│   │   ├── file-preview.js      # 预览/下载/上传（本机 fs + 远端 python，含路径围栏）
+│   │   ├── multipart.js         # 流式 multipart 解析（线性扫描 + 边界保持）
+│   │   ├── endpoints.js         # 连接端点规范化（host/port/唯一 id）
+│   │   ├── access-port.js       # 本地接入端口校验
+│   │   ├── open-workspace.js    # 在 Finder 中打开工作区（仅 macOS）
+│   │   └── service-config.js    # ~/.hwb/config.json 的读写与校验
 │   ├── dshhome/                 # 数据平面
 │   │   ├── reader.js            # 编排 read + normalize + store
-│   │   ├── indexer.js           # 后台索引循环（60s debounce + 退避）
+│   │   ├── remote-reader.js     # 远端只读索引（一次 ssh bash -s cat 4 个元数据文件）
+│   │   ├── indexer.js           # 后台索引循环（60s debounce + 按实例退避）
+│   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC）
+│   │   ├── live-poller.js       # 实时状态轮询（3s，仅运行中的本机实例）
 │   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目）
 │   │   └── quota.js             # 额度服务（TTL 缓存 60s，单 flight）
 │   ├── control/                 # 控制平面
 │   │   ├── registry.js          # 实例注册表（状态机 + 退避）
 │   │   ├── monitor.js           # 进程/端口探测（30s 循环）
-│   │   ├── launcher.js          # dsh web 启动/停止/重启 + token 抓取 + 深链探测
+│   │   ├── launcher.js          # dsh web 启动/停止/重启 + token 抓取 + 深链探测 + 端点切换
 │   │   ├── tunnel.js            # ssh -L 按需隧道
-│   │   ├── proxy.js             # 根路径 1:1 反向代理（含 WebSocket 升级）
+│   │   ├── ssh-opts.js          # SSH 参数统一（连接复用/压缩/跳板机）
+│   │   ├── proxy.js             # 根路径 1:1 反向代理（含 WebSocket 升级 + 预览注入）
 │   │   ├── remote.js            # 远端 dsh web 启停 + 抓 token
 │   │   ├── prober.js            # HTTP/进程/SSH/远端路径探测（独立可测）
-│   │   └── guard.js             # 进程指纹（防误杀）
+│   │   ├── guard.js             # 进程指纹（防误杀）
+│   │   └── workspace-menu.js    # 预览页的工作区下拉菜单注入
 │   ├── api/
-│   │   ├── server.js            # Node HTTP 服务器 + 静态资源
-│   │   ├── routes.js            # REST 路由
-│   │   └── sse.js               # SSE 广播中心
+│   │   ├── server.js            # Node HTTP 服务器 + 静态资源 + /api 来源校验
+│   │   ├── routes.js            # REST 路由 + 跨站写保护 + 请求体上限
+│   │   └── sse.js               # SSE 广播中心（背压上限 + 心跳）
 │   └── web/                     # 展示平面（原生 ESM，无构建）
 │       ├── index.html           # 布局 + 全部样式
 │       ├── app.js               # 路由 + 状态管理 + 持久 iframe
 │       ├── store.js             # 前端缓存（SSE 订阅 + 工具）
+│       ├── instance-navigation.js / instance-state.js   # 实例入口与实例键
+│       ├── preview-bridge.js    # 内嵌页 → 父页的工作区/会话上报
+│       ├── file-preview.css
 │       └── components/
 │           ├── workbench.js         # 仪表盘布局
-│           ├── recent-projects.js
-│           ├── recent-sessions.js
-│           ├── instance-grid.js
+│           ├── recent-projects.js / recent-sessions.js / instance-grid.js
 │           ├── usage-card.js        # 用量卡 + 堆叠趋势图 + 周期/维度切换
 │           ├── quota-card.js        # 额度卡片（见「已知限制」）
-│           └── add-home.js          # 添加/编辑实例表单 + onboarding
+│           ├── add-home.js          # 添加/编辑实例表单 + onboarding
+│           ├── endpoint-editor.js   # 连接端点编辑器
+│           ├── file-preview.js      # 文件预览/下载/拖拽上传侧栏
+│           ├── preview-image.js / preview-resize.js  # 图片查看与侧栏拖拽
+│           ├── log-panel.js         # 运行日志面板
+│           └── form-draft.js        # 表单草稿存取（跨 SSE 重建保活）
 ├── scripts/                     # 远程 dsh web 冷启动/缓存/隧道运维脚本
 ├── dsh-remote-index/            # 多实例会话索引（独立工具）
 ├── dsh-static-cache/            # dsh 前端静态缓存插件
+├── docs/topology.md             # 拓扑可视化附录（README/设计文档的可视化补充）
 ├── tests/                       # 单元测试 + mock-home 夹具
+├── images/                      # README 头图
 └── DSH_Workbench_Fusion_Architecture.md   # 设计文档（三平面/数据模型/里程碑）
 ```
+
+> 完整文件清单以 `git ls-files` 为准（上面只列主线，测试文件未逐个展开）。
 
 ---
 
@@ -425,10 +459,15 @@ hwb/
 npm test        # node --test tests/*.test.js
 ```
 
-当前 **62 个用例全绿**，交叉覆盖：schema 校验 / normalize 纯函数 / read-home 读取 /
+当前 **359 个用例（45 个测试文件）全绿**，交叉覆盖：schema 校验 / normalize 纯函数 / read-home 读取 /
 credentials 解析 / status 推导 / quota 适配器与 TTL 缓存 / store 查询与用量聚合 /
-monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深链探测。
+monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深链探测 /
+API 层（跨站写保护、DNS rebinding、请求体上限、UTF-8 分片解码）/ multipart 解析与上传 /
+SSH 重连与恢复 / 前端渲染转义与表单草稿 / Node 版本门槛与时间戳边界。
 `tests/mock-home/` 是真实 `~/.dsh` 形状的夹具（由 `tests/init-mock.js` 生成）。
+
+部分测试直接打真实 socket / 真 bash / 真 HTTP 服务（而不是只喂假对象），
+因为有些行为只有在真实分片、真实 shell 引号语义下才暴露得出来。
 
 ---
 

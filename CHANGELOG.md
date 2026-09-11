@@ -6,22 +6,59 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+> 本节原先只记了「文件预览上传」一件事，而 v0.1.1 之后其实落了 6 个功能性提交。
+> 下面先把它们补记齐（按主题合并，不逐条 commit 罗列），再是后续的修复记录。
+
 ### Added
+
+#### 统一管理命令 `hwb`
+- `hwb start | stop | restart | status | logs | config | doctor | upgrade | test`，以及 `hwb serve`
+  等价于原来的 `node src/server.js`。后台运行经 `src/service.js` + 私有控制 socket
+  （不用 PID 文件，避免 PID 复用误杀）；`doctor` 检查 Node 版本、配置与服务可达性。
+- `~/.hwb/config.json` 集中配置（port / db / log / intervalMs / homes / verbose / silent），
+  `hwb config set|update|show|path` 校验后原子落盘。
+
+#### 实例多连接端点
+- 实例身份（`homeId`）不再等同于「主机:端口」：端口成为实例下的一个**连接端点**，
+  同一实例可保留多条通道（1–32 条）并按需切换；`switch` 先验证新端点再释放旧连接，
+  失败时当前连接与实例身份不变。
+- 远程实例的**本地接入端口可持久化**（`accessPort`），预览代理端口跨重启保持稳定；
+  唯一性由数据库唯一索引兜底。
+
+#### 实时会话状态（3s 独立轮询）
+- 新增 `src/dshhome/live-poller.js`：3s 周期独立调度器，每个实例并发去重、进行中不重复发，
+  只在实例仍为运行态且 `activeEndpointId` 未变时写库（避免切换端点后旧响应覆盖新状态）。
+- `src/dshhome/live-status.js` 直接读运行中 dsh 的实时投影，以 dsh 的 `running` 布尔为权威信号
+  （持久化投影可能过期）；认证/RPC 失败区分成因，且日志不含 token。
+
+#### 浅色主题与外观切换
+- 默认改为暖纸白浅色主题（墨蓝 accent、系统字体栈），深色主题随系统偏好；
+  右上角「白天 / 黑夜 / 跟随系统」下拉，选择存 `localStorage` 并在 `<head>` 内联脚本里
+  首帧前应用（避免刷新闪一下）。切换后重绘工作台——实例/项目 chip 配色是内联样式，
+  深浅两套调色板需要重渲染才切换。
+- favicon.svg / png / ico 与 apple-touch-icon 换成配套配色。
+
+#### SSH 连接层统一（`src/control/ssh-opts.js`）
+- **根因记录**：经 tun + EasyConnect 的远端建一条 SSH 会话实测需 11.7–14.0 s，而代码里硬编码
+  `ConnectTimeout=10`，于是**所有**脚本化 ssh（抓 token / 建隧道 / 探测）必然 255 超时 ——
+  表现为「终端手动 ssh 能连、hwb 连不上」。
+- 连接层放宽 `ConnectTimeout`（默认 30s）、加保活（`ServerAliveInterval`/`CountMax`/`TCPKeepAlive`）
+  与复用（`ControlMaster=auto` + `ControlPersist=300`）。复用套接字用 12 位短哈希而非 `%C`：
+  macOS 的 unix socket 路径上限是 104 字节，`TMPDIR` 下的 `%C` 必然超限，故对最终路径长度做校验、
+  超限就退回不复用。瞬时连接故障按退避重试，且只对「失败得很快」的错误重试。
+- 隧道追加 `-C` 压缩；`ssh -G` 先解析 Host/Include/Match，再只删掉继承来的 forward 指令写进
+  私有配置，不会把 hwb 自己的 `-L` 一起清掉。
+
+#### 工作台 UI 与文件预览
+- 文件预览侧栏（浏览目录 / 图片查看 / 下载 / 拖拽上传）、实例入口改用预览代理 URL
+  （外部打开仍直连原始服务连接）、实例视图右上角浮层移除（停止改为设置里的明确确认流程）。
+- 刷新加序列号防抖，迟到的响应不再覆盖新状态。
 
 #### Node 版本门槛集中到单一事实来源（src/lib/node-version.js）
 - 新增 `MIN_NODE = '22.5.0'`、`isNodeSupported()`、`nodeRequirementMessage()`、`enforceNodeVersion()`；
   `package.json` 的 `engines`、`hwb doctor`、`hwb` 启动预检、CLI `--help` 文案现在同源，不再各写一份。
 - `hwb doctor` 原先把版本判断内联成 `major < 22 || (major === 22 && minor < 5)`，与新模块重复；
   改为复用同一判断，避免两处漂移。
-
-### Changed
-
-- **`engines.node` 从 `>=22` 收紧到 `>=22.5.0`**：索引依赖内置 `node:sqlite`，该模块自 22.5.0 起才提供。
-  原先声明 `>=22` 会把 Node 22.0–22.4 的用户放进来，然后死在
-  `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`——由于本项目零依赖，
-  这个报错极易被误读成「忘了 npm install」。
-- `src/server.js` 改为动态 `await import('./dshhome/store.js')`：静态 import 会先于模块体求值，
-  让 `node:sqlite` 的加载早于版本预检，预检就永远来不及给提示。其余 import 不受影响。
 
 #### 文件预览侧栏支持拖拽上传（src/web/components/file-preview.js + src/lib/file-preview.js + src/api/routes.js）
 - 浏览目录时侧栏显示上传区：拖拽文件到侧栏即上传到**当前预览目录**，也可点「选择文件上传」；
@@ -31,6 +68,17 @@ Semantic Versioning.
 - **同名不覆盖**：已存在 `data.csv` 时新文件落为 `data(1).csv`（本机与远端一致）。
 - 原子落盘：先写隐藏临时文件、写满后 `link`/`replace` 到最终名；中断只会留下隐藏临时文件，
   且 `stage`/`cleanup`/`commit` 都会清掉暂存目录，不在项目目录留副产物。
+
+### Changed
+
+- 索引层：实时会话状态双向合并（`store.applyLiveStatus` 只更新会话行，保留文件索引来的
+  workspace/provider 数据），并引入**按实例的索引退避** —— 单个实例反复失败不再拖慢整批。
+- **`engines.node` 从 `>=22` 收紧到 `>=22.5.0`**：索引依赖内置 `node:sqlite`，该模块自 22.5.0 起才提供。
+  原先声明 `>=22` 会把 Node 22.0–22.4 的用户放进来，然后死在
+  `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`——由于本项目零依赖，
+  这个报错极易被误读成「忘了 npm install」。
+- `src/server.js` 改为动态 `await import('./dshhome/store.js')`：静态 import 会先于模块体求值，
+  让 `node:sqlite` 的加载早于版本预检，预检就永远来不及给提示。其余 import 不受影响。
 
 ### Notes
 
@@ -569,8 +617,3 @@ Semantic Versioning.
 - 仅 `deepseek`/`kimi` 有公开余额 API；`zai`/`minimax` 显式降级为「余额不可用」。
 - 会话深链依赖客户端 `dsh-session-deeplink` 插件；未装插件时深链不触发。
 
----
-
-## Unreleased
-
-（预留下一版本变更记录。）

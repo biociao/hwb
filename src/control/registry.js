@@ -3,7 +3,9 @@
 // crashed/stopped）+ web/tunnel 的端口、pid、URL，以及 degraded 重连的退避计数。
 // 前端通过 monitor.get 映射到 runtime 形状；launcher 打开/关闭时写入。
 
-export const PHASES = ['unknown', 'probing', 'running', 'degraded', 'crashed', 'stopped'];
+// 实际会出现的阶段。Monitor 只会产出 running/degraded/stopped/gone（`crashed` 从未被设置，
+// 这里不再列出，避免文档与代码各说一套）。
+export const PHASES = ['unknown', 'probing', 'running', 'degraded', 'stopped', 'gone'];
 
 const BACKOFF = [1, 2, 4, 8, 16, 30]; // degraded 重连退避（秒），封顶 30s
 
