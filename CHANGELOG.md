@@ -570,6 +570,15 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   `scripts/render-check-dim-switch.js` 用真浏览器量两条路径（修复前「切维度后」失败）。
 
 ### Fixed
+#### `verifyProcess` 的「安全默认」没人守（src/control/guard.js）
+- 审查用变异证明过：把它的 `catch { return false }` 改成 `catch { return true }`（也就是**ps 不可用时
+  反而当作「进程已验证」**）套件照样全绿 —— 因为原测试只断言「返回布尔」，而它在受限环境里恒为 false。
+- 修复：给 `verifyProcess(pid, opts, run = pExecFile)` 加注入点，于是两个分支都能验证：
+  ①ps 不可用（EACCES/沙箱禁止 spawn）必须 **false**（安全默认不能反）；②ps 正常但查不到该 pid → false；
+  ③命令签名匹配 → true、不匹配 → false（ssh 签名不该匹配 dsh web 进程）；④非法 pid 直接 false。
+- **回归测试**：`tests/helpers-untested.test.js`（4 组断言）；变异验证：把 catch 改成 `return true` 立刻红。
+
+### Fixed
 #### 一个长期不可达的远端会把日志刷成噪音（真实日志里占了大头）（src/dshhome/indexer.js + remote-reader.js）
 - **现象（用户真实日志实测）**：`~/.hwb/hwb.log` 16,334 行里约 **700 次**
   `读取远程 dsh home 元数据失败` + 700 次 `索引该 home 失败(bot@cms.lo)`，每次都带**一整套 async 栈帧**

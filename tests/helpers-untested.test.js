@@ -130,3 +130,22 @@ test('logger 级别：setLevel/getLevel 往返，非法级别回落到默认', (
   assert.equal(levelVal('debug') < levelVal('warn'), true, '数值等级应随严重度递增');
   setLevel('error'); // 还原成安静的级别，避免影响后续输出
 });
+
+// `verifyProcess` 原先在套件里只被断言过「返回布尔」—— 而它在受限环境里恒为 false（ps 不可用），
+// 所以真正重要的那条**安全默认**（「查不到就当作不可信」）没人守：把 catch 改成 return true
+// 套件照样全绿（审查实测）。现在 run 可注入，两个分支都能验证。
+test('verifyProcess: ps 不可用时必须判 false（安全默认），命令匹配时才判 true', async () => {
+  const { verifyProcess } = await import('../src/control/guard.js');
+  // ① ps 不可用（EACCES/ENOENT/沙箱禁止 spawn）→ 必须 false
+  const denied = async () => { const e = new Error('spawn ps EACCES'); e.code = 'EACCES'; throw e; };
+  assert.equal(await verifyProcess(4242, {}, denied), false, 'ps 不可用时不能当作「已验证」');
+  // ② ps 正常但查不到该 pid（空输出）→ false
+  assert.equal(await verifyProcess(4242, {}, async () => ({ stdout: '   \n' })), false);
+  // ③ 命令匹配 → true；不匹配 → false
+  const dshWeb = async () => ({ stdout: '/usr/local/bin/node /opt/dsh/lib/bin.js web --port 3080\n' });
+  assert.equal(await verifyProcess(4242, { kind: 'dsh-web' }, dshWeb), true);
+  assert.equal(await verifyProcess(4242, { kind: 'ssh' }, dshWeb), false, 'ssh 实例的命令签名不该匹配一个 dsh web 进程');
+  // ④ 非法 pid 直接 false（不调 ps）
+  assert.equal(await verifyProcess(0, {}, dshWeb), false);
+  assert.equal(await verifyProcess('x', {}, dshWeb), false);
+});

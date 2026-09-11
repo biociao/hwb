@@ -25,10 +25,12 @@ export function expectedCommand({ kind }) {
 }
 
 // 可选：ps 校验 pid 处的命令是否仍匹配预期签名。ps 不可用/失败时返回 false（不阻塞主指纹）。
-export async function verifyProcess(pid, { kind } = {}) {
+// `run` 可注入：原先这条守卫在套件里只被断言过「返回布尔」（而它在沙箱里恒为 false，因为 ps
+// 不可用）—— 等于「ps 不可用时返回 false」这条**安全默认**没人守。注入之后两个分支都能测。
+export async function verifyProcess(pid, { kind } = {}, run = pExecFile) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    const { stdout } = await pExecFile('ps', ['-o', 'command=', '-p', String(pid)]);
+    const { stdout } = await run('ps', ['-o', 'command=', '-p', String(pid)]);
     const cmd = stdout.trim();
     if (!cmd) return false;
     if (kind && !expectedCommand({ kind }).test(cmd)) return false;
