@@ -222,6 +222,15 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Added
+#### 路由级的路径围栏回归测试（tests/api-path-containment.test.js）
+- preview / download 把 `?path=` 交给 file-preview 解析，围栏（realpath + commonpath、拒绝符号链接）
+  是「项目目录之外一个字节都读不到」的唯一保证。**单元测试覆盖了解析函数，但路由的接线**
+  （workspaceId 解析、400 的返回、正常 200、跨站头）只有真发 HTTP 才测得到。
+- 本轮先用真实 HTTP 探了一遍（相对越界 / 绝对路径 / 符号链接文件 / 符号链接目录 / 内嵌 `..` /
+  URL 编码的 `..%2F`）：download 与 preview 全部 400 且不回内容，正常文件 200 —— 然后把这份探针
+  固化成测试（含 `sec-fetch-site: cross-site` → 403、未知 workspaceId 不泄内容两条对照）。
+
+### Added
 #### 端到端冒烟：scripts/smoke-e2e.mjs（+ scripts/README-smoke-e2e.md）
 - 一条命令跑完整条链路并逐步断言：起**隔离**实例（显式 `--db/--log`）→ 造一个「更早用过」的假 dsh home
   → 注册/索引 → 列表/工作区/用量（含 24h 空窗口那条链）→ SSE 收到 `index:updated` → 真实 multipart
