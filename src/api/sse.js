@@ -8,11 +8,17 @@
 const MAX_LAG_BYTES = 4 * 1024 * 1024;
 // 心跳：探测半开连接（对端已消失但没有 FIN），同时让中间的代理不因空闲而切断。
 const HEARTBEAT_MS = 30_000;
+// 客户端数量上限。背压上限管的是「一个卡住的客户端」，但没说「有多少个客户端」：
+// 一个跑飞的脚本（或用户狂刷页面）可以开成百上千条 EventSource，每条都占一个 fd 与一份
+// 连接状态。超过上限时**拒绝新连接**（503，浏览器 EventSource 会自己退避重连），
+// 而不是踢掉正在工作的标签页 —— 后者会让用户当前看着的页面突然静默停止刷新。
+const MAX_CLIENTS = 32;
 
 export class SSEHub {
-  constructor({ heartbeatMs = HEARTBEAT_MS, maxLagBytes = MAX_LAG_BYTES } = {}) {
+  constructor({ heartbeatMs = HEARTBEAT_MS, maxLagBytes = MAX_LAG_BYTES, maxClients = MAX_CLIENTS } = {}) {
     this.clients = new Set();
     this.maxLagBytes = maxLagBytes;
+    this.maxClients = maxClients;
     // unref：心跳不应阻止进程退出（hwb 的 stop 路径依赖进程能正常结束）。
     this.timer = setInterval(() => this.#heartbeat(), heartbeatMs);
     this.timer.unref?.();
@@ -23,6 +29,14 @@ export class SSEHub {
   }
 
   handle(req, res) {
+    if (this.clients.size >= this.maxClients) {
+      // 用一个明确的 503 说明「太忙」，而不是接受连接后立刻断开（那看起来像随机故障）。
+      try {
+        res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(`SSE 连接数已达上限（${this.maxClients}）\n`);
+      } catch { /* 对端已经走了 */ }
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',

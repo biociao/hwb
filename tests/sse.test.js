@@ -16,6 +16,9 @@ function fakeRes() {
     writes: [],
     writeHead(status, headers) { this.head = { status, headers }; },
     write(chunk) { this.writes.push(chunk); this.writableLength += Buffer.byteLength(chunk); return false; },
+    // 真实的 ServerResponse 一定有 end()：假的也得有，否则「拒绝连接时回一句话」这种代码
+    // 在测试里会被 try/catch 吞掉，测出来的是假象。
+    end(chunk) { if (chunk !== undefined) this.writes.push(chunk); this.ended = true; },
     destroy() { this.destroyed = true; },
   };
 }
@@ -103,4 +106,29 @@ test('broadcast/handle 对抛错的响应不再二次抛出', (t) => {
   res.write = () => { throw new Error('write after end'); };
   assert.doesNotThrow(() => hub.broadcast('x', {}));
   assert.equal(hub.size, 0, '写失败的客户端应被清理');
+});
+
+// 背压上限管的是「一个卡住的客户端」，但没管「有多少个客户端」：一个跑飞的脚本能开成百上千条
+// EventSource，每条占一个 fd 与一份连接状态。超过上限拒绝**新**连接（浏览器会自己退避重连），
+// 而不是踢掉正在工作的标签页 —— 后者会让用户当前页面突然静默停止刷新。
+test('handle: 客户端数达上限时拒绝新连接（503），且不影响已有连接', (t) => {
+  const hub = new SSEHub({ heartbeatMs: 1_000_000, maxClients: 3 });
+  t.after(() => hub.close());
+  const first = [];
+  for (let i = 0; i < 3; i++) first.push(connect(hub));
+  assert.equal(hub.size, 3);
+  for (const { res } of first) assert.equal(res.head.status, 200);
+
+  const extra = connect(hub);
+  assert.equal(extra.res.head.status, 503, '第 4 条应被拒绝');
+  assert.match(String(extra.res.writes.join('')), /上限/);
+  assert.equal(hub.size, 3, '被拒绝的连接不该计入');
+
+  // 已有连接照旧收广播；关掉一条后新连接能被接受
+  hub.broadcast('log:event', { ok: true });
+  assert.ok(first[0].res.writes.some((w) => String(w).includes('log:event')));
+  first[0].req.close();
+  assert.equal(hub.size, 2);
+  const again = connect(hub);
+  assert.equal(again.res.head.status, 200, '有位置时新连接必须能进');
 });
