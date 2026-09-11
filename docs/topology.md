@@ -67,10 +67,15 @@
 ### 3.1 实例发现与生命周期（控制平面）
 - `registry`：状态机 `unknown → probing → running / degraded（对外 runtime 呈现为 unreachable）/ stopped / gone`，失败退避重连。
   （`PHASES` 里不再列 `crashed` —— `Monitor.#runCheck` 从不设置它，而实际会产出的 `gone` 之前反而漏了。）
-- `monitor`：探测本机进程存活、HTTP 端口响应、隧道健康。
+- `monitor`：探测本机进程存活、入口可用性（`probeAlive`：401/403 判**不可用** —— token 失效时
+  界面不能一片绿而 iframe 是栅栏页）、隧道健康。心跳**只用** `probeAlive`；`httpProbe`
+  （`status < 500`）留给「那个端口上有没有东西在听」这类判断，那里 401 恰恰是在听的证据。
 - `prober`：SSH 连通性、远端路径、远端 dsh web 可用性探测。
 - `launcher` / `remote`：本机 / 远端 dsh web 的拉起·停止·重启 + 抓取鉴权 token。
-- `guard`：进程指纹校验，防 pid 复用误杀。
+  **停止是确认式的**：SIGTERM → 等 3s → SIGKILL → 再等 2s，只有确认退出才写 `stopped` 并丢弃句柄；
+  杀不掉就保留句柄、如实报错（API 500）。退出路径先 `await stopAll()` 再 `process.exit`。
+  **连接会验证鉴权**：入口做一次真 token→cookie 交接，401/403 直接失败并给出补救办法。
+- `guard`：进程指纹校验，防 pid 复用误杀；`verifyProcess` 在 `ps` 不可用时**判不可信**（安全默认）。
 - **稳定第一**：连接问题只降级重探测，不重启/杀健康实例；`stop/restart` 需二次确认。
 
 ### 3.2 数据聚合（数据平面）
@@ -78,6 +83,8 @@
 - 共用同一套 `buildSnapshot → schema 校验 → normalize → SQLite upsert`。
 - 只读投影缓存 `session_projcache.json`，**永不碰 `*.zstd`**。
 - 版本不兼容只将该域标记 `degraded`，其余域照常，不白屏。
+  `session_projcache` 接受 **3/4/5**（依据 dsh 自己的 `compatibleVersions: [3,4]` 与当前 5；
+  三者的记录形状对 hwb 用到的字段一致），只认 3 会让「新版 dsh 写过的 home」整块停止更新。
 - 配额只读：`.credentials.yaml` 仅取 provider 名 → `balance.js` 查余额 → TTL 缓存 → SSE，key 永不出服务端。
 
 ### 3.3 访问 / 钻入（展示平面）
