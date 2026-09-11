@@ -477,6 +477,12 @@ Semantic Versioning.
   以及「README 不得写死会过期的计数」。README 里原本的「当前 62 个用例」已经漂到 359、又到 419 都没人发现，
   现在改为不写数字并由此测试守住。
 
+### Tests
+
+- 前端插值面的转义固化为回归测试（`tests/web-render-safety.test.js`）：端点编辑器（host/id/homeId）、
+  实例设置表单与添加表单、日志面板的**每个字段**都按「不可信输入」喂一遍，断言不产出真实标签。
+  这些数据来自 dsh 元数据与远端实例；此前只做过手工审计，而没有测试意味着下次改动又会悄悄开个口子。
+
 ### Fixed
 
 #### 格式化辅助函数是非数值文本进入 innerHTML 的通道（src/web/store.js + components/usage-card.js）

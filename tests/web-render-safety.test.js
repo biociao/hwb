@@ -10,6 +10,8 @@ globalThis.document = {
   getElementById: () => null,
   querySelector: () => null,
   querySelectorAll: () => [],
+  addEventListener() {},
+  removeEventListener() {},
 };
 globalThis.window = { matchMedia: () => ({ matches: false }) };
 
@@ -157,4 +159,56 @@ test('renderUsageCard: 被污染的用量字段不会产出可执行 HTML', asyn
     trendBy: { total: { hours: 24, stepMs: 3_600_000, buckets: [] } },
   }, 'total', '24h');
   assert.doesNotMatch(html, INJECTED_TAG, '用量卡同样不能出现真实注入标签');
+});
+
+// 把「前端各插值点已转义」这件事固化成回归测试。
+// 这些组件的数据全部来自 dsh 元数据或远端实例，属于不可信输入；手工审计过一轮，
+// 但如果只是「审过」而没有测试，下次改动又会悄悄打开一个口子。
+const { endpointSelector, currentChannel } = await import('../src/web/components/endpoint-editor.js');
+const { renderHomeForm, renderSettingsForm, applyHomeMode } = await import('../src/web/components/add-home.js');
+
+test('endpoint-editor: 端点字段（host/id/homeId）逐字段转义', () => {
+  const evil = '"><img src=x onerror=alert(1)>';
+  const html = endpointSelector({
+    homeId: evil, activeEndpointId: evil,
+    endpoints: [{ id: evil, host: evil, port: 3080 }, { id: 'b', host: 'h2', port: 3081 }],
+  });
+  assert.doesNotMatch(html, INJECTED_TAG);
+  assert.match(html, /&lt;img/);
+});
+
+test('endpoint-editor: 少于两个端点时不渲染选择器', () => {
+  assert.equal(endpointSelector({ homeId: 'a', endpoints: [] }), '');
+  assert.equal(endpointSelector({ homeId: 'a', endpoints: [{ id: 'x' }] }), '');
+  assert.equal(endpointSelector({ homeId: 'a' }), '');
+});
+
+test('currentChannel: 缺字段时不产出 undefined/NaN 之类的字样', () => {
+  assert.equal(currentChannel({ hostType: 'local', runtime: { port: 3080 } }), '127.0.0.1:3080');
+  // 缺端口时退化成只有主机名（本机默认 127.0.0.1）
+  assert.equal(currentChannel({ hostType: 'local' }), '127.0.0.1');
+  assert.doesNotMatch(currentChannel({ hostType: 'remote', host: 'box' }), /undefined|NaN/);
+  assert.doesNotMatch(currentChannel({}), /undefined|NaN/);
+});
+
+test('add-home 表单：实例字段（homePath/alias/host）逐字段转义', () => {
+  const evil = '"><img src=x onerror=alert(1)>';
+  for (const html of [
+    renderHomeForm(),
+    renderSettingsForm({ homeId: 'abcdef1234567890', hostType: 'local', homePath: evil, alias: evil, endpoints: [] }),
+    renderSettingsForm({ homeId: 'abcdef1234567890', hostType: 'remote', host: evil, remotePort: 3080, alias: evil, endpoints: [] }),
+  ]) {
+    assert.doesNotMatch(html, INJECTED_TAG, '表单里出现了真实注入标签');
+  }
+  assert.match(renderSettingsForm({ homeId: 'abcdef1234567890', hostType: 'local', homePath: evil, endpoints: [] }), /&lt;img/);
+});
+
+test('log-panel: 日志条目的每个字段都转义（日志内容含远端 stderr）', async () => {
+  const { logPanelHtml, appendLog, clearLogView } = await import('../src/web/components/log-panel.js');
+  const evil = '"><img src=x onerror=alert(1)>';
+  clearLogView();
+  appendLog({ ts: evil, level: 'error', scope: evil, message: evil, fields: { k: evil }, stack: evil });
+  const html = logPanelHtml();
+  assert.doesNotMatch(html, INJECTED_TAG, '日志面板出现了真实注入标签');
+  clearLogView();
 });
