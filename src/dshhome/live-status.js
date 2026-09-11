@@ -59,9 +59,51 @@ async function acquireCookie(origin, token, timeoutMs) {
   return first.headers.get('set-cookie')?.split(';')[0] ?? '';
 }
 
+// 实时 RPC 响应的上限。与文件侧（read-home 的 64 MiB 元数据上限、remote-reader 的 32 MiB stdout）
+// 同类：这条通道同样服务**远程**实例（服务器侧的隧道 URL），对面完全可以是外来的 dsh，
+// 所以「响应用户可控的大对象」这种情况必须有上限。
+// 审查实测（假 dsh 用复用的 1 MiB buffer 分块推送 200 MiB）：原先 `res.json()` 照单全收 ——
+// 读入侧 RSS +844 MiB、耗时 195ms，200 MiB 的「标题」还会原样落进 sessions.title 发给浏览器。
+// 只受 4s 的 AbortSignal 约束，在环回/高速隧道上等价于没有上限。
+const MAX_RPC_BYTES = 32 * 1024 * 1024;
+
+// 有上限地读 JSON：先看 content-length，再流式计数；超限就 cancel 并当作失败（不落库）。
+async function readJsonBounded(res, maxBytes = MAX_RPC_BYTES) {
+  const declared = Number(res.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    try { await res.body?.cancel?.(); } catch { /* 尽力而为 */ }
+    return { __error: 'rpc response too large' };
+  }
+  if (!res.body) {
+    // 没有流（某些运行时/实现）：退回整体读取，但仍用文本长度兜一道上限
+    const text = await res.text();
+    if (text.length > maxBytes) return { __error: 'rpc response too large' };
+    try { return JSON.parse(text); } catch { return { __error: 'rpc response not json' }; }
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* 尽力而为 */ }
+        return { __error: 'rpc response too large' };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock?.(); } catch { /* 已经释放/已取消 */ }
+  }
+  const buf = Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
+  try { return JSON.parse(buf.toString('utf8')); } catch { return { __error: 'rpc response not json' }; }
+}
+
 // POST 一次 RPC 到 `/api/<endpoint>`，返回 result（或 null）。
 // args 是端点参数；dsh 的 RPC 信封要求 payload 形如 { args: <object> }。
-async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS) {
+async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS, maxBytes = MAX_RPC_BYTES) {
   const { origin, token } = splitAuthUrl(url);
   const cookie = await acquireCookie(origin, token, timeoutMs);
   // 鉴权/握手失败（实例不可达、token 无效）：返回失败标记，调用方回退。
@@ -89,17 +131,15 @@ async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS) {
     return { __error: error.name === 'TimeoutError' ? 'rpc timeout' : 'rpc fetch failed' };
   }
   if (!res.ok) return { __error: `rpc http ${res.status}` };
-  try {
-    const msg = await res.json();
-    if (msg?.type !== 'server-response') return { __error: 'bad rpc envelope' };
-    if (msg.result?.ok === false) {
-      const code = msg.result.error?.code;
-      return { __error: `rpc rejected (${typeof code === 'string' && /^[a-zA-Z0-9_/-]{1,80}$/.test(code) ? code : 'unknown'})` };
-    }
-    return msg.result;
-  } catch {
-    return { __error: 'rpc response not json' };
+  const parsed = await readJsonBounded(res, maxBytes);
+  if (parsed?.__error) return parsed;
+  const msg = parsed;
+  if (msg?.type !== 'server-response') return { __error: 'bad rpc envelope' };
+  if (msg.result?.ok === false) {
+    const code = msg.result.error?.code;
+    return { __error: `rpc rejected (${typeof code === 'string' && /^[a-zA-Z0-9_/-]{1,80}$/.test(code) ? code : 'unknown'})` };
   }
+  return msg.result;
 }
 
 // 把 dsh 实时返回的一条会话折叠成 hwb 会话行可用的「状态覆盖」。
@@ -191,8 +231,9 @@ function extractLiveRows(result) {
 }
 
 export class LiveStatusReader {
-  constructor({ timeoutMs = RPC_TIMEOUT_MS } = {}) {
+  constructor({ timeoutMs = RPC_TIMEOUT_MS, maxResponseBytes = MAX_RPC_BYTES } = {}) {
     this.timeoutMs = timeoutMs;
+    this.maxResponseBytes = maxResponseBytes;   // 可注入：测试不必真造 32 MiB 的响应
     this.states = new Map();
   }
 
@@ -213,7 +254,7 @@ export class LiveStatusReader {
       else log.info('实时会话读取成功（写入由轮询器负责，失败会单独记 warn）', { ...context, sessionCount: count });
     };
     try {
-      const result = await rpc(url, 'session/list', { _request: {} }, this.timeoutMs);
+      const result = await rpc(url, 'session/list', { _request: {} }, this.timeoutMs, this.maxResponseBytes);
       if (result?.__error) {
         report(result.__error);
         return null;

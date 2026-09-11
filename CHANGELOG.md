@@ -243,6 +243,30 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 降级窗口里「已不在实时列表」的会话永远挂着「运行中」（src/dshhome/store.js）
+- **现象（审查实测）**：dsh 升级到 hwb 还不认识的 `unit.version` 时（代码自己写着这是「必然情形」），
+  projcache 域降级、sessions 表的整表替换被跳过。此时在 dsh 里关掉一个会话 →
+  它**永远**停在最后一次实时写入的「运行中」上。实测：又跑了 3 轮轮询 + 3 轮文件索引仍是 running；
+  而 projcache 一恢复就立刻自愈 —— 窗口 = 直到 hwb 支持新版本（天到周）。
+- **根因**：清状态的分支只在「实时列表**为空**」时执行，而只要 dsh 里还有任意一条会话活着列表就非空；
+  从列表里消失的 file-backed 行既不会被幽灵清理删掉（那只删 `liveOnly=1`），也刷不动。
+- **修复**：把「不在本次实时列表 ⇒ 清 status」推广到「sessions 域降级」的情形（清徽标、不删行，
+  UI 退回「空闲」，等域恢复后由文件索引覆盖）。未降级时**不清** —— 那种窗口由下一轮文件索引负责纠正。
+- **回归测试**：`tests/live-status-restore.test.js`（降级窗口必须清成 NULL、未降级仍由文件索引决定）。
+  修复前失败。（写这条测试时踩过一次假绿：只加 degraded 标记而不把快照的 sessions 置空，
+  索引会照常写文件值 —— 真实读取路径的产出形态是「置空 + 标记」两者都有。）
+
+#### 实时 RPC 响应没有大小上限（src/dshhome/live-status.js）
+- **现象（审查实测）**：文件侧有 64 MiB（read-home）与 32 MiB（remote-reader）的上限，实时通道却
+  `res.json()` 照单全收。假 dsh 分块推送 200 MiB → 客户端 **RSS +844 MiB**、耗时 195ms，
+  而且那个 200 MiB 的「标题」会原样落进 `sessions.title` 并发给浏览器。只受 4s 超时约束，
+  在环回/高速隧道上等价于无上限；这条通道同样服务**远程**实例（对面可以是外来的 dsh）。
+- **修复**：`readJsonBounded()` —— content-length 预检 + 流式字节计数 + 超限 `reader.cancel()`，
+  默认 32 MiB（与文件侧同量级），构造函数可注入（`maxResponseBytes`）以便测试。
+- **回归测试**：`tests/live-status.test.js`（声明超限、流式超限且必须 cancel、正常响应照旧）。
+  修复前失败。
+
+### Fixed
 #### 未来的 lastActivity 会关掉「运行中」的陈旧闸门（src/lib/status.js）
 - **现象**：`openStep` 还在、`lastActivity` 却是**未来**时刻的会话被判成「运行中」并永久挂着。
   实测（审查）：未来 6 小时 → running；写成公元 33658 年 → running；真实 projcache 连跑 3 遍索引仍是 running。

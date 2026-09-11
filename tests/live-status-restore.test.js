@@ -112,3 +112,58 @@ test('读取失败（非数组）不动账本：宽限期内仍按上一次成�
     '一次失败的实时读取不该让上一次成功的实时状态失效（那是通道抖动，不是 dsh 的结论）');
   store.close();
 });
+
+// 降级窗口里的「幽灵徽标」（审查实测）：unit.version 超出支持范围是 dsh 升级后的**必然情形**，
+// 此时 sessions 域降级、文件索引的整表替换被跳过 —— 而从实时列表里消失的 file-backed 行
+// 既不会被幽灵清理删掉（只删 liveOnly=1），也刷不动，于是停在最后一次实时写入的「运行中」上永远挂着。
+// 实测：s1 关掉后 3 轮轮询 + 3 轮文件索引仍是 running；projcache 一恢复立刻自愈。
+test('降级窗口里：不在实时列表的会话不再永远挂着「运行中」', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/mock/home' });
+  const fromFile = fileSnapshot(homeId);
+  indexSnapshot(store, '/mock/home', fromFile, null);
+
+  // ① 两个会话都在跑（实时）→ 都被标 running
+  store.applyLiveStatus(homeId, [liveSession('s1'), liveSession('s2')]);
+  assert.equal(kindOf(store, homeId, 's1'), 'running');
+  assert.equal(kindOf(store, homeId, 's2'), 'running');
+
+  // ② dsh 升级：projcache 域降级（文件索引再也刷不动 sessions 表）。
+  // 快照必须**同时**把 sessions 置空并带上 degraded 标记 —— 这才是真实读取路径的产出形态
+  // （见 store-degraded.test.js 的 rowsFor）：只加标记不置空的话，索引会照常写入文件侧的值，
+  // 于是这条用例就测不到降级窗口了（我第一版就是这么写的，pre-fix 也「通过」，是假绿）。
+  const degraded = { ...fromFile, sessions: [], degraded: [{ domain: 'projcache', error: 'unsupported unit.version 999' }] };
+  indexSnapshot(store, '/mock/home', degraded, null);
+
+  // ③ s1 在 dsh 里被关掉：只剩 s2 在实时列表里
+  store.applyLiveStatus(homeId, [liveSession('s2')]);
+  store.applyLiveStatus(homeId, [liveSession('s2')]);
+  indexSnapshot(store, '/mock/home', degraded, null);   // 文件索引又跑了两轮（仍刷不动）
+  indexSnapshot(store, '/mock/home', degraded, null);
+
+  // 清的是**状态徽标**（status = NULL，UI 退回「空闲」），不是删行 —— 数据要留着，
+  // 等 dsh 的 unit.version 被支持、域恢复之后再由文件索引覆盖。
+  assert.equal(kindOf(store, homeId, 's1'), null,
+    's1 已不在实时列表里，降级窗口里它的「运行中」必须被清掉（否则要挂到 dsh 升级被支持为止）');
+  assert.equal(kindOf(store, homeId, 's2'), 'running', '仍在实时列表里的会话不受影响');
+
+  // ④ 域恢复后一切照旧由文件索引决定
+  indexSnapshot(store, '/mock/home', fromFile, null);
+  assert.equal(kindOf(store, homeId, 's1'), 'idle');
+  store.close();
+});
+
+// 未降级时**不能**清：那种窗口里的 file-backed 行由下一轮文件索引负责纠正（宽限期内还属实时权威）。
+test('未降级时：不在实时列表的会话仍由文件索引纠正（不在这里清状态）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/mock/home' });
+  const fromFile = fileSnapshot(homeId);
+  indexSnapshot(store, '/mock/home', fromFile, null);
+  store.applyLiveStatus(homeId, [liveSession('s1'), liveSession('s2')]);
+  store.applyLiveStatus(homeId, [liveSession('s2')]);
+  // 未降级：状态仍由文件索引（下一步）决定 —— 这里先不清，文件索引跑完才是 idle
+  indexSnapshot(store, '/mock/home', fromFile, null);
+  assert.equal(kindOf(store, homeId, 's1'), 'idle');
+  assert.equal(kindOf(store, homeId, 's2'), 'running');
+  store.close();
+});

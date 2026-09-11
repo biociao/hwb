@@ -44,3 +44,43 @@ test('toLiveRow: 实时 approval 与文件侧走同一套守卫（长串截断�
     assert.equal(ok[0].status.approval, 'never', '正常字符串照旧');
   } finally { globalThis.fetch = saved; }
 });
+
+// 实时 RPC 响应**没有大小上限**（文件侧有：read-home 64 MiB、remote-reader 32 MiB）。
+// 审查实测（假 dsh 用**复用**的 1 MiB buffer 分块推送 200 MiB，读取侧增长全在客户端）：
+// 原先 `res.json()` 照单全收 —— 客户端 RSS +844 MiB、耗时 195ms；200 MiB 的「标题」还会原样
+// 落进 sessions.title 发给浏览器。只受 4s 的 AbortSignal 约束，环回/高速隧道上等价无上限。
+// 这条通道同样服务**远程**实例（对面可以是外来的 dsh），所以必须有上限。
+test('rpc 响应超上限时判为失败（不把超大对象读进内存、不落库）', async () => {
+  const { LiveStatusReader } = await import('../src/dshhome/live-status.js');
+  const saved = globalThis.fetch;
+  try {
+    // ① content-length 预检：声明超限就不读 body
+    let cancelled = 0;
+    globalThis.fetch = async () => new Response(JSON.stringify({ type: 'server-response', result: { ok: true } }), {
+      headers: { 'content-type': 'application/json', 'content-length': String(64 * 1024 * 1024) },
+    });
+    const reader1 = new LiveStatusReader({ maxResponseBytes: 1024 });
+    assert.equal(await reader1.read('http://127.0.0.1:1/', {}), null, '声明超限 → 失败（调用方回退文件索引）');
+
+    // ② 没有 content-length 时的流式计数（分块推送，总量超限）
+    const big = 'x'.repeat(64 * 1024);
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        for (let i = 0; i < 8; i++) controller.enqueue(new TextEncoder().encode(big));
+        controller.close();
+      },
+      cancel() { cancelled++; },
+    }), { headers: { 'content-type': 'application/json' } });
+    const reader2 = new LiveStatusReader({ maxResponseBytes: 100 * 1024 });
+    assert.equal(await reader2.read('http://127.0.0.1:1/', {}), null, '流式超限 → 失败');
+    assert.ok(cancelled >= 1, '超限后必须取消读取（否则连接与内存都留着）');
+
+    // ③ 正常大小的响应照旧可用（上限不能把正常路径挡住）
+    globalThis.fetch = async () => Response.json({
+      type: 'server-response',
+      result: { ok: true, value: { items: [{ sessionId: 's1', cwd: '/r', projections: { values: {} } }] } },
+    });
+    const ok = await new LiveStatusReader().read('http://127.0.0.1:1/', {});
+    assert.equal(ok?.[0]?.sessionId, 's1');
+  } finally { globalThis.fetch = saved; }
+});

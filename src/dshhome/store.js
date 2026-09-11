@@ -786,6 +786,18 @@ export class IndexStore {
       const del = this.db.prepare('DELETE FROM sessions WHERE id = ?');
       for (const g of ghosts) if (!liveIds.has(g.sessionId)) del.run(g.id);
     }
+    // 降级窗口里的「幽灵徽标」：上面的清状态原先**只**在「实时列表为空」那一分支执行，可是
+    // 只要 dsh 里还有任意一条会话活着，列表就非空 —— 而从列表里消失的 file-backed 行既不会被
+    // 幽灵清理删掉（那只删 liveOnly=1），也刷不动（sessions 域降级 ⇒ 文件索引的整表替换被跳过），
+    // 于是停在最后一次实时写入的状态上**永远**挂着。审查实测：s1 在 dsh 里关掉后，又跑了
+    // 3 轮轮询 + 3 轮文件索引仍是 running；而 projcache 一恢复就立刻自愈 ——
+    // 也就是说窗口 = 「dsh 升级到 hwb 还不认识的 unit.version」这段时间（天到周）。
+    // 清的是状态徽标而不是行：数据仍在，UI 退回「空闲」。
+    if (degradedTables(this.getHome(homeId)?.degraded).has('sessions')) {
+      const stale = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(homeId);
+      const clear = this.db.prepare('UPDATE sessions SET status = NULL WHERE id = ?');
+      for (const r of stale) if (!liveIds.has(r.sessionId)) clear.run(r.id);
+    }
     const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
       .map((row) => ({ ...row, type: 'session' }));
     this.upsertRows(mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() }));
