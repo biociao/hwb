@@ -130,3 +130,27 @@ test('CLI 的每个子命令都在 README 里有说明', async () => {
     assert.ok(readme.includes(`hwb ${c}`), `README 缺少子命令说明：hwb ${c}`);
   }
 });
+
+test('源码注释里的 §N.M 章节引用都能在设计文档里解析到', async () => {
+  const doc = await readFile(path.join(root, 'DSH_Workbench_Fusion_Architecture.md'), 'utf8');
+  const sections = new Set([...doc.matchAll(/^#{2,4} ([0-9]+(?:\.[0-9]+)?)/gm)].map((m) => m[1]));
+
+  const refs = new Map(); // 章节号 -> 引用它的文件
+  async function walk(dir) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { await walk(full); continue; }
+      if (!entry.name.endsWith('.js')) continue;
+      for (const m of (await readFile(full, 'utf8')).matchAll(/§([0-9]+(?:\.[0-9]+)?)/g)) {
+        if (!refs.has(m[1])) refs.set(m[1], []);
+        refs.get(m[1]).push(path.relative(root, full));
+      }
+    }
+  }
+  await walk(path.join(root, 'src'));
+
+  assert.ok(refs.size >= 8, `源码里应有多处章节引用，实际 ${refs.size}`);
+  const missing = [...refs.keys()].filter((k) => !sections.has(k));
+  assert.deepEqual(missing, [],
+    `源码引用了设计文档里不存在的章节：${missing.map((k) => `§${k} (${[...new Set(refs.get(k))].join(',')})`).join('; ')}`);
+});

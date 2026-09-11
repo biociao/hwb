@@ -217,6 +217,24 @@ CREATE TABLE model_tiers (...);
 - `idx_sessions_activity` — Recent 排序
 - `idx_sessions_home` — 按实例过滤
 
+### 4.6 远端只读索引（与本地共用同一套 schema）
+
+远端实例不挂载、不同步，只经一次 `ssh <host> bash -s` 把同样的 4 个元数据文件 **cat 出来**：
+
+```
+ssh <host> bash -s -- <remoteHome>   # 脚本本体经 stdin 传入，参数走 argv
+  └─ 远端依次 cat 4 个文件，用 __DSH_FILE_BEGIN__ / __DSH_FILE_END__ 分隔并标注文件名
+     → Node 侧 parseCatOutput 切分 → buildSnapshot → 与本地完全相同的 validate/normalize
+```
+
+要点（`src/dshhome/remote-reader.js` + `src/control/remote.js`）：
+
+- **不注入密钥、不修改任何远端文件**，只有 `cat` 与 `test -d` 两类只读命令。
+- projcache 常超过启动日志用的 64 KiB，`sshBash` 的 stdout 上限因此提高到 32 MiB，
+  超限**明确失败**而不是悄悄截断。
+- 输出缺少文件分隔标记时判为**传输残缺**并保留已有索引 —— 而不是把「没传成功」误记成「文件缺失」。
+- 远端路径一律整体加引号后再交给远端 shell（`test -d "$HOME"'/…'`），既防注入也防空格路径被拆成多个参数。
+
 ---
 
 ## 5. 控制平面：进程与隧道管理
