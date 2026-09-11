@@ -5,6 +5,10 @@
 // 每一次广播都会堆进它的写队列，内存只增不减——而 hwb 是单进程工作台，一个卡住的标签页
 // 就足以把进程拖到 OOM。所以广播必须**有背压上限**：落后太多的客户端直接断开，
 // 由浏览器 EventSource 自己重连（重连会重新拉一次全量状态，不会丢数据）。
+import { logger } from '../lib/logger.js';
+
+const log = logger('sse');
+
 const MAX_LAG_BYTES = 4 * 1024 * 1024;
 // 心跳：探测半开连接（对端已消失但没有 FIN），同时让中间的代理不因空闲而切断。
 const HEARTBEAT_MS = 30_000;
@@ -30,6 +34,14 @@ export class SSEHub {
 
   handle(req, res) {
     if (this.clients.size >= this.maxClients) {
+      // 拒绝必须**留痕**：规模审查指出，触顶时服务端此前一声不响 —— 客户端只会显示
+      // `reconnecting…`，而运维在日志里看不到任何东西（「谁的标签页被饿死了」无从判断）。
+      // 按「首次触顶 + 每 60s 一次」记录，避免一个跑飞的脚本刷爆日志（这正是要防的对象）。
+      const now = Date.now();
+      if (!this.capWarnedAt || now - this.capWarnedAt > 60_000) {
+        this.capWarnedAt = now;
+        log.warn('SSE 连接数已达上限，拒绝新客户端', { limit: this.maxClients, rejectedAt: now });
+      }
       // 用一个明确的 503 说明「太忙」，而不是接受连接后立刻断开（那看起来像随机故障）。
       try {
         res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });

@@ -132,3 +132,23 @@ test('handle: 客户端数达上限时拒绝新连接（503），且不影响已
   const again = connect(hub);
   assert.equal(again.res.head.status, 200, '有位置时新连接必须能进');
 });
+
+// 触顶拒绝原先**一声不响**：客户端只看到 `reconnecting…`，服务端日志里什么都没有
+// （规模审查指出：一个跑飞的脚本可以把真实用户的标签页饿死，而运维无从判断）。
+// 现在首次触顶记一条 warn，并按 60s 节流（避免那个跑飞的脚本刷爆日志）。
+test('handle: 触顶拒绝会留下一条 warn（并按 60s 节流）', async () => {
+  const { initLogger, getLogs } = await import('../src/lib/logger.js');
+  initLogger({ level: 'info', file: false, color: false, silent: true });
+  const hub = new SSEHub({ maxClients: 1, heartbeatMs: 60_000 });
+  const first = connect(hub);
+  assert.equal(hub.size, 1, '前置条件：第一个客户端已接入');
+
+  const before = getLogs({ limit: 100 }).length;
+  for (let i = 0; i < 3; i++) {
+    const x = connect(hub);
+    assert.equal(x.res.head.status, 503, `第 ${i + 2} 个客户端应被拒绝`);
+  }
+  const warns = getLogs({ limit: 100 }).slice(before).filter((e) => e.level === 'warn' && String(e.message).includes('SSE 连接数已达上限'));
+  assert.equal(warns.length, 1, `三次拒绝只该记一条 warn（实际 ${warns.length} 条）`);
+  hub.close();
+});
