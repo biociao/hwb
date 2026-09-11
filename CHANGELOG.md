@@ -224,6 +224,19 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 空闲的仪表盘也在每 10s 白跑 330ms 的同步聚合（src/dshhome/store.js + src/api/routes.js）
+- **现象**：`/api/usage` 的 8 个同步 SQLite 聚合在 40k 会话下合计约 330ms，而 `node:sqlite` 没有
+  异步接口 —— 这期间 HTTP/SSE/心跳全停。原先的服务端记忆只按**时间**（10s TTL）失效，于是
+  一个**空闲**的仪表盘（没有实例在跑 ⇒ 没有实时写入）一个字节都没变，却仍然每 10s 白跑一次。
+- **修复**：给 `IndexStore` 加数据版本（`dataVersion()`，`upsertRows` 与 `removeHome` 成功提交后自增），
+  memo 改成两级判据 —— ①版本没变 ⇒ 缓存**永远有效**；②版本变了但还在 TTL 内 ⇒ 仍然复用
+  （实例在跑、每 3s 都有实时写入时，聚合频率仍压在 1/10s，节流没有丢）。
+  `createApiServer` 新增 `usageTtlMs`（默认 10s）以便测试这个语义。
+- **回归测试**：`tests/usage-memo.test.js` —— 用 40ms 的 TTL 把语义钉住：数据不变 + 超过 TTL
+  仍复用（`usageSummary` 调用次数不增）、数据一变 + 超过 TTL 必须重算、版本变了但在 TTL 内仍节流、
+  以及 `upsertRows`/`removeHome` 都会抬高版本。修复前两条用例都失败。
+
+### Fixed
 #### 移除/新增/改名实例后，用量图还会带着旧实例（服务端 10s + 客户端 15s 两层记忆）（src/api/routes.js + src/web/app.js）
 - **现象**：删掉一个实例之后，「按实例」维度的用量图里仍然挂着它，最长十几秒才消失（用户视角
   就是「我已经移除它了，图上还在」）。改别名同理：图上还显示旧名字。

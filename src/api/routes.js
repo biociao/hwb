@@ -132,7 +132,7 @@ function dshHomeInfo(homePath) {
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000 }) {
   const connecting = new Set();
   // 定向重索引常常是 fire-and-forget（远程要等 SSH 超时，不能阻塞响应）。
   // 但「不 await」不等于「不管」：返回的 promise 一旦拒绝就是未处理拒绝，
@@ -148,13 +148,17 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
   // 把请求频率直接压到 1/10。用量面板统计的是历史，滞后 10 秒无感；代价是尖峰仍在
   // （每 10s 一次 ~330ms，不再是每 3s 一次）。要彻底消除尖峰得把 token 总量落成列（去 json_extract），
   // 那是一次 schema 迁移，留作后续工作 —— 这里先把它从「常态卡顿」降到「偶发尖峰」。
-  const USAGE_TTL_MS = 10_000;
+  const USAGE_TTL_MS = usageTtlMs;
   const USAGE_MEMO_MAX = 32;
-  const usageMemo = new Map();   // `${days}:${hours}` -> { at, body }
+  const usageMemo = new Map();   // `${days}:${hours}` -> { at, version, body }
   const usagePayload = (days, hours) => {
     const key = `${days}:${hours}`;
+    const version = store.dataVersion?.() ?? 0;
     const hit = usageMemo.get(key);
-    if (hit && Date.now() - hit.at < USAGE_TTL_MS) return hit.body;
+    // 两级判据：①数据版本没变 → 缓存**永远有效**（空闲的仪表盘不必为同一份数据反复跑聚合）；
+    // ②版本变了但还在 TTL 内 → 仍然复用，把「实例在跑、每 3s 都有实时写入」时的聚合频率压在 1/10s。
+    // 只有「版本变了且 TTL 也过了」才真跑那 8 个同步聚合。
+    if (hit && (hit.version === version || Date.now() - hit.at < USAGE_TTL_MS)) return hit.body;
     const body = {
       summary: store.usageSummary({ days }),
       trend: store.usageTrend({ hours }),
@@ -168,7 +172,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       },
     };
     if (usageMemo.size >= USAGE_MEMO_MAX) usageMemo.clear();   // 键的取值空间很小，防的是异常调用
-    usageMemo.set(key, { at: Date.now(), body });
+    usageMemo.set(key, { at: Date.now(), version, body });
     return body;
   };
   // 实例集合/名称变了（新增、移除、改别名），缓存的 body 就不再是同一份数据：

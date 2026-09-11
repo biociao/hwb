@@ -231,6 +231,8 @@ function safeJsonParse(raw, fallback, label) {
 export class IndexStore {
   // homeId -> 最近一次实时状态写入时间（见 liveStatusAt/applyLiveStatus）
   #liveWrittenAt;
+  // 「数据被改过」的单调计数（见 dataVersion）。
+  #writeVersion = 0;
   // homeId -> **最近一次实时列表里的 sessionId 集合**（见 applyLiveStatus/upsertRows）
   #liveIds;
   constructor(dbPath = ':memory:') {
@@ -456,6 +458,7 @@ export class IndexStore {
         this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(homeId);
       }
       this.db.exec('COMMIT');
+      this.#writeVersion++;   // 实例集合变了，缓存里的聚合结果不再成立
     } catch (e) {
       this.db.exec('ROLLBACK');
       throw e;
@@ -723,6 +726,7 @@ export class IndexStore {
         for (const r of list) upd.run(r.status, r.lastActivity, hid, r.sessionId);
       }
       this.db.exec('COMMIT');
+      this.#writeVersion++;   // 用量面板据此判断「缓存的聚合结果是否还需要重算」（见 dataVersion）
     } catch (e) {
       // 回滚本身失败时不要把真正的错误吞掉：磁盘满等情况下 SQLite 已经自动回滚，
       // 此时 ROLLBACK 会抛「cannot rollback - no transaction is active」，覆盖掉真实原因。
@@ -738,6 +742,12 @@ export class IndexStore {
   // 会一直留着：用户在 dsh 里关掉全部会话后，工作台仍显示上一个会话的「运行中」徽标，
   // 直到 60s 后的文件索引才纠正。现在按标记精确清掉这些行；有文件索引支撑的会话不受影响，
   // 它们的权威来源是文件索引，不该被实时列表的缺失误删。
+  // 数据版本：每次成功写入（文件索引 / 实时状态 / 移除实例）都会变。
+  // 用途：`/api/usage` 的服务端记忆据此判断「这份聚合结果还有效吗」—— 数据没变就不必重算。
+  // 为什么不能只看时间：那 8 个聚合是**同步**的（40k 会话实测 ~330ms，期间整个单线程服务都停着），
+  // 而一个空闲的仪表盘（没有实例在跑 ⇒ 没有实时写入）一个字节都不会变，却仍然每 10s 白跑一次。
+  dataVersion() { return this.#writeVersion; }
+
   // 最近一次「实时状态写入」的时间戳（按 home）。索引器在抓实时状态前会记下时间，
   // 抓完如果发现这期间轮询器已经写过更新的数据，就丢弃自己这份（多半已经过期）。
   // 见 src/dshhome/indexer.js 里的守卫。
