@@ -86,6 +86,19 @@ if (preExisting) {
   process.exit(2);
 }
 
+// 第二个假 home：projcache 的 unit.version 越出支持范围 → 该域 degraded。
+// 真实形态就是「dsh 升级到 hwb 还不认识的版本」，而它是「实例整块变空」那条历史缺陷的触发条件。
+const home2 = path.join(dir, 'home-degraded');
+mkdirSync(path.join(home2, 'storages'), { recursive: true });
+writeFileSync(path.join(home2, 'storages', 'workspace.json'), JSON.stringify({
+  unit: { name: 'workspace', version: 2 },
+  global: { initialized: true, workspaceIds: ['ws-x'], archivedSessionIds: [] },
+  tables: { workspaces: { 'ws-x': { title: '降级项目', path: proj, sessionIds: [], createdAt: 1, updatedAt: 2 } } },
+}));
+writeFileSync(path.join(home2, 'storages', 'session_projcache.json'), JSON.stringify({
+  unit: { name: 'session_projcache', version: 999 }, global: null, tables: { sessions: {} },
+}));
+
 const server = spawn(process.execPath, [path.join(ROOT, 'src/server.js'),
   '--port', String(PORT), '--db', path.join(state, 'hwb.db'), '--log', path.join(state, 'hwb.log')],
 { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -166,9 +179,24 @@ try {
   const quota = await j('/api/quota');
   check('GET /api/quota 不泄漏 key', quota.status === 200 && !/sk-[A-Za-z0-9]|SECRET/.test(quota.text), `status=${quota.status}`);
 
-  // ⑧ 真浏览器渲染（可选）—— 必须在移除实例**之前**跑：那时仪表盘上才用得着用量卡
+  // ⑧ 降级实例：注册一个 unit.version 越界的 home —— 必须**照常出现在界面上并标出降级**，
+  //    而不是让整个实例看起来「空了」（那是历史缺陷，界面上完全不显示 degraded）。
+  const added2 = await j('/api/homes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ homePath: home2, alias: '降级实例' }) });
+  const degradedDomains = (added2.body?.result?.degraded ?? []).map((d) => d.domain);
+  check('降级实例仍然被索引入库并标出 degraded 域', degradedDomains.includes('projcache'), JSON.stringify(degradedDomains));
+  const homesAfter = await j('/api/homes');
+  const degradedHome = homesAfter.body?.homes?.find((h) => h.homeId === added2.body?.homeId);
+  check('/api/homes 里该实例为 degraded 且可辨认', degradedHome?.status === 'degraded' && degradedDomains.includes('projcache'),
+    `status=${degradedHome?.status}`);
+
+  // ⑨ 真浏览器渲染（可选）—— 必须在移除实例**之前**跑：那时仪表盘上才用得着用量卡
   if (WITH_CHROME) {
-    const script = 'return { title: document.title, cards: document.querySelectorAll("#usage-card").length, buttons: document.querySelectorAll("#usage-period-toggle button").length }';
+    const script = `return {
+      title: document.title,
+      cards: document.querySelectorAll("#usage-card").length,
+      buttons: document.querySelectorAll("#usage-period-toggle button").length,
+      warnChips: [...document.querySelectorAll("#dashboard .chip.warn")].map((c) => c.textContent.trim()),
+    }`;
     const r = spawnSync(process.execPath, [path.join(ROOT, 'scripts/render-check.mjs'), '--url', `${BASE}/`, '--wait-ms', '4000',
       '--expr', script], { encoding: 'utf8', timeout: 60_000 });
     let parsed = null;
@@ -176,15 +204,16 @@ try {
     check('真浏览器加载工作台且用量卡已渲染（无 console.error / 未捕获异常）',
       parsed?.ok === true && parsed?.result?.cards === 1 && parsed?.result?.buttons === 5,
       JSON.stringify(parsed?.result ?? r.stdout?.slice(0, 120)));
+    check('界面里能看到降级实例的警示 chip', parsed?.result?.warnChips?.some((t) => t.includes('降级')), JSON.stringify(parsed?.result?.warnChips ?? null));
   }
 
-  // ⑨ 移除实例：用量「按实例」维度必须立刻不再包含它（缓存不得滞后）
+  // ⑩ 移除实例：用量「按实例」维度必须立刻不再包含它（缓存不得滞后）
   const del = await j(`/api/homes/${homeId}`, { method: 'DELETE' });
   const after = await j('/api/usage?days=30&hours=720');
   const instances = Object.keys(after.body?.trendBy?.instance?.buckets?.flatMap((b) => b.groups)?.reduce((a, g) => ({ ...a, ...g }), {}) ?? {});
   check('DELETE 实例后同一 /api/usage 立刻不再含它', del.status === 200 && !instances.includes('冒烟实例'), `instances=${JSON.stringify(instances)}`);
 
-  // ⑩ 优雅退出：SIGTERM 后必须自己退出（含 stopAll 收子进程）
+  // ⑪ 优雅退出：SIGTERM 后必须自己退出（含 stopAll 收子进程）
   const exited = new Promise((r) => server.on('exit', (code, signal) => r({ code, signal })));
   const t0 = Date.now();
   server.kill('SIGTERM');
