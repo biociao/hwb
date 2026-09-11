@@ -13,8 +13,8 @@ Semantic Versioning.
 
 ### 起床后先看这三件事
 
-1. **代码在哪**：分支 `tmp-reorder2`，今晚新增 **136 个提交（本地，未 push）**；
-   `main` 落后于本分支，**要不要合并/push 由你决定**。工作树是干净的、全套 **634 例（633 通过 / 1 skip / 0 失败）**。
+1. **代码在哪**：分支 `tmp-reorder2`，今晚新增 **139 个提交（本地，未 push）**；
+   `main` 落后于本分支，**要不要合并/push 由你决定**。工作树是干净的、全套 **636 例（635 通过 / 1 skip / 0 失败）**。
 2. **你现在这台机器上的服务还在跑旧代码**：真实库副本上验证过，重启后会自动完成迁移 ——
    `user_version 0 → 2`、补齐四个派生列、建好新索引 `idx_sessions_home_ws`，**耗时 3ms**，
    派生列求和与 `json_extract` 预言机**分毫不差**（3,937,139,946），迁移前后行数不变（553 会话 / 5 实例）。
@@ -45,7 +45,7 @@ Semantic Versioning.
 web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览与静态缓存与远端索引 /
 渲染壳与日志脚本 / 跨模块数据流 / 存储层 / 近两轮改动的回归审查 / 数据管线 / cli+service+lib 生命周期 /
 **测试网自身** / **规模与长跑**）+ 1 轮纯函数对抗 fuzz + 2 轮敌意环境测试 +
-多轮针对「我自己刚改的代码」的自审，共 **136 个提交、634 个用例**
+多轮针对「我自己刚改的代码」的自审，共 **139 个提交、636 个用例**
 （`npm test` 的输出为准；README 刻意不写死这个数字）。
 
 后几轮开始把「不变量」本身当成审查对象，于是又挖出一类新问题：**守卫存在但没人守**。
@@ -357,6 +357,27 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 正文恰好是 JSON `null` 的 POST 会**得不到任何响应**（src/api/routes.js + src/api/server.js）
+- **现象**（本轮真机 fuzz 发现）：`curl -d 'null' -H 'content-type: application/json' /api/homes`
+  **既没有响应也不断开** —— curl 6s 超时后报 `HTTP 000`，连接与 socket 一直被服务端持有着；
+  而同一条路径上 `{}` / `[]` / `"x"` / `5` / `true` 全部一瞬间 400（逐个跑过，`null` 是唯一挂死的）。
+- **根因**：`readJsonBodyOr400()` 用 `null` 同时表达两件事 ——「解析失败、已回 400」与
+  「正文解析出来就是 `null`」，而四个写路由统一写着 `if (body === null) return;`。
+  `JSON.parse('null') === null` 一到就被当成「已响应」直接 return：没写响应头、也没 end。
+- **修复**：哨兵换成专用 `Symbol('body-handled')`（`BODY_HANDLED`），不再与合法正文撞车；
+  非对象正文（`null`/数字/字符串/布尔）显式回 400「正文必须是 JSON 对象」，而不是放过去、
+  最后报一句与根因无关的 `homePath is required`；`open-workspace` 那条此前直接用 `readJsonBody`
+  （正文 `null` 会变成 `Cannot read properties of null` 的 400）也统一走同一入口。
+- **兜底网**：`src/api/server.js` 新增并导出 `ensureResponded()` —— 路由 return 之后若**一个字节都没写**，
+  补 500 并记日志（带 method/path）。判据刻意是「没发过响应头」而不是「没 end」：
+  SSE（`/api/events`）会立刻发头、然后长时间挂着连接，那种连接绝不能被补一个 500 掐掉。
+- **回归测试**：`tests/api-server-hardening.test.js` 新增两条（修复前均红，实测）——
+  ① 带 3s 超时的 fetch 打 `null`/`5`/`"x"`/`true` 四种正文，修复前以 TimeoutError 失败、修复后 400；
+  ② `ensureResponded` 三态（没写→补 500+日志；已结束→什么都不做；已发头=SSE→什么都不做）
+  外加接线结构断言。变异验证：删掉 `server.js` 里那句调用，结构断言立刻变红（12/13 → 红 1 条）。
+- **真机复验**：新代码起在 4398 上，四种正文都是 ~1ms 的 400，日志里没有兜底网记录
+  （说明是根因修好了，而不是被兜底网兜住）。
+
 #### 文本字段里的 U+0000 会在写库时被静默截断（src/lib/normalize.js + src/dshhome/live-status.js）
 - **现象**：`node:sqlite` 绑 TEXT 时按 C 字符串处理 —— 值里的 U+0000 会把**后面全部截掉**，
   而且没有报错、没有 degraded、界面上看不出少了什么。实测（审查）：`run('A\u0000B')` 读回 `'A'`，

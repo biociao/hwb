@@ -96,6 +96,20 @@ export function allowedHostsFromEnv(env = process.env) {
     .filter(Boolean);
 }
 
+// 兜底网：路由**已经 return 但一个字节都没写响应**时，请求会一直挂在客户端上
+// （实测 `curl -d 'null' .../api/homes` 6s 超时后 `HTTP 000`，连接与 socket 都不释放）。
+// 这类缺陷的共同后果是「客户端永远等不到响应」，不该只靠逐个 handler 自觉 —— 而它确实发生过：
+// 用 `null` 同时表示「解析失败」与「正文就是 null」，四个写路由一起中招。
+// 判据刻意用「没写过响应头」而不只是「没 end」：SSE（/api/events）会立刻发头、然后长时间挂着连接，
+// 那种情况绝不能在这里补 500 把它掐掉。返回 true 表示这次真的由兜底网响应了。
+export function ensureResponded(res, log, meta) {
+  if (res.writableEnded || res.headersSent) return false;
+  log.error('API 路由返回时没有产生任何响应（已兜底回 500）', new Error('route returned without responding'), meta);
+  res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ error: '内部错误：请求未被处理' }));
+  return true;
+}
+
 export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec, usageTtlMs, maxConcurrentUploads }) {
   const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs, maxConcurrentUploads });
   return createServer((req, res) => {
@@ -117,7 +131,10 @@ export function createApiServer({ store, indexer, hub, launcher, monitor, quota,
         res.end(JSON.stringify({ error: 'API 仅接受来自本机回环地址的请求' }));
         return;
       }
-      route(req, res, url).catch((e) => {
+      route(req, res, url).then(() => {
+        // 路由正常返回后仍要确认它真的写了响应（见 ensureResponded 的说明）。
+        ensureResponded(res, log, { method: req.method, path: url.pathname });
+      }).catch((e) => {
         // API 处理抛错：记录请求路径 + 错误栈，返回 500；前端能拿到 message，日志能还原根因。
         log.error('API 请求处理失败', e, { method: req.method, path: url.pathname });
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });

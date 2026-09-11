@@ -250,3 +250,69 @@ test('api: 路由处理器抛错时返回 500，并且日志里留下请求路�
     store.close();
   }
 });
+
+// ---- JSON 正文是 `null` 的 POST：路由会把它当成「解析失败、已响应」的哨兵 ----
+// 原实现用 `null` 同时表示两件事（解析失败、正文就是 null），调用方一律 `if (body === null) return;`，
+// 于是 `curl -d 'null' -H 'content-type: application/json' /api/homes` **既没有响应也没有断开**：
+// 请求一直挂在客户端上（实测 curl 6s 超时、`HTTP 000`，连接与 socket 都不释放），
+// 而同一条路径上 `{}` / `[]` / `"x"` / `5` 都是一瞬间 400 —— 说明差别只在「正文恰好是 null」。
+// 用带超时的 fetch：修复前会以 TimeoutError 失败，修复后立刻拿到 400。
+test('api: 正文恰为 JSON null 的 POST 必须有响应，不能把请求挂死', async () => {
+  const { server } = makeServer();
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (const raw of ['null', '5', '"x"', 'true']) {
+      const res = await fetch(`${base}/api/homes`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: base },
+        body: raw,
+        signal: AbortSignal.timeout(3000),
+      }).catch((e) => { throw new Error(`正文 ${raw} 没有得到任何响应（${e.message}）`); });
+      assert.equal(res.status, 400, `正文 ${raw} 应被拒为 400（实际 ${res.status}）`);
+      const body = await res.json();
+      assert.equal(typeof body.error, 'string');
+    }
+  } finally { await new Promise((r) => server.close(r)); }
+});
+
+// ---- 兜底网：路由 return 了却没写任何响应 ----
+// 上面那类缺陷的**共同后果**是「请求永远不返回」，而它不该只靠逐个 handler 自觉。
+// 这里直接测兜底函数本身，而不是间接依赖某条路由：写得出来才说明这张网真的存在。
+test('api: 路由返回但没写响应时，兜底网补一个 500（且不打扰已开始流式响应的请求）', async () => {
+  const { ensureResponded } = await import('../src/api/server.js');
+  const errors = [];
+  const log = { error: (msg, err, meta) => errors.push({ msg, err, meta }) };
+  const meta = { method: 'POST', path: '/api/homes' };
+
+  // ① 什么都没写：补 500 + 记日志，返回 true 表示「网住了」。
+  const written = { head: null, body: null, ended: false };
+  const res = {
+    writableEnded: false, headersSent: false,
+    writeHead(code, headers) { written.head = { code, headers }; },
+    end(chunk) { written.body = chunk; written.ended = true; },
+  };
+  assert.equal(ensureResponded(res, log, meta), true);
+  assert.equal(written.head.code, 500);
+  assert.match(String(written.body), /"error"/);
+  assert.equal(errors.length, 1);
+  assert.deepEqual(errors[0].meta, meta, '日志要带上是哪条请求，否则无法归因');
+
+  // ② 已经结束（正常情况下路由都会走到这里）：什么都不做 —— 否则会把正常响应覆盖成 500。
+  const done = { writableEnded: true, headersSent: true, writeHead() { throw new Error('不该再写头'); }, end() { throw new Error('不该再 end'); } };
+  assert.equal(ensureResponded(done, log, meta), false);
+  assert.equal(errors.length, 1);
+
+  // ③ 已发头但没结束：这是 **SSE**（/api/events 会一直挂着连接）。绝不能在这里补 500 把它掐掉。
+  const sse = { writableEnded: false, headersSent: true, writeHead() { throw new Error('不该再写头'); }, end() { throw new Error('不该再 end'); } };
+  assert.equal(ensureResponded(sse, log, meta), false);
+  assert.equal(errors.length, 1, 'SSE 连接不该被记成「路由没响应」');
+
+  // ④ 接线本身：兜底网写得再对，只要 server 里那句调用被删掉就等于不存在（而它照样能全绿）。
+  // 这条是**结构断言**——故意不做行为测试，因为「让路由悄悄 return 不响应」需要一个内部缺陷来喂它，
+  // 那样的测试会随实现漂移；源码断言至少保证「网被拆掉」会被发现。
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../src/api/server.js', import.meta.url), 'utf8');
+  assert.match(source, /route\(req, res, url\)\.then\(\(\) => \{[\s\S]*?ensureResponded\(res, log, \{ method: req\.method, path: url\.pathname \}\)/,
+    'src/api/server.js 必须在路由返回后调用 ensureResponded（否则兜底网没有任何接线）');
+});

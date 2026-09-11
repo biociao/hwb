@@ -98,14 +98,29 @@ async function readJsonBody(req) {
 }
 
 // 统一把 readJsonBody 的失败翻译成 400（包太大 → 原样透出，JSON 非法 → 固定文案）。
-// 返回 null 表示已响应，调用方直接 return 即可。
+// 返回 BODY_HANDLED 表示「已经响应过了」，调用方直接 return 即可。
+//
+// ⚠️ 这个哨兵**不能**是 `null`：JSON 里的 `null` 是合法正文（`JSON.parse('null') === null`），
+// 用 null 当哨兵会让调用方把「正文就是 null」误判成「解析失败、已响应」而直接 return ——
+// 既没写响应也没断连接，请求永远挂着（实测 `curl -d 'null' -H 'content-type: application/json'
+// /api/homes` 6s 超时后 `HTTP 000`；同一路径上 `{}`/`[]`/`"x"`/`5` 都是一瞬间 400）。
+export const BODY_HANDLED = Symbol('body-handled');
 async function readJsonBodyOr400(req, res) {
+  let body;
   try {
-    return await readJsonBody(req);
+    body = await readJsonBody(req);
   } catch (error) {
     send(res, 400, { error: error.code === 'BODY_TOO_LARGE' ? error.message : 'invalid JSON body' });
-    return null;
+    return BODY_HANDLED;
   }
+  // 「解析成功但不是对象」的正文（null / 数字 / 字符串 / 布尔）对每条路由都没有意义：
+  // 放过去只会在下面某处读到 undefined，最后报一句与根因无关的「homePath is required」。
+  // 显式拒掉，错误信息才对得上原因。（数组仍是对象，交给各路由自己校验。）
+  if (body === null || typeof body !== 'object') {
+    send(res, 400, { error: 'invalid JSON body（正文必须是 JSON 对象）' });
+    return BODY_HANDLED;
+  }
+  return body;
 }
 
 // 跨站写保护。hwb 只监听 127.0.0.1 且无鉴权（架构文档 §11），所以浏览器里的任意页面都能
@@ -203,7 +218,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     const finder = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/open-workspace$/);
     if (req.method === 'POST' && finder) {
       try {
-        const body = await readJsonBody(req);
+        const body = await readJsonBodyOr400(req, res);
+        if (body === BODY_HANDLED) return;
         const home = store.getHome(finder[1]);
         const workspace = home && store.listWorkspaces({ homeId: home.homeId }).find((w) => w.workspaceId === body.workspaceId);
         await openWorkspaceInFinder(home, workspace);
@@ -328,7 +344,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     }
     if (req.method === 'POST' && pathname === '/api/homes') {
       const body = await readJsonBodyOr400(req, res);
-      if (body === null) return;
+      if (body === BODY_HANDLED) return;
       if (body.endpoints !== undefined) {
         try {
           body.endpoints = normalizeEndpoints(mergeEndpointTokens(body.endpoints, []), body.hostType || 'local');
@@ -408,7 +424,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         return;
       }
       const body = await readJsonBodyOr400(req, res);
-      if (body === null) return;
+      if (body === BODY_HANDLED) return;
       if (connecting.has(instanceKey(home))) {
         send(res, 409, { error: '请先断开连接再修改实例配置' });
         return;
@@ -522,7 +538,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     }
     if (req.method === 'POST' && pathname === '/api/homes/order') {
       const body = await readJsonBodyOr400(req, res);
-      if (body === null) return;
+      if (body === BODY_HANDLED) return;
       const ids = Array.isArray(body.homeIds) ? body.homeIds : null;
       if (!ids || !ids.every((id) => typeof id === 'string' && store.getHome(id))) {
         send(res, 400, { error: 'homeIds must be a non-empty array of known homeIds' });
@@ -629,7 +645,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       const home = store.getHome(switchHome[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
       const body = await readJsonBodyOr400(req, res);
-      if (body === null) return;
+      if (body === BODY_HANDLED) return;
       const endpoint = home.endpoints?.find((e) => e.id === body.endpointId);
       if (!endpoint) { send(res, 400, { error: '未知连接端点' }); return; }
       const key = instanceKey(home);
