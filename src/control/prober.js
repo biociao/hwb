@@ -7,15 +7,37 @@ const pExecFile = promisify(execFile);
 // —— 探测模块（M6）：进程存活 / HTTP 端口 / SSH 连通 / 远端路径，均为独立可测函数 ——
 
 // HTTP 端口响应（status < 500 视为"活着"）。
+//
+// 这个口径服务的是「那个端口上有没有 dsh web 在听」这类判断 —— 那里 401 **恰恰是**「在听」的证据
+// （新版 dsh 的入口有 token 栅栏，裸 URL 必然 401）。要判断「这个入口用户点开能不能用」，
+// 请用 probeAlive()：对用户来说 401 栅栏页面和挂了没区别。
 export async function httpProbe(url, timeoutMs = 3000) {
+  const status = await httpProbeStatus(url, timeoutMs);
+  return status !== null && status < 500;
+}
+
+// 探测并返回 HTTP 状态码；不可达/超时/非法响应返回 null。
+// 单独导出是因为「活着」与「可用」是两回事，而 httpProbe 的布尔值把状态码信息丢掉了。
+export async function httpProbeStatus(url, timeoutMs = 3000) {
   try {
     // token 入口的重定向已能说明服务存活，无需继续下载页面；及时释放响应流。
     const res = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
     try { await res.body?.cancel(); } catch { /* 释放失败不改变已收到的 HTTP 状态。 */ }
-    return res.status < 500;
+    return res.status;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// 鉴权感知的存活探测（Monitor 的心跳用它）：401/403 判为**不可用**。
+//
+// 为什么不能沿用 httpProbe：token 填错、或远端 dsh web 轮换了 token 之后，url/iframeUrl 仍然
+// 指向 dsh 端口本身，于是探测每 30s 拿到一个 401 —— status < 500 ⇒ running，界面一片绿、
+// iframe 里却是 401 栅栏页（审查实测：monitor.refresh() 对只有 401 的端点报 running，
+// latencyMs 7）。这类实例需要的是「降级并提示重新填 token」，不是「运行中」。
+export async function probeAlive(url, timeoutMs = 3000) {
+  const status = await httpProbeStatus(url, timeoutMs);
+  return status !== null && status < 500 && status !== 401 && status !== 403;
 }
 
 // 进程是否存活（signal 0 不发送信号，仅探测）。

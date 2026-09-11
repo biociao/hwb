@@ -169,10 +169,48 @@ async function restartRemoteToken(home) {
   return r.code === 0 ? r.stdout : throwSsh(r, '重启远程 dsh web', home);
 }
 
-// 停止远端 dsh web(按端口 kill,尽力而为)。
+// 停止远端 dsh web(按端口 kill)。
+//
+// 判据必须与 REMOTE_START 里的 killport() **同一套**：lsof 优先（macOS/Linux 都有），
+// 没有再退回 fuser。原先这里只用 fuser 且「找不到 fuser 就 echo no-fuser; exit 0」——
+// 最小化的 Linux/容器镜像里没有 fuser，于是 hwb 报「已停止」、隧道也拆了，
+// 而远端 dsh web 仍占着 remotePort 与 DSH_HOME（审查复现：「no-fuser」分支返回 0 且什么都没杀）。
+// 现在：杀完复核一次（还在监听就升级 SIGKILL 再复核），确实收不掉就以非 0 退出 ——
+// 宁可让用户看到「远端没停下来」，也不要谎报成功。
+export const REMOTE_STOP = `#!/bin/bash
+port="$1"
+killed=0
+if command -v lsof >/dev/null 2>&1; then
+  pids="$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  for p in $pids; do kill "$p" >/dev/null 2>&1 || true; killed=1; done
+fi
+if [ "$killed" = 0 ] && command -v fuser >/dev/null 2>&1; then
+  fuser -k "$port/tcp" >/dev/null 2>&1 && killed=1
+fi
+if [ "$killed" = 0 ]; then
+  # 没有任何进程在监听 = 本来就停着，算成功；连杀进程的工具都没有才是真的没法确认。
+  if command -v lsof >/dev/null 2>&1 || command -v fuser >/dev/null 2>&1; then
+    echo "not-listening"; exit 0
+  fi
+  echo "neither lsof nor fuser is available on the remote host" >&2
+  exit 1
+fi
+sleep 1
+if command -v lsof >/dev/null 2>&1; then
+  still="$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$still" ]; then
+    for p in $still; do kill -9 "$p" >/dev/null 2>&1 || true; done
+    sleep 1
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "port $port is still listening after SIGKILL" >&2
+      exit 1
+    fi
+  fi
+fi
+echo killed`;
+
 async function stopRemote(home) {
-  const script = `#!/bin/bash\nport="$1"\nif command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; echo killed; exit 0; fi\necho "no-fuser"`;
-  const r = await sshBash(home.host, script, [String(home.remotePort)], 20_000);
+  const r = await sshBash(home.host, REMOTE_STOP, [String(home.remotePort)], 20_000);
   if (r.code !== 0) {
     log.error('停止远程 dsh web 失败', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, code: r.code, stderr: r.stderr, stdout: r.stdout });
     throw new Error(`停止远程 dsh web 失败(${home.host}:${home.remotePort}): ${r.stderr || r.stdout}`);

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { httpProbe } from './prober.js';
+import { probeAlive } from './prober.js';
 import { InstanceRegistry } from './registry.js';
 import { logger } from '../lib/logger.js';
 
@@ -23,7 +23,10 @@ function connectionKey(home, inst, gone) {
 }
 
 export class Monitor {
-  constructor({ store, launcher, registry = new InstanceRegistry(), broadcast = () => {}, probe = httpProbe, exists = existsSync, intervalMs = 30_000 }) {
+  // probe 默认用 probeAlive（鉴权感知）而不是 httpProbe：心跳判的是「用户点开这个入口能不能用」，
+  // token 失效时入口回 401，`status < 500` 会把它算成 running（实测：只有 401 的端点被报 running，
+  // latencyMs 7，而 iframe 是栅栏页）。「端口上有没有东西在听」那类判断仍用 httpProbe。
+  constructor({ store, launcher, registry = new InstanceRegistry(), broadcast = () => {}, probe = probeAlive, exists = existsSync, intervalMs = 30_000 }) {
     this.store = store;
     this.launcher = launcher;
     this.registry = registry;

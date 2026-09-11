@@ -10,11 +10,18 @@ import { logger } from '../lib/logger.js';
 
 const log = logger('launcher');
 
+// 停止子进程的两段等待：先 SIGTERM 等 3s，再 SIGKILL 等 2s。
+// 3s 的依据是 dsh web 自己的收尾（关监听、flush 日志）实测在 1s 内；给到 3s 是为了容忍磁盘慢的机器，
+// 同时不让「停止」按钮在进程已死的情况下多等。SIGKILL 之后再等 2s 是为了拿到 exit 事件
+// （kill 只是投递信号，不保证立刻回收）。
+const STOP_TERM_MS = 3000;
+const STOP_KILL_MS = 2000;
+
 // Launcher（§5）：本地 home 起 `dsh web`，远程 home 建 ssh -L 隧道。
 // 进程句柄存 this.procs；控制状态（phase/url/port/pid）写入共享 registry，
 // 由 Monitor 推进状态机。stop 前经 guard 指纹校验，防误杀。
 export class Launcher {
-  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy } = {}) {
+  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy, stopTermMs = STOP_TERM_MS, stopKillMs = STOP_KILL_MS } = {}) {
     this.registry = registry;
     this.tunnelFactory = tunnelFactory;
     this.remotePathExists = remotePathExists;
@@ -25,6 +32,8 @@ export class Launcher {
     this.stopRemoteFn = stopRemoteFn;
     this.rememberAccessPort = rememberAccessPort;
     this.proxyFactory = proxyFactory; // 可注入：预览代理的建立是异步的，竞态需要能被测试复现
+    this.stopTermMs = stopTermMs;     // 可注入：测试不该为「忽略信号的子进程」真的等 5 秒
+    this.stopKillMs = stopKillMs;
     this.procs = new Map(); // homeId -> { pid, port, url, proc, deeplink, kind }
     process.on('exit', () => {
       for (const inst of this.procs.values()) {
@@ -32,6 +41,58 @@ export class Launcher {
         if (inst.proc) inst.proc.kill();
       }
     });
+  }
+
+  // SIGTERM → 等 → SIGKILL → 等。返回「是否确认已退出」。
+  //
+  // 为什么必须等：kill() 只是**投递**信号。原先 stop() 发完信号就无条件
+  // procs.delete + registry phase 'stopped' —— 若子进程忽略 SIGTERM（自装了处理器正在收尾、
+  // 卡在系统调用里、或压根不是我们以为的那个程序），用户看到的是
+  // 「已停止 / {ok:true,stopped:true}」而进程仍在监听端口（审查实测：lsof 显示同一个 pid 仍在
+  // LISTEN、curl 仍返回 200），句柄却已经从 procs 里删掉 —— UI 连重试的机会都没有，
+  // 端口要等到 hwb 退出才释放。所以：确认退出才算停掉，杀不掉就如实失败并保留句柄。
+  async #terminate(inst, { termMs = this.stopTermMs, killMs = this.stopKillMs } = {}) {
+    const proc = inst?.proc;
+    // 没有子进程（adopted-local）或已经死了/pid 已被复用：无需动作。
+    if (!fingerprint(proc)) return true;
+    if (await this.#signalAndWait(proc, 'SIGTERM', termMs)) return true;
+    log.warn('SIGTERM 后子进程未退出，升级为 SIGKILL', { pid: inst.pid, waitMs: termMs });
+    if (await this.#signalAndWait(proc, 'SIGKILL', killMs)) return true;
+    return !fingerprint(proc); // 超时后再按指纹复核一次（exit 可能刚发生）
+  }
+
+  // 先挂 'exit' 监听再发信号（真实 ChildProcess 的 exit 一定是异步 emit，但假句柄/已死的句柄
+  // 可能同步就完成回收 —— 先挂监听 + 事后指纹复核，两种都能覆盖）。
+  // 定时器**不 unref**：这是一段有界的等待（最多 3s + 2s），而「等子进程退出」正是进程该活着的原因；
+  // 早先 unref 过一次，结果是「等待的 Promise 还没落地，事件循环就空了」。
+  #signalAndWait(proc, signal, ms) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        proc.off?.('exit', onExit);
+        resolve(value);
+      };
+      const onExit = () => finish(true);
+      const timer = setTimeout(() => finish(false), ms);
+      proc.on('exit', onExit);
+      try { proc.kill(signal); } catch { /* 可能刚好在这一刻退出 */ }
+      if (!fingerprint(proc)) finish(true);
+    });
+  }
+
+  // 退出前收尾：把所有受管子进程真的收掉。
+  // process 'exit' 钩子里的 proc.kill() 是投递即返回的，而 process.exit() 之后事件循环不再运行 ——
+  // 子进程若还没装上 SIGTERM 处理器（启动中）或忽略它，就会变成孤儿继续占着端口与 DSH_HOME
+  // （审查实测：父进程没了，子进程仍在 LISTEN 并返回 200，没有任何人再管它）。
+  async stopAll() {
+    const list = [...this.procs.values()];
+    const results = await Promise.all(list.map((inst) => this.#terminate(inst).catch(() => false)));
+    const failed = results.filter((ok) => !ok).length;
+    if (failed) log.warn('退出时有子进程未能停止', { total: list.length, failed });
+    return failed;
   }
 
   status(homeId) {
@@ -52,7 +113,7 @@ export class Launcher {
     // 本机受管进程保留所有权，断开只撤销 hwb 接入，之后可以重新连接。
     if (inst?.previewProxy) await inst.previewProxy.close();
     if (inst?.proxy) await inst.proxy.close();
-    if (inst?.kind === 'ssh' && fingerprint(inst.proc)) inst.proc.kill();
+    if (inst?.kind === 'ssh' && fingerprint(inst.proc)) await this.#terminate(inst);
     if (inst?.kind === 'dsh-web' && !release) {
       inst.detached = true;
       delete inst.previewProxy;
@@ -60,8 +121,11 @@ export class Launcher {
       delete inst.iframeUrl;
     } else {
       if (release && inst?.proc && fingerprint(inst.proc)) {
-        log.info('移除实例：回收 hwb 拉起的本机 dsh web', { homeId: home.homeId, pid: inst.pid });
-        inst.proc.kill();
+        log.info('回收 hwb 拉起的本机 dsh web（移除实例，或连接建立失败）', { homeId: home.homeId, pid: inst.pid });
+        const exited = await this.#terminate(inst);
+        // 这里无法像 stop() 那样把句柄留着重试：实例记录可能马上被删掉，注册表也没有它的位置了。
+        // 所以至少要**留痕**——否则进程会带着端口和 DSH_HOME 静默活下去，日志里什么都看不到。
+        if (!exited) log.error('本机 dsh web 未能在 SIGTERM/SIGKILL 后退出，需手动处理', { homeId: home.homeId, pid: inst.pid, port: inst.port });
       }
       this.procs.delete(home.homeId);
     }
@@ -72,23 +136,36 @@ export class Launcher {
     const inst = this.procs.get(home.homeId);
     this.#cancelRecovery(inst);
     // 远程:同时把远端 dsh web 停掉,而不是只拆隧道。
+    let remoteStopError = null;
     if (home.hostType === 'remote') {
       try {
         await this.stopRemoteFn(home);
       } catch (e) {
-        log.warn('停止远端 dsh web 失败', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, err: e });
+        // 记下来：本地连接照常拆（用户要的是「断开」），但最后要如实告诉用户远端还活着 ——
+        // 原先这里只 log.warn，用户看到的是「已停止」，而远端 dsh web 仍占着 remotePort 与 DSH_HOME。
+        remoteStopError = e;
+        log.error('停止远端 dsh web 失败（本地连接仍会拆掉）', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, err: e?.message ?? String(e) });
       }
     }
     if (!inst) {
       this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
       log.info('stop: 实例未在运行', { homeId: home.homeId });
+      if (remoteStopError) throw new Error(`远端 dsh web 未能停止：${remoteStopError.message ?? remoteStopError}`);
       return false;
     }
     if (inst.proc) {
       // guard：仅当这是我们持有且仍存活的子进程（pid 未被复用）才 kill，避免误杀。
       if (fingerprint(inst.proc)) {
-        log.info('stop: kill 子进程', { homeId: home.homeId, pid: inst.pid, signal: 'SIGTERM' });
-        inst.proc.kill();
+        log.info('stop: 终止子进程', { homeId: home.homeId, pid: inst.pid, signal: 'SIGTERM' });
+        const exited = await this.#terminate(inst);
+        if (!exited) {
+          // 杀不掉就**不谎报**：保留句柄（UI 还能再点一次停止，端口归属也还清楚），注册表保持
+          // 「仍在运行」——那才是事实。抛错让 API 回 500 并把原因带给用户。
+          log.error('stop: 子进程在 SIGTERM/SIGKILL 之后仍未退出', { homeId: home.homeId, pid: inst.pid, port: inst.port });
+          this.registry.set(home.homeId, { lastError: `子进程 ${inst.pid} 未能在 SIGTERM/SIGKILL 后退出，端口 ${inst.port ?? '-'} 仍被占用` });
+          throw new Error(`未能停止实例进程（pid ${inst.pid}）：它忽略了 SIGTERM 与 SIGKILL，`
+            + `端口 ${inst.port ?? '-'} 仍被占用。请手动处理：kill -9 ${inst.pid}`);
+        }
       } else {
         log.warn('guard 拒绝 kill（子进程已退出，pid 可能被复用）', { homeId: home.homeId, pid: inst.pid });
       }
@@ -101,6 +178,7 @@ export class Launcher {
     if (inst.proxy) await inst.proxy.close().catch(() => {});
     this.procs.delete(home.homeId);
     this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
+    if (remoteStopError) throw new Error(`本地连接已断开，但远端 dsh web 未能停止：${remoteStopError.message ?? remoteStopError}`);
     return inst.proc ? fingerprint(inst.proc) : false;
   }
 
@@ -128,7 +206,14 @@ export class Launcher {
     this.registry.set(home.homeId, { phase: 'probing' });
     const result = home.hostType === 'remote' ? await this.#openRemote(home) : await this.#openLocal(home);
     try { return await this.#withPreview(home, result); }
-    catch (error) { await this.disconnect(home); throw error; }
+    catch (error) {
+      // 这次 open 是我们**刚拉起**的连接（本地 = 新起的 dsh web 子进程），用户一次都没连上，
+      // 所以失败时要连子进程一起收掉（release:true）。否则 disconnect 的「本机受管进程保留所有权」
+      // 分支会把它标成 detached 留着：注册表说 stopped、status() 返回 null、监控报未运行，
+      // 而子进程仍在监听那个端口（审查复现：pid 38693 仍 LISTEN 在 58316）—— 一个谁都管不到的僵尸。
+      await this.disconnect(home, { release: true });
+      throw error;
+    }
   }
 
   // 先验证新端点，再释放旧连接；失败时当前连接和实例身份不变。
@@ -176,7 +261,15 @@ export class Launcher {
       inst.previewPending ||= this.proxyFactory({ target: new URL(inst.url).origin, preview: true, port: remote ? home.accessPort || 0 : 0 });
       try { inst.previewProxy = await inst.previewPending; }
       catch (error) {
-        if (error.code === 'EADDRINUSE') throw new Error(`本地端口 ${home.accessPort} 已被占用，请释放该端口或在实例设置中更换`);
+        if (error.code === 'EADDRINUSE') {
+          // 端口提示只在**确实是那个端口**的冲突时才给：本机实例的 accessPort 是 undefined，
+          // 原先把任何 EADDRINUSE 都改写成「本地端口 undefined 已被占用」，用户既不知道是哪个端口，
+          // 也丢掉了真正的原因（实测就是这么打印出来的）。
+          const hint = home.accessPort
+            ? `本地端口 ${home.accessPort} 已被占用，请释放该端口或在实例设置中更换。`
+            : '预览代理端口被占用（本机实例的端口由系统分配）。';
+          throw new Error(`${hint}原始错误：${error.message}`);
+        }
         throw error;
       }
       finally { inst.previewPending = null; }
@@ -211,6 +304,32 @@ export class Launcher {
     delete previous.previewProxy;
     inst.previewProxy.retarget(new URL(inst.url).origin);
     inst.iframeUrl = inst.previewProxy.url + '/' + new URL(inst.url).search;
+  }
+
+  // 连上之后必须验证**鉴权真的通过**，否则「连接成功」是假的。
+  //
+  // 现象（审查复现）：token 填错、或远端 dsh web 轮换了 token 时，open() 照样解析成功、
+  // 注册表 phase=running、iframeUrl 指向的页面却是 401 栅栏，监控每 30s 报 running。
+  // 根因：连接路径上的唯一存活性判据是 httpProbe —— 它的口径是 `status < 500`，401 也算「活着」
+  // （对「远端端口上有没有 dsh web 在听」这类判断这是对的，对「用户点开能不能用」是错的）。
+  // 这里用与 iframe **同一条入口**做一次真正的 token→cookie 交接：拿到 4xx 就明确失败，
+  // 而不是把一个进不去的入口记成已连接。
+  async #assertAuthorized(url) {
+    let res;
+    try {
+      res = await authFetch(url);
+    } catch (error) {
+      throw new Error(`dsh web 鉴权探测失败：${error?.message ?? error}`);
+    }
+    try { await res.body?.cancel(); } catch { /* 释放失败不影响状态码判定 */ }
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`dsh web 拒绝了这次连接（HTTP ${res.status}）：token 可能已失效或填错。`
+        + '请在实例设置里重新填写 dsh web token（新版 dsh 的入口必须带 ?token=），或对该实例执行「重新连接」以重取 token。');
+    }
+    if (res.status >= 400) {
+      throw new Error(`dsh web 入口返回 HTTP ${res.status}：这个地址可能不是 dsh web（或入口路径不对）。`);
+    }
+    return res.status;
   }
 
   // 重启：先撤当前实例（远程=停远端 dsh + 拆隧道；本地=杀进程），再拉起。
@@ -312,6 +431,7 @@ export class Launcher {
       // 该 URL 也是真实地址而非转发门面）。远程实例仍需反代（ssh -L 隧道本身不可被浏览器直达），见 #connectRemote。
       const url = localWebUrl(baseUrl, tokenFragment);
       inst.url = url;
+      await this.#assertAuthorized(url);
       inst.deeplink = await probeDeeplink(url);
       this.registry.set(home.homeId, { phase: 'running', url, port, pid: inst.pid, deeplink: inst.deeplink });
       log.info('本地 dsh web 已启动', { homeId: home.homeId, pid: inst.pid, port, deeplink: inst.deeplink });
@@ -355,6 +475,16 @@ export class Launcher {
         `本机 dsh web 不可达: http://127.0.0.1:${port} — 请确认该端口上的实例在跑`
         + (tokenFragment ? '' : '，并在实例配置里填 dsh web 鉴权 token（新版 dsh 需要）')
       );
+    }
+    // 鉴权必须在这里就验掉：waitForHttp 只看 `status < 500`，一个 401 栅栏页面同样「可达」——
+    // 用户手填的 token 写错时，原先会得到「已连接」，而 iframe 里是 401（审查复现）。
+    try {
+      await this.#assertAuthorized(url);
+    } catch (error) {
+      this.procs.delete(home.homeId);
+      this.registry.set(home.homeId, { phase: 'stopped', lastError: error.message });
+      log.error('直连本机 dsh web 鉴权失败', error, { homeId: home.homeId, port });
+      throw error;
     }
     inst.deeplink = await probeDeeplink(url);
     this.registry.set(home.homeId, { phase: 'running', url, port, pid: null, deeplink: inst.deeplink });
@@ -486,6 +616,10 @@ export class Launcher {
       assertCurrent();
       inst.url = hasToken ? `${inst.proxy.url}/${tokenFragment}` : inst.proxy.url;
       inst.port = inst.proxy.port;
+      // 鉴权验证必须在 `connected = true` 之前：远端 dsh web 轮换了 token（或手填的 token 已失效）时，
+      // 隧道与反代都是通的、httpProbe 也返回「活着」，但入口只会回 401 —— 原先照记 running。
+      await this.#assertAuthorized(inst.url);
+      assertCurrent();
       inst.deeplink = await probeDeeplink(inst.url);
       assertCurrent();
       let result = { url: inst.url, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };

@@ -207,7 +207,7 @@ server.on('error', (err) => {
 });
 
 let shuttingDown = false;
-function shutdown(reason = 'signal') {
+async function shutdown(reason = 'signal') {
   if (shuttingDown) return;
   shuttingDown = true;
   log.info(`shutdown (${reason})`);
@@ -215,10 +215,20 @@ function shutdown(reason = 'signal') {
   indexer.stop();
   monitor.stop();
   hub.close(); // 清掉 SSE 心跳定时器并断开所有客户端，避免退出时残留句柄
+  // 先把子进程**真的**收掉再退出。原先直接 process.exit(0) 靠 'exit' 钩子里的 proc.kill()，
+  // 而那只是投递 SIGTERM、且 process.exit() 之后事件循环不再运行 —— 启动中的 dsh web 还没装上
+  // 信号处理器、或忽略 SIGTERM 时就会变成孤儿：父进程没了，它仍在监听端口并响应 200，
+  // 端口与 DSH_HOME 都被占着，没有任何人再管它（审查用忽略 SIGTERM 的假 dsh 复现过）。
+  // 这里等它退出（SIGTERM → 3s → SIGKILL → 2s），'exit' 钩子退化成最后一道保险。
+  try {
+    await launcher.stopAll();
+  } catch (error) {
+    log.warn('退出前停止子进程失败', { err: error?.message ?? String(error) });
+  }
   server.close();
   store.close();
-  process.exit(0); // 'exit' 事件里 Launcher 会杀掉所有 dsh web 子进程
+  process.exit(0);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => { shutdown('SIGINT').catch(() => process.exit(0)); });
+process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(0)); });

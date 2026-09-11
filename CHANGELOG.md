@@ -203,6 +203,80 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 「停止实例」只发信号不等待：忽略 SIGTERM 的子进程仍活着，界面却报已停止（src/control/launcher.js）
+- **现象**：点「停止」后 API 回 `{ok:true,stopped:true}`、`/api/homes` 显示 `runtime: "stopped"`、
+  pid/url 清空，而那个 dsh web 子进程**仍在监听端口并返回 200**。句柄已经不在 `procs` 里，
+  UI 连重试的机会都没有，端口要等到 hwb 退出（'exit' 钩子）才释放。
+- **根因**：`stop()` 在 `inst.proc.kill()`（SIGTERM）之后**无条件** `procs.delete()` +
+  `registry.set({phase:'stopped'})`。`kill()` 只是投递信号，既没等 exit，也没有超时与 SIGKILL 升级。
+  审查用忽略 SIGTERM 的假 dsh 端到端复现：`lsof` 显示同一个 pid 仍在 LISTEN，`curl` 返回 200。
+- **修复**：`#terminate()` —— 先挂 'exit' 监听再发信号，SIGTERM 等 3s，未退出则升级 SIGKILL 再等 2s；
+  最终仍活着就**如实失败**：抛错（API 回 500 带 pid 与端口）、**保留句柄**（用户可再点一次）、
+  注册表**不写 stopped**（进程还在跑就是 running），只追加 `lastError`。
+- **回归测试**：`tests/launcher-terminate.test.js` —— 真子进程 + 假 dsh（`process.on('SIGTERM')` 忽略）：
+  stop() 返回时进程必须真的没了、`signalCode === 'SIGKILL'`、且至少等了 SIGTERM 的窗口；
+  另有一个永不退出的假句柄，断言 `stop()` 必须 reject、句柄保留、phase 不被改写成 stopped。
+  修复前两条都失败（第二条停在 `Missing expected rejection`）。
+
+#### 父进程退出会留下孤儿 dsh web（src/control/launcher.js + src/server.js）
+- **现象**：hwb 退出后子进程仍在监听端口并响应 200，没有任何人再管它（审查用忽略 SIGTERM 的假 dsh 复现：
+  父进程的 `lsof -p` 已经空了，端口还在听）。
+- **根因**：`shutdown()` 直接 `process.exit(0)`，兜底只有 `process.on('exit')` 里的 `proc.kill()` ——
+  投递即返回，而 `process.exit()` 之后事件循环不再运行：启动中的 dsh（还没装信号处理器）或忽略
+  SIGTERM 的 dsh 就活下来了。
+- **修复**：`Launcher.stopAll()`（复用 `#terminate` 的 SIGTERM → 等 → SIGKILL → 等），
+  `shutdown()` 改为 `async`，在 `process.exit(0)` 之前 `await launcher.stopAll()`；
+  'exit' 钩子退化成最后一道保险。
+- **回归测试**：`tests/launcher-terminate.test.js`（`stopAll()` 必须返回 0 个失败、子进程必须真的死）。
+
+#### 预览代理建立失败会把实例变成僵尸（子进程活着、句柄没了）（src/control/launcher.js）
+- **现象**：`open()` 失败后 `launcher.status()` 返回 null、注册表 `stopped`、监控报未运行，
+  而子进程仍在监听端口（审查复现：pid 38693 仍 LISTEN 在 58316）。重连是唯一的出路。
+- **根因**：`open()` 的失败分支调 `disconnect(home)`（`release=false`）—— 这条分支的语义是
+  「本机受管进程保留所有权，只是撤销接入」，于是刚**为这次连接拉起**的子进程被标成 `detached` 留着。
+- **修复**：失败分支改用 `disconnect(home, {release:true})`，把这次拉起的子进程一并收掉（等它真的退出）；
+  收不掉时记 `log.error` 写明 pid 与端口（移除语义下无法保留句柄，至少要留痕）。
+- **回归测试**：`tests/launcher-terminate.test.js` —— 注入一个必然 EADDRINUSE 的 proxyFactory，
+  断言 open() 失败后那个 pid 已经不存在（修复前子进程仍活着）。
+
+#### 连接不验证鉴权：token 错了也报「已连接」（src/control/launcher.js + prober.js + monitor.js）
+- **现象**：token 填错、或远端 dsh web 轮换了 token 时，`open()` 照样成功、卡片显示已连接、
+  监控每 30s 报 running，而 iframe 里是 401 栅栏页（审查实测：`monitor.refresh()` 对只有 401 的端点
+  返回 `runtime: 'running'`、`latencyMs: 7`）。
+- **根因**：连接路径上唯一的存活性判据是 `httpProbe`，它的口径是 `status < 500` ——
+  **401 也算活着**（对「远端端口上有没有 dsh web 在听」这是对的，对「用户点开能不能用」是错的），
+  而 `#connectRemote` / `#connectLocalExisting` / `#spawnLocalDsh` 都没有验证过鉴权。
+- **修复**：①新增 `#assertAuthorized(url)`：用与 iframe **同一条入口**做一次 token→cookie 交接，
+  401/403 直接失败并给出补救办法（重填 token / 重新连接），其它 4xx 也判失败；
+  三条连接路径（含远端重连）在写 `phase:'running'` 之前都必须通过它。
+  ②`prober.js` 拆出 `httpProbeStatus()` 并新增 `probeAlive()`（401/403 判为不可用），
+  Monitor 的心跳默认改用 `probeAlive` —— httpProbe 的语义保持不变，供端口探测类判断继续使用。
+- **回归测试**：`tests/launcher-terminate.test.js` —— 假 dsh 带真 token 栅栏（裸 URL/错 token 401，
+  对 token 303 + Set-Cookie 后 200）：错 token 的直连必须失败且不留「已连接」状态、对 token 必须照常连上；
+  另断言 `httpProbe(裸 URL) === true` 而 `probeAlive(裸 URL) === false`，以及 Monitor 默认探测就是
+  `probeAlive`。修复前「错 token 也连上」与「401 算可用」两条都失败。
+
+#### 预览代理失败的真因被丢弃：报「本地端口 undefined 已被占用」（src/control/launcher.js）
+- **现象**：任何 `EADDRINUSE` 都被改写成 `本地端口 ${home.accessPort} 已被占用…`，而本机实例的
+  `accessPort` 是 undefined —— 用户看到「本地端口 undefined 已被占用」，既不知道是哪个端口，
+  也丢掉了真正的错误（审查的复现日志里逐字出现过）。
+- **修复**：只在 `home.accessPort` 确实存在时才给端口提示，否则说明「预览代理端口被占用（本机实例
+  由系统分配）」，并把原始错误消息追加在后面。
+- **回归测试**：`tests/launcher-terminate.test.js` 断言消息里不出现 `undefined` 且保留 `EADDRINUSE`。
+
+#### 远端「停止」在没装 fuser 的机器上什么都没做，却返回成功（src/control/remote.js）
+- **现象**：最小化的 Linux/容器镜像里没有 fuser，于是 hwb 报「已停止」、隧道也拆了，
+  而远端 dsh web 仍占着 remotePort 与 DSH_HOME。
+- **根因**：`stopRemote` 的脚本是 fuser-only：`command -v fuser … || echo "no-fuser"`，且**没有 fuser 也 exit 0**
+  —— 而上层只看退出码。同文件的 `killport()`（启动脚本里）早就为此用了 lsof → ss/netstat。
+- **修复**：`REMOTE_STOP` 与 `killport()` 同一套判据：lsof 优先 → fuser → 两者都没有就**明确失败**（非 0）；
+  杀完复核，仍在监听就升级 `kill -9` 再复核，仍收不掉则以非 0 退出。端口本来就没在监听则算成功
+  （输出 `not-listening`）。`launcher.stop()` 也改为把远端停止失败**上报给用户**
+  （本地连接照常拆，但最后抛出「本地连接已断开，但远端 dsh web 未能停止」）。
+- **回归测试**：`tests/remote-stop.test.js` —— 用真 bash 跑这段脚本：起一个真的监听进程 → 必须被杀掉且
+  `kill -9` 复核无误；空端口 → `not-listening` 且退出 0；把 PATH 清空（既无 lsof 也无 fuser）→ 必须非 0。
+  修复前 4 个用例全失败。
+
 #### 实时 tokenUsage 只带一部分计数器时会整列覆盖，用量面板静默塌掉 99.9%（src/dshhome/reader.js）
 - **现象**：用量面板上的历史合计突然从 109100 掉到 120，没有任何报错、没有 degraded 标记。
 - **根因**：实时通道（3s 轮询 → `sessions.tokenUsage`）是**整列替换**语义：

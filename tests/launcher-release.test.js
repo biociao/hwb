@@ -17,11 +17,25 @@ function trackExitListeners() {
 
 function managedInstance() {
   const killed = [];
+  const listeners = new Set();
+  // 假句柄要**照着真实 ChildProcess 的契约**做：有 on/off，被 kill 后置 signalCode 并触发 'exit'。
+  // 只写一个 { kill() } 的对象会让「终止要等它真的退出」这段逻辑无从验证（实测：缺 on 直接 TypeError）。
+  const proc = {
+    pid: 4242, exitCode: null, signalCode: null,
+    on(event, fn) { if (event === 'exit') listeners.add(fn); return proc; },
+    off(event, fn) { if (event === 'exit') listeners.delete(fn); return proc; },
+    kill(sig = 'SIGTERM') {
+      killed.push(sig);
+      proc.signalCode = sig;
+      for (const fn of [...listeners]) fn(null, sig);
+      return true;
+    },
+  };
   const inst = {
     kind: 'dsh-web',
     port: 3080,
     url: 'http://127.0.0.1:3080',
-    proc: { pid: 4242, exitCode: null, signalCode: null, kill: (sig) => { killed.push(sig ?? 'SIGTERM'); } },
+    proc,
     previewProxy: { close: async () => {} },
   };
   return { inst, killed };
