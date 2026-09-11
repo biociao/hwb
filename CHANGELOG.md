@@ -97,6 +97,17 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 预览代理的建立竞态会留下孤儿监听端口（src/control/launcher.js）
+- `#withPreview` 会 `await createProxy(...)`，而 `disconnect` 只能关掉「当时已经存在」的
+  `inst.previewProxy`；`previewPending` 只是作废了一个引用，管不到那个已经跑起来的 Promise。
+  于是「代理还没就绪时实例被断开/移除」会让刚 bind 成功的端口没人持有，一直留到进程退出。
+  API 层的 `connecting` 集合挡住了大部分并发，但 Monitor 的移除清理与端点切换不走它。
+- **修复**：代理就绪后检查实例是否已失效（`detached`/`cancelled`/已不在 `procs` 里），是则自己关掉。
+  同时把 `createProxy` 做成可注入的 `proxyFactory`（与既有的 `tunnelFactory`/`waitHttp` 一致），
+  否则这个竞态窗口无法在测试里复现。
+- **回归测试**：`tests/launcher-release.test.js` —— 注入一个「挂着不返回」的工厂，在挂起期间断开实例，
+  再放行工厂，断言新代理被关闭且不会挂到已断开的实例上（移除该保护后测试会失败）。
+
 #### 后台索引路径上的两处未处理拒绝（src/dshhome/indexer.js + src/api/routes.js）
 - `Indexer.#tick()` 只用 `.finally()` 收尾（与 Monitor 心跳同款问题）：`#runAll` 一旦抛错就变成
   每轮一次的 unhandledRejection，被 crash handler 记成 fatal 并掩盖真因。补 `catch` + warn。

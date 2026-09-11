@@ -14,7 +14,7 @@ const log = logger('launcher');
 // 进程句柄存 this.procs；控制状态（phase/url/port/pid）写入共享 registry，
 // 由 Monitor 推进状态机。stop 前经 guard 指纹校验，防误杀。
 export class Launcher {
-  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {} } = {}) {
+  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy } = {}) {
     this.registry = registry;
     this.tunnelFactory = tunnelFactory;
     this.remotePathExists = remotePathExists;
@@ -24,6 +24,7 @@ export class Launcher {
     this.recoveryCooldownMs = recoveryCooldownMs;
     this.stopRemoteFn = stopRemoteFn;
     this.rememberAccessPort = rememberAccessPort;
+    this.proxyFactory = proxyFactory; // 可注入：预览代理的建立是异步的，竞态需要能被测试复现
     this.procs = new Map(); // homeId -> { pid, port, url, proc, deeplink, kind }
     process.on('exit', () => {
       for (const inst of this.procs.values()) {
@@ -172,13 +173,23 @@ export class Launcher {
     const remote = home.hostType === 'remote';
     if (!inst.previewProxy) {
       // Separate iframe entry preserves the original external dsh URL.
-      inst.previewPending ||= createProxy({ target: new URL(inst.url).origin, preview: true, port: remote ? home.accessPort || 0 : 0 });
+      inst.previewPending ||= this.proxyFactory({ target: new URL(inst.url).origin, preview: true, port: remote ? home.accessPort || 0 : 0 });
       try { inst.previewProxy = await inst.previewPending; }
       catch (error) {
         if (error.code === 'EADDRINUSE') throw new Error(`本地端口 ${home.accessPort} 已被占用，请释放该端口或在实例设置中更换`);
         throw error;
       }
       finally { inst.previewPending = null; }
+      // 等 createProxy 落地这段时间里，实例可能已经被断开/移除/换掉了（disconnect 只关得掉
+      // 「当时已经存在」的代理；previewPending 只能作废引用，管不到这个正在进行中的 Promise）。
+      // 那样这个刚监听起来、又没人持有的端口会一直留到进程退出 —— 这里自己关掉它。
+      if (inst.detached || inst.cancelled || this.procs.get(home.homeId) !== inst) {
+        log.warn('预览代理就绪时实例已失效，回收该端口', { homeId: home.homeId, port: inst.previewProxy.port });
+        await inst.previewProxy.close().catch(() => {});
+        delete inst.previewProxy;
+        delete inst.iframeUrl;
+        return result;
+      }
       if (remote && !home.transient) {
         try {
           this.rememberAccessPort(home.homeId, inst.previewProxy.port);
