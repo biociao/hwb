@@ -45,9 +45,27 @@ function request(command = 'status') {
 // 取第一个会把**上一次**失败的提示当成这一次的原因 —— 实测：日志开头是旧的
 // `无法打开数据库（/tmp/OLD-backup/hwb.db）`，而这一次其实死于端口占用，
 // 用户却被告知去改一个跟当前问题无关的数据库路径。
-function failureDetail(logFile, maxLines = 8) {
+function failureDetail(logFile, maxLines = 8, tailBytes = 64 * 1024) {
+  // 只读**尾部**：service.log 是子进程 stdout/stderr 的重定向目标，append-only 且从不轮转，
+  // 所以它可能长到几百 MB。原先整份 readFileSync + split：审查实测 433 MB 的日志 →
+  // 1.80s 阻塞、峰值 RSS **1.98 GB**（≈文件大小的 4.5 倍）—— 恰恰是最需要给出诊断的那条路径。
+  // 语义完全不变：我们要的本来就是「最后」一个 `hwb:` 提示块（几行而已），64 KiB 足够装下。
   let text;
-  try { text = fs.readFileSync(logFile, 'utf8'); } catch { return ''; }
+  try {
+    const fd = fs.openSync(logFile, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const start = Math.max(0, size - tailBytes);
+      const buf = Buffer.allocUnsafe(Math.min(size, tailBytes));
+      const read = fs.readSync(fd, buf, 0, buf.length, start);
+      text = buf.subarray(0, read).toString('utf8');
+      // 从中间截断时，第一行可能是半截 —— 丢掉它（它不可能是提示块的首行「hwb: …」）
+      if (start > 0) {
+        const nl = text.indexOf('\n');
+        text = nl === -1 ? '' : text.slice(nl + 1);
+      }
+    } finally { fs.closeSync(fd); }
+  } catch { return ''; }
   const lines = text.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim() !== '');
   let hint = [];
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -97,8 +115,42 @@ async function start() {
     child.once('message', msg => { if (msg.ready) { clearTimeout(timer); resolve(); } });
   });
   child.unref();
+  try { fs.writeFileSync(servicePortFile, String(cfg.port), { mode: 0o600 }); } catch { /* 只读目录：忽略 */ }
   console.log(`已启动 PID ${child.pid} http://127.0.0.1:${cfg.port}`);
 }
+// 前台 `hwb serve` 实际使用的端口会写进这里（后台服务有控制 socket，不依赖它）。
+// 为什么必须记：`stop`/`status`/`doctor` 原先只探测**配置里**的端口，而 `hwb serve --port 4399`
+// 可以让生效端口与配置不同（server.js 的 `--port` 覆盖配置）。审查实测的后果：
+//   · `hwb stop` 打印「已停止」并 exit 0，而 4399 上的服务照常返回 200；
+//   · 紧接着 `hwb start` 会再起一个后台服务 —— 两个进程共用同一个 hwb.db 与同一个 hwb.log
+//     （lsof 可见两个 FD 指向同一文件），而这正是「database is locked / 降级」的场景。
+// 端口文件只是**线索**：读它的地方仍然用 hwbOnPort() 确认对面确实是 hwb，
+// 所以进程被 kill -9 后留下的陈旧文件不会造成误报。
+const servicePortFile = path.join(serviceDir, 'service.port');
+
+// 从 argv 里取生效端口（`--port a --port b` 取最后一个，与 server.js 的解析顺序一致）。
+function effectivePort(argv) {
+  let port = readConfig().port;
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] !== '--port') continue;
+    const n = Number(argv[i + 1]);
+    if (Number.isInteger(n) && n > 0 && n < 65536) port = n;
+  }
+  return port;
+}
+
+// 候选端口：记录下来的生效端口优先，其次是配置端口（两者相同就只留一个）。
+function candidatePorts() {
+  const ports = [];
+  try {
+    const recorded = Number(fs.readFileSync(servicePortFile, 'utf8').trim());
+    if (Number.isInteger(recorded) && recorded > 0 && recorded < 65536) ports.push(recorded);
+  } catch { /* 没有记录（后台服务或从没起过前台 serve） */ }
+  const cfg = readConfig().port;
+  if (!ports.includes(cfg)) ports.push(cfg);
+  return ports;
+}
+
 // 端口上是不是**hwb 自己**在服务（不依赖控制 socket）。
 // 只探测「端口有没有人在听」是不够的：随便一个程序占了配置端口，就会被报成
 // 「前台运行的 hwb serve」—— 那是另一个方向的谎报。这里问一句只有 hwb 会这样答的问题：
@@ -129,16 +181,17 @@ async function stop() {
     // 没有控制 socket ≠ 服务没在跑：前台 `hwb serve` 不创建 socket，但它占着端口。
     // 原先直接打印「已停止」并返回 0，用户以为停掉了，下一次 `hwb start` 却只报一句
     // 难懂的「启动失败 (1)」（其实是 EADDRINUSE）。这里说清楚实际情况。
-    const port = readConfig().port;
-    if (await hwbOnPort(port)) {
-      throw Error(`没有控制 socket，但 http://127.0.0.1:${port} 上有 hwb 在服务 —— `
-        + '多半是前台运行的 `hwb serve`。请到那个终端按 Ctrl-C 停止它。');
-    }
-    if (await portInUse(port)) {
-      // 端口被占但不是 hwb：不要说成「前台 hwb serve」，那会把用户引到错误的方向
-      // （去某个终端找 Ctrl-C），而实际该处理的是另一个程序。
-      throw Error(`没有控制 socket，端口 ${port} 被**其它程序**占用（不是 hwb）。`
-        + `可换端口：\`hwb config set port <新端口>\`；或查占用者：\`lsof -i :${port}\`。`);
+    for (const port of candidatePorts()) {
+      if (await hwbOnPort(port)) {
+        throw Error(`没有控制 socket，但 http://127.0.0.1:${port} 上有 hwb 在服务 —— `
+          + '多半是前台运行的 `hwb serve`。请到那个终端按 Ctrl-C 停止它。');
+      }
+      if (await portInUse(port)) {
+        // 端口被占但不是 hwb：不要说成「前台 hwb serve」，那会把用户引到错误的方向
+        // （去某个终端找 Ctrl-C），而实际该处理的是另一个程序。
+        throw Error(`没有控制 socket，端口 ${port} 被**其它程序**占用（不是 hwb）。`
+          + `可换端口：\`hwb config set port <新端口>\`；或查占用者：\`lsof -i :${port}\`。`);
+      }
     }
     console.log('已停止'); return;
   }
@@ -178,7 +231,16 @@ async function main() {
   }
   if (!command || command === 'serve' || command.startsWith('-')) {
     const extra = command && command !== 'serve' ? [command, ...args] : args;
-    process.argv = [process.execPath, path.join(root, 'src/server.js'), ...serverArgs(readConfig()), ...extra];
+    const argv = [...serverArgs(readConfig()), ...extra];
+    // 记下**生效**端口供 stop/status/doctor 使用（见 servicePortFile 的注释），
+    // 退出时删掉。写失败不影响启动（这只是给别的命令用的线索）。
+    try {
+      fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(servicePortFile, String(effectivePort(argv)), { mode: 0o600 });
+      process.on('exit', () => { try { fs.rmSync(servicePortFile, { force: true }); } catch { /* 尽力而为 */ } });
+      process.on('SIGINT', () => { try { fs.rmSync(servicePortFile, { force: true }); } catch { /* 尽力而为 */ } });
+    } catch { /* 只读目录等情况：忽略，别的命令会退回配置端口 */ }
+    process.argv = [process.execPath, path.join(root, 'src/server.js'), ...argv];
     await import('./server.js'); return;
   }
   if (['start', 'stop', 'restart', 'status', 'upgrade', 'doctor'].includes(command) && args.length) throw Error(`${command} 不接受额外参数`);
@@ -196,11 +258,12 @@ async function main() {
       // 没有控制 socket ≠ 没在跑：前台 `hwb serve` 不创建 socket，但它占着配置里的端口。
       // `stop` 早就为这件事补了端口探测，`status`/`doctor` 当时漏了 —— 于是看板明明在返回 200、
       // `status` 却说 `stopped` 并以退出码 1 结束（脚本里 `set -e` 会据此当成「服务挂了」）。
-      const port = readConfig().port;
-      if (await hwbOnPort(port)) {
-        console.log(JSON.stringify({ status: 'running', foreground: true, port,
-          note: '前台运行的 hwb serve 不创建控制 socket' }, null, 2));
-        return;   // 确实是 hwb 在服务 → 退出码 0
+      for (const port of candidatePorts()) {
+        if (await hwbOnPort(port)) {
+          console.log(JSON.stringify({ status: 'running', foreground: true, port,
+            note: '前台运行的 hwb serve 不创建控制 socket' }, null, 2));
+          return;   // 确实是 hwb 在服务 → 退出码 0
+        }
       }
       console.log('stopped');
       process.exitCode = 1;
@@ -243,8 +306,11 @@ async function main() {
         up = true;
       } else {
         // 同上：后台服务之外还有「前台 serve」这一种在跑法，它没有控制 socket。
-        port = port || readConfig().port;
-        up = await hwbOnPort(port);
+        // 端口也同理：前台 serve 可能用了 `--port` 覆盖配置，所以要遍历候选端口。
+        for (const candidate of candidatePorts()) {
+          if (await hwbOnPort(candidate)) { port = candidate; up = true; break; }
+        }
+        port = port ?? readConfig().port;
       }
       if (up) {
         const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(3000) });
@@ -269,7 +335,18 @@ async function main() {
       const wasRunning = await request();
       run('git', ['pull', '--ff-only']);
       test();
-      if (wasRunning) run(process.execPath, [path.join(root, 'src/cli.js'), 'restart']);
+      if (wasRunning) {
+        // 复核一次：升级期间服务可能已经不在了（用户 stop、崩溃、或锁被接管后的另一次启停）。
+        // 只有「升级前在跑**且**现在还活着」才重启 —— 否则会把用户明确停掉的服务又拉起来。
+        if (!await request()) {
+          console.log('升级及测试完成；升级期间检测到服务已停止，未自动重启（需要时 hwb start）');
+          return;
+        }
+        // 进程内重启，**不要**再 spawn 一个 `hwb restart` 子进程：那个子进程会去抢同一把启停锁，
+        // 而锁正被本进程持有 —— 它会直接失败（或被误判成残留后接管）。
+        await stop();
+        await start();
+      }
       console.log('升级及测试完成'); return;
     }
     default: throw Error(`未知命令: ${command}\n运行 hwb --help 查看用法`);
@@ -304,10 +381,12 @@ const touchLock = () => { try { activeLock?.touch(); } catch { /* 锁已被清�
 // 但**只看 PID 活不活是不够的**：PID 会被回收（macOS 上限约 99998）。一个被 kill -9 的启停命令
 // 留下的锁，其 PID 被任何无关进程复用之后，锁就永远「被持有」了 —— 用户再次卡在同一个症状上
 // （实测：拿一个跟 hwb 无关的常驻进程 PID 写进锁文件，start/stop/restart 全部退出码 1）。
-// 因此再加一路**心跳**：持有者活着就每 5s 摸一次锁文件的 mtime；20s 没有心跳即视为残留。
-// 这样「PID 被复用」与「持有者真的死了」都能识别，而正常的长操作（`hwb upgrade` 会跑一整套
-// 测试）因为一直在心跳，不会被误抢。代价写明白：持有者被 SIGSTOP/整机休眠而暂停超过 20s 时，
-// 它也会被判为残留 —— 那种情况下另一个命令接管反而更符合用户期待。
+// 因此再加一路**心跳**：持有者活着就每 5s 摸一次锁文件的 mtime；超过 LOCK_STALE_MS 没更新
+// 即视为残留。这样「PID 被复用」与「持有者真的死了」都能识别，而正常的长操作不会被误抢 ——
+// `upgrade` 现在**确实**持锁（见 dispatch），它期间的 `git pull`/整套测试都走 spawnSync
+// （事件循环被阻塞、定时器不触发），所以 run() 会在每次阻塞调用前后各摸一次锁（touchLock）。
+// 代价写明白：持有者被 SIGSTOP/整机休眠而暂停超过 LOCK_STALE_MS 时，它也会被判为残留 ——
+// 那种情况下另一个命令接管反而更符合用户期待。
 function lockHeldBy(lock) {
   const raw = (() => { try { return fs.readFileSync(lock, 'utf8').trim(); } catch { return ''; } })();
   const pid = Number(raw.split(/\s+/)[0]);
@@ -376,7 +455,11 @@ function acquireLock(lock) {
 }
 
 async function dispatch() {
-  if (!['start', 'stop', 'restart'].includes(process.argv[2])) return main();
+  // upgrade 也要持锁：它中间会 `git pull` + 跑整套测试（几十秒，且是 spawnSync —— 事件循环被
+  // 阻塞，心跳定时器不触发），最后还要重启服务。不持锁的后果审查实测过：用户在这次 upgrade
+  // 期间执行 `hwb stop`（成功、退出码 0），upgrade 结束后却**把服务又拉起来了** ——
+  // 两条命令谁都不报冲突，用户的明确意图被静默撤销。
+  if (!['start', 'stop', 'restart', 'upgrade'].includes(process.argv[2])) return main();
   fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
   const lock = path.join(serviceDir, 'service.lock');
   const held = acquireLock(lock);

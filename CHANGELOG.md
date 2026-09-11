@@ -243,6 +243,43 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 前台 `hwb serve --port` 用了非配置端口时，`stop`/`status`/`doctor` 全部谎报（src/cli.js）
+- **现象（审查端到端复现）**：配置端口 4378、`hwb serve --port 4399` 时 ——
+  `hwb status` 打印 `stopped` 并以退出码 1 结束，`hwb stop` 打印「已停止」退出 0，
+  而 4399 上的服务照常返回 200；紧接着 `hwb start` 会再起一个后台服务，
+  **两个 hwb 进程共用同一个 `hwb.db` 与同一个 `hwb.log`**（`lsof` 可见两个 FD 指向同一文件）。
+- **根因**：三个命令只探测**配置里**的端口，而 `server.js` 的解析顺序是「命令行 `--port` 覆盖配置」，
+  CLI 的 help 也明确支持 `hwb serve [服务器选项]`。
+- **修复**：前台 serve 启动前把**生效端口**写进 `<HWB_DIR>/service.port`（退出时删掉，后台 `start` 也写），
+  `stop`/`status`/`doctor` 按「记录端口 → 配置端口」的顺序探测。端口文件只是线索：
+  读它的地方仍用 `hwbOnPort()` 确认对面确实是 hwb，所以 kill -9 留下的陈旧文件不会造成误报。
+- **回归测试**：`tests/cli.test.js` —— 真起一个 `serve --port <非配置端口>`，断言 `status` 报 running、
+  `stop` 必须提示「前台运行/Ctrl-C」且服务仍在服务。修复前该用例失败。
+
+#### 启动失败的诊断把整份 `service.log` 读进内存（src/cli.js）
+- **现象（审查实测）**：`service.log` 是子进程 stdout/stderr 的重定向目标，append-only 且从不轮转，
+  长到 433 MB 时 `hwb start` 的失败路径阻塞 **1.80s**、峰值 RSS **1.98 GB**（≈文件大小的 4.5 倍）
+  —— 恰恰是最需要给出诊断的那条路径。
+- **根因**：`failureDetail()` 用 `fs.readFileSync` 整份读取再 split/遍历。
+- **修复**：只读尾部 64 KiB（`open`+`fstat`+`readSync`，被截断的首行丢掉）。
+  语义不变：要的本来就是「**最后**一个 `hwb:` 提示块」。
+- **回归测试**：`tests/cli.test.js` —— 100 MB 的日志 + `--max-old-space-size=128`（整份读会 OOM），
+  断言仍能给出**本次**的真实原因，且日志开头那个陈旧提示块没有被当成原因。修复前该用例失败。
+
+#### `hwb upgrade` 期间并发的 `hwb stop` 会被静默撤销（src/cli.js）
+- **现象（审查端到端复现）**：`upgrade` 跑着（`git pull` + 整套测试，几十秒），用户执行 `hwb stop`
+  成功并退出 0，升级结束后**服务又被拉起来了** —— 两条命令谁都不报冲突，用户的明确意图被静默撤销。
+- **根因**：`upgrade` 不在取启停锁的命令列表里（于是 `touchLock()` 也是死代码、
+  `LOCK_STALE_MS` 注释里「upgrade 持锁跑长命令」的理由与事实相反），且最后**无条件**
+  `node src/cli.js restart`。
+- **修复**：①`upgrade` 纳入持锁列表（并发的启停命令会被明确拒绝，而不是成功后又被撤销）；
+  ②重启前复核运行状态 —— 升级期间服务若已被停掉就不再拉起，并明确打印说明；
+  ③重启改为**进程内** `stop()+start()`（spawn 子 CLI 会去抢同一把锁，必然失败）；
+  ④把 `LOCK_STALE_MS` 的注释与事实对齐（现在 upgrade 真的持锁，`touchLock()` 真的在用）。
+- **回归测试**：`tests/cli.test.js` —— 仓库副本（含当前工作树）+ 一个 6 秒的慢用例拉开窗口，
+  升级进行中执行 `stop` 必须被明确拒绝。修复前该用例失败（`stop` 会成功打印「已停止」）。
+
+### Fixed
 #### 空闲的仪表盘也在每 10s 白跑 330ms 的同步聚合（src/dshhome/store.js + src/api/routes.js）
 - **现象**：`/api/usage` 的 8 个同步 SQLite 聚合在 40k 会话下合计约 330ms，而 `node:sqlite` 没有
   异步接口 —— 这期间 HTTP/SSE/心跳全停。原先的服务端记忆只按**时间**（10s TTL）失效，于是

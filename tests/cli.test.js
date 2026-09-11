@@ -404,3 +404,115 @@ test('CLI: upgrade 在没有上游分支时给出可照做的提示', async t =>
       return true;
     });
 });
+
+// 审查实测：`hwb serve --port 4399`（配置里是别的端口）时，`stop` 打印「已停止」并 exit 0，
+// 而 4399 上的服务照常返回 200；紧接着 `hwb start` 会再起一个后台服务 —— 两个进程共用同一个
+// hwb.db 与同一个 hwb.log。根因是 stop/status/doctor 只看**配置里**的端口。
+// 现在前台 serve 会把生效端口写进 <HWB_DIR>/service.port，三个命令都先看它。
+test('CLI: 前台 serve 用了非配置端口时，stop 不得谎报已停止', async (t) => {
+  const { dir, run } = await fixture(t);
+  const cfgPort = await port();
+  const servePort = await port();
+  await run('config', 'set', 'port', String(cfgPort));
+  const child = spawn(process.execPath, [cli, 'serve', '--port', String(servePort)],
+    { env: { ...process.env, HWB_DIR: dir }, stdio: 'ignore' });
+  t.after(() => { try { child.kill('SIGKILL'); } catch { /* 已经退出 */ } });
+  // 等它起来
+  let up = false;
+  for (let i = 0; i < 60 && !up; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    up = await fetch(`http://127.0.0.1:${servePort}/api/homes`).then((r) => r.ok, () => false);
+  }
+  assert.equal(up, true, '前置条件：前台 serve 已在非配置端口上服务');
+  assert.ok(fs.existsSync(path.join(dir, 'service.port')), '生效端口必须被记下来');
+
+  const status = await run('status').then((r) => r.stdout, (e) => e.stdout ?? '');
+  assert.match(status, /running/, `status 必须报 running（实际 ${status.trim()}）`);
+
+  const stopped = await run('stop').then(() => 'ok', (e) => e.message);
+  assert.match(String(stopped), /前台运行|Ctrl-C/, `stop 必须指出服务还在（实际 ${stopped}）`);
+  const still = await fetch(`http://127.0.0.1:${servePort}/api/homes`).then((r) => r.ok, () => false);
+  assert.equal(still, true, '服务仍在服务（stop 不该声称已停止）');
+});
+
+// service.log 是子进程 stdout/stderr 的重定向目标，append-only 且从不轮转 ⇒ 可能几百 MB。
+// 原先整份 readFileSync + split：审查实测 433 MB → 1.80s 阻塞、峰值 RSS 1.98 GB（≈4.5×文件大小）。
+// 这里用一个 100 MB 的日志 + `--max-old-space-size=128` 复现同一形状：整份读会 OOM，
+// 只读尾部则照常给出「最后一个 hwb: 提示块」。同时在文件**开头**放一个陈旧的提示块 ——
+// 它绝不能被当成这一次的原因（这也是「取最后一个」这条语义在大文件下的回归）。
+test('CLI: 启动失败的诊断只读日志尾部（100 MB 的 service.log 也不会整份读进内存）', async (t) => {
+  const { dir, run } = await fixture(t);
+  const busy = await port();
+  await run('config', 'set', 'port', String(busy));
+  // 占住配置端口，让 start 必然失败
+  const blocker = net.createServer((s) => s.destroy());
+  await new Promise((r) => blocker.listen(busy, '127.0.0.1', r));
+  t.after(() => new Promise((r) => blocker.close(r)));
+
+  const logFile = path.join(dir, 'service.log');
+  const fd = fs.openSync(logFile, 'w');
+  fs.writeSync(fd, 'hwb: 很久以前的旧原因（不该被当成这一次）\n  /tmp/OLD-backup/hwb.db\n');
+  const line = 'x'.repeat(1023) + '\n';
+  const chunk = Buffer.from(line.repeat(1024));   // ~1 MiB
+  for (let i = 0; i < 100; i++) fs.writeSync(fd, chunk);   // ~100 MB
+  fs.closeSync(fd);
+
+  const capped = (...args) => exec(process.execPath, [cli, ...args], {
+    env: { ...process.env, HWB_DIR: dir, NODE_OPTIONS: '--max-old-space-size=128' }, timeout: 30000,
+  });
+  let message = '';
+  try { await capped('start'); } catch (e) { message = `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`; }
+  assert.match(message, /已被占用|无法启动/, `必须给出本次的真实原因（实际 ${message.slice(0, 300)}）`);
+  assert.doesNotMatch(message, /很久以前的旧原因/, '不能把日志开头的陈旧提示块当成这一次的原因');
+});
+
+// `hwb upgrade` 会跑 `git pull` + 整套测试（几十秒），期间事件循环被 spawnSync 阻塞。
+// 原先它**不持有启停锁**，而且最后无条件 restart —— 审查实测：用户在升级期间 `hwb stop`
+// （成功、退出码 0），升级结束后服务被**又拉起来了**，两条命令谁都不报冲突。
+// 修复：upgrade 也持锁（于是并发的启停命令会被明确拒绝，而不是「成功后被静默撤销」），
+// 重启前再复核一次运行状态。
+//
+// 这里用**仓库副本**（含当前工作树，不是 HEAD）：upgrade 只作用于 CLI 自己所在的仓库，
+// 所以必须在副本里跑；把副本的 tests/ 换成一个 6 秒的慢用例，把窗口拉开。
+test('CLI: upgrade 全程持有启停锁（并发 stop 必须被明确拒绝）', async (t) => {
+  const root = path.resolve(path.dirname(cli), '..');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-upgrade-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const copy = path.join(base, 'repo');
+  const bare = path.join(base, 'upstream.git');
+  const state = path.join(base, 'state');
+  fs.mkdirSync(copy, { recursive: true });
+  await exec('/bin/sh', ['-c', `tar -C ${JSON.stringify(root)} --exclude=.git --exclude=node_modules -cf - . | tar -C ${JSON.stringify(copy)} -xf -`]);
+
+  const g = (...args) => exec('git', ['-c', 'user.email=t@example.invalid', '-c', 'user.name=t', ...args], { cwd: copy, timeout: 30000 });
+  await g('init', '-q', '-b', 'main');
+  // 把整套测试换成一个 6 秒的慢用例：upgrade 的窗口就是 test() 这一步
+  fs.rmSync(path.join(copy, 'tests'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(copy, 'tests'));
+  fs.writeFileSync(path.join(copy, 'tests', 'slow.test.js'),
+    "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\ntest('slow', async () => { await new Promise((r) => setTimeout(r, 6000)); assert.ok(true); });\n");
+  await g('add', '-A');
+  await g('commit', '-q', '-m', 'init');
+  await g('init', '-q', '--bare', bare);
+  await g('remote', 'add', 'origin', bare);
+  await g('push', '-q', '-u', 'origin', 'main');
+
+  const env = { ...process.env, HWB_DIR: state };
+  const upgrade = spawn(process.execPath, [path.join(copy, 'src/cli.js'), 'upgrade'],
+    { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let upgradeOut = '';
+  upgrade.stdout.on('data', (d) => { upgradeOut += d; });
+  upgrade.stderr.on('data', (d) => { upgradeOut += d; });
+  const done = new Promise((r) => upgrade.on('exit', (code) => r(code)));
+  t.after(() => { try { upgrade.kill('SIGKILL'); } catch { /* 已退出 */ } });
+
+  await new Promise((r) => setTimeout(r, 2500));   // 等它进入 test() 阶段（此时锁已被持有）
+  const stopOut = await exec(process.execPath, [path.join(copy, 'src/cli.js'), 'stop'], { env, timeout: 20000 })
+    .then((r) => r.stdout, (e) => `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`);
+  assert.match(stopOut, /另一个启停命令/,
+    `升级期间并发 stop 必须被明确拒绝（否则它会「成功」又被升级撤销），实际：${stopOut.trim().slice(0, 200)}`);
+
+  const code = await done;
+  assert.equal(code, 0, `upgrade 应正常结束，实际 ${code}；输出：${upgradeOut.slice(-300)}`);
+  assert.match(upgradeOut, /升级及测试完成/);
+});
