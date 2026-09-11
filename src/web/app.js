@@ -555,6 +555,16 @@ async function handleAction(e) {
       case 'remove-endpoint':
         btn.closest('.endpoint-row').remove();
         break;
+      case 'clear-endpoint-token': {
+        // 服务端不再回传 token，所以「清除」必须在界面上显式表达一次：
+        // 标记这一行，由 readEndpoints 转成 tokenClear: true（留空只是「保持不变」）。
+        const row = btn.closest('.endpoint-row');
+        row.dataset.tokenClear = '1';
+        const state = row.querySelector('[data-token-state]');
+        if (state) state.textContent = '保存后清除 token';
+        btn.disabled = true;
+        break;
+      }
       case 'choose-channel': {
         const home = lastHomes.find((h) => h.homeId === btn.dataset.homeId);
         if (!home || (home.endpoints?.length || 0) < 2) break;

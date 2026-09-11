@@ -4,8 +4,12 @@ export function endpointRow(endpoint = {}, remote = true, activeId = null) {
   return `<div class="endpoint-row" data-endpoint-id="${esc(endpoint.id || '')}" data-legacy-label="${esc(endpoint.label || '')}">
     ${remote ? `<label class="config-field"><span>SSH 主机</span><input data-field="host" placeholder="例如 bot@cms.lo" value="${esc(endpoint.host || '')}" autocomplete="off"></label>` : ''}
     <label class="config-field"><span>dsh web 端口</span><input data-field="port" type="number" min="1" max="65535" placeholder="例如 3080" value="${esc(endpoint.port || '')}"></label>
-    <label class="config-field endpoint-token"><span>鉴权 Token <small>可选</small></span><input data-field="token" placeholder="留空自动读取" value="${esc(endpoint.token || '')}" autocomplete="off"></label>
-    <div class="endpoint-row-actions"><span class="meta">${endpoint.id && endpoint.id === activeId ? '当前选用' : ''}</span><button type="button" data-action="remove-endpoint">移除</button></div>
+    <label class="config-field endpoint-token"><span>鉴权 Token <small>可选</small></span><input data-field="token"
+      placeholder="${endpoint.tokenSet ? '已配置，留空保持不变' : '留空自动读取'}" value="" autocomplete="off"
+      ${endpoint.tokenSet ? 'data-token-set="1"' : ''}></label>
+    <div class="endpoint-row-actions"><span class="meta">${endpoint.id && endpoint.id === activeId ? '当前选用' : ''}${
+      endpoint.tokenSet ? '<span data-token-state>已配置 token</span>' : ''}</span>${
+      endpoint.tokenSet ? '<button type="button" data-action="clear-endpoint-token">清除 token</button>' : ''}<button type="button" data-action="remove-endpoint">移除</button></div>
   </div>`;
 }
 
@@ -18,11 +22,19 @@ export function endpointEditor(home) {
   </fieldset>`;
 }
 
+// 服务端不再回传端点 token（它是控制凭据），所以这里也必须改语义：
+//   · 输入框留空 → **不传 token 字段**，服务端沿用已存的那个（否则「打开设置再保存」= 静默清除）；
+//   · 用户点了「清除 token」→ 传 tokenClear: true；
+//   · 用户填了新值 → 正常传 token。
 export function readEndpoints(form) {
   return [...form.querySelectorAll('.endpoint-row')].map((row) => {
     const read = (name) => row.querySelector(`[data-field="${name}"]`)?.value.trim() || '';
-    return { id: row.dataset.endpointId || undefined, label: row.dataset.legacyLabel || '', host: read('host') || null,
-      port: Number(read('port')), token: read('token') || null };
+    const typed = read('token');
+    const out = { id: row.dataset.endpointId || undefined, label: row.dataset.legacyLabel || '',
+      host: read('host') || null, port: Number(read('port')) };
+    if (typed) out.token = typed;
+    else if (row.dataset.tokenClear === '1') out.tokenClear = true;
+    return out;
   });
 }
 

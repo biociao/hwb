@@ -15,11 +15,36 @@ import { readFilePreview, resolveUploadDir, writeUpload, UPLOAD_BYTES, sessionWo
 // （实测就是这样拿到明文 SUPER-SECRET-LAUNCH-TOKEN 的）。界面并不需要它 —— 带 token 的 iframe 入口
 // 由 `POST /homes/{id}/open` 现取现用（`inst.iframeUrl || inst.url`），
 // 而部分更新（PATCH）只在客户端**显式**传 token 时才改它，所以读接口不再回传不会破坏任何流程。
-// 注意：endpoints[] 里的 token 是「连接端点」各自的字段，端点编辑器需要它做预填，保持原样。
+// endpoints[] 里的 token 是**同一类凭据**（每个连接端点一个），原先一并回传 —— 理由是端点编辑器
+// 需要它做预填，否则保存时会把 token 抹掉。现在改成「不回传 + 留空即保持不变」：
+// 出站时把值换成 `tokenSet: true`，更新时客户端不传 token 就沿用已存的那个（见 mergeEndpointTokens）。
+// 这样既不再把凭据交给浏览器，也不会让「打开设置再保存」变成一次静默清除。
 function publicHome(home) {
   if (!home || typeof home !== 'object') return home;
-  const { token, ...rest } = home;
-  return rest;
+  const { token, endpoints, ...rest } = home;
+  return {
+    ...rest,
+    endpoints: Array.isArray(endpoints)
+      ? endpoints.map(({ token: epToken, ...ep }) => ({ ...ep, tokenSet: Boolean(epToken) }))
+      : endpoints,
+  };
+}
+
+// 「留空即保持不变」的合并语义（端点 token）。
+// 客户端不再收到 token，所以它提交的端点里通常**没有** token 字段：这种情况沿用已存的值。
+// 要清除必须显式表达：`tokenClear: true`（或显式传 `token: ''`）。
+function mergeEndpointTokens(input, existing = []) {
+  if (!Array.isArray(input)) return input;
+  const byId = new Map(existing.map((e) => [e?.id, e]));
+  return input.map((entry) => {
+    if (!entry || typeof entry !== 'object') return entry;
+    const prev = entry.id ? byId.get(entry.id) : null;
+    if (entry.tokenClear === true) return { ...entry, token: null };
+    if (!Object.hasOwn(entry, 'token') || entry.token === undefined) {
+      return { ...entry, token: prev?.token ?? null };
+    }
+    return entry;
+  });
 }
 
 function send(res, status, body) {
@@ -274,7 +299,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       if (body === null) return;
       if (body.endpoints !== undefined) {
         try {
-          body.endpoints = normalizeEndpoints(body.endpoints, body.hostType || 'local');
+          body.endpoints = normalizeEndpoints(mergeEndpointTokens(body.endpoints, []), body.hostType || 'local');
           const first = body.endpoints[0];
           if (first) Object.assign(body, endpointPatch({ hostType: body.hostType || 'local' }, first));
         } catch (error) { send(res, 400, { error: error.message }); return; }
@@ -366,7 +391,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         }
       }
       if (body.endpoints !== undefined) {
-        try { patch.endpoints = normalizeEndpoints(body.endpoints, home.hostType); }
+        try {
+          patch.endpoints = normalizeEndpoints(mergeEndpointTokens(body.endpoints, home.endpoints), home.hostType);
+        }
         catch (error) { send(res, 400, { error: error.message }); return; }
       }
       if (typeof body.serverId === 'string') patch.serverId = body.serverId.trim() || null;

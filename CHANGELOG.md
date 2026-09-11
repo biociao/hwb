@@ -366,6 +366,20 @@ Semantic Versioning.
 - **顺带修文档**：`README-dsh-remote-web.md` 里两处仍写着隧道状态文件在 `/tmp/.dsh-remote-web.*`，
   而代码早已迁到 `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/`（同一文档后面自己还写着「已从 /tmp 迁出」）。
 
+#### 端点 token 仍然会回传到浏览器（src/api/routes.js + src/web/components/endpoint-editor.js）
+- **现象**（独立审查第 8 轮）：上一轮只收掉了实例级 `token`，`endpoints[].token` 照旧明文回传
+  （实测 `grep SECRET-EP-TOKEN` 命中两个端点）。当时留它的理由是「端点编辑器要预填，否则保存会抹掉」——
+  理由成立，但结论不该是「那就继续交出去」。
+- **修复**：出站把端点 token 换成 `tokenSet: true`（界面据此提示「已配置」），同时把「留空」的语义
+  从「清空」改成「保持不变」：服务端按端点 id 合并，客户端不传 `token` 字段就沿用已存值，
+  要清除必须显式 `tokenClear: true`（编辑器里对应一个「清除 token」按钮）。
+  这样凭据不再交给浏览器，而「打开设置 → 直接保存」也不会静默清掉 token。
+- **回归测试**：`tests/api-token-exposure.test.js` 新增一条（真 HTTP + 真 store）：响应里不得出现
+  端点 token、必须给 `tokenSet`；留空保存保留原值（并确认 label 改动生效）、`tokenClear` 只清被标记
+  的那一个、显式传新值能设置。`tests/form-draft.test.js` 断言编辑器的读写语义（留空不带字段、
+  填了才传、点清除才传 `tokenClear`）。修复前三条相关用例都失败。
+- **README**：「安全边界」里那条「端点 token 仍会回传」的说明随之更新为现在的语义。
+
 #### 日志脱敏的「值」只吃前缀；`getLogs({limit:0})` 会倒出整个环缓冲（src/lib/logger.js）
 - **现象**（独立审查第 7 轮）：
   · 值字符集写的是 `[A-Za-z0-9_-]`，于是 `token=abc+DEF/ghi==` 只被脱敏成

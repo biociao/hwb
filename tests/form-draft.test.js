@@ -164,3 +164,28 @@ test('usage-cache: 窗口内复用、换周期不复用、过期后重新取', a
   cache.invalidate();
   assert.equal(cache.peek('30:24'), null, '主动切换周期时应丢弃缓存');
 });
+
+// 端点 token 的界面语义：服务端不再回传它，所以保存时**留空必须等于保持不变**，
+// 否则「打开设置 → 直接点保存」会静默清除所有端点的 token。
+test('endpoint-editor: 留空不传 token、填了才传、点清除才传 tokenClear', async () => {
+  const { endpointRow, readEndpoints } = await import('../src/web/components/endpoint-editor.js');
+  // 行 HTML 不再把 token 写进 value，只提示「已配置」
+  const html = endpointRow({ id: 'ep-1', label: 'l', host: 'bot@x', port: 3080, tokenSet: true }, true, 'ep-1');
+  assert.doesNotMatch(html, /value="[^"]*EP-SECRET/, '页面里不该出现 token 值');
+  assert.match(html, /已配置，留空保持不变/);
+  assert.match(html, /clear-endpoint-token/, '应提供显式的清除入口');
+
+  // 用一个极简 DOM stub：只需要 querySelectorAll('.endpoint-row') 与每个行的 data-*
+  const rows = [
+    { dataset: {}, q: { host: 'bot@x', port: '3080', token: '' } },
+    { dataset: {}, q: { host: 'bot@y', port: '3080', token: 'NEW-TOK' } },
+    { dataset: { tokenClear: '1' }, q: { host: 'bot@z', port: '3080', token: '' } },
+  ];
+  const form = { querySelectorAll: () => rows.map((r) => ({ dataset: r.dataset,
+    querySelector: (sel) => ({ value: r.q[sel.match(/"(\w+)"/)[1]] }) })) };
+  const out = readEndpoints(form);
+  assert.deepEqual(out[0], { id: undefined, label: '', host: 'bot@x', port: 3080 }, '留空 → 不带 token 字段');
+  assert.equal(out[1].token, 'NEW-TOK', '填了才传 token');
+  assert.equal(out[2].tokenClear, true, '显式清除');
+  assert.equal('token' in out[2], false, 'tokenClear 时不要再带 token 字段');
+});
