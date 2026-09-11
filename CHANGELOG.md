@@ -203,6 +203,24 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 实时状态保护把「已从实时列表消失的会话」永久钉在「运行中」（src/dshhome/store.js）
+- **现象**：某个会话在 dsh 里被归档/关掉之后，工作台上会一直显示它是「运行中」，而且**永不纠正**
+  （直到 dsh 停止）。`/api/sessions/recent` 里它的 `status` 是 `running 运行中`、活跃时间冻在最后一次，
+  排序也跟着错位；`sessionCount`/运行中计数一并虚高。
+- **根因（A/B 复现，3/3 一致）**：上一轮为「索引器把实时徽标打回陈旧值」加的保护是
+  「替换前记下该 home 所有非 NULL 的 status，替换后写回」。而轮询器每 3s 写一次，只要 dsh 里
+  **还有任意一个**会话活着，`LIVE_GRACE_MS`（10s）就永远成立 —— 于是这层保护会把该 home
+  **每一条**会话的 status 都写回，包括实时列表里**已经不存在**的那些。文件索引从此再也清不掉它，
+  幽灵行清理只删 `liveOnly=1` 的行也救不了，`RUNNING_STALE_MS` 的陈旧度闸门同样被绕过。
+  实测（同一夹具，只换代码版本）：修复前 `s2=running s1=running`，修复后 `s2=running s1=idle`（期望值）。
+  这正是本项目已声明修过的「18/179 个会话永久标成运行中」那个缺陷类。
+- **修复**：`applyLiveStatus` 额外记账「**这次**实时列表里的 sessionId 集合」（`#liveIds`，按 home），
+  `upsertRows` 回写 status/lastActivity 时只认集合内的会话；不在集合里的退回文件索引推导值。
+  空列表也记成**空集合**（「dsh 当前没有会话」是有效信息），而读取失败（非数组）不动账本
+  —— 那是「不知道」，不是「没有」。
+- **回归测试**：`tests/live-status-restore.test.js`（3 个用例：实时列表缩小、列表变空、读取失败）。
+  前两个用例在修复前失败（`not ok`），修复后通过。
+
 #### SSH 主机名里的控制字符能一路走到 spawn，并让 sshBash 变成 rejection（src/lib/endpoints.js + src/control/remote.js）
 - **现象**：主机名校验用的是 `\s`，而 `\s` **不匹配** `\0`（也不匹配 `\x01` 之类），
   于是 `"bot@x\0y"` 能通过校验并落库。等它被用于 ssh 时，Node 的 `spawn` 因为「参数不能含 NUL」

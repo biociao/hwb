@@ -225,9 +225,12 @@ function safeJsonParse(raw, fallback, label) {
 export class IndexStore {
   // homeId -> 最近一次实时状态写入时间（见 liveStatusAt/applyLiveStatus）
   #liveWrittenAt;
+  // homeId -> **最近一次实时列表里的 sessionId 集合**（见 applyLiveStatus/upsertRows）
+  #liveIds;
   constructor(dbPath = ':memory:') {
     this.db = new DatabaseSync(dbPath);
     this.#liveWrittenAt = new Map();
+    this.#liveIds = new Map();
     this.dbPath = dbPath;
     try {
       this.db.exec(SCHEMA);   // 建表 + 建触发器（在只读库上这一步就会写失败）
@@ -566,8 +569,20 @@ export class IndexStore {
         // 索引器把它打回「空闲」）。只要这个 home 最近有实时写入，就在替换前记下这两列、替换后写回。
         // 只在实时通道**确实在写**的时间窗内让步：通道停了（实例停止、RPC 连续失败）就没有实时写入，
         // 宽限期一过文件索引重新拿到权威 —— 否则会退化成「会话永远挂着旧徽标」那个已修的缺陷。
-        if (Date.now() - this.liveStatusAt(home.homeId) < LIVE_GRACE_MS) {
-          const live = this.db.prepare('SELECT sessionId, status, lastActivity FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(home.homeId);
+        //
+        // 但「宽限期内有实时写入」**不等于**「这一行现在还有实时支撑」：轮询器每 3s 写一次，
+        // 只要 dsh 里还有**任意一个**会话活着，宽限期就永远成立，于是这层保护会把该 home **所有**
+        // 非 NULL 的 status 一起写回 —— 包括实时列表里已经不存在的那些会话（dsh 里归档/关掉的）。
+        // 实测（A/B，3/3 一致）：s1 一小时前活跃（文件推导为 idle）、实时列表只报 s2，保护前
+        // s1=idle s2=running（正确），加了保护后 s1=running s2=running —— 文件索引再也清不掉它，
+        // 幽灵清理只删 liveOnly=1 的行，于是这个错误徽标一直挂到 dsh 停止为止。这正是本项目
+        // 已经修过的「会话永久显示运行中」缺陷类（CHANGELOG 里那 18/179 个会话），而且比它更糟：
+        // 它绕过了 lib/status.js 的 RUNNING_STALE_MS 陈旧度闸门，把 60s 的陈旧变成永久。
+        // 所以只对**当前实时列表里确实存在的**会话保留（#liveIds 由 applyLiveStatus 记账）。
+        const liveIds = this.#liveIds.get(home.homeId);
+        if (liveIds && Date.now() - this.liveStatusAt(home.homeId) < LIVE_GRACE_MS) {
+          const live = this.db.prepare('SELECT sessionId, status, lastActivity FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(home.homeId)
+            .filter((r) => liveIds.has(r.sessionId));
           if (live.length) preservedLiveStatus.set(home.homeId, live);
         }
         for (const table of CHILD_TABLES) {
@@ -718,6 +733,12 @@ export class IndexStore {
 
   applyLiveStatus(homeId, live) {
     if (!this.getHome(homeId) || !Array.isArray(live)) return;
+    // 记账「这次实时列表里有哪些会话」：upsertRows 在宽限期内回写 status/lastActivity 时
+    // 只认这些 sessionId（见那里的注释）。空列表同样是**有效信息**（dsh 当前没有会话），
+    // 所以要记空集合而不是留着上一次的集合 —— 否则宽限期内还按旧的集合回写陈旧状态。
+    // 读取失败（非数组）在上面就 return 了，不动账本：那才是「不知道」，不是「没有」。
+    const liveIds = new Set(live.map((l) => l?.sessionId).filter(Boolean));
+    this.#liveIds.set(homeId, liveIds);
     if (!live.length) {
       this.db.prepare('DELETE FROM sessions WHERE homeId = ? AND liveOnly = 1').run(homeId);
       // 如果 projcache 域正降级，剩下的会话行是**上次成功索引**的冻结快照，谁也刷新不了它们
@@ -736,7 +757,6 @@ export class IndexStore {
     // 实测在实时列表里移除一条会话后，它整整 70 秒（直到下一轮文件索引）都还在，
     // 而在 projcache 降级时是**永久**的（文件索引永远覆盖不了它）。
     // 逐行删而不是 `sessionId NOT IN (...)`：实时列表可能有几千条，SQL 变量数有上限。
-    const liveIds = new Set(live.map((l) => l?.sessionId).filter(Boolean));
     const ghosts = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND liveOnly = 1').all(homeId);
     if (ghosts.length) {
       const del = this.db.prepare('DELETE FROM sessions WHERE id = ?');
