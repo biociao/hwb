@@ -359,9 +359,26 @@ function openFile() {
     // 0700/0600：日志里有本地路径、会话标题等，且这是每个用户自己的私有状态目录。
     // 原先 openSync 不带 mode → 0666 & ~umask = 0644（实测 ~/.hwb/hwb.log 就是 -rw-r--r--），
     // 同机其它用户可读。已存在的旧文件也要纠正权限，否则升级后仍是 0644。
-    fs.mkdirSync(path.dirname(config.file), { recursive: true, mode: 0o700 });
+    const dir = path.dirname(config.file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // `mkdirSync` 的 mode 只对新目录生效：**已存在**的目录（老版本建的 0755）不会被改动。
+    // 而目录可遍历就等于泄露了里面有什么（config.json / hwb.db 的存在与名字），
+    // 所以这里显式收一次。与 src/service.js 同一套白名单：HWB_DIR 被误设成 /tmp、$HOME、/
+    // 这类共享位置时**不**动权限（那会把不属于 hwb 的目录重新授权）。
+    try {
+      const resolved = path.resolve(dir);
+      const shared = new Set(['/', path.resolve(os.homedir()), path.resolve(os.tmpdir()),
+        (() => { try { return fs.realpathSync(os.tmpdir()); } catch { return ''; } })()]);
+      if (!shared.has(resolved)) fs.chmodSync(resolved, 0o700);
+    } catch { /* 尽力而为 */ }
     fileFd = fs.openSync(config.file, 'a', 0o600);
     try { fs.fchmodSync(fileFd, 0o600); } catch { /* 某些文件系统不支持，忽略 */ }
+    // 轮转代（.1/.2）也要收权限：它们由**老版本**以 0644 写出，里面同样有 `?token=…`
+    // （审查实测：一次轮转后 .1 变成 0600，而被它顶到 .2 的那一代仍是 0644 且含旧 token ——
+    // 升级路径下这个泄露一直留着）。fchmod 只作用于活文件的 fd，所以这里按路径收。
+    for (let i = 1; i <= KEEP_ROTATED; i++) {
+      try { fs.chmodSync(`${config.file}.${i}`, 0o600); } catch { /* 不存在/不支持：忽略 */ }
+    }
   } catch (e) {
     reportFileError(e);
   }

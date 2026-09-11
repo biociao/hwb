@@ -216,3 +216,33 @@ test('结构: 任何从 logger() 取到的日志对象都不得被当成函数�
   }
   assert.deepEqual(offenders, [], `logger 返回的是对象，不能直接调用：\n${offenders.join('\n')}`);
 });
+
+// 权限收紧原先只覆盖**活文件**：`mkdirSync(..., mode:0o700)` 对已存在的目录无效，
+// 而轮转代 `.1/.2` 是**老版本**以 0644 写的（里面同样有 `?token=…`，本文件自己的注释就写了
+// 「实测有 44 处 ?token=」）。审查实测：一次轮转后 .1 变 0600，而被它顶到 .2 的那一代仍是 0644。
+test('轮转代（.1/.2）与已存在的目录也要收权限（升级路径下 token 不再留在 world-readable 文件里）', async (t) => {
+  if (process.platform === 'win32') return t.skip('权限位在 Windows 上没有意义');
+  const { mkdtemp, mkdir, writeFile, chmod, stat, readFile, rm } = await import('node:fs/promises');
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-logperm-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sub = path.join(dir, 'state');
+  const file = path.join(sub, 'hwb.log');
+  await mkdir(sub, { recursive: true });
+  await chmod(sub, 0o755).catch(() => {});
+  await writeFile(file, 'x\n', { mode: 0o644 });
+  await writeFile(`${file}.1`, 'dsh web: http://127.0.0.1:3080/?token=OLDTOKEN1\n', { mode: 0o644 });
+  await writeFile(`${file}.2`, 'x\n', { mode: 0o644 });
+  await chmod(file, 0o644).catch(() => {});
+  await chmod(`${file}.1`, 0o644).catch(() => {});
+  await chmod(`${file}.2`, 0o644).catch(() => {});
+  assert.equal((await stat(sub)).mode & 0o777, 0o755, '前置条件：目录是旧版本留下的 0755');
+  assert.equal((await stat(`${file}.2`)).mode & 0o777, 0o644, '前置条件：.2 是 world-readable');
+
+  initLogger({ level: 'info', file, color: false });
+  logger('sec').info('upgrade path');
+  assert.equal((await stat(sub)).mode & 0o777, 0o700, '已存在的状态目录必须被收紧到 0700');
+  for (const f of [file, `${file}.1`, `${file}.2`]) {
+    assert.equal((await stat(f)).mode & 0o777, 0o600, `${f} 应收紧到 0600`);
+  }
+  assert.match(await readFile(`${file}.1`, 'utf8'), /OLDTOKEN1/, '内容不受影响（只是权限）');
+});

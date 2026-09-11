@@ -243,6 +243,27 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 日志权限收紧漏了轮转代与「已存在的目录」（src/lib/logger.js）
+- **现象（审查实测）**：先造出升级前的遗留状态（目录 0755、live/.1/.2 全 0644，`.1` 里有
+  `?token=OLDTOKEN1`），再让日志轮转一次 —— 结果是 `live=0600`、**`.1=0600`、`.2 仍是 0644**，
+  且 `.2` 里那份旧 token 仍对同机其它用户可读；目录也仍是 0755（能被遍历，
+  等于泄露 `config.json` / `hwb.db` 的存在与名字）。
+- **根因**：`mkdirSync(..., { mode: 0o700 })` 只对**新建**目录生效；权限收紧只作用于活文件的 fd
+  （`fchmodSync`），被轮转到 `.2` 的那一代没人管。
+- **修复**：`openFile()` 里显式 `chmodSync(dir, 0o700)`（沿用 `src/service.js` 的共享目录白名单：
+  HWB_DIR 指向 `/`、`$HOME`、`os.tmpdir()` 时**不**动权限），并对 `.1`/`.2` 各 `chmodSync(0o600)`。
+- **回归测试**：`tests/logger-security.test.js` —— 预置 0755 目录 + 三个 0644 文件（含旧 token），
+  初始化后必须全部收紧到 0700/0600 且内容不变。修复前失败。
+
+#### 上传被 kill -9 后在用户项目目录里留下永久暂存目录（src/lib/file-preview.js）
+- **现象（审查实测）**：上传中途 `kill -9` → 项目目录里留下 `.hwb-upload-Zoj1DL/part`（32 MB），
+  谁都不会清（`commit` 的 finally 只覆盖本进程内的失败路径，SIGKILL 不可捕获），
+  而且它会出现在文件列表里 —— 用户看到一个叫 `part` 的目录，无从判断。
+- **修复**：`sweepStaleStaging()` —— 构造上传器时扫同目录的 `.hwb-upload-*`，删掉 mtime 早于
+  1 小时的（正常上传 ≤256 MiB 不可能写这么久，所以正在写的不会被误删）。
+- **回归测试**：`tests/file-upload.test.js`（陈旧目录必须消失、正在写的必须留下）。修复前失败。
+
+### Fixed
 #### 降级窗口里「已不在实时列表」的会话永远挂着「运行中」（src/dshhome/store.js）
 - **现象（审查实测）**：dsh 升级到 hwb 还不认识的 `unit.version` 时（代码自己写着这是「必然情形」），
   projcache 域降级、sessions 表的整表替换被跳过。此时在 dsh 里关掉一个会话 →

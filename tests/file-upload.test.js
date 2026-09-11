@@ -425,3 +425,28 @@ test('localUploader: commit 失败（link 报错）也要清掉自己的暂存�
   await assert.rejects(staged.commit(), /ENOENT/, 'link 失败应把错误抛出来');
   assert.deepEqual(await readdir(target), [], 'commit 失败也不该留下暂存目录');
 });
+
+// `.hwb-upload-*` 建在**用户的项目目录**里；commit 的 finally 只覆盖本进程内的失败路径 ——
+// 进程被 kill -9 / 机器重启（SIGKILL 不可捕获）留下的目录谁都不会清。
+// 审查实测：上传中途 kill -9 → 目录里留下 `.hwb-upload-Zoj1DL/part`（32 MB，永久），
+// 而且它会出现在文件列表里（用户看到一个叫 part 的目录）。现在上传前顺手清掉过期的。
+test('localUploader: 过期的暂存目录会被清掉，正在写入的不会被误删', async (t) => {
+  const { utimes, stat } = await import('node:fs/promises');
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-stage-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  // ① 陈旧（mtime 2 小时前）：应被清掉
+  const stale = path.join(dir, '.hwb-upload-OLD');
+  await mkdir(stale, { recursive: true });
+  await writeFile(path.join(stale, 'part'), 'x'.repeat(1024));
+  const longAgo = new Date(Date.now() - 2 * 3600_000);
+  await utimes(stale, longAgo, longAgo);
+  // ② 正在写（mtime 现在）：必须留下
+  const fresh = path.join(dir, '.hwb-upload-NEW');
+  await mkdir(fresh, { recursive: true });
+  await writeFile(path.join(fresh, 'part'), 'y');
+
+  await localUploader(dir, '.');   // 构造上传器时就会扫一遍
+  await assert.rejects(stat(stale), '陈旧暂存目录应被清掉');
+  assert.ok((await stat(fresh)).isDirectory(), '正在写入的暂存目录不能被误删');
+});

@@ -1,4 +1,4 @@
-import { open, realpath, opendir, lstat, stat, mkdtemp, link, unlink, rm } from 'node:fs/promises';
+import { open, realpath, opendir, lstat, stat, mkdtemp, link, unlink, rm, readdir } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { sshBash } from '../control/remote.js';
@@ -241,8 +241,34 @@ async function localTaken(dir) {
 // 收一个上传的文件：body 由 multipart 解析器边解析边喂进来（options.onFileStart 拿唯一文件名）。
 // 先落隐藏临时文件、写全后再 link 到最终名：任何中断都不会留下「半截但看起来正常」的文件，
 // 也不会把别人刚创建的同名文件覆盖掉（link 撞名即 EEXIST，换个名字重试）。
+// 陈旧暂存目录的清理：`.hwb-upload-*` 建在**用户的项目目录**里，而 commit 的 finally 只能覆盖
+// 本进程内的失败路径 —— 进程被 kill -9、机器重启（SIGKILL 不可捕获）时留下的目录谁都不会清。
+// 审查实测：上传中途 kill -9 → 项目目录里留下 `.hwb-upload-Zoj1DL/part`，32 MB，永远留着；
+// 它还会出现在文件列表里（用户看到一个叫 part 的目录，无从判断它是什么）。
+// 阈值取 1 小时：正常上传（≤256 MiB）不可能写这么久，所以正在写的不会被误删。
+const STAGING_TTL_MS = 60 * 60_000;
+
+export async function sweepStaleStaging(dir, { now = Date.now(), ttlMs = STAGING_TTL_MS } = {}) {
+  let removed = 0;
+  let names;
+  try { names = await readdir(dir); } catch { return 0; }
+  for (const name of names) {
+    if (!name.startsWith('.hwb-upload-')) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = await stat(full);
+      if (!st.isDirectory() || now - st.mtimeMs < ttlMs) continue;
+      await rm(full, { recursive: true, force: true });
+      removed++;
+    } catch { /* 并发删除/权限问题：跳过 */ }
+  }
+  return removed;
+}
+
 export async function localUploader(root, requestedDir) {
   const { dir } = await resolveUploadDir(root, requestedDir);
+  // 顺手清掉上次异常退出留下的暂存目录（尽力而为，失败不影响本次上传）。
+  await sweepStaleStaging(dir).catch(() => {});
   const taken = await localTaken(dir);
   let temp = null, stream = null, active = null, size = 0;
   // 已经 stage（写完、等 commit）的临时目录。stage() 会把 temp 交给 commit 闭包并置空，
