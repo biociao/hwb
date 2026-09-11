@@ -9,6 +9,12 @@
 //   · Content-Length 存在（上传用 XHR 发送 File，浏览器会自动带长度）；缺失时直接拒绝，
 //     因为不做 chunked 解码就无法在写盘前设限。
 //   · 只接受单文件字段，多余部分一律报错而不是静默丢数据。
+//
+// ⚠️ 端到端内存**不是恒定**的：解析器把字节交给同步的 write(chunk)，而落盘写入是异步的，
+// 于是**当前的上传路由**（src/api/routes.js）把每个 chunk 先推进数组、解析完再交给写入端 ——
+// 实测 64 MiB 上传会在解析期间保留约 64 MiB 的 chunk 数组。上限 256 MiB 时是同一量级。
+// 这是有界且短暂的开销（单机工具、单请求），但不要据此声称「内存占用与文件大小无关」；
+// 要改成真流式，需要让解析器支持异步写入端。CHANGELOG 的 [Unreleased] Notes 里有同一条订正。
 export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, onSettle }) {
   // 分隔符一律带前导 CRLF：只匹配 `--boundary` 会误伤头部里的子串（如 "multipart/form-data"
   // 里的 "--b"），也会让「part 体里的 CRLF」和「分隔符前缀」无法区分。
