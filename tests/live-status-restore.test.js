@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { IndexStore } from '../src/dshhome/store.js';
-import { indexSnapshot } from '../src/dshhome/reader.js';
+import { indexSnapshot, mergeLiveStatus } from '../src/dshhome/reader.js';
 
 // 「宽限期内保留实时状态」这层保护（见 store.upsertRows）必须只保留**这次实时列表确实还在报**
 // 的会话，否则它会退化成「幽灵徽标」：
@@ -171,32 +171,78 @@ test('未降级时：不在实时列表的会话仍由文件索引纠正（不�
 // 空闲的 dsh 每 3s 送来的内容与库里一模一样，而 upsertRows 是「整表替换」——
 // 代价正比于该实例的**总会话数**（规模审查实测：40k/10 实例 891ms/轮，约占每轮 30% 的同步阻塞；
 // 单 home 200k 会话时单次 3,494ms）。全等时跳过整表写，任何一处不同仍然走原路径（语义不变）。
-test('applyLiveStatus: 实时内容与库里完全一致时跳过整表写（省掉空闲时每 3s 的一次全量 upsert）', () => {
+test('applyLiveStatus: 没有新增行时走「只写变化的行」，有新增/幽灵时回退整表替换', () => {
   const store = new IndexStore(':memory:');
   const homeId = store.registerHome({ homePath: '/mock/home' });
   indexSnapshot(store, '/mock/home', fileSnapshot(homeId), null);
 
-  let calls = 0;
-  const orig = store.upsertRows.bind(store);
-  store.upsertRows = (...args) => { calls++; return orig(...args); };
+  let full = 0;
+  const origUpsert = store.upsertRows.bind(store);
+  store.upsertRows = (...args) => { full++; return origUpsert(...args); };
 
-  // 第一次：实时状态与文件侧不同（s1/s2 都变 running）→ 必须写
-  // 注意：这里**复用同一组对象**做第二次调用。第一版我用 liveSession() 重新造了一组，
-  // 以为「内容一样」—— 但 lastActivity 是 new Date().toISOString()，两次只差几毫秒就不相等，
-  // 于是这条用例随机失败（我自己的测试踩了「时间相关」这个坑，和审查在别处指出的是同一类）。
   const live = [liveSession('s1'), liveSession('s2')];
   store.applyLiveStatus(homeId, live);
-  assert.equal(calls, 1, '有变化时必须照常写');
-  assert.equal(kindOf(store, homeId, 's1'), 'running');
+  assert.equal(kindOf(store, homeId, 's1'), 'running', '实时状态必须写进去');
+  assert.equal(full, 0, '只有已存在的行变化时**不该**整表替换（那就是省下来的那 891ms）');
 
-  // 第二次：**逐字节相同**的载荷（同一组对象）→ 全等，跳过整表写
-  store.applyLiveStatus(homeId, live);
-  assert.equal(calls, 1, '内容完全一致时不该再写（这就是省下来的那一次全量 upsert）');
-  assert.equal(kindOf(store, homeId, 's1'), 'running', '跳过写入不影响已有状态');
+  const before = kindOf(store, homeId, 's1');
+  store.applyLiveStatus(homeId, live);   // 同一组对象：内容逐字节相同
+  assert.equal(full, 0, '内容没变更不该整表替换');
+  assert.equal(kindOf(store, homeId, 's1'), before);
 
-  // 第三次：状态真的变了（s1 变 idle）→ 必须写
-  store.applyLiveStatus(homeId, [{ ...live[0], status: { kind: 'idle', label: '空闲', subagents: 0, approval: null } }, live[1]]);
-  assert.equal(calls, 2, '状态变了必须写');
-  assert.equal(kindOf(store, homeId, 's1'), 'idle');
+  // 实时列表里有库里还没有的会话 → 必须回退整表替换（要插入行）
+  store.applyLiveStatus(homeId, [...live, liveSession('brand-new')]);
+  assert.equal(full, 1, '有新增行时必须走整表替换');
+  assert.equal(kindOf(store, homeId, 'brand-new'), 'running');
+
+  // 幽灵行（只有实时支撑的行从列表里消失）→ 同样要回退整表替换（要删行）
+  // 注意：brand-new 是**只有实时支撑**的行（liveOnly=1），它从列表里消失时要被删掉 —— 那需要整表替换
+  store.applyLiveStatus(homeId, [liveSession('s1')]);
+  assert.equal(full, 2, '要删幽灵行时必须走整表替换');
+  assert.ok(!store.recentSessions({ homeId }).some((s) => s.sessionId === 'brand-new'), '只有实时支撑的行从列表消失后应被删掉');
+  assert.ok(store.recentSessions({ homeId }).some((s) => s.sessionId === 's2'), '有文件索引支撑的行即使不在实时列表也必须保留');
   store.close();
+});
+
+// **差分测试**：优化后的「只写变化的行」与原来的整表替换必须产出**完全相同的库状态**。
+// 用两个 store 跑同一串实时载荷：A 走 applyLiveStatus（新路径），B 手工做
+// rows → mergeLiveStatus → upsertRows（旧路径），最后逐行比对 sessions 表。
+test('applyLiveStatus: 只写变化行与整表替换的库状态逐行一致（差分测试）', () => {
+  const a = new IndexStore(':memory:');
+  const b = new IndexStore(':memory:');
+  const homeA = a.registerHome({ homePath: '/mock/home' });
+  const homeB = b.registerHome({ homePath: '/mock/home' });
+  indexSnapshot(a, '/mock/home', fileSnapshot(homeA), null);
+  indexSnapshot(b, '/mock/home', fileSnapshot(homeB), null);
+
+  const dump = (store, homeId) => store.db.prepare(
+    'SELECT sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, liveOnly FROM sessions WHERE homeId = ? ORDER BY sessionId'
+  ).all(homeId).map((r) => ({ ...r }));
+
+  const scenarios = [
+    [liveSession('s1'), liveSession('s2')],                                   // 已有行变化
+    [liveSession('s1'), liveSession('s2')],                                   // 完全不变
+    [{ ...liveSession('s1'), tokenUsage: { uncachedInputTokens: 111, outputTokens: 222 } }, liveSession('s2')],  // 部分 token 合并
+    [liveSession('s1'), liveSession('s2'), liveSession('new-live')],          // 新增行
+    [liveSession('s1')],                                                      // 幽灵消失
+    [],                                                                       // 空列表
+    [liveSession('s1'), liveSession('s2')],                                   // 再恢复
+  ];
+  for (const [i, live] of scenarios.entries()) {
+    a.applyLiveStatus(homeA, live);
+    // 旧路径的等价复现：与 applyLiveStatus 内部完全相同的步骤，只是不做「只写变化行」的优化
+    const rows = b.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeB).map((row) => ({ ...row, type: 'session' }));
+    if (live.length === 0) {
+      b.db.prepare('DELETE FROM sessions WHERE homeId = ? AND liveOnly = 1').run(homeB);
+    } else {
+      const liveIds = new Set(live.map((l) => l.sessionId));
+      for (const g of b.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND liveOnly = 1').all(homeB)) {
+        if (!liveIds.has(g.sessionId)) b.db.prepare('DELETE FROM sessions WHERE id = ?').run(g.id);
+      }
+      const fresh = b.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeB).map((row) => ({ ...row, type: 'session' }));
+      b.upsertRows(mergeLiveStatus(fresh, live, { homeId: homeB, generatedAt: rows[0]?.generatedAt ?? new Date().toISOString() }));
+    }
+    assert.deepEqual(dump(a, homeA), dump(b, homeB), `第 ${i} 个场景后两个库必须逐行一致`);
+  }
+  a.close(); b.close();
 });

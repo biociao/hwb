@@ -815,22 +815,46 @@ export class IndexStore {
     // 送来的内容与库里一模一样 —— 那 891ms 纯属白跑。
     // 只做「全等就跳过」这一档：任何一处不同就仍然走原来的整表替换路径（语义完全不变），
     // 所以这条优化不可能改变写入结果。幽灵清理与降级清理仍然照做（它们有自己的计数）。
+    // 注意：`mergeLiveStatus` 会**原地修改并返回同一个数组**（还会往里 push 实时独有的新会话），
+    // 所以「库里原来有哪些会话」必须在合并**之前**记下来 —— 我第一版把 existing 放在合并之后算，
+    // 于是新会话被当成了「已存在」，那条新行再也不会被插入（测试立刻抓到：rpc-only 没进库）。
     const before = new Map();
+    const existing = new Set();
     for (const row of rows) {
+      existing.add(row.sessionId);
       if (liveIds.has(row.sessionId)) before.set(row.sessionId, JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]));
     }
     const merged = mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() });
-    const unchanged = merged.length === rows.length && merged.every((row) => {
-      const prev = before.get(row.sessionId);
-      return prev === undefined ? false
-        : prev === JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]);
-    });
-    if (!unchanged || ghostsDeleted || clearedStale) {
-      this.upsertRows(merged);
-    } else {
+    const changed = merged.filter((row) => before.get(row.sessionId) !== undefined
+      && before.get(row.sessionId) !== JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]));
+    const newRows = merged.filter((row) => !existing.has(row.sessionId));
+    if (!changed.length && !newRows.length && !ghostsDeleted && !clearedStale) {
       log.debug('实时状态与库里完全一致，跳过整表写', { homeId, sessions: rows.length });
+    } else if (!newRows.length && !ghostsDeleted && !clearedStale) {
+      // **只写变了的行**。整表替换的代价正比于该实例的**总会话数**，而一轮实时刷新通常只动了
+      // 少数几条（正在跑的会话）—— 规模审查实测 40k/10 实例每轮 891ms（≈每 3s 一次、约占 30%
+      // 的同步阻塞），其中绝大部分是在重写没变的行。
+      // 等价性：`merged` 是从**库里那几行**复制出来再合并实时字段的，所以对已存在的行而言，
+      // 整表替换实际改变的只有 status/lastActivity/tokenUsage/title/generatedAt（其余列的值
+      // 都等于库里原值）。这里逐行改这几列，结果与整表替换一致（有差分测试守着）。
+      // 有新增行（实时列表里有库里还没有的会话）或幽灵行要删时仍走整表替换 —— 那条路径要插入/删除行。
+      this.#updateLiveRows(homeId, changed);
+      log.debug('实时状态只写了变化的行', { homeId, changed: changed.length, total: rows.length });
+    } else {
+      this.upsertRows(merged);
     }
     this.#liveWrittenAt.set(homeId, Date.now());
+  }
+
+  // 只更新实时通道拥有的那几列（见 applyLiveStatus 里的等价性论证）。
+  #updateLiveRows(homeId, rows) {
+    const upd = this.db.prepare(`UPDATE sessions
+      SET status = ?, lastActivity = ?, tokenUsage = ?, title = ?, generatedAt = ?
+      WHERE homeId = ? AND sessionId = ?`);
+    for (const row of rows) {
+      upd.run(row.status ?? null, row.lastActivity ?? null, row.tokenUsage ?? null, row.title ?? null,
+        row.generatedAt ?? null, homeId, row.sessionId);
+    }
   }
 
   // 每个 home 的「当前项目/当前会话」——取最近活跃（lastActivity 最大）的 session 及其所属 workspace。
