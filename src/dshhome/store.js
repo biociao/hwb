@@ -367,12 +367,22 @@ export class IndexStore {
   // 因此：某域降级时**跳过它对应的表的 DELETE**，保留上次成功的行；其余域照常刷新。
   upsertRows(rows) {
     const homeRows = rows.filter((r) => r.type === 'home');
+    const preservedSessions = new Map(); // homeId -> Map(sessionId -> 上一版的 workspace 归属)
 
     this.db.exec('BEGIN');
     try {
       for (const home of homeRows) {
+        const protectedTables = degradedTables(home.degraded);
+        // 跨表牵连：sessions 的 workspaceId/workspaceTitle/project 是从 workspace.json **推导**出来的
+        // （normalize 反查 workspace.sessionIds）。workspace 域降级时 snapshot.workspaces 为空，
+        // 新产出的会话行 workspaceId 全是 null —— 而 workspaces 表保留着旧行，于是会话与工作区断开：
+        // sessionWorkspace() 直接返回 null，preview / download / upload 对一个完全正常的会话报
+        // 「当前会话尚未关联可用的 project 工作区」，保留的 workspace 也变成孤儿。
+        // 这里把上一版的归属回填到新行上（workspace 域恢复后会被新数据自然覆盖）。
+        // 注意必须在下面的 DELETE **之前**读：workspace 降级时 sessions 本身仍会被替换掉。
+        if (protectedTables.has('workspaces')) preservedSessions.set(home.homeId, this.#sessionWorkspaceLinks(home.homeId));
         for (const table of CHILD_TABLES) {
-          if (degradedTables(home.degraded).has(table)) continue; // 该域降级 → 保留上次成功的行
+          if (protectedTables.has(table)) continue; // 该域降级 → 保留上次成功的行
           this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(home.homeId);
         }
       }
@@ -418,13 +428,19 @@ export class IndexStore {
               JSON.stringify(row.degraded)
             );
             break;
-          case 'session':
+          case 'session': {
+            const link = row.workspaceId == null ? preservedSessions.get(row.homeId)?.get(row.sessionId) : null;
             insSession.run(
-              row.homeId, row.sessionId, row.workspaceId, row.workspaceTitle,
-              row.project, row.title ?? null, row.tokenUsage, row.contextPressure, row.status, row.lastActivity, row.generatedAt,
+              row.homeId, row.sessionId,
+              row.workspaceId ?? link?.workspaceId ?? null,
+              row.workspaceTitle ?? link?.workspaceTitle ?? null,
+              // project 同理：workspace 域降级时它退化成 basename(cwd)，回填上一版更准的值。
+              link?.project ?? row.project,
+              row.title ?? null, row.tokenUsage, row.contextPressure, row.status, row.lastActivity, row.generatedAt,
               row.liveOnly ? 1 : 0
             );
             break;
+          }
           case 'workspace':
             insWorkspace.run(
               row.homeId, row.workspaceId, row.title, row.path,
@@ -457,6 +473,14 @@ export class IndexStore {
     if (!this.getHome(homeId) || !Array.isArray(live)) return;
     if (!live.length) {
       this.db.prepare('DELETE FROM sessions WHERE homeId = ? AND liveOnly = 1').run(homeId);
+      // 如果 projcache 域正降级，剩下的会话行是**上次成功索引**的冻结快照，谁也刷新不了它们
+      // （整表替换被跳过）。此时 dsh 明确报告「没有会话」，那些行上的 status 就一定是陈旧的——
+      // 用户会看到一个永远显示「运行中」的幽灵会话。清掉状态徽标（而不是删行）：UI 退回「空闲」，
+      // 数据仍在，等 projcache 恢复后由文件索引覆盖。
+      const home = this.getHome(homeId);
+      if (degradedTables(home?.degraded).has('sessions')) {
+        this.db.prepare('UPDATE sessions SET status = NULL WHERE homeId = ?').run(homeId);
+      }
       return;
     }
     const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
@@ -500,6 +524,17 @@ export class IndexStore {
     if (!homeId) return null;
     const row = this.db.prepare(`${HOME_SELECT} WHERE h.homeId = ?`).get(homeId);
     return row ? this.#enrichHome(row) : null;
+  }
+
+  // 该 home 现有会话行的 workspace 归属（供 workspace 域降级时回填）。
+  #sessionWorkspaceLinks(homeId) {
+    const map = new Map();
+    for (const row of this.db.prepare(
+      'SELECT sessionId, workspaceId, workspaceTitle, project FROM sessions WHERE homeId = ?'
+    ).all(homeId)) {
+      map.set(row.sessionId, { workspaceId: row.workspaceId, workspaceTitle: row.workspaceTitle, project: row.project });
+    }
+    return map;
   }
 
   #enrichHome(h) {

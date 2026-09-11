@@ -238,7 +238,12 @@ export class Launcher {
       // （见那里的兼容说明），但本机路径一直硬发 —— 于是同一台旧版 dsh 远端能用、本机连不上，
       // 报错只有一句 `unknown option '--no-open'`。这里识别到就摘掉该参数重试一次；
       // 不带 `--no-open` 最多是多弹一个浏览器标签，远比连不上好。
-      if (!/--no-open/.test(error.message) || !/unknown option|unrecognized|invalid option/i.test(error.message)) throw error;
+      //
+      // 判据必须覆盖**完整 stderr**（error.stderr），不能只看 message：commander 会把
+      // `(Did you mean --open?)` 另起一行，message 的尾部于是不含 `--no-open`，
+      // 只看 message 会在真实场景下永远不触发重试（测试里单行的假输出恰好能过）。
+      const diagnostic = `${error.message}\n${error.stderr ?? ''}`;
+      if (!/--no-open/.test(diagnostic) || !/unknown option|unrecognized|invalid option|did you mean/i.test(diagnostic)) throw error;
       log.warn('本机 dsh 不支持 --no-open，去掉该参数重试一次', { homeId: home.homeId });
       return await this.#spawnLocalDsh(home, false);
     }
@@ -309,7 +314,14 @@ export class Launcher {
       proc.kill();
       this.registry.set(home.homeId, { phase: 'stopped', lastError: e.message });
       log.error('启动本地 dsh web 失败', e, { homeId: home.homeId, port, baseUrl, stderr: lastStderr(24) });
-      throw new Error(`dsh web did not come up: ${e.message}${stderr ? ` — ${stderr.trim().split('\n').pop()}` : ''}`);
+      // 消息里带上 stderr 的**最后几行**，而不是只带最后一行：commander 在选项名相近时会把
+      // 建议另起一行输出（`error: unknown option '--no-open'` + `(Did you mean --open?)`），
+      // 只取最后一行就等于把「unknown option」这个关键判据丢掉了（见 #openLocal 的重试判断）。
+      const tail = stderr ? stderr.trim().split('\n').slice(-3).map((l) => l.trim()).join(' | ') : '';
+      const failure = new Error(`dsh web did not come up: ${e.message}${tail ? ` — ${tail}` : ''}`);
+      // 完整 stderr 挂到 error 上：调用方（兼容重试）要按内容判断，不该靠 message 里被截断的片段。
+      failure.stderr = stderr;
+      throw failure;
     }
   }
 

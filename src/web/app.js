@@ -8,7 +8,7 @@ import { connectedHomes, tabHomes } from './instance-state.js';
 import { planPaneNavigation, planPaneRecovery, updatePaneSession } from './instance-navigation.js';
 import { renderInstanceGrid } from './components/instance-grid.js';
 import { renderUsageCard, usageTrendHtml, USAGE_PERIODS } from './components/usage-card.js';
-import { renderHomeForm, renderOnboarding, renderSettingsForm } from './components/add-home.js';
+import { renderHomeForm, renderOnboarding, renderSettingsForm, applyHomeMode } from './components/add-home.js';
 import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLogView, logPanelHtml } from './components/log-panel.js';
 import { captureFormDraft, restoreFormDraft } from './components/form-draft.js';
 
@@ -170,8 +170,13 @@ async function refresh() {
 async function renderDashboard(sequence = refreshSequence) {
   if (lastHomes.length === 0) {
     dashboardEl.dataset.layout = 'onboarding';
+    // 首装时这个表单是唯一的出口，而 monitor 每 30s 就会无条件广播一次 → 重建。
+    // 不保留草稿的话用户每半分钟就被清空一次输入（与 grid 布局同一个问题）。
+    const onboardingDraft = captureAddFormDraft();
     const detected = await api('/api/homes/detect');
+    if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
     dashboardEl.innerHTML = renderOnboarding(detected);
+    restoreAddFormDraft(onboardingDraft);
     return;
   }
   dashboardEl.dataset.layout = 'grid';
@@ -196,8 +201,7 @@ async function renderDashboard(sequence = refreshSequence) {
   lastUsage = usage;
   const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
-  const addForm = dashboardEl.querySelector('#add-home');
-  const draft = showAddForm ? captureFormDraft(addForm, document.activeElement) : null;
+  const draft = captureAddFormDraft();
   dashboardEl.innerHTML = renderWorkbench({
     projects: connectedIds.size ? renderRecentProjects(projects.filter((p) => connectedIds.has(p.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
     sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId))) : '<div class="empty">连接实例后显示对应会话</div>',
@@ -208,9 +212,10 @@ async function renderDashboard(sequence = refreshSequence) {
   logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
   if (showAddForm) {
     dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm());
-    if (!restoreFormDraft(dashboardEl.querySelector('#add-home'), draft)) {
-      dashboardEl.querySelector('#add-home input[name=homePath]')?.focus();
-    }
+    const form = dashboardEl.querySelector('#add-home');
+    const restored = restoreFormDraft(form, draft); // 内部会重放模式（显隐/必填）
+    applyHomeMode(form, form.mode?.value === 'remote' ? 'remote' : 'local');
+    if (!restored) form.querySelector('input[name=homePath]')?.focus();
   }
   hlProject = null; hlRow = null; hlKind = null; // 刷新后清除残留高亮状态
 }
@@ -795,25 +800,25 @@ main.addEventListener('submit', async (e) => {
   }
 });
 
-// 添加实例表单：本机 / SSH 远程 字段显隐切换
 dashboardEl.addEventListener('change', (e) => {
   if (!e.target.matches('#add-home .home-mode')) return;
-  const form = e.target.closest('form');
-  const remote = e.target.value === 'remote';
-  form.homePath.hidden = remote;
-  form.host.hidden = !remote;
-  form.remotePort.hidden = !remote;
-  form.remoteHome.hidden = !remote;
-  form.remoteCmd.hidden = !remote;
-  form.remoteLog.hidden = !remote;
-  form.token.hidden = false;        // 手填 token：本机/远程直连通用
-  form.localPort.hidden = remote;   // 本机直连端口：仅本机模式
-  form.accessPort.hidden = !remote;
-  form.accessPort.disabled = !remote;
-  form.homePath.required = !remote;
-  form.host.required = remote;
-  form.remotePort.required = remote;
+  applyHomeMode(e.target.closest('form'), e.target.value);
 });
+
+// 重建 dashboard 前后的一对操作：记下 / 写回「添加实例」表单草稿。
+// onboarding 与 grid 两条渲染路径都要用 —— 否则首装用户每 ≤30s（monitor 无条件广播）
+// 就会丢一次输入，而那正是唯一能让工作台从「空的」变成「有实例」的表单。
+function captureAddFormDraft() {
+  return captureFormDraft(dashboardEl.querySelector('#add-home'), document.activeElement);
+}
+
+function restoreAddFormDraft(draft) {
+  const form = dashboardEl.querySelector('#add-home');
+  if (!form) return;
+  // 先重放模式（显隐/必填），再恢复值/焦点：两者顺序无关，但模式必须在提交前是对的。
+  applyHomeMode(form, form.mode?.value === 'remote' ? 'remote' : 'local');
+  restoreFormDraft(form, draft);
+}
 
 // —— 联动高亮：悬停 project 高亮它 + 其所有 session；悬停 session 只高亮它 + 对应 project ——
 let hlProject = null;

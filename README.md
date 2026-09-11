@@ -508,6 +508,13 @@ SSH 重连与恢复 / 前端渲染转义与表单草稿 / Node 版本门槛与�
   `Origin` 与本机 `Host` 不一致的请求一律 403。这不能只依赖 CORS：`Content-Type: text/plain`
   之类的请求属于 **CORS 简单请求**，不触发预检，浏览器不会替你拦。非浏览器客户端（curl 等）不带
   这两个头，照常可用。
+- **DNS rebinding 防护**：`/api/*` 只接受回环 Host（`127.0.0.1` / `localhost` / `::1`）。
+  只靠 Origin/Host 比较挡不住 rebinding——那两个值在攻击场景下都由攻击者控制；
+  Host 是否指向回环地址才是唯一能区分「本机页面」与「rebinding 页面」的信号。
+  **逃生口**：如果你通过 `/etc/hosts` 别名、devcontainer/Codespaces 的转发域名、或保留
+  浏览器 authority 的反代访问，把该主机名加进 `HWB_ALLOWED_HOSTS`（逗号分隔）即可，
+  例如 `HWB_ALLOWED_HOSTS=hwb.local hwb start`。放行等于允许该来源的页面访问本地 API，
+  请只填自己控制的名字。
 - **API key 永不越界**：`.credentials.yaml` 的 key 只用于服务端查余额，浏览器只收到
   `{ provider, remaining, currency }`（单测专门断言 key 不出现在列表里）。
 - **远程读取只读**：SSH 单条命令只提取元数据，不注入密钥、不修改远端文件。

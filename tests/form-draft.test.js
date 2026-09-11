@@ -80,3 +80,68 @@ test('restoreFormDraft: setSelectionRange 抛错（number 类型输入框）不�
   assert.equal(port.value, '4310');
   assert.equal(port.focusCalls, 1);
 });
+
+// ── 与「模式相关字段状态」的配合（回归：只恢复值会让 SSH 表单提交不了） ──
+//
+// 显隐/必填是值之外的状态，只在 change 处理器里设置；dashboard 每次 SSE 重建都会生成一个
+// 「本机」布局的新表单。若恢复草稿时只写 value，就会出现：select 显示「SSH 远程」、
+// host/remotePort 仍 hidden（输入的内容看不见也改不了），而可见的空 homePath 仍是 required
+// → 原生校验直接拦下提交，submit 事件根本不触发。只能来回切两次模式才能恢复。
+// 这里用真实渲染出的标记 + 最小 DOM 同时验证「标记里的默认布局」与「applyHomeMode 的修正」。
+
+const { applyHomeMode } = await import('../src/web/components/add-home.js');
+
+function fieldsFrom(form) {
+  const names = ['homePath', 'host', 'remotePort', 'remoteHome', 'remoteCmd', 'remoteLog', 'token', 'localPort', 'accessPort'];
+  const out = {};
+  for (const name of names) out[name] = { hidden: false, disabled: false, required: false };
+  return out;
+}
+
+test('applyHomeMode(remote): host/port 可见且必填，homePath 隐藏且不再必填', () => {
+  const form = { ...fieldsFrom(), mode: { value: 'remote' } };
+  applyHomeMode(form, 'remote');
+  assert.equal(form.host.hidden, false);
+  assert.equal(form.remotePort.hidden, false);
+  assert.equal(form.host.required, true, '远程模式必须要求 host');
+  assert.equal(form.remotePort.required, true);
+  assert.equal(form.homePath.hidden, true);
+  assert.equal(form.homePath.required, false, '隐藏的 homePath 若仍 required 会静默拦下提交');
+  assert.equal(form.accessPort.disabled, false);
+  assert.equal(form.token.hidden, false, 'token 两种模式都可见');
+});
+
+test('applyHomeMode(local): 回到本机布局（homePath 可见必填，远程字段隐藏）', () => {
+  const form = { ...fieldsFrom(), mode: { value: 'local' } };
+  applyHomeMode(form, 'local');
+  assert.equal(form.homePath.hidden, false);
+  assert.equal(form.homePath.required, true);
+  assert.equal(form.host.hidden, true);
+  assert.equal(form.host.required, false);
+  assert.equal(form.remotePort.hidden, true);
+  assert.equal(form.accessPort.disabled, true);
+});
+
+test('renderHomeForm 的默认布局就是「本机」——所以恢复 remote 草稿必须重放 applyHomeMode', async () => {
+  const { renderHomeForm } = await import('../src/web/components/add-home.js');
+  const html = renderHomeForm();
+  assert.match(html, /name="homePath"[^>]*(required|placeholder)/, 'homePath 在默认布局里可见且必填');
+  assert.match(html, /name="host"[^>]*hidden/, 'host 在默认布局里是隐藏的');
+  assert.match(html, /name="remotePort"[^>]*hidden/, 'remotePort 在默认布局里是隐藏的');
+  // 也就是说：只恢复 value 会让 select=remote 与「本机布局」打架 —— 这正是必须重放模式的原因。
+});
+
+test('restoreFormDraft 会调用 onRestored 钩子（调用方据此重放模式）', () => {
+  const controls = [fakeInput('homePath'), fakeInput('host')];
+  const draft = { values: { homePath: '', host: 'me@box' }, focused: null };
+  const seen = [];
+  restoreFormDraft(fakeForm(controls), draft, { onRestored: (form, d) => seen.push([form, d]) });
+  assert.equal(seen.length, 1, '恢复后必须给调用方一次重放模式的机会');
+  assert.equal(seen[0][1], draft);
+});
+
+test('restoreFormDraft 不传钩子时照常工作（向后兼容）', () => {
+  const controls = [fakeInput('homePath')];
+  assert.equal(restoreFormDraft(fakeForm(controls), { values: { homePath: '/x' }, focused: null }), false);
+  assert.equal(controls[0].value, '/x');
+});

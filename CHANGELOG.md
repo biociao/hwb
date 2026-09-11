@@ -10,7 +10,6 @@ Semantic Versioning.
 > 下面先把它们补记齐（按主题合并，不逐条 commit 罗列），再是后续的修复记录。
 
 ### Added
-
 #### 统一管理命令 `hwb`
 - `hwb start | stop | restart | status | logs | config | doctor | upgrade | test`，以及 `hwb serve`
   等价于原来的 `node src/server.js`。后台运行经 `src/service.js` + 私有控制 socket
@@ -70,7 +69,6 @@ Semantic Versioning.
   且 `stage`/`cleanup`/`commit` 都会清掉暂存目录，不在项目目录留副产物。
 
 ### Changed
-
 - 索引层：实时会话状态双向合并（`store.applyLiveStatus` 只更新会话行，保留文件索引来的
   workspace/provider 数据），并引入**按实例的索引退避** —— 单个实例反复失败不再拖慢整批。
 - **`engines.node` 从 `>=22` 收紧到 `>=22.5.0`**：索引依赖内置 `node:sqlite`，该模块自 22.5.0 起才提供。
@@ -80,8 +78,13 @@ Semantic Versioning.
 - `src/server.js` 改为动态 `await import('./dshhome/store.js')`：静态 import 会先于模块体求值，
   让 `node:sqlite` 的加载早于版本预检，预检就永远来不及给提示。其余 import 不受影响。
 
-### Notes
 
+- 本机**下载**不再经 base64 中转（`readLocalPreview` 直接交回 `Buffer`）。原先的链路上有三层同尺寸
+  副本：原 buffer → base64 字符串（1.33×）→ `JSON.stringify` 的结果（又一份）→ 调用方再解一遍，
+  实测 64 MiB 文件额外堆占用约 170 MiB（合计约 235 MB 峰值）。远端仍用 base64（ssh 传输需要），
+  调用方按类型分别处理。实测本机 64 MiB 下载的 RSS 增量从 ~235 MB 降到 64 MB。
+
+### Notes
 - 远程实例的上传**内容经命令行参数按 512 KiB 分片传输**（远端先分片落盘到临时目录再合并）。
   实测把文件字节写到 `sshBash` 的 stdin 不可行：`bash -s` 会把脚本之后的字节当命令执行
   （表现为 `...: command not found`，Python 一个字节都读不到）；而「长度前缀」之类的 stdin 协议
@@ -96,7 +99,6 @@ Semantic Versioning.
   属于后续工作，不再声称「内存占用与文件大小无关」。
 
 ### Security
-
 - **日志里的 dsh 启动 token 不再落盘**（`src/lib/logger.js`）。实测本机 `~/.hwb/hwb.log` 是
   `-rw-r--r--`（目录 `drwxr-xr-x`），里面有 **44 处** `http://127.0.0.1:<port>/?token=<launchToken>`
   —— monitor / launcher 会把带 token 的 URL 直接写进日志字段，而持有该 token 等于持有那个
@@ -110,7 +112,6 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
-
 #### 预览代理的建立竞态会留下孤儿监听端口（src/control/launcher.js）
 - `#withPreview` 会 `await createProxy(...)`，而 `disconnect` 只能关掉「当时已经存在」的
   `inst.previewProxy`；`previewPending` 只是作废了一个引用，管不到那个已经跑起来的 Promise。
@@ -129,14 +130,6 @@ Semantic Versioning.
   但「不 await」不等于「不管」：返回的 promise 一旦拒绝同样产生未处理拒绝。
   统一走 `reindexInBackground()`，并容忍「同步抛出」与「返回 undefined」两种实现。
 
-### Changed
-
-- 本机**下载**不再经 base64 中转（`readLocalPreview` 直接交回 `Buffer`）。原先的链路上有三层同尺寸
-  副本：原 buffer → base64 字符串（1.33×）→ `JSON.stringify` 的结果（又一份）→ 调用方再解一遍，
-  实测 64 MiB 文件额外堆占用约 170 MiB（合计约 235 MB 峰值）。远端仍用 base64（ssh 传输需要），
-  调用方按类型分别处理。实测本机 64 MiB 下载的 RSS 增量从 ~235 MB 降到 64 MB。
-
-### Fixed
 
 #### 拖拽排序提交的是「部分顺序」，会把刚排好的顺序打乱（src/web/app.js）
 - `handleDragEnd` 只从 DOM 里读 `tab[draggable=true]` 的顺序，而 DOM 里只有 `tabHomes`
@@ -477,6 +470,51 @@ Semantic Versioning.
   内部滚动，配合「跟随到底」+ 级别过滤，长日志不必频繁滚动。
 
 ### Fixed
+
+#### 回归：草稿恢复后 SSH 表单提交不了（src/web/app.js + components/add-home.js + components/form-draft.js）
+- **现象**（对抗式自审发现）：显隐/必填是**值之外**的状态，只在 `change` 处理器里设置，而
+  dashboard 每次 SSE 重建（有实例在跑时约 3s 一次）都会生成一个「本机」布局的新表单。
+  只恢复 `value` 的结果是：select 显示「SSH 远程」、host/remotePort 仍 `hidden`（输入的内容看不见
+  也改不了），而可见的空 `homePath` 仍是 `required` → 原生校验直接拦下提交，**submit 事件根本不触发**。
+  只能来回切两次模式才能恢复 —— 比修复前更糟。
+- **修复**：把模式切换抽成可复用的 `applyHomeMode(form, mode)`（移到 `components/add-home.js` 以便单测），
+  恢复草稿后重放它。测试同时断言「表单默认标记就是本机布局」与「重放后各字段显隐/必填正确」。
+- **同处的第二个缺口**：草稿逻辑原先只接在 grid 布局上，**onboarding 路径没接** ——
+  而首装时那个表单是唯一出口，`monitor` 每 30s 无条件广播一次就会重建它。现在两条路径共用
+  `captureAddFormDraft` / `restoreAddFormDraft`。
+
+#### `--no-open` 兼容重试在真实错误输出下从不触发（src/control/launcher.js）
+- 重试判据读的是错误消息，而消息只带 stderr 的**最后一行**；commander 在选项名相近时会把
+  `(Did you mean --open?)` 另起一行输出，于是最后一行不含 `--no-open` → 重试永远不触发，
+  用户看到的仍是一句「启动失败」。上一轮的测试用单行假输出，恰好掩盖了这一点。
+- **修复**：消息改为带 stderr 最后三行，并把完整 stderr 挂到 `error.stderr`；判据同时匹配两者。
+  测试改为复现 commander 的多行输出，并断言错误消息里保留 `unknown option` 那一行。
+
+#### 降级域的跨表牵连：会话变孤儿 / 幽灵「运行中」（src/dshhome/store.js）
+- 对抗式自审发现前两轮的两个修复会互相干扰：
+  ① **workspace 域降级**时 `normalize` 拿不到工作区（`snapshot.workspaces` 为空），产出的会话行
+  `workspaceId/workspaceTitle` 全是 null、`project` 退化成 `basename(cwd)`；而 `workspaces` 表保留着
+  旧行 → 会话与工作区断开，`sessionWorkspace()` 返回 null，`preview`/`download`/`upload` 对一个
+  完全正常的会话报「当前会话尚未关联可用的 project 工作区」，保留的 workspace 也变成孤儿。
+  **修复**：workspace 域受保护时，**在 DELETE 之前**抓一份「会话 → 工作区归属」映射并回填到新行上
+  （必须在 DELETE 之前 —— 此时 sessions 表本身仍会被替换）。恢复后由新数据自然覆盖。
+  ② **projcache 域降级 + 实时列表为空**：整表替换被跳过，谁也无法刷新那些行，于是陈旧的
+  `status = running` 会永久留在 dsh 明确报告「没有会话」的实例上 —— 正是上一轮想消除的症状，
+  却从「最多 60s」变成了「永久」。**修复**：这种情况清掉 `status`（而不是删行）：数据仍在、
+  UI 退回「空闲」，projcache 恢复后被文件索引覆盖。projcache 正常时不动文件索引的 status。
+
+#### 回环 Host 限制缺少逃生口（src/api/server.js + README）
+- DNS rebinding 防护要求 `/api/*` 只接受回环 Host，但 `/etc/hosts` 别名、devcontainer/Codespaces 的
+  转发域名、以及保留浏览器 authority 的反代都会让 Host 不是回环名 —— 那时 SPA 能加载、
+  每个 `/api/*` 却 403，且无法自证。新增 `HWB_ALLOWED_HOSTS`（逗号分隔）显式放行，
+  默认空即「只允许回环」；README 的安全边界一节说明放行意味着什么。
+
+#### dsh-static-cache：请求一个真实存在的目录会抛 EISDIR（dsh-static-cache/lib/index.js）
+- 越界检查用的是 `stat()`，而 `stat` 对目录是成功的（所以 `err.code === 'EISDIR'` 那个分支永远不会
+  命中），真正抛 EISDIR 的是随后的 `readFile`。`dist/assets` 下确实有目录（`assets/langs`、
+  `assets/fonts`），于是 `GET /assets/langs` 让处理器 promise 拒绝：dsh 的 webserver 兜住它，
+  用户拿到 400 而不是 404，每次命中还往 dsh 日志写一段 warn+堆栈。
+  **修复**：readFile 前显式 `if (!st.isFile()) 404`。
 
 #### 实例卡不再展示「当前项目/当前会话」块（src/web/components/instance-grid.js）
 - **根因**：实例卡里的 `currentBlock`（当前项目 / 当前会话 + 状态 chip / token / 最近活动）与

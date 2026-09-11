@@ -18,7 +18,7 @@ import { Monitor } from './control/monitor.js';
 import { InstanceRegistry } from './control/registry.js';
 import { QuotaService } from './dshhome/quota.js';
 import { SSEHub } from './api/sse.js';
-import { createApiServer } from './api/server.js';
+import { createApiServer, allowedHostsFromEnv } from './api/server.js';
 import { initLogger, logger, defaultLogFile, installCrashHandlers, getLogs, onLog } from './lib/logger.js';
 
 const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -148,6 +148,9 @@ const server = createApiServer({
   quota,
   logApi: { getLogs },
   webRoot: path.join(pkgRoot, 'src', 'web'),
+  // 逃生口：/etc/hosts 别名、devcontainer 转发域名、保留浏览器 authority 的反代都会让 Host
+  // 不是回环名，此时 SPA 能加载但每个 /api/* 都 403。显式用 HWB_ALLOWED_HOSTS 放行。
+  allowedHosts: allowedHostsFromEnv(),
 });
 server.listen(opts.port, '127.0.0.1', () => {
   globalThis.hwbServiceReady?.();

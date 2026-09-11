@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { createApiServer, isLoopbackHost } from '../src/api/server.js';
+import { createApiServer, isLoopbackHost, allowedHostsFromEnv, hostNameOf } from '../src/api/server.js';
 
 // 真实 HTTP 服务端上的加固回归。这些行为**只有走真 socket 才测得出来**：
 // 假 req（async generator + 假 res）拿不到 TCP 分片边界、看不到响应是否真的送到了对端，
@@ -9,9 +9,10 @@ import { createApiServer, isLoopbackHost } from '../src/api/server.js';
 
 const HOME_ID = 'abcdef1234567890';
 
-function makeServer() {
+function makeServer({ allowedHosts = [] } = {}) {
   const registered = [];
   const server = createApiServer({
+    allowedHosts,
     store: {
       listHomes: () => [{ homeId: HOME_ID, hostType: 'local', hostPath: '/home/u/.dsh', token: 'secret-token' }],
       getHome: (id) => (id === HOME_ID ? { homeId: id, hostType: 'local' } : null),
@@ -125,4 +126,42 @@ test('非 ASCII 请求体被 TCP 分片切开时仍能正确解码', async (t) =
   // 落库的别名必须是完整的中文，而不是带 U+FFFD 的乱码。
   assert.equal(registered.at(-1)?.alias, '中文别名');
   assert.doesNotMatch(JSON.stringify(registered.at(-1)), /\uFFFD/);
+});
+
+// 逃生口：/etc/hosts 别名、devcontainer 转发域名、保留浏览器 authority 的反代，都会让 Host
+// 不是回环名 —— 那时 SPA 能加载但每个 /api/* 都 403，没有任何办法自证是本人。
+// HWB_ALLOWED_HOSTS 是显式的放行名单（默认空 = 只允许回环）。
+test('isLoopbackHost: allowedHosts 显式放行，且不放松回环默认', () => {
+  assert.equal(isLoopbackHost('hwb.local:4310'), false, '默认不放行');
+  assert.equal(isLoopbackHost('hwb.local:4310', ['hwb.local']), true);
+  assert.equal(isLoopbackHost('HWB.LOCAL:4310', ['hwb.local']), true, '大小写不敏感');
+  assert.equal(isLoopbackHost('other.local:4310', ['hwb.local']), false);
+  assert.equal(isLoopbackHost('127.0.0.1:4310', []), true, '回环始终允许');
+  assert.equal(isLoopbackHost(undefined, ['hwb.local']), false, '空 Host 仍拒绝');
+});
+
+test('hostNameOf: 去端口与 IPv6 方括号', () => {
+  assert.equal(hostNameOf('127.0.0.1:4310'), '127.0.0.1');
+  assert.equal(hostNameOf('[::1]:4310'), '::1');
+  assert.equal(hostNameOf('Example.COM:80'), 'example.com');
+  assert.equal(hostNameOf(''), '');
+});
+
+test('allowedHostsFromEnv: 逗号分隔、去空白、大小写归一', () => {
+  assert.deepEqual(allowedHostsFromEnv({}), []);
+  assert.deepEqual(allowedHostsFromEnv({ HWB_ALLOWED_HOSTS: 'hwb.local, Dev.Box ' }), ['hwb.local', 'dev.box']);
+  assert.deepEqual(allowedHostsFromEnv({ HWB_ALLOWED_HOSTS: ' , ' }), []);
+});
+
+test('真实服务：放行的 Host 能访问，未放行的仍然 403', async (t) => {
+  const { server, registered } = makeServer({ allowedHosts: ['hwb.local'] });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); }));
+  const port = server.address().port;
+
+  const allowed = await rawRequest(port, { path: '/api/homes', host: `hwb.local:${port}` });
+  assert.equal(statusOf(allowed), 200, '显式放行的 Host 应放行');
+
+  const denied = await rawRequest(port, { path: '/api/homes', host: `evil.example:${port}` });
+  assert.equal(statusOf(denied), 403, '未放行的 Host 仍必须拒绝');
 });

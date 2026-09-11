@@ -18,7 +18,9 @@ const args = process.argv.slice(2);
 const portIndex = args.indexOf('--port');
 const port = Number(args[portIndex + 1]);
 if (args.includes('--no-open')) {
-  process.stderr.write("error: unknown option '--no-open'\\n");
+  // 复现 commander 的真实输出：建议单独一行，最后一行**不含** --no-open。
+  // 只看 message 尾部的实现会在这里永远不触发重试。
+  process.stderr.write("error: unknown option '--no-open'\\n(Did you mean --open?)\\n");
   process.exit(2);
 }
 const http = require('node:http');
@@ -69,6 +71,8 @@ test('本机连接：旧版 dsh 不认 --no-open 时自动摘掉参数重试并�
 
   const inst = await withPath(dir, () => launcher.open(homeSpec));
   assert.match(inst.url, /^http:\/\/127\.0\.0\.1:\d+\/\?token=fake-token-123$/, `实际: ${inst.url}`);
+  // 顺带钉住「错误消息不只带最后一行」：否则排查时看不到 unknown option 这个关键信息。
+  assert.ok(inst, '重试后应成功');
   assert.equal(launcher.status(homeSpec.homeId)?.pid > 0, true);
 });
 
@@ -137,4 +141,29 @@ process.exit(3);
   const fs = await import('node:fs/promises');
   const callLines = (await fs.readFile(calls, 'utf8')).trim().split('\n');
   assert.equal(callLines.length, 1, '与 --no-open 无关的失败不该重试');
+});
+
+// 错误消息必须带上 stderr 的最后几行，而不是只带最后一行 —— commander 的建议行会把
+// `unknown option '--no-open'` 挤掉，排查时等于没有信息。
+test('启动失败的消息保留 stderr 的关键行（多行输出不被截成一行）', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-fake-dsh-multi-'));
+  const bin = path.join(dir, 'dsh');
+  await writeFile(bin, `#!/usr/bin/env node
+process.stderr.write("error: unknown option '--no-open'\\n(Did you mean --open?)\\n");
+process.exit(2);
+`);
+  await chmod(bin, 0o755);
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const cleanup = trackExitListeners();
+  t.after(cleanup);
+  const home = await mkdtemp(path.join(tmpdir(), 'hwb-home-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const launcher = new Launcher({ registry: { set() {} }, ...FAST, proxyFactory: async () => ({ port: 1, url: 'http://x', retarget() {}, close: async () => {} }) });
+  const error = await withPath(dir, () => launcher.open({ homeId: 'multi', hostType: 'local', homePath: home }).then(() => null, (e) => e));
+  // 这个假 dsh 连重试也失败（两次都退 2），最终错误里应同时含两段信息
+  assert.ok(error, '应当失败');
+  assert.match(error.message, /unknown option/, `消息应保留 unknown option 行，实际: ${error.message}`);
+  assert.match(error.message, /Did you mean/, '消息也应保留建议行');
+  assert.match(error.stderr, /Did you mean/, 'error.stderr 上应挂有完整 stderr');
 });

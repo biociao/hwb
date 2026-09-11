@@ -16,8 +16,11 @@ test('removing an instance cancels its connection before deletion and blocks con
     },
     launcher: {
       status: () => null,
-      disconnect: async h => {
+      disconnect: async (h, opts) => {
         assert.equal(h, home);
+        // 移除路径必须传 release:true —— 否则 hwb 自己拉起的本机 dsh web 只会被标记 detached，
+        // 在 store 里已不可达的情况下继续占着端口与 DSH_HOME 直到进程退出。
+        assert.deepEqual(opts, { release: true }, 'DELETE 必须要求 Launcher 真正回收受管进程');
         events.push('disconnect');
         await closing;
         events.push('closed');

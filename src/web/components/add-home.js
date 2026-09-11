@@ -48,6 +48,30 @@ export function renderHomeForm() {
 }
 
 // First-run onboarding: no homes registered yet (§7.1 空态引导).
+// 本机 / SSH 远程 模式的字段显隐与必填切换。
+//
+// 单独导出是必须的：这些属性是**值之外**的状态，只在 change 处理器里设置，
+// 而 dashboard 每次 SSE 重建都会生成一个「本机」布局的新表单 —— 恢复草稿时若不重放这个函数，
+// 就会出现「select 显示 SSH 远程、host/port 仍隐藏、而空 homePath 仍 required」的表单，
+// 原生校验直接拦下提交（submit 事件根本不触发）。
+export function applyHomeMode(form, mode) {
+  const remote = mode === 'remote';
+  form.homePath.hidden = remote;
+  form.host.hidden = !remote;
+  form.remotePort.hidden = !remote;
+  form.remoteHome.hidden = !remote;
+  form.remoteCmd.hidden = !remote;
+  form.remoteLog.hidden = !remote;
+  form.token.hidden = false;        // 手填 token：本机/远程直连通用
+  form.localPort.hidden = remote;   // 本机直连端口：仅本机模式
+  form.accessPort.hidden = !remote;
+  form.accessPort.disabled = !remote;
+  form.homePath.required = !remote;
+  form.host.required = remote;
+  form.remotePort.required = remote;
+  return mode;
+}
+
 export function renderOnboarding(detected) {
   const detect = detected?.exists
     ? `<button class="primary" data-action="add-detected" data-path="${esc(detected.path)}">

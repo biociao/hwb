@@ -277,3 +277,57 @@ test('guard: fingerprint avoids killing dead/reused-pid processes', async () => 
   assert.equal(expectedCommand({ kind: 'ssh' }).test('ssh -N -L 1:2:3 host'), true);
   assert.equal(expectedCommand({ kind: 'dsh-web' }).test('dsh web --port 1'), true);
 });
+
+// 实例被移除后的兜底清理：Monitor 巡检时会发现 registry 里还留着已删除实例的条目。
+// 删除 API 正常走时已经 disconnect 过，这里是「没走到 API」的兜底路径。
+// 必须传 release:true —— 否则 hwb 拉起的本机 dsh web 只会被标记 detached，
+// 而它在 store 里已经不可达，于是继续占着端口与 DSH_HOME 直到进程退出。
+test('monitor: 移除实例的兜底清理要求 Launcher 真正回收进程（release: true）', async (t) => {
+  const calls = [];
+  const registry = new InstanceRegistry();
+  const home = { homeId: 'gone-home', hostType: 'local', homePath: '/x', activeEndpointId: null };
+  let present = true;
+  const monitor = new Monitor({
+    store: { listHomes: () => (present ? [home] : []), getHome: () => (present ? home : null) },
+    launcher: {
+      status: () => null,
+      disconnect: async (h, opts) => { calls.push([h, opts]); },
+    },
+    registry,
+    probe: async () => false,
+    exists: () => true,
+    broadcast: () => {},
+    intervalMs: 60_000,
+  });
+  t.after(() => monitor.stop());
+  await monitor.refresh(home.homeId);
+  registry.seed(home.homeId);
+  present = false; // 实例已被删除
+  // 孤儿清点发生在 #checkAll（心跳整轮）里，不在单实例的 refresh 路径上。
+  monitor.start();
+  for (let i = 0; i < 50 && calls.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+
+  assert.equal(calls.length, 1, `兜底清理应调用一次 disconnect，实际 ${calls.length}`);
+  assert.deepEqual(calls[0][0], { homeId: home.homeId });
+  assert.deepEqual(calls[0][1], { release: true }, '必须要求真正回收，不能只标记 detached');
+});
+
+// 端点切换用的临时条目（:switch 后缀）不属于「已删除实例」，不该被当成孤儿回收。
+test('monitor: :switch 临时条目不参与孤儿清理', async (t) => {
+  const calls = [];
+  const registry = new InstanceRegistry();
+  const monitor = new Monitor({
+    store: { listHomes: () => [], getHome: () => null },
+    launcher: { status: () => null, disconnect: async (h, opts) => { calls.push([h, opts]); } },
+    registry,
+    probe: async () => false,
+    exists: () => true,
+    broadcast: () => {},
+    intervalMs: 60_000,
+  });
+  t.after(() => monitor.stop());
+  registry.seed('staging:switch');
+  monitor.start();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.deepEqual(calls, [], ':switch 是端点候选，不该被回收');
+});

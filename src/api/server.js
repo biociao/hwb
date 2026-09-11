@@ -63,22 +63,45 @@ async function serveStatic(webRoot, pathname, req, res) {
 // 经 preview/download 读取工作区文件、并经 upload 写入文件。
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
-export function isLoopbackHost(hostHeader) {
+/**
+ * 解析 Host 头里的主机名（去掉端口与 IPv6 方括号）。
+ */
+export function hostNameOf(hostHeader) {
   const raw = String(hostHeader ?? '').trim();
-  if (!raw) return false;
-  // 去掉端口；IPv6 字面量是 [::1]:4310 这种形式，先剥方括号再取冒号前的部分。
-  const hostname = raw.startsWith('[') && raw.includes(']')
-    ? raw.slice(1, raw.indexOf(']'))
-    : raw.split(':')[0];
-  return LOOPBACK_HOSTNAMES.has(hostname.toLowerCase());
+  if (!raw) return '';
+  return (raw.startsWith('[') && raw.includes(']') ? raw.slice(1, raw.indexOf(']')) : raw.split(':')[0]).toLowerCase();
 }
 
-export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot }) {
+/**
+ * 该 Host 是否允许访问 API。
+ *
+ * 默认只允许回环地址（DNS rebinding 防护）。`extraAllowed` 是显式的逃生口：
+ * /etc/hosts 别名、devcontainer/Codespaces 的转发域名、以及会保留浏览器 authority 的反代，
+ * 都会让 Host 不是回环名 —— 那时 SPA 能加载但每个 /api/* 都 403，且没有任何办法自证是本人。
+ * 通过 `HWB_ALLOWED_HOSTS=a.example,b.example` 或创建服务器时的 `allowedHosts` 显式放行，
+ * 同时把安全后果写清楚（放行等于允许该主机名来源的页面访问本地 API）。
+ */
+export function isLoopbackHost(hostHeader, extraAllowed = []) {
+  const hostname = hostNameOf(hostHeader);
+  if (!hostname) return false;
+  if (LOOPBACK_HOSTNAMES.has(hostname)) return true;
+  return extraAllowed.some((allowed) => String(allowed ?? '').trim().toLowerCase() === hostname);
+}
+
+/** 从 `HWB_ALLOWED_HOSTS`（逗号分隔）读逃生口列表。 */
+export function allowedHostsFromEnv(env = process.env) {
+  return String(env.HWB_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [] }) {
   const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {
-      if (!isLoopbackHost(req.headers.host)) {
+      if (!isLoopbackHost(req.headers.host, allowedHosts)) {
         log.warn('拒绝非回环 Host 的 API 请求（疑似 DNS rebinding）', { host: req.headers.host, path: url.pathname });
         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'API 仅接受来自本机回环地址的请求' }));
