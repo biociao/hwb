@@ -215,6 +215,14 @@ Semantic Versioning.
   空窗口仍有 5 个周期按钮、点击 30 天后标签与散点偏差 0.00px 且不重叠不越界、
   无 0 值散点、日志面板有历史行、添加实例的 warning 在 SSE 刷新后仍在。
 
+### Added
+#### 宽度扫描：scripts/render-harness.html + scripts/render-check-widths.js（render-check 增加 --serve）
+- `render-check.mjs --serve` 把仓库根当静态站起在随机端口上，于是渲染夹具可以直接跑
+  （组件的 ESM 在 `file://` 下会被 CORS 挡掉，必须有个 http 源）。
+- 宽度扫描把 **6 种卡片宽度 × 3 种数据形态** 跑一遍，逐条量「对齐 / 重叠 / 越界」。
+  修复后 18/18 通过（偏差全 0.0px）。这张表同时是「x 轴标签不能用静态常量收边」的证据：
+  同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
+
 ### Fixed
 #### 移除/新增/改名实例后，用量图还会带着旧实例（服务端 10s + 客户端 15s 两层记忆）（src/api/routes.js + src/web/app.js）
 - **现象**：删掉一个实例之后，「按实例」维度的用量图里仍然挂着它，最长十几秒才消失（用户视角

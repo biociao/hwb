@@ -1,0 +1,129 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="/src/web/style.css">
+<style>body{width:640px;margin:0;padding:8px;font-family:system-ui}
+  #stage{width:600px}
+  /* 组件依赖的样式来自 index.html 的内联 <style>（不是 style.css），这里按需复制最小子集 */
+</style>
+</head><body>
+<div id="stage"></div>
+<pre id="result">pending</pre>
+<!-- 这个页面只提供「真实布局夹具」：把组件渲染进 #stage（宽度可调），
+     断言由 --expr-file 传入的脚本用 getBoundingClientRect 自己量（见 scripts/README-render-check.md）。-->
+<script type="module">
+import { renderUsageCard, usageTrendHtml, fitTrendLabels } from '/src/web/components/usage-card.js';
+
+const out = { checks: [], ok: true };
+const check = (name, pass, detail) => { out.checks.push({ name, pass, detail }); if (!pass) out.ok = false; };
+
+// 组件样式来自 index.html 的内联 <style>：这里把那份 CSS 注入进来，保证测的是真实样式
+const cssText = await (await fetch('/src/web/index.html')).text();
+const styleBlock = cssText.match(/<style>([\s\S]*?)<\/style>/);
+if (styleBlock) {
+  const s = document.createElement('style');
+  s.textContent = styleBlock[1];
+  document.head.appendChild(s);
+}
+
+const H = 3_600_000, t0 = Date.parse('2026-09-01T00:00:00.000Z');
+const mk = (i, total) => ({ ts: new Date(t0 + i * H).toISOString(), groups: total ? { '合计': total } : {}, total });
+
+// ① 空窗口：必须有周期按钮
+{
+  const stage = document.getElementById('stage');
+  stage.innerHTML = renderUsageCard({ summary: { sessionCount: 0, days: 1 }, trendBy: { total: { hours: 24, stepMs: 900000, buckets: [] } } }, 'total', '24h');
+  const btns = stage.querySelectorAll('#usage-period-toggle button');
+  check('空状态渲染周期按钮', btns.length === 5, `buttons=${btns.length}`);
+  const toggle = stage.querySelector('#usage-period-toggle');
+  const rect = toggle?.getBoundingClientRect();
+  check('周期按钮可见且有尺寸', !!rect && rect.width > 0 && rect.height > 0, rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : 'none');
+}
+
+// ② 稀疏趋势：标签必须与散点对齐（按真实布局测量）
+{
+  const stage = document.getElementById('stage');
+  const buckets = Array.from({ length: 60 }, (_, i) => mk(i, 0));
+  for (const i of [55, 56, 57, 58, 59]) buckets[i] = mk(i, 100 + i);
+  stage.innerHTML = usageTrendHtml({ trendBy: { total: { buckets, hours: 720, stepMs: 12 * H } } }, 'total');
+  fitTrendLabels(stage);
+  const dots = [...stage.querySelectorAll('.trend-dot')].map((d) => {
+    const r = d.getBoundingClientRect();
+    return r.left + r.width / 2;
+  });
+  const labels = [...stage.querySelectorAll('.trend-xlabel')].filter((l) => !l.hidden).map((l) => {
+    const r = l.getBoundingClientRect();
+    const anchor = l.classList.contains('trend-xlabel-right') ? 'right'
+      : (l.classList.contains('trend-xlabel-left') ? 'left' : 'center');
+    return { cx: r.left + r.width / 2, text: l.textContent, right: r.right, left: r.left, anchor };
+  });
+  const plot = stage.querySelector('.trend-plot').getBoundingClientRect();
+  // 对齐判据按锚点来：普通标签中心对准散点，右对齐标签的右边缘对准散点（贴边时不裁切）
+  const worst = labels.map((l) => {
+    const anchorX = l.anchor === 'right' ? l.right : (l.anchor === 'left' ? l.left : l.cx);
+    return Math.min(...dots.map((d) => Math.abs(d - anchorX)));
+  });
+  check('标签数量 >0', labels.length > 0, `labels=${labels.length}`);
+  check('每个标签都对齐到某个散点（<1.5px）', worst.every((d) => d < 1.5),
+    `最大偏差=${worst.map((d) => d.toFixed(2)).join(',')}px 标签=${labels.map((l) => l.text + '@' + l.anchor).join('|')} 散点=${dots.map((d) => d.toFixed(0)).join(',')}`);
+  check('标签不溢出绘图区右侧', labels.every((l) => l.right <= plot.right + 1), `plot.right=${plot.right.toFixed(0)} labels.right=${labels.map((l) => l.right.toFixed(0)).join(',')}`);
+  check('标签不溢出绘图区左侧', labels.every((l) => l.left >= plot.left - 1), `plot.left=${plot.left.toFixed(0)} labels.left=${labels.map((l) => l.left.toFixed(0)).join(',')}`);
+  let overlap = null;
+  for (let i = 1; i < labels.length; i++) {
+    if (labels[i].left < labels[i - 1].right - 0.5) overlap = `${labels[i - 1].text}|${labels[i].text}`;
+  }
+  check('标签之间不重叠', !overlap, overlap ? `重叠: ${overlap}` : `间距=${labels.map((l, i) => i ? (l.left - labels[i - 1].right).toFixed(0) : '-').join(',')}px`);
+}
+
+// ②b 审查实测的那个稀疏窗口（72.9/86.4/96.6/98.3/100%）：标签应有多个且互不重叠、都对齐到散点
+{
+  const stage = document.getElementById('stage');
+  const buckets = Array.from({ length: 60 }, (_, i) => mk(i, 0));
+  for (const i of [43, 51, 57, 58, 59]) buckets[i] = mk(i, 100 + i);
+  stage.innerHTML = usageTrendHtml({ trendBy: { total: { buckets, hours: 720, stepMs: 12 * H } } }, 'total');
+  fitTrendLabels(stage);
+  const dots = [...stage.querySelectorAll('.trend-dot')].map((d) => { const r = d.getBoundingClientRect(); return r.left + r.width / 2; });
+  const labels = [...stage.querySelectorAll('.trend-xlabel')].filter((l) => !l.hidden).map((l) => {
+    const r = l.getBoundingClientRect();
+    const anchor = l.classList.contains('trend-xlabel-right') ? 'right' : (l.classList.contains('trend-xlabel-left') ? 'left' : 'center');
+    return { cx: r.left + r.width / 2, left: r.left, right: r.right, text: l.textContent, anchor };
+  });
+  const worst = labels.map((l) => {
+    const anchorX = l.anchor === 'right' ? l.right : (l.anchor === 'left' ? l.left : l.cx);
+    return Math.min(...dots.map((d) => Math.abs(d - anchorX)));
+  });
+  check('稀疏窗口：标签≥2 且都对齐散点', labels.length >= 2 && worst.every((d) => d < 1.5),
+    `labels=${labels.length} 偏差=${worst.map((d) => d.toFixed(2)).join(',')} 位置=${labels.map((l) => l.text).join('|')}`);
+  let overlap = null;
+  for (let i = 1; i < labels.length; i++) if (labels[i].left < labels[i - 1].right - 0.5) overlap = `${labels[i - 1].text}|${labels[i].text}`;
+  check('稀疏窗口：标签互不重叠', !overlap, overlap ? `重叠: ${overlap}` : `间距=${labels.map((l, i) => i ? (l.left - labels[i - 1].right).toFixed(0) : '-').join(',')}px`);
+}
+
+// ③ 拆维度：不该有 0 值散点
+{
+  const stage = document.getElementById('stage');
+  const buckets = Array.from({ length: 6 }, (_, i) => ({
+    ts: new Date(t0 + i * H).toISOString(),
+    groups: i < 2 ? { projA: 1000, projB: 0, projC: 0 } : { projA: 0, projB: 0, projC: 0 },
+    total: i < 2 ? 1000 : 0,
+  }));
+  stage.innerHTML = usageTrendHtml({ trendBy: { project: { buckets, hours: 24, stepMs: H } } }, 'project');
+  const toks = [...stage.querySelectorAll('.trend-dot')].map((d) => d.dataset.tok);
+  check('没有 0 值散点', !toks.includes('0'), `toks=${toks.join(',')}`);
+}
+
+// ④ 正常状态（有数据）：周期按钮 + 高亮与数据一致
+{
+  const stage = document.getElementById('stage');
+  const buckets = Array.from({ length: 24 }, (_, i) => mk(i, i < 3 ? 1000 : 0));
+  stage.innerHTML = renderUsageCard({
+    summary: { sessionCount: 3, days: 3, totalTokens: 3000, inputTokens: 1000, outputTokens: 1000, cacheRead: 500, cacheWrite: 500, cacheHitRate: 0.5 },
+    trendBy: { total: { buckets, hours: 72, stepMs: H } },
+  }, 'total', '3d');
+  const active = stage.querySelector('#usage-period-toggle button.active')?.dataset.period;
+  check('高亮周期 = 传入的数据周期', active === '3d', `active=${active}`);
+}
+
+document.getElementById('result').textContent = JSON.stringify(out, null, 1);
+document.title = out.ok ? 'RENDER_OK' : 'RENDER_FAIL';
+</script>
+</body></html>

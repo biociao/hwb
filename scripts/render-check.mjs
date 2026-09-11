@@ -19,9 +19,11 @@
 
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile as readFileP } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const DEFAULT_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
@@ -30,10 +32,37 @@ function arg(name, dflt) {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt;
 }
 
-const url = arg('url');
+const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+// --serve：把仓库根当静态站起在随机端口上，于是 `--url /scripts/render-harness.html` 就能直接跑
+// （组件是从 /src/... import 的模块，file:// 下会被 CORS 挡掉，必须有个 http 源）。
+const serve = process.argv.includes('--serve');
+let staticServer = null;
+function startStaticServer() {
+  return new Promise((resolve) => {
+    const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
+    staticServer = createServer(async (req, res) => {
+      try {
+        const { pathname } = new URL(req.url, 'http://x');
+        const file = path.join(REPO_ROOT, path.normalize(pathname).replace(/^([/\\])+/, ''));
+        if (!file.startsWith(REPO_ROOT)) { res.writeHead(403); res.end('forbidden'); return; }
+        const body = await readFileP(file);
+        res.writeHead(200, { 'content-type': TYPES[path.extname(file)] || 'application/octet-stream' });
+        res.end(body);
+      } catch { res.writeHead(404); res.end('not found'); }
+    });
+    staticServer.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${staticServer.address().port}`));
+  });
+}
+
+let url = arg('url');
 if (!url) {
-  console.error('用法: node scripts/render-check.mjs --url <URL> [--wait-ms 3000] [--expr-file <文件> | --expr <代码>]');
+  console.error('用法: node scripts/render-check.mjs (--url <URL> | --serve --url /scripts/render-harness.html) [--wait-ms 3000] [--expr-file <文件> | --expr <代码>]');
   process.exit(2);
+}
+if (serve) {
+  const origin = await startStaticServer();
+  url = url.startsWith('http') ? url : origin + url;
 }
 const waitMs = Number(arg('wait-ms', 3000));
 const exprFile = arg('expr-file');
@@ -129,6 +158,7 @@ try {
 } finally {
   try { ws.close(); } catch { /* 已关闭 */ }
   chrome.kill('SIGKILL');
+  try { staticServer?.close(); } catch { /* 没起或被关了 */ }
   await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
 }
 process.exit(exitCode);

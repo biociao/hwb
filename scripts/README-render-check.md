@@ -17,14 +17,31 @@
 ## 用法
 
 ```bash
-# 需要 Chrome（macOS 默认路径见脚本内 DEFAULT_CHROME，可用 CHROME_PATH 覆盖）
+# ① 直接检查一个真实页面（自带 Chrome，macOS 默认路径见脚本内 DEFAULT_CHROME，可用 CHROME_PATH 覆盖）
 node scripts/render-check.mjs --url http://127.0.0.1:4310/ \
      --wait-ms 3000 --expr 'return document.title'
 
-# 复杂检查写成文件（表达式在页面里以 async 函数体执行，return 的值会被 JSON 序列化）
-node scripts/render-check.mjs --url http://127.0.0.1:4310/ \
-     --wait-ms 4000 --expr-file /tmp/check.js
+# ② 用仓库自带的渲染夹具（--serve 会把仓库根当静态站起在随机端口；组件是 /src/... 的 ESM，
+#    file:// 下会被 CORS 挡掉，所以必须有 http 源）。宽度扫描是现成的例子：
+node scripts/render-check.mjs --serve --url /scripts/render-harness.html \
+     --wait-ms 3000 --expr-file scripts/render-check-widths.js
 ```
+
+表达式在页面里以 async 函数体执行，`return` 的值会被 JSON 序列化后打印。
+
+### 宽度扫描（scripts/render-check-widths.js）
+
+把 6 种卡片宽度 × 3 种数据形态（满窗口 / 稀疏 / 末尾聚集）跑一遍，逐条量
+「标签是否对齐散点、是否互相重叠、是否越出绘图区」。最近一次结果（修复后）：
+
+| 形态 | 300px | 360px | 480px | 640px | 900px | 1200px |
+|------|-------|-------|-------|-------|-------|--------|
+| 满窗口（60 桶都有数据） | 3 标签 | 4 | 4 | 7 | 8 | 8 |
+| 稀疏（5 个非空） | 1 | 1 | 2 | 2 | 3 | 3 |
+| 末尾聚集（末尾 5 桶） | 1 | 1 | 1 | 1 | 1 | 1 |
+
+18/18 通过：偏差全为 0.0px、无重叠、无越界。**这张表就是「为什么不能用静态常量」的证据**：
+同一组数据在 242px 的绘图区与 1142px 的绘图区里，能放下的标签数差 3 倍。
 
 输出：`{ ok, result, consoleErrors, exceptions }`；退出码 0 = 表达式执行成功且无
 `console.error`/未捕获异常，1 = 有异常，2 = 启动或连接失败。
@@ -58,6 +75,7 @@ return { checks, ok: checks.every((c) => c.pass) };
 | 拆维度（按项目） | 不存在 `data-tok="0"` 的散点 | 0 值点全叠在 0% 基线上 |
 | 运行日志面板 | `#log-entries .log-row` > 0 | 首屏快照失败一次就永远空着 |
 | 添加实例的 warning | 提交后与 **SSE 刷新之后**提示条都可见 | 普通提示会被成功刷新撤掉，粘性提示不该 |
+| 6 种宽度 × 3 种数据形态 | 18/18：标签对齐 0.0px、不重叠、不越界 | 标签宽度取决于字体与卡片宽度，静态常量算不出来 |
 
 ## 准备数据（隔离实例，别碰用户的服务）
 
