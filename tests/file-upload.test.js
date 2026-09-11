@@ -486,3 +486,24 @@ test('上传：并发闸门把同时进行的上传压到上限（超出立刻 5
   const after = await request(route, { body: multipartBody('B', [{ name: 'c.txt', data: 'z' }]), query: 'sessionId=s&dir=dir' });
   assert.equal(after.status, 200, '闸门释放后新的上传应被放行');
 });
+
+// 自查本轮改动时发现的自伤：并发闸门在 `uploadsInFlight++` 之后有若干条**提前返回**
+// （实例不存在 / 没有可用工作区 / 不是 multipart / 路径非法），原先只有最内层 parse+write 的
+// finally 会减计数 —— 于是**一个**参数不合法的请求就把计数器永久顶到上限，此后所有上传都 503，
+// 直到进程重启。现在整个处理过程都在 try/finally 里。
+test('上传：参数不合法的请求不会把并发闸门卡死（计数器必须归零）', async (t) => {
+  const { root } = await fixture(t);
+  const route = makeRoute(root);
+  // ① 不是 multipart → 400（走的是闸门之后的提前返回路径）
+  const bad = await request(route, { body: Buffer.from('x'), query: 'sessionId=s&dir=dir', headers: { 'content-type': 'text/plain' } });
+  assert.equal(bad.status, 400, `前置条件：非 multipart 必须 400（实际 ${bad.status}）`);
+  // ② 紧接着一个**正常**上传必须成功 —— 如果计数泄漏，这里会是 503
+  const ok = await request(route, { body: multipartBody('B', [{ name: 'after-bad.txt', data: 'y' }]), query: 'sessionId=s&dir=dir' });
+  assert.equal(ok.status, 200, `坏请求之后正常上传仍应成功（实际 ${ok.status}：闸门被卡死了）`);
+
+  // ③ 另一种提前返回：workspace 不存在（400）
+  const bad2 = await request(route, { body: multipartBody('B', [{ name: 'x.txt', data: 'z' }]), query: 'sessionId=unknown&dir=dir' });
+  assert.equal(bad2.status, 400);
+  const ok2 = await request(route, { body: multipartBody('B', [{ name: 'after-bad2.txt', data: 'w' }]), query: 'sessionId=s&dir=dir' });
+  assert.equal(ok2.status, 200, '第二种提前返回同样不能泄漏计数');
+});

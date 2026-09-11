@@ -259,6 +259,11 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         return;
       }
       uploadsInFlight++;
+      // **整个处理过程**都在 try/finally 里：闸门的递增之后有若干条提前返回（实例不存在、
+      // 没有可用工作区、不是 multipart、路径非法）。原先只有最内层 parse+write 的 finally 会减，
+      // 于是**一个**参数不合法的请求就会把计数器永久顶到上限 —— 此后所有上传都 503，
+      // 直到进程重启（自查本轮改动时发现的：这类「提前 return 漏减引用计数」是经典的自伤）。
+      try {
       const home = store.getHome(upload[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
       const workspaces = store.listWorkspaces({ homeId: home.homeId });
@@ -302,7 +307,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         const listing = await readFilePreview(home, workspace.path, dir, remoteExec);
         send(res, 200, { ok: true, dir: result.dir, files: result.files,
           listing: listing.kind === 'directory' ? listing : null });
-      } catch (e) { send(res, 400, { error: e.message }); } finally { uploadsInFlight--; }
+      } catch (e) { send(res, 400, { error: e.message }); }
+      } finally { uploadsInFlight--; }
       return;
     }
 
