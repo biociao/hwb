@@ -221,3 +221,54 @@ test('projcache 未降级时，空实时列表不会去动文件的 status（那
   assert.equal((typeof row.status === 'string' ? JSON.parse(row.status) : row.status).kind, 'running');
   store.close();
 });
+
+// 穷举「哪些域降级」的全部 16 种组合，逐一核对「该域对应的表保留、其余照常清空」。
+// 单点用例容易恰好都写在对的路径上；组合矩阵能抓到「两个域同时降级时的相互影响」这类问题
+// （历史上这里就出过顺序问题：归属映射在 DELETE 之后才读，读到的已经是空表）。
+const DOMAIN_TABLE = { workspace: 'workspaces', projcache: 'sessions', credentials: 'providers', modelTier: 'model_tiers' };
+
+test('upsertRows：16 种降级组合下，保留/清空的表都与降级域一一对应', () => {
+  const domains = Object.keys(DOMAIN_TABLE);
+  const seeded = (homeId) => normalize({
+    homeId, homePath: '/m', generatedAt: iso(0), wsVersion: 2, pcVersion: 3,
+    workspaces: [{ workspaceId: 'w1', title: 'A', path: '/r/a', archived: false, sessionIds: ['s1'] }],
+    sessions: [{ sessionId: 's1', tokenUsage: null, lastActivity: iso(1) }],
+    modelTier: { activeId: 'std', tiers: { std: { provider: 'p', model: 'm' } } },
+    providers: [{ ref: 'K', provider: 'p' }], degraded: [],
+  });
+
+  const mismatches = [];
+  for (let mask = 0; mask < 16; mask++) {
+    const degradedDomains = domains.filter((_, i) => mask & (1 << i));
+    const store = new IndexStore(':memory:');
+    const homeId = store.registerHome({ homePath: '/m' });
+    store.upsertRows(seeded(homeId));
+    // 第二次 upsert：所有域都产出 0 行，被标记降级的域应对应的表必须保留旧行
+    store.upsertRows(normalize({
+      homeId, homePath: '/m', generatedAt: iso(0),
+      wsVersion: degradedDomains.includes('workspace') ? 999 : 2,
+      pcVersion: degradedDomains.includes('projcache') ? 999 : 3,
+      workspaces: [], sessions: [], modelTier: null, providers: [],
+      degraded: degradedDomains.map((domain) => ({ domain, error: 'x', degraded: true })),
+    }));
+
+    const home = store.getHome(homeId);
+    const actual = {
+      sessions: store.recentSessions({ homeId }).length,
+      workspaces: store.listWorkspaces({ homeId }).length,
+      providers: home.providers.length,
+      modelTiers: home.activeTier ? 1 : 0,
+    };
+    const expected = {
+      sessions: degradedDomains.includes('projcache') ? 1 : 0,
+      workspaces: degradedDomains.includes('workspace') ? 1 : 0,
+      providers: degradedDomains.includes('credentials') ? 1 : 0,
+      modelTiers: degradedDomains.includes('modelTier') ? 1 : 0,
+    };
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      mismatches.push(`degraded=[${degradedDomains.join(',') || '无'}] 实际 ${JSON.stringify(actual)} 期望 ${JSON.stringify(expected)}`);
+    }
+    store.close();
+  }
+  assert.deepEqual(mismatches, [], `降级组合行为不符：\n${mismatches.join('\n')}`);
+});
