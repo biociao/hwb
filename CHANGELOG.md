@@ -476,6 +476,11 @@ Semantic Versioning.
   慢实例 sleep 5→12s、elapse 上限 4000→8000（判别力不变：隔离被回退时整轮要等满 12s）。
   单独跑 12 次 0 失败、8 个 CPU 占满也不失败 —— 只有并发套件时才现。
 - 审查同时确认：**最近 9 个带源码改动的提交，其回归测试都真的会红**（16 次定向变异，全部被捕获）。
+- 另外两条「断言写成了实现细节」的也顺手收紧（都属于审查点出的第 8 类）：
+  `sshProbe` 原先只断言 `typeof === 'boolean'`（把 `catch { return true }` 注进去照样绿），
+  现在断言连不上的主机必须是 `false`；workspace 菜单原先用 `match(/hwb-finder/)` ——
+  而它是 `hwb:open-workspace-finder` 的子串，菜单项 id 被改成 `hwb-finder-typo`（点了没反应）
+  照样绿；现在把「菜单项 id」与「handler 判断的 id」各自取出来做**逐字对比**。两条都重跑了变异。
 
 ### Fixed
 #### 陈旧的 `service.port` 会让 `hwb stop` 报一个与 hwb 无关的占用错误（src/cli.js）

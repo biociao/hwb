@@ -98,8 +98,10 @@ test('verifyProcess: 在一个 ps 不可用的环境里 fail-safe 返回 false�
 test('sshProbe: 缺 host 直接 false；被注入的 ssh 调用失败时也 false（未被接线）', async () => {
   assert.equal(await sshProbe('', 1000), false);
   assert.equal(await sshProbe(null, 1000), false);
-  // 用一个必然失败的主机名（配合 pExecFile 的 timeout），只断言不抛
-  assert.equal(typeof await sshProbe('nonexistent.invalid', 300), 'boolean');
+  // 用一个必然失败的主机名（配合 pExecFile 的 timeout）。这里必须断言**具体的 false** ——
+  // 原先只断言「typeof === 'boolean'」，审查把 `catch { return true }` 注进去套件照样全绿，
+  // 也就是说「探测失败被当成连通」这种反了的语义没人守。
+  assert.equal(await sshProbe('nonexistent.invalid', 300), false, '连不上的主机必须判 false');
 });
 
 test('httpProbe: status < 500 视为活着，连接失败为 false', async (t) => {

@@ -36,7 +36,14 @@ function ProjectRowItem({ group, onToggle, onCreate, actions, drag, home, t }) {
 test('注入改动会同时打上 items 与 handler 两个锚点', () => {
   const out = addWorkspaceFinderMenu(FIXTURE);
   assert.notEqual(out, FIXTURE, '两个锚点都在时应发生替换');
-  assert.match(out, /hwb-finder/);
+  // 「菜单项的 id」与「handler 判断的 id」必须**逐字一致**：不一致就是点了没反应（静默空操作）。
+  // 原先只 `match(/hwb-finder/)`，而它是 `hwb:open-workspace-finder` 的子串 —— 审查把菜单项的 id
+  // 改成 `hwb-finder-typo` 之后套件照样全绿。这里把两处 id 各自取出来对比。
+  const itemId = out.match(/const workspaceMenuItems = \[\.\.\.\(row\.workspaceId === void 0 \? \[\] : \[\{\s*\n\s*id: "([^"]+)"/)?.[1];
+  const handlerId = out.match(/if \(id === "([^"]+)"\) \{\s*\n\s*window\.dispatchEvent/)?.[1];
+  assert.ok(itemId, '应能从注入后的 items 里取到 id');
+  assert.ok(handlerId, '应能从注入后的 handler 里取到 id');
+  assert.equal(itemId, handlerId, `两处 id 必须一致（实际 items=${itemId} handler=${handlerId}）`);
   assert.match(out, /hwb:open-workspace/);
   assert.match(out, /IconFolderOpen16/);
 });
