@@ -102,3 +102,19 @@ test('deriveSessionStatus: plan.active 是持久模式开关，不表示「正�
   assert.equal(deriveSessionStatus({ plan: { running: { commandId: 'c' }, active: true }, lastActivity: fresh }).kind, 'running');
   assert.equal(deriveSessionStatus({ plan: { running: { commandId: 'c' } }, lastActivity: fresh }).kind, 'running');
 });
+
+// 未来的 lastActivity 会**关掉**陈旧闸门：age 是负数，而 `age > RUNNING_STALE_MS` 对负数恒为 false。
+// 实测（审查）：`openStep + lastActivity 在未来 6 小时` 判成 running；写成公元 33658 年同样 running。
+// 而真实 projcache 里时钟偏一点就会产生未来时间戳（CHANGELOG 记录过远端实例时钟偏一点的实测），
+// 这个闸门正是为修「179 个会话里 18 个被永久标成运行中」而写的，不能被一个未来时刻绕过。
+test('deriveSessionStatus: 未来的 lastActivity 不再关掉陈旧闸门（按 idle 降级）', () => {
+  const future = new Date(Date.now() + 6 * 3600_000).toISOString();
+  assert.equal(deriveSessionStatus({ sessionStats: { openStep: 3 }, lastActivity: future }).kind, 'idle',
+    '未来 6 小时：本机时钟无法判断它有多新，按项目一贯取舍降级 idle');
+  assert.equal(deriveSessionStatus({ sessionStats: { openStep: 3 }, lastActivity: new Date(33658, 0, 1).toISOString() }).kind, 'idle',
+    '公元 33658 年同样不能再当「正在运行」');
+  // 对照：正常的新鲜时间戳仍然是 running（闸门本身不能被这次修复弄坏）
+  assert.equal(deriveSessionStatus({ sessionStats: { openStep: 3 }, lastActivity: new Date(Date.now() - 60_000).toISOString() }).kind, 'running');
+  // 以及既有的取舍：没有时间信息时不判断
+  assert.equal(deriveSessionStatus({ sessionStats: { openStep: 3 } }).kind, 'running');
+});

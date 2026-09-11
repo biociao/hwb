@@ -7,6 +7,8 @@ export class LiveStatusPoller {
   constructor({ store, homes, read, broadcast = () => {}, intervalMs = 3000 }) {
     Object.assign(this, { store, homes, read, broadcast, intervalMs });
     this.pending = new Map();
+    // homeId -> 上一次失败的原因（用于「同 home 同原因只记一次」的去重，成功即清除）。
+    this.writeErrors = new Map();
     this.timer = null;
     this.running = false;
   }
@@ -71,9 +73,19 @@ export class LiveStatusPoller {
       if (!this.running || !Array.isArray(live) || !this.store.getHome(homeId)) return;
       if (this.store.getHome(homeId).activeEndpointId !== home.activeEndpointId) return;
       this.store.applyLiveStatus(homeId, live);
+      this.writeErrors.delete(homeId);
       this.broadcast('index:updated', { homeId, source: 'live', sessionCount: live.length });
     }).catch((error) => {
-      log.debug('实时会话刷新失败', { homeId, error: error.message });
+      // 写失败必须在**默认级别**可见：默认 level=info，原先这里记 debug ⇒ 日志环里只剩
+      // 「实时会话同步成功」，而库里一行都没写进去（审查实测：一行脏数据让整批回滚，
+      // committed rows = 0，界面继续显示上一轮的**错**状态，home 也不 degraded）。
+      // 轮询每 3s 一次，所以按「同 home 同原因」去重，成功一次即复位（见上面的 delete）。
+      const reason = error?.message ?? String(error);
+      const key = `${homeId}|${reason}`;
+      if (this.writeErrors.get(homeId) !== key) {
+        this.writeErrors.set(homeId, key);
+        log.warn('实时状态写入失败（该实例的状态不会被更新）', { homeId, error: reason });
+      }
     }).finally(() => this.pending.delete(homeId));
     this.pending.set(homeId, work);
     return work;

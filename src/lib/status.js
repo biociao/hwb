@@ -13,13 +13,24 @@ function isStale(lastActivity) {
   if (!lastActivity) return false; // 没有时间信息时不做判断（例如只从实时通道来的会话）
   const at = Date.parse(lastActivity);
   if (!Number.isFinite(at)) return false;
-  return Date.now() - at > RUNNING_STALE_MS;
+  const age = Date.now() - at;
+  // **未来的时间戳也算陈旧**：它的 age 是负数，而 `age > RUNNING_STALE_MS` 对负数恒为 false ——
+  // 闸门被整个关掉。实测（审查）：`openStep + lastActivity 在未来 6 小时` 判成 running；
+  // 写成公元 33658 年同样 running；而真实 projcache 里时钟偏一点就会产生未来时间戳
+  // （CHANGELOG 记录过：远端实例时钟偏一点 → summary 6000 而 trend 0）。
+  // 这个闸门本身就是为修「179 个会话里 18 个被永久标成运行中」而写的，不能被一个未来时刻绕过。
+  // 本机时钟无法判断「未来的时刻有多新」，按本项目一贯的取舍降级为 idle —— 真正在跑的实例
+  // 另有实时通道（3s 轮询）覆盖状态。
+  return age < 0 || age > RUNNING_STALE_MS;
 }
 
 // 审批策略：只保留字符串，并限制长度（超长直接截断 —— 它只是一个展示用的次级提示）。
 const APPROVAL_MAX = 64;
 
-function normalizeApproval(value) {
+// 导出：实时通道（dshhome/live-status.js）也必须经过同一套守卫 —— 否则 `permissions.approval`
+// 会绕过它（实测：`{"obj":true}` 直接落库 → 界面显示「审批 [object Object]」；300k 的字符串
+// 会把 sessions.status 撑到 300KB 且每 3s 重写一次），而且在宽限期内实时值赢过文件侧被守卫的值。
+export function normalizeApproval(value) {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   if (!trimmed) return null;

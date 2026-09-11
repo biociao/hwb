@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { IndexStore } from '../src/dshhome/store.js';
 import { LiveStatusPoller } from '../src/dshhome/live-poller.js';
 import { LiveStatusReader } from '../src/dshhome/live-status.js';
+import { initLogger, getLogs } from '../src/lib/logger.js';
 
 const status = (kind) => ({ kind, label: kind, subagents: 0, approval: null });
 
@@ -91,7 +92,9 @@ test('live reader reports failures once, distinguishes malformed and empty lists
   const logs = JSON.stringify(getLogs({ limit: 100 }));
   assert.ok(logs.includes('rpc http 401'));
   assert.ok(logs.includes('gateway/bad-request'));
-  assert.ok(logs.includes('同步成功'));
+  // 成功日志只说「读取」成功 —— 写入是轮询器的事，写失败会单独记 warn（见下面那条用例）。
+  // 原先这里写的是「实时会话同步成功」，在「读到了但一行都没写进去」时那句话是假的。
+  assert.ok(logs.includes('读取成功'));
   assert.ok(!logs.includes('DO_NOT_LOG'));
   assert.ok(!logs.includes('PRIVATE'));
 });
@@ -127,4 +130,32 @@ test('live poller: homes() 返回非数组时也只跳过本轮（不因 .find/f
   assert.doesNotThrow(() => poller.start());
   assert.doesNotThrow(() => poller.refresh('a'));
   poller.stop();
+});
+
+// 审查实测：一行脏数据（sessionId 是 `true`/`{}`/`[]`）会让整批 upsert 抛
+// 「Provided value cannot be bound to SQLite parameter 2」，committed rows = 0 ——
+// 而失败只记在 debug 上，默认 level（info）看不到：日志环里只有「同步成功」，
+// 库里一行都没写，界面继续显示上一轮的**错**状态。现在：
+//   ① 类型校验前移到 toLiveRow（只有非空字符串 sessionId 才接受）；
+//   ② 写失败记 warn，并按「同 home 同原因」去重（成功即复位）。
+test('live poller: 写失败必须记 warn（默认级别可见），且同因去重', async () => {
+  initLogger({ level: 'info', file: false, color: false, silent: true });
+  const store = {
+    getHome: () => ({ homeId: 'h1', activeEndpointId: null }),
+    applyLiveStatus: () => { throw new Error('Provided value cannot be bound to SQLite parameter 2'); },
+  };
+  const poller = new LiveStatusPoller({
+    store, homes: () => [{ homeId: 'h1', activeEndpointId: null }],
+    read: async () => [{ sessionId: 'x', status: { kind: 'idle', label: '空闲' } }],
+    intervalMs: 60_000,
+  });
+  // refresh() 的守卫要求 running=true（否则整段静默空转 —— 这也是那条「日志说成功、库里 0 行」
+  // 之所以难查的一部分）。这里不 start()，避免留下定时器。
+  poller.running = true;
+  await poller.refresh('h1');
+  await poller.refresh('h1');
+  await poller.refresh('h1');
+  const warnings = getLogs({ limit: 100 }).filter((e) => e.level === 'warn' && String(e.message).includes('实时状态写入失败'));
+  assert.equal(warnings.length, 1, `同 home 同原因只记一次（实际 ${warnings.length} 条）`);
+  assert.match(JSON.stringify(warnings[0]), /cannot be bound/, '要带上真正的原因，便于排查');
 });

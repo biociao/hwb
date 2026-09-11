@@ -1,5 +1,6 @@
 import { logger } from '../lib/logger.js';
 import { msToIso } from '../lib/time.js';
+import { normalizeApproval } from '../lib/status.js';
 
 const log = logger('live-status');
 
@@ -134,7 +135,13 @@ export function normalizeLiveTokenUsage(raw) {
 }
 
 function toLiveRow(item) {
-  const sid = item?.sessionId ?? item?.id ?? null;
+  const raw = item?.sessionId ?? item?.id ?? null;
+  // sessionId 必须是**非空字符串**。它是唯一没做类型校验的绑定点，而外层 applyLiveStatus 走的是
+  // 整批 upsert：一行脏数据会让**整批**一行都写不进去并抛
+  // 「Provided value cannot be bound to SQLite parameter 2」（审查实测：`true`/`{}`/`[]` 都抛，
+  // committed rows = 0），而库里的行保持上一轮的值 —— 显示的是**错**的状态，不只是旧状态。
+  // 数字虽然能写进去（被 TEXT affinity 改写），但那也不是 sessionId，一并拒绝。
+  const sid = typeof raw === 'string' && raw.trim() !== '' ? raw : null;
   if (!sid) return null;
   const values = item?.projections?.values ?? {};
   const stats = values.sessionStats ?? {};
@@ -162,7 +169,9 @@ function toLiveRow(item) {
       kind,
       label: labels[kind],
       subagents,
-      approval: values.permissions?.approval ?? null,
+      // 与文件侧走同一套守卫（长字符串截断、非字符串丢弃）：实时值在宽限期内会**赢过**文件值，
+      // 不守卫就等于把守卫整条绕过。
+      approval: normalizeApproval(values.permissions?.approval),
     },
     lastActivity: msToIso(lastPromptAt),
     tokenUsage: normalizeLiveTokenUsage(values.tokenUsage),
@@ -201,7 +210,7 @@ export class LiveStatusReader {
       // 不记录 URL/token/cookie、RPC 正文或远端错误详情。
       const context = { homeId, host, endpoint: 'session/list', timeoutMs: this.timeoutMs };
       if (error) log.warn('实时会话同步失败，工作台仍使用文件索引', { ...context, reason: error });
-      else log.info('实时会话同步成功', { ...context, sessionCount: count });
+      else log.info('实时会话读取成功（写入由轮询器负责，失败会单独记 warn）', { ...context, sessionCount: count });
     };
     try {
       const result = await rpc(url, 'session/list', { _request: {} }, this.timeoutMs);

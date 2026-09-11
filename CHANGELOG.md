@@ -243,6 +243,40 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 未来的 lastActivity 会关掉「运行中」的陈旧闸门（src/lib/status.js）
+- **现象**：`openStep` 还在、`lastActivity` 却是**未来**时刻的会话被判成「运行中」并永久挂着。
+  实测（审查）：未来 6 小时 → running；写成公元 33658 年 → running；真实 projcache 连跑 3 遍索引仍是 running。
+- **根因**：`isStale()` 的判据是 `Date.now() - at > RUNNING_STALE_MS`，而未来时刻的差值是**负数**，
+  对负数恒为 false —— 闸门被整个关掉。而这条闸门正是为修「179 个会话里 18 个被永久标成运行中」
+  而写的，而 CHANGELOG 里也记录过「远端实例时钟偏一点就会产生未来时间戳」的实测。
+- **修复**：`age < 0 || age > RUNNING_STALE_MS`。本机时钟无法判断「未来的时刻有多新」，
+  按本项目一贯的取舍降级 idle —— 真正在跑的实例另有实时通道（3s 轮询）覆盖状态。
+  `lastActivity` 缺失/不可解析时不判断这条既有的取舍保持不变（测试锁定）。
+- **回归测试**：`tests/status.test.js`（未来 6 小时 / 公元 33658 年 → idle；新鲜的 1 分钟前仍 running）。
+  修复前失败。
+
+#### 实时通道的 `permissions.approval` 绕过了守卫，而且赢过文件侧（src/dshhome/live-status.js）
+- **现象**：对象形态的 approval 直接落库，界面显示「审批 [object Object]」；30 万字符的字符串会把
+  `sessions.status` 这一列撑到 300KB 并每 3s 重写一次。而且实时值在宽限期内**赢过**文件侧被守卫过的值
+  （审查实测 1→5 步：文件侧是 `"never"`，实时轮询一来就变回对象，且每次轮询重新赢，不自愈）。
+- **根因**：`lib/status.js` 的 `normalizeApproval`（只留字符串、截断 64）是模块私有的，
+  实时通道 `toLiveRow` 直接取 `values.permissions?.approval ?? null`。
+- **修复**：导出 `normalizeApproval` 并在 `toLiveRow` 里使用。
+- **回归测试**：`tests/live-status.test.js`（对象 → null、30 万字符 → 65 字符、正常字符串不变）。修复前失败。
+
+#### 实时写入失败只记 debug，日志里只剩「同步成功」（src/dshhome/live-poller.js + live-status.js）
+- **现象（审查实测）**：一行脏数据（`sessionId` 是 `true`/`{}`/`[]`）让**整批** upsert 抛
+  `Provided value cannot be bound to SQLite parameter 2`，committed rows = 0 ——
+  而失败记在 **debug** 上，默认 level（info）根本看不到：日志环里只有「实时会话同步成功」，
+  库里一行都没写，界面继续显示上一轮的**错**状态，home 也不 degraded。
+- **根因**：`toLiveRow` 是唯一没做类型校验的绑定点（文件侧的 sessionId 来自 JSON 对象键，必为字符串）；
+  轮询器的 catch 用 `log.debug`；而 live-status 的 INFO「同步成功」只描述**读取**成功。
+- **修复**：①`toLiveRow` 只接受非空**字符串** sessionId（数字虽能被 TEXT affinity 写进去，也不是 id）；
+  ②轮询器写失败改 `log.warn`，并按「同 home 同原因」去重（成功即复位），避免每 3s 刷一条；
+  ③把那句 INFO 改成「实时会话读取成功（写入由轮询器负责，失败会单独记 warn）」——原先它在写失败时是假的。
+- **回归测试**：`tests/live-poller.test.js`（写失败必须留下 **warn** 且同因只一条）。修复前失败。
+
+### Fixed
 #### 切维度后趋势图标签又互相压字（src/web/app.js）
 - **现象（真浏览器实测）**：点「30 天」标签是好的；再点「按项目」，两个标签叠在一起
   （`09-04 20:00|09-05 20:00` 重叠）。同一个图表、两条渲染路径两种表现。

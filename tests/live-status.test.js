@@ -20,3 +20,27 @@ test('live-status: 实时 tokenUsage 的三种形态都被归一成扁平计数'
     assert.equal(normalizeLiveTokenUsage(bad), null, `${JSON.stringify(bad)} 应归一为 null`);
   }
 });
+
+// 实时通道的 `permissions.approval` 原先直接落库，绕过了 lib/status.js 的守卫（只留字符串、截断到 64），
+// 而且在宽限期内**赢过**文件侧被守卫过的值 —— 每次轮询重新赢，不自愈。
+// 实测（审查）：`{"obj":true}` 落库 → 界面显示「审批 [object Object]」；
+// 30 万字符的字符串会把 sessions.status 这一列撑到 300KB，且每 3s 重写一次。
+test('toLiveRow: 实时 approval 与文件侧走同一套守卫（长串截断、非字符串丢弃）', async () => {
+  const { LiveStatusReader } = await import('../src/dshhome/live-status.js');
+  const saved = globalThis.fetch;
+  const rowsFor = async (values) => {
+    globalThis.fetch = async () => Response.json({
+      type: 'server-response',
+      result: { ok: true, value: { items: [{ sessionId: 's1', cwd: '/r', projections: { values } }] } },
+    });
+    return new LiveStatusReader().read('http://127.0.0.1:1/', {});
+  };
+  try {
+    const obj = await rowsFor({ permissions: { approval: { obj: true } } });
+    assert.equal(obj[0].status.approval, null, '非字符串一律丢弃');
+    const long = await rowsFor({ permissions: { approval: 'x'.repeat(300_000) } });
+    assert.equal(long[0].status.approval.length, 65, '超长截断到 64 字符 + 省略号');
+    const ok = await rowsFor({ permissions: { approval: 'never' } });
+    assert.equal(ok[0].status.approval, 'never', '正常字符串照旧');
+  } finally { globalThis.fetch = saved; }
+});
