@@ -177,3 +177,37 @@ test('indexer: 抓实时状态期间轮询器写过新数据时，索引器不�
   assert.equal(kind, 'running', `轮询器写的新状态不该被索引器的旧快照覆盖（实际 ${kind}）`);
   store.close();
 });
+
+// 端点守卫：索引器抓实时状态期间用户切换了连接端点（同一个实例 id、另一个 dsh 进程），
+// 那份实时数据属于**旧端点**，不该写进库。live-poller 一直有这句守卫，索引器这条路径原先没有。
+test('indexer: 抓实时状态期间切换端点时，丢弃旧端点的实时数据', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-epswitch-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await mkdir(path.join(dir, 'storages'), { recursive: true });
+  await writeFile(path.join(dir, 'storages', 'workspace.json'), JSON.stringify({
+    unit: { name: 'workspace', version: 2 }, global: { initialized: true, workspaceIds: ['w1'] },
+    tables: { workspaces: { w1: { title: 'A', path: '/r/a', sessionIds: ['s1'] } } },
+  }));
+  await writeFile(path.join(dir, 'storages', 'session_projcache.json'), JSON.stringify({
+    unit: { name: 'session_projcache', version: 3 }, global: null,
+    tables: { sessions: { s1: { identity: { createdAt: Date.now(), cwd: '/r/a' }, rows: {} } } },
+  }));
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: dir, hostType: 'local' });
+  let release; const gate = new Promise((r) => { release = r; });
+  const indexer = new Indexer({ store,
+    homes: () => [{ homeId, hostType: 'local', homePath: dir }],
+    liveStatus: async () => { await gate; return [{ sessionId: 's1', cwd: '/r/a',
+      status: { kind: 'running', label: '运行中', subagents: 0, approval: null }, lastActivity: new Date().toISOString() }]; } });
+
+  const pending = indexer.reindexNow();
+  await new Promise((r) => setTimeout(r, 30));
+  // 期间切换端点（用直接写库模拟 API 的 switch 效果）
+  store.db.prepare('UPDATE homes SET activeEndpointId = ? WHERE homeId = ?').run('other-endpoint', homeId);
+  release();
+  await pending;
+  const row = store.recentSessions({ homeId })[0];
+  const kind = (typeof row.status === 'string' ? JSON.parse(row.status) : row.status)?.kind;
+  assert.notEqual(kind, 'running', `旧端点的实时状态不该写进库（实际 ${kind}）`);
+  store.close();
+});

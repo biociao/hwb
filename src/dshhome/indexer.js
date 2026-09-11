@@ -137,6 +137,11 @@ export class Indexer {
           this.liveStatus ? () => this.liveStatus(home) : null);
         return this.#finish(home, homeId, snapshot, rows, results);
       }
+      // 端点守卫：和 live-poller 里那句一样（`getHome(homeId).activeEndpointId !== home.activeEndpointId`
+      // 就放弃）。原先只有轮询器有这句话，索引器这条路径没有 —— 用户在索引跑动期间切换连接端点时，
+      // 索引器会把**上一个端点**读到的实时数据写进库（同一个实例 id、不同的 dsh 进程）。
+      // 这里在抓取前后各读一次，端点变了就丢弃这份实时数据（文件快照来自磁盘，与端点无关）。
+      const endpointBefore = this.store.getHome?.(homeId)?.activeEndpointId ?? null;
       const snapshot = readHomeSnapshot(home.homePath);
       if (this.liveStatus) {
         // 抓实时状态要等一次 RPC（本机也可能几百毫秒），而 live-poller 每 3s 就在写同一批行。
@@ -147,6 +152,8 @@ export class Indexer {
         const liveCaptureStartedAt = Date.now();
         try { live = await this.liveStatus(home); } catch { live = null; }
         if (this.store.liveStatusAt?.(homeId) > liveCaptureStartedAt) live = null;
+        const endpointAfter = this.store.getHome?.(homeId)?.activeEndpointId ?? null;
+        if (endpointAfter !== endpointBefore) live = null;
       }
       const rows = indexSnapshot(this.store, home.homePath, snapshot, live);
       return this.#finish(home, homeId, snapshot, rows, results);

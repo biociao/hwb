@@ -531,6 +531,16 @@ Semantic Versioning.
   自动重试，修好后重启必须自愈且数字分毫不差（2,222,000）；②「四列只加了一部分」的库必须补全且
   用量查询可用。修复前两条都失败。
 
+#### 索引器缺少端点守卫（src/dshhome/indexer.js）
+- **问题**：`live-poller` 早有「端点变了就放弃本次实时数据」的守卫
+  （`getHome(homeId).activeEndpointId !== home.activeEndpointId`），而索引器这条路径没有。
+  用户在索引跑动期间**切换连接端点**时，索引器会把**上一个端点**读到的实时数据写进库 ——
+  同一个实例 id、却是另一个 dsh 进程的会话与状态。审查把它标为「机制成立但未在 HTTP 上复现」。
+- **修复**：抓取前后各读一次 `activeEndpointId`，变了就丢弃这份实时数据（文件快照来自磁盘，
+  与端点无关，照常使用）。与轮询器的守卫保持同一套语义。
+- **回归测试**：`tests/indexer.test.js` —— 让实时抓取挂住，期间改写 `activeEndpointId`，
+  放行后库里**不得**出现那个 running 状态。修复前失败。
+
 #### 降级 + 实时合并会把文件索引撑起来的会话「洗白」甚至删掉（src/dshhome/store.js，CRITICAL）
 - **现象**（独立审查第 9 轮，实测复现）：projcache 域降级时（dsh 升级到不认识的 `unit.version`，
   正是降级路径存在的原因），`normalize()` 产出 0 条会话行，于是 `mergeLiveStatus` 把**每一条**
