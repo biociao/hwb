@@ -287,3 +287,22 @@ test('store: 派生列全为 0 但 user_version=1 的库也要被回填纠正（
   assert.equal(Number(trig.n), 2, '触发器必须补齐');
   b.close();
 });
+
+// 「另一个进程正在使用这个库」与「权限/磁盘问题」的补救办法完全不同：前者不该让用户去改名或换路径
+// （那等于把库整个换掉），后者才需要。审查指出原先任何失败都只给后者 —— 对瞬时锁是错建议。
+test('store: 另一个进程持写锁时，错误消息给的是「谁在用」而不是「改名或换路径」', (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'hwb-locked-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'hwb.db');
+  const held = new IndexStore(file);
+  held.db.exec('BEGIN IMMEDIATE'); // 持住写锁：另一个连接的第一步（CREATE TABLE IF NOT EXISTS）就会失败
+  let message = null;
+  try { new IndexStore(file); } catch (e) { message = e.message; }
+  held.db.exec('ROLLBACK');
+  held.close();
+
+  assert.ok(message, '持锁时应明确失败');
+  assert.match(message, /locked|busy/i, `底层原因要保留：${message}`);
+  assert.match(message, /另一个进程|hwb status/, `应指向「谁在用这个库」：${message}`);
+  assert.doesNotMatch(message, /改名或换一个路径/, '瞬时锁不该建议用户换库');
+});

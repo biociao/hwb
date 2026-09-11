@@ -245,9 +245,17 @@ export class IndexStore {
       // 把「初始化/迁移失败」说清楚：底层可能只是 `attempt to write a readonly database`
       // 或 `database or disk is full`，用户看不出该怎么恢复。迁移与建表都是**幂等**的，
       // 所以明确告诉他「修好后重启会自动继续」，而不是让他以为库坏了要重建。
-      throw new Error(`数据库初始化/迁移失败（${dbPath}）：${error?.message ?? error}。`
-        + '若是权限或磁盘空间问题，修复后重启会自动重试（建表与迁移都是幂等的）；'
-        + '若这个文件根本不是 SQLite 数据库，请改名或换一个路径。');
+      //
+      // 但要**分情况**给建议：`database is locked` 时的正确做法是「先看看是不是另一个 hwb 在用它」，
+      // 而不是「改名或换一个路径」—— 那把用户的库整个换掉了（审查提过：这条建议对瞬时锁是错的）。
+      // （SCHEMA 里的 CREATE TABLE IF NOT EXISTS 也要拿写锁，所以另一个进程持锁时第一步就会失败。）
+      const busy = /\blocked\b|database is busy|SQLITE_BUSY/i.test(String(error?.message ?? ''));
+      const hint = busy
+        ? '看起来是另一个进程正在使用这个数据库：先 `hwb status` / `lsof -nP -iTCP:<端口>` 确认没有第二个 hwb 在跑，'
+          + '或稍后重试（瞬时锁会自行消失）。'
+        : '若是权限或磁盘空间问题，修复后重启会自动重试（建表与迁移都是幂等的）；'
+          + '若这个文件根本不是 SQLite 数据库，请改名或换一个路径。';
+      throw new Error(`数据库初始化/迁移失败（${dbPath}）：${error?.message ?? error}。${hint}`);
     }
   }
 

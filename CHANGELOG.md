@@ -216,6 +216,18 @@ Semantic Versioning.
   无 0 值散点、日志面板有历史行、添加实例的 warning 在 SSE 刷新后仍在。
 
 ### Fixed
+#### 数据库被另一个进程占用时，给的是「改名或换路径」这条错误建议（src/dshhome/store.js）
+- **现象**：两个 hwb 用同一个 `hwb.db`（或外部工具持着写锁）时，第二个进程立刻报
+  `database is locked`，而包装后的消息只教用户「改名或换一个路径」—— 那等于让他把库换掉。
+- **根因**：`constructor` 的 catch 对所有失败给同一段补救建议。SCHEMA 里的
+  `CREATE TABLE IF NOT EXISTS` 也要拿写锁，所以「另一个进程在用」这种最常见的失败也走这条路。
+  （审查也确认：这条路径与本次改动无关，是既有行为。）
+- **修复**：按底层错误分类 —— `locked/busy` ⇒ 提示先确认有没有第二个 hwb 在跑（`hwb status`）、
+  瞬时锁会自动消失；其余沿用「权限/磁盘问题、幂等重试」的原建议。
+- **回归测试**：`tests/store-token-columns.test.js` —— 同进程内先 `BEGIN IMMEDIATE` 持写锁，
+  再打开同一个库：消息必须含「另一个进程」且**不含**「改名或换一个路径」。修复前该用例失败。
+
+### Fixed
 #### 迁移版本闸门被当成「列里的数据是对的」的证据（src/dshhome/store.js）
 - **现象（潜在，非 hwb 自己能造出）**：一个四列都在、`PRAGMA user_version = 1`、
   但四列**全是 0** 的库（外部工具改过、或从别处拷来的 `hwb.db`）会被直接放行 ——
