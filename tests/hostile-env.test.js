@@ -189,3 +189,53 @@ test('logger: 日志文件被删除后会重新创建，磁盘日志不再静默
   const body = await readFile(file, 'utf8');
   assert.match(body, /after-window/, '重新打开后的日志应写进磁盘');
 });
+
+// ── CRITICAL：凭据文件是 FIFO 时曾永久卡死（比 projcache 那条更致命） ──
+// 这条路径是 `GET /api/quota` → QuotaService.#hasStale() → refresh() → readCredentials()
+// 一路**没有 await** 地同步进来的，所以阻塞会冻住整个事件循环：端口不再响应、SIGTERM 也无效。
+// 它和 read-home.js 里修过的是同一个故障模式，只是凭据这条路径当时漏改了。
+test('balance: .credentials.yaml 是 FIFO 时立刻降级，不再冻住事件循环', async (t) => {
+  const { readCredentials } = await import('../src/lib/balance.js');
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-credfifo-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await new Promise((resolve, reject) => {
+    execFile('mkfifo', [path.join(dir, '.credentials.yaml')], (e) => (e ? reject(e) : resolve()));
+  });
+
+  const started = Date.now();
+  const creds = readCredentials(dir); // 原实现在这里永远不返回
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2000, `不该阻塞，实际 ${elapsed}ms`);
+  assert.deepEqual(creds, []);
+
+  // 真实调用链：QuotaService.refresh() 内部会同步走到这里
+  const { QuotaService } = await import('../src/dshhome/quota.js');
+  const svc = new QuotaService({
+    store: { listHomes: () => [{ homeId: 'h', homePath: dir, providers: [{ ref: 'DEEPSEEK_API_KEY', provider: 'deepseek' }] }] },
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+  const t2 = Date.now();
+  const rows = await svc.refresh();
+  assert.ok(Date.now() - t2 < 2000, 'quota.refresh 也不该被卡住');
+  assert.equal(rows.length, 1, '每个 provider 都应产出结果行（这里是读不到 key 的降级行）');
+});
+
+test('balance: 带 BOM 的凭据文件与不带 BOM 解析结果完全一致', async (t) => {
+  const { readCredentials } = await import('../src/lib/balance.js');
+  const { parseCredentialsYaml } = await import('../src/lib/read-home.js');
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-credbom-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const body = 'version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-abc\n  ZAI_API_KEY: zzz\n';
+
+  await writeFile(path.join(dir, '.credentials.yaml'), body);
+  const plain = readCredentials(dir);
+  assert.deepEqual(plain.map((c) => c.ref), ['DEEPSEEK_API_KEY', 'ZAI_API_KEY']);
+  const plainMeta = parseCredentialsYaml(body).map((c) => c.ref);
+
+  await writeFile(path.join(dir, '.credentials.yaml'), '\uFEFF' + body);
+  const bom = readCredentials(dir);
+  // BOM 是 U+FEFF，而 JS 的 \s 匹配它 —— 原实现里 `\uFEFFrefs:` 走错分支、inRefs 永远为 false，
+  // 表现为「这个实例一个 key 都没有」（配额面板整块变空）。
+  assert.deepEqual(bom.map((c) => c.ref), plain.map((c) => c.ref), '带 BOM 不该少解析出 ref');
+  assert.deepEqual(bom.map((c) => c.ref), plainMeta, '两条解析路径的结论必须一致');
+});

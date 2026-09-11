@@ -31,6 +31,31 @@ function t0(store) {
     '最后一个桶应当是当前小时');
 }
 
+// ── store：usageTrend 的 SQL 窗口必须与它产出的桶完全重合 ──
+// 两者错位时（原实现：SQL 从 `now - hours*H` 起，桶却从整点起）会有一小段
+// 「查得出来、却没有桶可放」的行被静默丢掉 —— 白查一趟，而且两条趋势口径在边界上
+// 悄悄不一致。这个错位在**输出上**看不出来（桶本来就是那个样子），所以只能钉住查询参数。
+test('usageTrend: SQL 窗口起点与首个桶重合（不留「查出来却无桶可放」的边界段）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/m' });
+  store.db.prepare('INSERT INTO sessions (homeId, sessionId, project, lastActivity, tokenUsage) VALUES (?,?,?,?,?)')
+    .run(homeId, 's', 'p', new Date().toISOString(), JSON.stringify({ uncachedInputTokens: 1 }));
+
+  const orig = store.db.prepare.bind(store.db);
+  const seen = [];
+  store.db.prepare = (sql) => {
+    const st = orig(sql);
+    if (!sql.includes('GROUP BY h')) return st;
+    return { ...st, all: (...args) => { seen.push(args[0]); return st.all(...args); } };
+  };
+  const trend = store.usageTrend({ hours: 24 });
+  store.db.prepare = orig;
+
+  assert.equal(seen.length, 1, '应恰好执行一次分桶查询');
+  assert.equal(seen[0], trend[0].ts, 'SQL 窗口起点必须等于首个桶的时间（原实现早了 H - now%H）');
+  store.close();
+});
+
 // ── store：SUM(a + b + c + d) 里缺任何一项都会让整段变 NULL ──
 test('usageSummary / usageByProject: 缺少任一 token 字段时总量仍正确', () => {
   const store = new IndexStore(':memory:');

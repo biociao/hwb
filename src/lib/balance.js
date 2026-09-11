@@ -1,5 +1,4 @@
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
+import { readMetadataFile } from './read-home.js';
 
 // §8.1: API key 只存在于服务端内存 —— readCredentials 的返回值 NEVER 传给浏览器。
 // /api/quota 只输出 { provider, remaining, currency, ... }。
@@ -10,10 +9,19 @@ const KEY_LINE = /^([A-Za-z0-9_]+)\s*:\s*(.+)$/;
 export function readCredentials(homePath) {
   let text;
   try {
-    text = readFileSync(path.join(homePath, '.credentials.yaml'), 'utf8');
+    // 必须走 readMetadataFile，而不是裸 readFileSync：
+    //  · 该路径若是 **FIFO**，同步 readFileSync 会永久阻塞事件循环 —— 而且这条路径是从
+    //    `GET /api/quota` → QuotaService.#hasStale() → refresh() 一路**没有 await** 地进来的，
+    //    所以阻塞会卡死整个进程（端口无响应、SIGTERM 也无效，只能 kill -9）。
+    //    这正是 read-home.js 那边修过的同一个故障模式，凭据这条路径当时漏了。
+    //  · 顺带拿到「非普通文件/符号链接/超限」的拒绝与大文件上限。
+    text = readMetadataFile(homePath, '.credentials.yaml');
   } catch {
     return [];
   }
+  // 剥掉 UTF-8 BOM：JS 的 `\s` 匹配 U+FEFF，于是 `\uFEFFrefs:` 会走错分支、inRefs 永远为 false，
+  // 带 BOM 的凭据文件会表现为「一个 key 都没有」—— 与 parseCredentialsYaml 那边保持一致。
+  text = String(text).replace(/^\uFEFF/, '');
   const creds = [];
   let inRefs = false;
   for (const raw of text.split('\n')) {

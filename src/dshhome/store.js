@@ -114,6 +114,16 @@ function daysAgoIso(days) {
   return new Date(Date.now() - safe * 86_400_000).toISOString();
 }
 
+// tokenUsage 是 TEXT 列，里面存 JSON。`json_extract` 遇到**非法 JSON** 会直接让整条 SQL
+// 报 `malformed JSON` —— 于是**一行**脏数据就把 /api/usage 与 /api/projects/recent 打成 500
+// （读路径上的 safeJsonParse 只保护行映射，管不到 SQL 聚合）。
+// 因此下面所有取值都写成 `CASE WHEN json_valid(x) THEN json_extract(x,'$.k') ELSE NULL END`
+// （外层再 COALESCE 成 0）：非法 JSON 视同「该字段不存在」，按 0 计入，
+// 而不是让整块面板一起不可用。
+//
+// 注意：加法一定要**逐项** COALESCE。写成 COALESCE(SUM(a + b + c + d), 0) 时，
+// 只要某个键缺失，整个相加就是 NULL、SUM 又忽略 NULL —— totalTokens 会变成 0。
+
 const int = (v, dflt) => {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : dflt;
@@ -611,10 +621,10 @@ export class IndexStore {
        ) SELECT s.project,
               COUNT(*) AS sessionCount,
               MAX(s.lastActivity) AS lastActivity,
-              SUM(COALESCE(json_extract(s.tokenUsage, '$.uncachedInputTokens'), 0)
-                + COALESCE(json_extract(s.tokenUsage, '$.cacheReadTokens'), 0)
-                + COALESCE(json_extract(s.tokenUsage, '$.cacheWriteTokens'), 0)) AS inputTokens,
-              SUM(COALESCE(json_extract(s.tokenUsage, '$.outputTokens'), 0)) AS outputTokens,
+              SUM(COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
+                + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
+                + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)) AS inputTokens,
+              SUM(COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.outputTokens') ELSE NULL END, 0)) AS outputTokens,
               (SELECT x.homeId FROM visible_sessions x WHERE x.project = s.project
                  ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS homeId,
               (SELECT x.sessionId FROM visible_sessions x WHERE x.project = s.project
@@ -673,14 +683,14 @@ export class IndexStore {
     const r = this.db.prepare(
       `SELECT
          COUNT(*) AS sessionCount,
-         COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')), 0) AS inputTokens,
-         COALESCE(SUM(json_extract(tokenUsage, '$.outputTokens')), 0) AS outputTokens,
-         COALESCE(SUM(json_extract(tokenUsage, '$.cacheReadTokens')), 0) AS cacheRead,
-         COALESCE(SUM(json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS cacheWrite,
-         COALESCE(SUM(COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0)
-                 + COALESCE(json_extract(tokenUsage, '$.outputTokens'), 0)
-                 + COALESCE(json_extract(tokenUsage, '$.cacheReadTokens'), 0)
-                 + COALESCE(json_extract(tokenUsage, '$.cacheWriteTokens'), 0)), 0) AS totalTokens
+         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END), 0) AS inputTokens,
+         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END), 0) AS outputTokens,
+         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END), 0) AS cacheRead,
+         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END), 0) AS cacheWrite,
+         COALESCE(SUM(COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
+                 + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END, 0)
+                 + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
+                 + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)), 0) AS totalTokens
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?`
     ).get(since);
@@ -697,28 +707,30 @@ export class IndexStore {
     };
   }
 
-  // 分时用量趋势：按小时分桶（最后 `hours` 小时），填充空白桶使图表连续。
+  // 分时用量趋势：按小时分桶（最后 `hours` 个整小时），填充空白桶使图表连续。
   usageTrend({ hours = 24 } = {}) {
     const now = Date.now();
-    const start = now - hours * 3_600_000;
-    const startIso = new Date(start).toISOString();
+    // 桶范围必须**包含当前这一小时**：原实现只列到 `floor(now/H) - 1` —— 当前这一小时的数据
+    // 被 SQL 选出来了却没有桶可放，于是被静默丢掉（实测真实库 24h 窗口里丢了 3.5% 的 token，
+    // 全部落在当前小时）。同时改为从旧到新（与 usageTrendGrouped 一致，图表不该反着画）。
+    const endHour = Math.floor(now / 3_600_000);
+    const startHour = endHour - hours + 1;
+    // SQL 窗口必须与**桶的范围**完全重合（这是 usageTrendGrouped 的做法）。
+    // 原实现写 `now - hours * 3600_000`：它比首个桶的起点更早（早 H - (now mod H)），
+    // 于是那一小段「落在窗口里、却没有桶可放」的行被查出来又丢掉 —— 白查一趟，
+    // 而且两条趋势口径在同一条边界上悄悄不一致。改成对齐后，取出的每一行都必定有桶。
+    const startIso = new Date(startHour * 3_600_000).toISOString();
     const rows = this.db.prepare(
       `SELECT CAST(STRFTIME('%s', lastActivity) / 3600 AS INTEGER) AS h,
-              COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')), 0) AS inputTokens,
-              COALESCE(SUM(json_extract(tokenUsage, '$.outputTokens')), 0) AS outputTokens,
-              COALESCE(SUM(json_extract(tokenUsage, '$.cacheReadTokens')), 0) AS cacheRead,
-              COALESCE(SUM(json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS cacheWrite
+              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END), 0) AS inputTokens,
+              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END), 0) AS outputTokens,
+              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END), 0) AS cacheRead,
+              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END), 0) AS cacheWrite
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY h`
     ).all(startIso);
     const byH = new Map(rows.map((r) => [r.h, r]));
-    // 桶范围必须**包含当前这一小时**：SQL 的窗口是 `lastActivity >= now - hours`，
-    // 而原实现只列到 `floor(now/H) - 1` —— 当前这一小时的数据被 SQL 选出来了却没有桶可放，
-    // 于是被静默丢掉（实测真实库 24h 窗口里丢了 3.5% 的 token，全部落在当前小时）。
-    // 同时改为从旧到新的顺序（与 usageTrendGrouped 一致，图表不该反着画）。
-    const endHour = Math.floor(now / 3_600_000);
-    const startHour = endHour - hours + 1;
     const buckets = [];
     for (let h = startHour; h <= endHour; h++) {
       const r = byH.get(h);
@@ -739,10 +751,10 @@ export class IndexStore {
     return this.db.prepare(
       `SELECT project,
               COUNT(*) AS sessionCount,
-              COALESCE(SUM(COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0)
-                      + COALESCE(json_extract(tokenUsage, '$.outputTokens'), 0)
-                      + COALESCE(json_extract(tokenUsage, '$.cacheReadTokens'), 0)
-                      + COALESCE(json_extract(tokenUsage, '$.cacheWriteTokens'), 0)), 0) AS tokens
+              COALESCE(SUM(COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
+                      + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END, 0)
+                      + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
+                      + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)), 0) AS tokens
        FROM sessions
        WHERE project IS NOT NULL AND lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY project
@@ -783,10 +795,10 @@ export class IndexStore {
     const rows = this.db.prepare(
       `SELECT CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER) AS h,
               ${groupExpr} AS grp,
-              COALESCE(SUM(json_extract(s.tokenUsage, '$.uncachedInputTokens')
-                      + json_extract(s.tokenUsage, '$.outputTokens')
-                      + json_extract(s.tokenUsage, '$.cacheReadTokens')
-                      + json_extract(s.tokenUsage, '$.cacheWriteTokens')), 0) AS tokens
+              COALESCE(SUM(COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
+                      + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.outputTokens') ELSE NULL END, 0)
+                      + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
+                      + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)), 0) AS tokens
        FROM sessions s
        WHERE s.lastActivity IS NOT NULL AND s.lastActivity >= ?
        GROUP BY h, grp

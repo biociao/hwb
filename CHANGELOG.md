@@ -151,7 +151,68 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
-#### 预览代理的建立竞态会留下孤儿监听端口（src/control/launcher.js）
+#### 一行坏 JSON 就让整个用量面板 500（src/dshhome/store.js）
+- **现象**：`sessions.tokenUsage` 只要有一行不是合法 JSON（外部工具改过库、或写入中途断电），
+  `GET /api/usage` 与 `GET /api/projects/recent` 直接 500，前端整块用量面板与项目列表一起空掉；
+  而**同一个坏值**在会话列表里是正常降级的（`safeJsonParse`）。
+- **根因**：`json_extract` 遇到非法 JSON 会让**整条 SQL** 报 `malformed JSON`。读路径上的
+  `safeJsonParse` 只保护「行 → 对象」的映射，管不到 SQL 聚合这一层 —— 一层保护，两处入口。
+  实测：插入一行 `'not json at all'` 后，`usageSummary` 立刻抛错。
+- **修复**：`store.js` 里全部 24 处取值统一写成
+  `CASE WHEN json_valid(x) THEN json_extract(x,'$.k') ELSE NULL END`（外层再 COALESCE 成 0）：
+  非法 JSON 视同「该字段不存在」，按 0 计入，而不是让整块面板不可用。
+- **回归测试**：`tests/bad-json-sql.test.js` —— 用**真 HTTP 服务端 + 真 IndexStore** 造一行坏
+  JSON，断言 `/api/usage` 与 `/api/projects/recent` 都 200，且坏行按 0 计入、好行照常统计。
+  修复前这 4 个用例全部失败。另加一条**结构测试**：扫描 `src/**/*.js`，任何一处
+  `json_extract(` 若同行没有 `json_valid(` 就报错 —— 防止以后再漏一处入口。
+
+#### 分组趋势图把「只记了部分 token 字段」的会话整行丢掉（src/dshhome/store.js）
+- **现象**：`usageTrendGrouped` 的合计比 `usageSummary` 少。实测同一份数据：
+  summary/byProject = 333，分组趋势 = 113（少了 220）。
+- **根因**：分组趋势的桶值是 `SUM(a + b + c + d)`，四个加数**没有逐项 COALESCE**。
+  dsh 写 tokenUsage 时不一定带全部四个键，缺一个键 → 整个相加为 NULL → `SUM` 忽略该行 →
+  这行的 220 个 token **静默消失**（不报错，只是数字不对，最难发现的那类）。
+- **修复**：与其他四处查询统一为逐项 `COALESCE(..., 0)`。
+- **回归测试**：`tests/bad-json-sql.test.js` 的「四套口径一致」用例 —— 造一行完整、一行缺两个
+  键、一行坏 JSON，断言 summary / trend / trendGrouped / byProject 四者总量全部相等（均为 333），
+  且 `totalTokens` 恒等于四项之和。修复前该用例失败（113 ≠ 333）。
+
+#### 分时趋势的查询窗口比它的桶更宽，边界段被「查出来又丢掉」（src/dshhome/store.js）
+- **现象**：`usageTrend` 只产出整点对齐的桶，但 SQL 窗口从 `now - hours*3600_000` 起，
+  比首个桶的起点早 `H - (now mod H)`。落在这段里的行被查出来、却没有任何桶能放它，
+  于是被静默丢弃 —— 白查一趟，而且与 `usageTrendGrouped`（窗口与桶严格对齐）在同一条
+  边界上口径不一致。
+- **根因**：窗口起点与桶范围各自计算，没有共用同一个对齐基点。
+- **修复**：先算 `startHour`，SQL 窗口起点直接取 `startHour * 3600_000`，与桶范围完全重合
+  （取出的每一行都必定有桶）。这是**无行为变化**的修正：那段行本来也没出现在返回值里。
+- **回归测试**：`tests/audit-fixes.test.js` 的「SQL 窗口起点与首个桶重合」用例。
+  这个错位在输出上根本看不出来（桶本来就是那个样子），所以用一条**不变量**测试钉住查询参数：
+  拦截 `db.prepare`，断言传给分桶查询的起点参数 `=== trend[0].ts`。修复前该用例失败。
+
+#### 凭据文件是 FIFO 时整个工作台永久卡死（src/lib/balance.js）
+- **现象**：`~/.dsh/.credentials.yaml` 若是 FIFO（命名管道），进程会永久阻塞：端口根本没 bind、
+  `SIGTERM` 无效，只能 `kill -9`。与 `read-home.js` 修过的是同一个故障模式，但凭据这条路径漏了。
+- **根因**：`readCredentials` 用裸 `readFileSync`。致命之处在于它的调用链
+  `GET /api/quota` → `QuotaService.#hasStale()` → `refresh()` → `readCredentials()`
+  **一路没有 await**，所以这是一个同步阻塞整个事件循环的操作 —— 连日志都写不出去。
+  实测：同款读取路径在修复前的最坏同步阻塞是 5725 ms（`read-home.js` 那条，可见）而凭据这条
+  从不返回；修复后探针里 `readCredentials` 0 ms、`QuotaService.refresh()` 1 ms 即降级返回。
+- **修复**：改用 `read-home.js` 的 `readMetadataFile`（`lstat` 拒绝非普通文件/符号链接、
+  `64 MiB` 上限、`O_NONBLOCK` 打开），顺带获得与元数据读取一致的加固。
+- **回归测试**：`tests/hostile-env.test.js` 用真 `mkfifo` 造 FIFO，断言 `readCredentials` 与
+  真实调用链 `QuotaService.refresh()` 都在 2s 内返回并降级。修复前该用例**永久挂住**
+  （只能被 `timeout` 杀掉）—— 这本身就是那条 bug 的直接证据。
+
+#### 带 BOM 的凭据文件会被解析成「一个 key 都没有」（src/lib/balance.js）
+- **现象**：把 `.credentials.yaml` 存成带 BOM 的 UTF-8（Windows 编辑器、部分脚本的默认行为），
+  配额面板整块变空 —— 实例明明配了 key，界面显示没有。
+- **根因**：JS 的 `\s` 匹配 U+FEFF，于是 `\uFEFFrefs:` 走错分支、`inRefs` 永远为 `false`。
+  `read-home.js` 的 `parseCredentialsYaml` 已经剥过 BOM，两条解析路径因此结论不一致。
+- **修复**：`readCredentials` 读入后剥掉前导 BOM，与 `parseCredentialsYaml` 保持一致。
+- **回归测试**：`tests/hostile-env.test.js` —— 同一份内容带/不带 BOM 各解析一次，
+  断言两条路径给出的 ref 列表完全相同。
+
+
 - `#withPreview` 会 `await createProxy(...)`，而 `disconnect` 只能关掉「当时已经存在」的
   `inst.previewProxy`；`previewPending` 只是作废了一个引用，管不到那个已经跑起来的 Promise。
   于是「代理还没就绪时实例被断开/移除」会让刚 bind 成功的端口没人持有，一直留到进程退出。
