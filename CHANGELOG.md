@@ -492,6 +492,12 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 源码注释引用了设计文档里不存在的章节（DSH_Workbench_Fusion_Architecture.md）
+- 三个文件（`reader.js` / `remote-reader.js` / `server.js`）都在注释里指向「§4.6」，而设计文档的
+  第 4 节只到 §4.5 —— 顺着引用去查的人会一无所获。补上真正的 §4.6「远端只读索引」小节
+  （`ssh host bash -s` + 分隔标记、32 MiB 上限、残缺判定、路径引用规则），
+  并新增测试：扫描 `src/**` 里的 `§N.M` 引用，逐个到文档里核对章节号存在。
+
 #### registry.applyProbe 在恢复成功后仍挂着旧错误（src/control/registry.js）
 - `if (cur.lastError) next.lastError = cur.lastError;` 是**无条件**覆盖的：成功分支明明写了
   `lastError: null`，却又被旧值盖回去。于是会出现「phase=running、attempts 归零，却还挂着一条
