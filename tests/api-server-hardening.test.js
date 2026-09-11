@@ -316,3 +316,52 @@ test('api: 路由返回但没写响应时，兜底网补一个 500（且不打�
   assert.match(source, /route\(req, res, url\)\.then\(\(\) => \{[\s\S]*?ensureResponded\(res, log, \{ method: req\.method, path: url\.pathname \}\)/,
     'src/api/server.js 必须在路由返回后调用 ensureResponded（否则兜底网没有任何接线）');
 });
+
+// ---- 兜底网不能误伤真实流量（尤其是 SSE 长连接） ----
+// 兜底网的判据是「路由返回时还没发过响应头」。如果哪天有路由把 `writeHead` 推迟到下一次
+// 事件循环（SSE 最容易被改成这样），兜底网就会给一个**刚刚建立的长连接**补 500，把它掐掉 ——
+// 而单测 `ensureResponded` 三态仍然全绿（它只喂假 res）。所以这里在真 socket 上跑一遍
+// 真实路由集合（普通 JSON、SSE、文件预览），断言「一次兜底网都没触发」。
+test('api: 真实流量（JSON/SSE/预览）不会触发兜底网', async () => {
+  const { initLogger, getLogs } = await import('../src/lib/logger.js');
+  initLogger({ level: 'info', file: false, color: false, silent: true });
+  const { tmpdir } = await import('node:os');
+  const server = createApiServer({
+    store: {
+      listHomes: () => [{ homeId: HOME_ID, hostType: 'local', homePath: '/tmp/.dsh', status: 'ok' }],
+      getHome: (id) => (id === HOME_ID ? { homeId: id, hostType: 'local', homePath: '/tmp/.dsh' } : null),
+      listWorkspaces: () => [{ workspaceId: 'ws-1', title: 'w', path: tmpdir() }],
+      getSession: () => null,
+    },
+    indexer: { reindexNow: async () => [] },
+    hub: { broadcast() {}, handle: (req, res) => { res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.write(': connected\n\n'); } },
+    launcher: { status: () => null },
+    monitor: { get: () => ({ runtime: 'stopped' }), refresh: async () => {} },
+    quota: { list: () => [], refresh: async () => ({}) },
+    logApi: { getLogs: () => [] },
+    webRoot: '/nonexistent-web-root',
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const homes = await fetch(`${base}/api/homes`);
+    assert.equal(homes.status, 200);
+    await homes.json();
+
+    const preview = await fetch(`${base}/api/homes/${HOME_ID}/preview?workspaceId=ws-1&path=.`);
+    assert.equal(preview.status, 200, `预览必须 200（实际 ${preview.status}）`);
+    await preview.json().catch(() => {});
+
+    // SSE：拿到第一段数据就主动断开（模拟浏览器标签页关闭）。
+    const ac = new AbortController();
+    const sse = await fetch(`${base}/api/events`, { signal: ac.signal });
+    assert.equal(sse.status, 200, `SSE 必须 200 —— 被兜底网补 500 就说明长连接被误杀（实际 ${sse.status}）`);
+    const reader = sse.body.getReader();
+    await reader.read();
+    ac.abort();
+    await reader.cancel().catch(() => {});
+    // 兜底网的日志是同步写的（writeHead 之前），所以这里不需要等待。
+    const bogus = getLogs({ limit: 200 }).filter((e) => String(e.message).includes('没有产生任何响应'));
+    assert.deepEqual(bogus, [], `真实路由不该触发兜底网，出现 ${bogus.length} 次`);
+  } finally { await new Promise((r) => server.close(r)); }
+});
