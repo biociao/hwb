@@ -167,8 +167,11 @@ test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然�
   assert.equal(JSON.parse((await run('status')).stdout).ready, true);
   await run('stop');
 
-  // ② 空锁文件（上次在 openSync 与 writeFileSync 之间被杀）同样算残留
+  // ② 空锁文件（上次在创建与写内容之间被杀）同样算残留 —— 但要**过期**才算：
+  // 空锁可能是并发命令刚创建的那一瞬间，那必须视为「被持有」（见下一条用例）。
   fs.writeFileSync(lock, '');
+  const aged = new Date(Date.now() - 60_000);
+  fs.utimesSync(lock, aged, aged);
   await run('start');
   await run('stop');
 
@@ -325,4 +328,23 @@ test('CLI: status/doctor 对「前台 hwb serve」必须如实报告在运行', 
   assert.match(status.stdout, /foreground/);
   const doctor = await run('doctor');
   assert.match(doctor.stdout, /HTTP 正常/, `doctor 应报服务正常，实际：${doctor.stdout}`);
+});
+
+// 空锁（持有者正在 open 与 write 之间）不能被当成残留：那是并发命令刚创建的那一瞬间，
+// 抢过去就变成两个持有者。只有「空且已经不再更新」才算残留。
+test('CLI 启停锁：刚创建的空锁算「被持有」，过期空锁才算残留', async t => {
+  const { dir, run } = await fixture(t);
+  const lock = path.join(dir, 'service.lock');
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+
+  fs.writeFileSync(lock, '');                       // 空锁 + 刚刚的 mtime = 并发命令正在写
+  await assert.rejects(run('start'), /持有/, '空但新鲜的锁必须被视为被持有');
+
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(lock, old, old);                    // 空锁 + 过期 mtime = 上次崩在 open 与 write 之间
+  const taken = await run('start');
+  assert.match(taken.stdout, /已启动/);
+  await run('stop');
+  fs.rmSync(lock, { force: true });
 });

@@ -292,26 +292,47 @@ function lockHeldBy(lock) {
   const alive = Number.isInteger(pid) && pid > 0 && pidAlive(pid);
   let ageMs = 0;
   try { ageMs = Date.now() - fs.statSync(lock).mtimeMs; } catch { return { held: false, pid, alive: false, ageMs: 0, raw }; }
-  return { held: alive && ageMs <= LOCK_STALE_MS, pid, alive, ageMs, raw };
+  const fresh = ageMs <= LOCK_STALE_MS;
+  // 空锁（持有者正在 open 与 write 之间）**不能**当成残留：那是并发命令刚创建的那一瞬间，
+  // 抢过去就变成两个持有者。只有「空且已经不再更新」才算残留。
+  const held = raw === '' ? fresh : (alive && fresh);
+  return { held, pid, alive, ageMs, raw };
+}
+
+// 接管一把残留锁：先把它**原子地**移到一边，再确认移走的正是我们读到的那个文件。
+// 直接用 rmSync 是不安全的：并发接管者可能在我们读取之后、删除之前已经建好了自己的新锁，
+// 我们那一记 rm 会把**别人的新锁**删掉，然后自己也 `wx` 成功 —— 两个持有者（审查提出，
+// 未能复现，但窗口确实存在）。rename + 内容比对把这件事变成可判定的。
+function takeOverLock(lock, expectedRaw) {
+  const parked = `${lock}.stale-${process.pid}-${Date.now()}`;
+  try { fs.renameSync(lock, parked); } catch { return false; }   // 别人先接管了
+  let same = false;
+  try { same = fs.readFileSync(parked, 'utf8').trim() === expectedRaw; } catch { same = false; }
+  if (!same) {
+    // 我们移走的是别人的新锁：还回去（尽力而为）并放弃接管
+    try { fs.renameSync(parked, lock); } catch { /* 已被别人占住 */ }
+    return false;
+  }
+  try { fs.rmSync(parked, { force: true }); } catch { /* 已被清掉 */ }
+  return true;
 }
 
 function acquireLock(lock) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fd = fs.openSync(lock, 'wx', 0o600);
-      // 立刻写上 PID 并开始心跳：锁文件从创建到写入之间不该是一个「空锁」。
-      fs.writeFileSync(fd, `${process.pid} ${Date.now()}`);
+      // 用带 flag:'wx' 的一次 writeFileSync 创建并写入（而不是 open + write 两步），
+      // 尽量缩短「锁存在但内容为空」的窗口；配合上面「空锁按新鲜度判断」，并发命令不会互相抢。
+      const body = `${process.pid} ${Date.now()}`;
+      fs.writeFileSync(lock, body, { flag: 'wx', mode: 0o600 });
       const beat = setInterval(() => { const now = new Date(); try { fs.utimesSync(lock, now, now); } catch { /* 锁已被清掉 */ } }, LOCK_REFRESH_MS);
       beat.unref?.();
-      return { fd, release() { clearInterval(beat); try { fs.closeSync(fd); } catch { /* 已关 */ } try { fs.rmSync(lock, { force: true }); } catch { /* 已被清掉 */ } } };
+      return { release() { clearInterval(beat); try { fs.rmSync(lock, { force: true }); } catch { /* 已被清掉 */ } } };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       const info = lockHeldBy(lock);
       if (info.held) throw Error(`另一个启停命令（PID ${info.pid}）持有 ${lock}；确认它确实不在运行后，删除该锁文件即可`);
-      if (attempt === 0) {
-        // 只删这一个锁文件，不碰任何进程。两个并发接管者都清掉旧文件后，
-        // 仍然只有一个能 'wx' 成功 —— 另一个会拿到 EEXIST 并如实报「被占用」。
-        try { fs.rmSync(lock, { force: true }); } catch { /* 已被别人清掉 */ }
+      if (attempt === 0 && takeOverLock(lock, info.raw)) {
+        // 只动这一个锁文件，不碰任何进程。
         const why = info.alive
           ? `持有者 PID ${info.pid} 虽在运行，但已 ${Math.round(info.ageMs / 1000)}s 没有心跳（很可能是 PID 被回收了）`
           : `持有者 PID ${info.raw || '未知'} 已不存在`;
