@@ -8,6 +8,20 @@ import path from 'node:path';
 import { parseMultipart } from '../lib/multipart.js';
 import { readFilePreview, resolveUploadDir, writeUpload, UPLOAD_BYTES, sessionWorkspace } from '../lib/file-preview.js';
 
+// 实例对象出站前的整形：去掉 dsh 的 token。
+//
+// token 是**控制凭据**（持有它 = 持有那个 dsh 实例：能执行 shell、写文件），而这个 API 在回环上
+// 是**没有鉴权**的：任何本机进程 `curl http://127.0.0.1:<port>/api/homes` 就能拿到全部实例的 token
+// （实测就是这样拿到明文 SUPER-SECRET-LAUNCH-TOKEN 的）。界面并不需要它 —— 带 token 的 iframe 入口
+// 由 `POST /homes/{id}/open` 现取现用（`inst.iframeUrl || inst.url`），
+// 而部分更新（PATCH）只在客户端**显式**传 token 时才改它，所以读接口不再回传不会破坏任何流程。
+// 注意：endpoints[] 里的 token 是「连接端点」各自的字段，端点编辑器需要它做预填，保持原样。
+function publicHome(home) {
+  if (!home || typeof home !== 'object') return home;
+  const { token, ...rest } = home;
+  return rest;
+}
+
 function send(res, status, body) {
   const json = JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -213,7 +227,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     }
 
     if (req.method === 'GET' && pathname === '/api/homes') {
-      const homes = store.listHomes().map((h) => ({ ...h, runtime: monitor.get(h.homeId) }));
+      const homes = store.listHomes().map((h) => ({ ...publicHome(h), runtime: monitor.get(h.homeId) }));
       send(res, 200, { homes });
       return;
     }
@@ -370,7 +384,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         if (changedEndpoint || changesConnection) { send(res, 409, { error: '当前连接端点正在使用；可添加其他端点并切换后再修改它' }); return; }
       }
       const updated = store.updateHomeConfig(home.homeId, patch);
-      send(res, 200, { home: { ...updated, runtime: monitor.get(home.homeId) } });
+      send(res, 200, { home: { ...publicHome(updated), runtime: monitor.get(home.homeId) } });
       return;
     }
     if (req.method === 'DELETE' && delHome) {
