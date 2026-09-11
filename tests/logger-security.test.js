@@ -258,3 +258,32 @@ test('轮转代（.1/.2）与已存在的目录也要收权限（升级路径下
   }
   assert.match(await readFile(`${file}.1`, 'utf8'), /OLDTOKEN1/, '内容不受影响（只是权限）');
 });
+
+// 目录权限收紧**绝不能碰当前目录及其祖先**：日志路径可以是相对的（`--log hwb.log`、
+// `hwb config set log x`），那样 dirname 就是 `.` 或 `..` —— 无条件 chmod 会把用户的工作目录
+// （甚至家的上一级）改成 0700，比它想防的「目录可被遍历」严重得多。自查本轮改动时发现的。
+test('logger: 日志路径是相对路径时，不许改动当前目录及其祖先的权限', async (t) => {
+  if (process.platform === 'win32') return t.skip('权限位在 Windows 上没有意义');
+  const { mkdtemp, mkdir, writeFile, chmod, stat, rm } = await import('node:fs/promises');
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-logrel-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const work = path.join(base, 'work');
+  await mkdir(work, { recursive: true });
+  await chmod(work, 0o755).catch(() => {});
+  const saved = process.cwd();
+  process.chdir(work);
+  t.after(() => process.chdir(saved));
+  try {
+    // 相对路径：dirname 就是 `.`（即 work 目录本身）
+    initLogger({ level: 'info', file: path.join('.', 'rel.log'), color: false });
+    logger('sec').info('relative log path');
+    assert.equal((await stat(work)).mode & 0o777, 0o755, '当前目录的权限不许被日志模块改动');
+    // 文件本身仍应收紧（那是我们要防的凭据泄漏）
+    initLogger({ level: 'info', file: path.join('.', 'rel2.log'), color: false });
+    logger('sec').info('x');
+    assert.equal((await stat(path.join(work, 'rel2.log'))).mode & 0o777, 0o600, '日志文件本身仍要 0600');
+  } finally {
+    // 还原 cwd 之后再收尾，避免 rm 在已 chdir 的目录里失败
+    process.chdir(saved);
+  }
+});

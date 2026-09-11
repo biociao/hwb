@@ -258,6 +258,11 @@ export async function sweepStaleStaging(dir, { now = Date.now(), ttlMs = STAGING
     try {
       const st = await stat(full);
       if (!st.isDirectory() || now - st.mtimeMs < ttlMs) continue;
+      // **必须确认它真是我们建的暂存目录**：目录名匹配还不够 —— 用户完全可能自己有一个叫
+      // `.hwb-upload-xxx` 的目录（而且已经放了一段时间），无条件删就是把他的数据删掉。
+      // 我们建的暂存目录结构是固定的：里面只有 `part`（可能还有我们写的中间产物）。
+      const inside = await readdir(full).catch(() => null);
+      if (!inside || !inside.includes('part')) continue;
       await rm(full, { recursive: true, force: true });
       removed++;
     } catch { /* 并发删除/权限问题：跳过 */ }

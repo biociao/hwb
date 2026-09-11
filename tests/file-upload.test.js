@@ -446,9 +446,17 @@ test('localUploader: 过期的暂存目录会被清掉，正在写入的不会�
   await mkdir(fresh, { recursive: true });
   await writeFile(path.join(fresh, 'part'), 'y');
 
+  // ③ 名字像暂存目录、但**不是我们建的**（里面没有 part）：绝不能删 —— 用户可能自己有这么个目录
+  const notOurs = path.join(dir, '.hwb-upload-MINE');
+  await mkdir(notOurs, { recursive: true });
+  await writeFile(path.join(notOurs, 'important.txt'), 'user data');
+  await utimes(notOurs, longAgo, longAgo);
+
   await localUploader(dir, '.');   // 构造上传器时就会扫一遍
   await assert.rejects(stat(stale), '陈旧暂存目录应被清掉');
   assert.ok((await stat(fresh)).isDirectory(), '正在写入的暂存目录不能被误删');
+  assert.ok((await stat(path.join(notOurs, 'important.txt'))).isFile(),
+    '只有名字像、结构不像的目录不能被删（那是用户自己的数据）');
 });
 
 // 上传路由把整包 body 攒在内存里（解析器是同步契约），实测 256 MiB 单次峰值 RSS 1.12 GiB，

@@ -373,9 +373,14 @@ function openFile() {
     // 这类共享位置时**不**动权限（那会把不属于 hwb 的目录重新授权）。
     try {
       const resolved = path.resolve(dir);
+      const cwd = path.resolve(process.cwd());
       const shared = new Set(['/', path.resolve(os.homedir()), path.resolve(os.tmpdir()),
         (() => { try { return fs.realpathSync(os.tmpdir()); } catch { return ''; } })()]);
-      if (!shared.has(resolved)) fs.chmodSync(resolved, 0o700);
+      // 绝不改动**当前目录及其祖先**：日志路径可以是相对的（`--log hwb.log`、`hwb config set log x`），
+      // 那样 `path.dirname()` 就是 `.` 或 `..` —— 无条件 chmod 会把用户的工作目录（甚至家的上一级）
+      // 改成 0700，这比它想防的「目录可被遍历」严重得多。自查本轮改动时发现的。
+      const touchesCwd = resolved === cwd || cwd.startsWith(resolved + path.sep);
+      if (!shared.has(resolved) && !touchesCwd) fs.chmodSync(resolved, 0o700);
     } catch { /* 尽力而为 */ }
     fileFd = fs.openSync(config.file, 'a', 0o600);
     try { fs.fchmodSync(fileFd, 0o600); } catch { /* 某些文件系统不支持，忽略 */ }
