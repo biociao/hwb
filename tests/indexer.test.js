@@ -211,3 +211,53 @@ test('indexer: 抓实时状态期间切换端点时，丢弃旧端点的实时�
   assert.notEqual(kind, 'running', `旧端点的实时状态不该写进库（实际 ${kind}）`);
   store.close();
 });
+
+// 「抓实时状态期间轮询器已经写了更新的数据 → 丢弃自己这份」这条守卫原先没有测试：
+// 审查把它改写成 `if (false) live = null;` 之后整个套件仍然全绿（610/609/0）。
+// 它守的是：索引器拿一份**更旧**的快照把刚写进去的新状态覆盖回去
+// （实测过：dsh 报 running、轮询器刚写成「运行中」，索引器把它改回「空闲」，
+// 那份快照里还缺窗口期内新出现的会话，整表替换会把它们删掉）。
+test('indexer: 抓取期间轮询器已写入更新数据时，丢弃自己这份 live', async () => {
+  const live = [{
+    sessionId: 'stale-live-session', cwd: '/r/p', title: '旧快照里的会话',
+    status: { kind: 'idle', label: '空闲', subagents: 0, approval: null },
+    lastActivity: '2026-09-06T07:30:00.000Z', tokenUsage: { outputTokens: 1 },
+  }];
+  const capturedRows = { rows: null };
+  const store = {
+    upsertRows: (rows) => { capturedRows.rows = rows; },
+    markHomeError: () => {},
+    // 关键：抓取结束后再问一次 → 返回**晚于**抓取开始时刻的时间戳，表示轮询器期间写过
+    liveStatusAt: () => Date.now() + 1000,
+    getHome: () => ({ homeId: 'aa'.repeat(8), activeEndpointId: null }),
+  };
+  const local = { homeId: 'aa'.repeat(8), homePath: mockHome, hostType: 'local' };
+  const indexer = new Indexer({
+    store, homes: () => [local], broadcast: () => {}, baseMs: 100, maxMs: 400,
+    liveStatus: async () => live,
+  });
+  await indexer.reindexNow(local.homeId);
+  assert.ok(capturedRows.rows, '索引应当照常落库');
+  assert.ok(!capturedRows.rows.some((r) => r.sessionId === 'stale-live-session'),
+    '轮询器已有更新数据时，索引器这份旧的 live 必须被丢弃（否则会把新状态覆盖回去）');
+  assert.ok(capturedRows.rows.some((r) => r.type === 'session' && r.sessionId === 'sess-001'), '文件侧的会话照常入库');
+});
+
+test('indexer: 端点切换后丢弃这份 live（快照属于旧端点）', async () => {
+  const live = [{ sessionId: 'ep-session', cwd: '/r/p', status: { kind: 'running', label: '运行中', subagents: 0, approval: null }, lastActivity: '2026-09-06T07:30:00.000Z' }];
+  const capturedRows = { rows: null };
+  // getHome 在「抓取前」与「抓取后」各被读一次：第一次 A、之后 B —— 模拟用户在 RPC 飞行途中切换端点
+  let reads = 0;
+  const store = {
+    upsertRows: (rows) => { capturedRows.rows = rows; },
+    markHomeError: () => {},
+    liveStatusAt: () => 0,
+    getHome: () => ({ homeId: 'aa'.repeat(8), activeEndpointId: ++reads <= 1 ? 'A' : 'B' }),
+  };
+  const local = { homeId: 'aa'.repeat(8), homePath: mockHome, hostType: 'local', activeEndpointId: 'A' };
+  const indexer = new Indexer({
+    store, homes: () => [local], broadcast: () => {}, baseMs: 100, maxMs: 400, liveStatus: async () => live,
+  });
+  await indexer.reindexNow(local.homeId);
+  assert.ok(!capturedRows.rows.some((r) => r.sessionId === 'ep-session'), '端点已切换，旧端点的快照不能落库');
+});

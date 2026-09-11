@@ -391,7 +391,11 @@ test('app.js: 用量卡的高亮周期取自屏上数据（lastUsageKey），不
   const { readFile } = await import('node:fs/promises');
   const src = await readFile(new URL('../src/web/app.js', import.meta.url), 'utf8');
   assert.match(src, /let lastUsageKey = null/, '需要单独记录「屏上数据属于哪个周期」');
-  assert.match(src, /lastUsageKey = key;/, '成功拉到某个周期的数据后要更新它');
+  // 位置也是契约：必须写在「序号守卫 + 周期键校验」**之后**的成功路径里。
+  // 提到 await 之前的话，一次被丢弃的响应也会把它改掉 —— 卡片就会高亮一个屏上并没有数字的周期
+  // （审查实测：把它上移一行，套件依然全绿）。
+  assert.match(src, /if \(seq !== usageSequence \|\| key !== usageKey\(\)\) return;[\s\S]{0,300}?lastUsageKey = key;/,
+    'lastUsageKey 只能在通过序号/周期校验之后才更新');
   assert.match(src, /renderUsageCard\(usage, usageDim, lastUsageKey\)/);
   assert.match(src, /renderUsageCard\(usage, usageDim, lastUsageKey \?\? usagePeriod\.key\)/);
   assert.doesNotMatch(src, /renderUsageCard\(usage, usageDim, usagePeriod\.key\)/,
@@ -407,8 +411,11 @@ test('app.js: 趋势图的每条渲染路径都会按实测宽度拟合标签', 
   const src = await readFile(new URL('../src/web/app.js', import.meta.url), 'utf8');
   const fn = src.match(/function renderTrendInto\(el\) \{([\s\S]*?)\n\}/);
   assert.ok(fn, '趋势图渲染应收敛成一个函数');
-  assert.match(fn[1], /innerHTML = usageTrendHtml\(lastUsage, usageDim\);/);
-  assert.match(fn[1], /fitTrendLabels\(el\)/, 'renderTrendInto 必须在写 innerHTML 之后拟合');
+  // **顺序**是契约本身：fitTrendLabels 是对已经渲染出来的 .trend-xlabel 量宽度再收边/去重叠，
+  // 先拟合再写 innerHTML 等于什么都没拟合（切维度标签重叠那个缺陷会原样回来）。
+  // 分开写两条 match 挡不住顺序颠倒（审查实测：把顺序换过来，套件依然全绿）。
+  assert.match(fn[1], /el\.innerHTML = usageTrendHtml\(lastUsage, usageDim\);\s*\n\s*fitTrendLabels\(el\);/,
+    'renderTrendInto 必须**先**写 innerHTML、**再**按实测宽度拟合');
   assert.match(src, /renderTrendInto\(document\.getElementById\('usage-trend'\)\)/, '切维度路径必须走它');
   // 所有「写 usageTrendHtml 结果」的地方都必须在这一个函数里（否则就是又漏了一条路径）
   const all = [...src.matchAll(/innerHTML = usageTrendHtml\(/g)].length;

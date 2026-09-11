@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { createApiServer, isLoopbackHost, allowedHostsFromEnv, hostNameOf } from '../src/api/server.js';
+import { IndexStore } from '../src/dshhome/store.js';
 
 // 真实 HTTP 服务端上的加固回归。这些行为**只有走真 socket 才测得出来**：
 // 假 req（async generator + 假 res）拿不到 TCP 分片边界、看不到响应是否真的送到了对端，
@@ -213,4 +214,39 @@ test('HTTP: /api/* 带 no-store 与 nosniff，HEAD 与 GET 行为一致', async 
     assert.match(missing.headers.get('content-type') || '', /application\/json/);
     assert.equal(missing.headers.get('cache-control'), 'no-store');
   } finally { await new Promise((r) => server.close(r)); }
+});
+
+// 路由处理器抛错时必须回 **500** 并留下日志（`src/api/server.js` 的 catch）。
+// 这条路径原先没有任何测试：审查把它改成「吞掉 + 回 200」之后整个套件仍然全绿（610/609/0）。
+// 后果是任何路由回归都变成「静默的空响应 / 200」，前端错误分支永不触发、日志里也没有痕迹 ——
+// 而本项目的原则是「失败必须说出来」。
+test('api: 路由处理器抛错时返回 500，并且日志里留下请求路径', async () => {
+  const { initLogger, getLogs } = await import('../src/lib/logger.js');
+  initLogger({ level: 'info', file: false, color: false, silent: true });
+  const store = new IndexStore(':memory:');
+  const explosion = new Error('store exploded');
+  const server = createApiServer({
+    store: { ...{}, listHomes: () => { throw explosion; }, getHome: () => null, dataVersion: () => 1 },
+    indexer: { reindexNow: async () => [] },
+    hub: { broadcast() {}, handle() {} },
+    launcher: { status: () => null },
+    monitor: { get: () => ({ runtime: 'stopped' }), refresh: async () => {} },
+    quota: { list: () => [], refresh: async () => ({}) },
+    logApi: { getLogs: () => [] },
+    webRoot: '/nonexistent-web-root',
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const res = await fetch(`${base}/api/homes`);
+    assert.equal(res.status, 500, `路由抛错必须回 500（实际 ${res.status}）`);
+    const body = await res.json().catch(() => null);
+    assert.ok(body && typeof body.error === 'string' && body.error.includes('store exploded'),
+      `响应里要带上真正的错误（实际 ${JSON.stringify(body)}）`);
+    const logged = getLogs({ limit: 50 }).some((e) => String(e.message).includes('API 请求处理失败'));
+    assert.ok(logged, '日志里必须有「API 请求处理失败」这一条，便于归因');
+  } finally {
+    await new Promise((r) => server.close(r));
+    store.close();
+  }
 });

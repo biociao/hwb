@@ -283,7 +283,9 @@ async function makeMixedInstances(t) {
   const good = await write('node-good', `printf '%s' '{"instance":"good","resources":["good"],`
     + `"projects":[{"key":"pg","path":"/r/pg","sessions":[{"id":"session-good-1","cwd":"/r/pg","updatedAt":2}]}],`
     + `"sessions":[{"id":"session-good-1"}]}'`);
-  const slow = await write('node-slow', `sleep 5\nprintf '%s' '{"instance":"slow","resources":["slow"],"projects":[],"sessions":[]}'`);
+  // 慢实例睡 12s：它必须被**隔离**（不许拖住整页），而 12s 远大于下面的 elapse 上限，
+  // 所以「修复被回退」时这条断言依然会红（这是本用例的判别力来源）。
+  const slow = await write('node-slow', `sleep 12\nprintf '%s' '{"instance":"slow","resources":["slow"],"projects":[],"sessions":[]}'`);
   const instances = path.join(base, 'instances.json');
   await writeFile(instances, JSON.stringify({ instances: [
     { id: 'bad', nodeBin: bad, sessionsRoot: path.join(base, 'r'), cacheRoot: path.join(base, 'c') },
@@ -309,14 +311,23 @@ test('merged-index: 一个实例的坏条目不再让整页渲染失败（健康
   assert.match(html, /777/, '坏实例里那条 id 是数字的会话应被规范成字符串后正常渲染');
 });
 
+// 采集是**串行**的 spawnSync，每个实例各有一个 COLLECT_TIMEOUT_MS 上限。这条用例的判别力在于：
+// 「慢实例被隔离」时整轮 ≈ 超时 + 健康实例的时间；若隔离被回退（没有超时），整轮会等满慢实例的
+// sleep(12s) —— 所以 elapse 上限取 8s：两边都留足余量。
+//
+// 超时值从 800ms 放宽到 2500ms 是**修一个真实的 flake**（审查实测）：
+// 4 份测试套件并发跑（10 核机）时，1/4 次出现「健康实例仍要出图」失败 —— 原因是健康夹具自身
+// 也是个要启动的进程，CPU 争抢下 >800ms 就被判「采集超时」，于是断言把「我的进程没及时启动」
+// 当成了「修复失效」。单独跑 12 次 0 失败、8 个 CPU 占满进程也不失败，只有并发套件时才现。
+// 这类假失败最大的代价是训练人忽略测试。
 test('merged-index: 单个实例卡住时按超时隔离，其余实例照常出图', async (t) => {
   const { base, slowInstances } = await makeMixedInstances(t);
   const out = path.join(base, 'out-slow.html');
   const started = Date.now();
   const { stdout } = await exec(process.execPath, [MERGED_INDEX, '--instances', slowInstances,
-    '--html', out, '--collect-timeout-ms', '800'], { timeout: 30000 });
+    '--html', out, '--collect-timeout-ms', '2500'], { timeout: 30000 });
   const elapsed = Date.now() - started;
-  assert.ok(elapsed < 4000, `应在超时后立刻继续（sleep 5 的实例不该拖满 5s），实际 ${elapsed}ms`);
+  assert.ok(elapsed < 8000, `应在超时后立刻继续（sleep 12 的实例不该拖满 12s），实际 ${elapsed}ms`);
   assert.match(stdout, /离线: slow/, '慢实例应被标成离线并给出原因');
   const html = await readFile(out, 'utf8');
   assert.match(html, /session-good-/, '健康实例仍要出图');

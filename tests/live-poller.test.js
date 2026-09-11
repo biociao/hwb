@@ -159,3 +159,26 @@ test('live poller: 写失败必须记 warn（默认级别可见），且同因�
   assert.equal(warnings.length, 1, `同 home 同原因只记一次（实际 ${warnings.length} 条）`);
   assert.match(JSON.stringify(warnings[0]), /cannot be bound/, '要带上真正的原因，便于排查');
 });
+
+// 「抓取期间端点被切换」这条守卫原先没有任何测试：审查把它改写成 `if (false) return`
+// 之后整个套件仍然全绿（610/609/0）。而它守的是**静默写错行**：用户在 RPC 飞行途中切换连接端点，
+// 那份快照属于**旧端点**，写下去就等于把 B 实例的状态记在 A 实例名下 —— 无日志、无降级标记，
+// 界面上看不出来（本项目已经踩过的「静默错数据」那一类）。
+test('live poller: 抓取期间 activeEndpointId 变了就不许写（否则会把状态写到错的实例上）', async () => {
+  let applied = 0;
+  const store = {
+    // 第一次读（refresh 开头）与第二次读（写之前）返回**不同**的端点
+    getHome: () => ({ homeId: 'h1', activeEndpointId: 'B' }),
+    applyLiveStatus: () => { applied++; },
+    liveStatusAt: () => 0,
+  };
+  const poller = new LiveStatusPoller({
+    store,
+    homes: () => [{ homeId: 'h1', activeEndpointId: 'A' }],
+    read: async () => [{ sessionId: 'x', status: { kind: 'idle', label: '空闲' } }],
+    intervalMs: 60_000,
+  });
+  poller.running = true;
+  await poller.refresh('h1');
+  assert.equal(applied, 0, '端点已变为 B（快照属于 A）时必须丢弃这份快照');
+});

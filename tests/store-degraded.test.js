@@ -413,3 +413,15 @@ test('store: 降级期间被保留的会话，其指向已消失 workspace 的�
   assert.deepEqual(wsIds, ['ws-2'], `工作区表应按新快照刷新，实际 ${JSON.stringify(wsIds)}`);
   store.close();
 });
+
+// `markHomeError` 的 catch 必须**吞掉**自己的失败：它由 Indexer 的 catch 调用，
+// 而那个 catch 在「索引该 home 失败」时执行 —— 若 markHomeError 再抛（只读库、磁盘满、
+// 库文件被删），异常会冒出去，**中断整轮索引**里剩下的所有实例（它们一个都不再刷新）。
+// 审查把这里改成 `throw e` 之后整个套件仍然全绿（610/609/0）：因为 hostile-env 注入的是
+// **桩** markHomeError，真正这个方法在套件里从没被失败路径调用过。
+test('store: markHomeError 自身写失败时必须吞掉（否则会中断整轮索引）', () => {
+  const store = new IndexStore(':memory:');
+  store.registerHome({ homePath: '/mock/home' });
+  store.close();   // 库已关：任何写入都会抛（等价于只读库/磁盘满/文件被删）
+  assert.doesNotThrow(() => store.markHomeError('any-home', 'boom'), 'markHomeError 不能把异常抛给 Indexer');
+});
