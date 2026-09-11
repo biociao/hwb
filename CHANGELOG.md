@@ -19,8 +19,8 @@ Semantic Versioning.
 
 ### 起床后先看这三件事
 
-1. **代码在哪**：分支 `tmp-reorder2`，今晚新增 **144 个提交（本地，未 push）**；
-   `main` 落后于本分支，**要不要合并/push 由你决定**。工作树是干净的、全套 **637 例（636 通过 / 1 skip / 0 失败）**。
+1. **代码在哪**：分支 `tmp-reorder2`，今晚新增 **145 个提交（本地，未 push）**；
+   `main` 落后于本分支，**要不要合并/push 由你决定**。工作树是干净的、全套 **638 例（637 通过 / 1 skip / 0 失败）**。
 2. **你现在这台机器上的服务还在跑旧代码**：真实库副本上验证过，重启后会自动完成迁移 ——
    `user_version 0 → 2`、补齐四个派生列、建好新索引 `idx_sessions_home_ws`，**耗时 3ms**，
    派生列求和与 `json_extract` 预言机**分毫不差**（3,937,139,946），迁移前后行数不变（553 会话 / 5 实例）。
@@ -51,7 +51,7 @@ Semantic Versioning.
 web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览与静态缓存与远端索引 /
 渲染壳与日志脚本 / 跨模块数据流 / 存储层 / 近两轮改动的回归审查 / 数据管线 / cli+service+lib 生命周期 /
 **测试网自身** / **规模与长跑**）+ 1 轮纯函数对抗 fuzz + 2 轮敌意环境测试 +
-多轮针对「我自己刚改的代码」的自审，共 **144 个提交、637 个用例**
+多轮针对「我自己刚改的代码」的自审，共 **145 个提交、638 个用例**
 （`npm test` 的输出为准；README 刻意不写死这个数字）。
 
 后几轮开始把「不变量」本身当成审查对象，于是又挖出一类新问题：**守卫存在但没人守**。
@@ -373,6 +373,20 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### `hwb` 报 `permission denied`：`bin` 入口在 git 里从来没被记为可执行（src/cli.js + tests/packaging.test.js）
+- **现象**（用户在真实终端踩到）：`hwb stop` → `zsh: permission denied: hwb`，而 `which hwb` **找得到**它。
+  直接原因：全局 bin 是软链 `~/.nvm/.../bin/hwb -> …/hwb/src/cli.js`，而仓库里的 `src/cli.js` 是 **0644**。
+- **根因**：`package.json` 声明了 `bin: { hwb: src/cli.js }`，但 git **从来没有**把该文件记为 `100755`
+  （索引与历史里一直是 `100644`），文件上的可执行位来自当年 `npm link` 给**工作树**加的 +x。
+  于是任何一次重写/checkout 都会静默丢掉它 —— `git status` **不会提示**：索引本来就是 0644，
+  反过来把工作树 chmod 成 0755 才会被报成「有改动」。这就是它一直没被发现的原因。
+  （诚实标注：我不能从 git 断定是谁清掉的，但今晚我多次重写 `src/cli.js`、写文件的工具落 0644 —— 这很可能就是原因。）
+- **修复**：`chmod +x src/cli.js` 并把 **100755 记进 git 索引**（`git update-index --chmod=+x`），
+  于是 clone / checkout / `npm link` 之后都自带可执行位；README 的「统一管理命令」一节补上这条症状与自救命令。
+- **回归测试**：`tests/packaging.test.js` —— 对 `package.json` 的每个 `bin` 断言
+  ① 有 shebang、② 工作树里有可执行位、③ **git 索引里是 100755**（非 git 检出时跳过，且会核对找到的行数，
+  避免断言空转）。变异验证：只 `chmod -x` 工作树 → 红；只把索引改回 100644 → 红。
+
 #### 正文恰好是 JSON `null` 的 POST 会**得不到任何响应**（src/api/routes.js + src/api/server.js）
 - **现象**（本轮真机 fuzz 发现）：`curl -d 'null' -H 'content-type: application/json' /api/homes`
   **既没有响应也不断开** —— curl 6s 超时后报 `HTTP 000`，连接与 socket 一直被服务端持有着；

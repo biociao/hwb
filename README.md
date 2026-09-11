@@ -111,6 +111,11 @@ node src/server.js
 
 在仓库目录执行一次 `npm link`，即可在任意目录使用 `hwb`（Node.js 22.5+，macOS / Linux）。
 
+> **如果 `hwb` 报 `zsh: permission denied: hwb`（而 `which hwb` 找得到它）**：
+> 全局 bin 是个软链（`~/.nvm/.../bin/hwb -> …/hwb/src/cli.js`），症状说明**目标文件**丢了可执行位。
+> `chmod +x src/cli.js` 即可恢复；仓库现在把 `src/cli.js` 记为 **100755**，所以正常 clone 不会再遇到。
+> 之所以要写在这里：这种丢失 `git status` **不会提示**（索引原本就是 0644），只能靠症状认出来。
+
 ```bash
 hwb start                  # 后台启动，等待 HTTP 监听成功
 hwb status                 # 状态、PID、启动时间、实际监听端口
