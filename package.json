@@ -4,7 +4,7 @@
   "description": "hwb (harness workbench) — 面向 dsh home 的数据平面工作台：跨实例聚合项目 / 会话 / Token 用量，并托管本机与远程 dsh web（控制平面）",
   "type": "module",
   "bin": {
-    "hwb": "src/server.js"
+    "hwb": "src/cli.js"
   },
   "files": [
     "src",

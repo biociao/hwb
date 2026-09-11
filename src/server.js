@@ -130,6 +130,7 @@ const server = createApiServer({
   webRoot: path.join(pkgRoot, 'src', 'web'),
 });
 server.listen(opts.port, '127.0.0.1', () => {
+  globalThis.hwbServiceReady?.();
   log.info(`hwb listening on http://127.0.0.1:${opts.port} (level=${opts.level}${opts.logFile ? ` log=${opts.logFile}` : ''})`);
   log.info(`db: ${opts.db}`);
   for (const h of store.listHomePaths()) log.info(`home: ${h}`);
