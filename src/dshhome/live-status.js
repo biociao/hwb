@@ -118,6 +118,9 @@ async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS) {
 // sessions.tokenUsage —— 用量聚合按 `$.uncachedInputTokens` 取值只会得到 0，而且这次实时写入会
 // **覆盖掉文件索引里正确的扁平值**。宁可返回 null（保持文件索引的值），也不存一个自己解析不出来的结构。
 // 只有确实取到至少一个有限数字才返回对象。
+// 注意「部分认得出来」（少一两个键）也会返回对象，这本身没问题：写入侧 mergeLiveStatus 是
+// **按 key 合并**进已有 tokenUsage，没报的键保留投影缓存的值 —— 所以这里不需要（也不该）把
+// 部分对象一律判为 null，否则会连带丢掉实时确实报了的那个键。
 export function normalizeLiveTokenUsage(raw) {
   const candidate = raw?.val?.totals ?? raw?.totals ?? raw;
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;

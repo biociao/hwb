@@ -3,6 +3,35 @@ import { readHome } from '../lib/read-home.js';
 import { normalize } from '../lib/normalize.js';
 import { readHomeRemote } from './remote-reader.js';
 
+const TOKEN_KEYS = ['uncachedInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
+
+// 实时用量**按 key 合并**进已有的 tokenUsage，而不是整列替换。
+//
+// 这条路径写的是 sessions.tokenUsage 这一个 JSON 列（用量面板与派生列 tokInput/… 全都从它算），
+// 所以「实时对象里缺哪个键」就等于「把哪个键清零」：实测把文件侧合计 109100 的会话
+// （12400/3200/88100/5400）喂给一个只带 {uncachedInputTokens:100, outputTokens:20} 的实时对象后，
+// 用量面板变成 120 —— 静默丢掉 99.9%。normalizeLiveTokenUsage 的契约是「认得出来才返回对象」，
+// 但**部分**认得出来（少一两个键）同样会返回对象，于是照样整列覆盖。
+// 正常情况下下一轮文件索引会把累计值写回来（实测），但 projcache 降级时实时值就是权威 ——
+// 那正是这套实时保护存在的场景，错了就永久错了。
+// 因此逐个 key 覆盖：实时报了哪个键就更新哪个键，没报的保持投影缓存的值（宁可保守也不清零）。
+// 实时对象四个键齐全时（dsh 的常规情形）结果与整列替换完全一致。
+function mergeTokenUsage(existing, liveUsage) {
+  const patch = {};
+  for (const k of TOKEN_KEYS) {
+    const v = liveUsage?.[k];
+    if (typeof v === 'number' && Number.isFinite(v)) patch[k] = v;
+    else if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) patch[k] = Number(v);
+  }
+  if (Object.keys(patch).length === 0) return existing; // 一个可用计数都没有：不动这一列
+  let base = null;
+  if (typeof existing === 'string' && existing) {
+    try { base = JSON.parse(existing); } catch { base = null; } // 坏 JSON 当成没有基线
+  }
+  if (!base || typeof base !== 'object' || Array.isArray(base)) base = {};
+  return JSON.stringify({ ...base, ...patch });
+}
+
 // 把「实时状态」合并进 normalize 出来的会话行（两个方向）：
 //   1. 覆盖：live 里已有的会话覆盖从（可能冻结的）投影缓存推导出的状态/活跃时间/用量/标题；
 //   2. 补插：live 里有、投影缓存里还没有的会话（冻结期间新产生的）补成新的 session 行——
@@ -21,7 +50,7 @@ export function mergeLiveStatus(rows, live, { homeId, generatedAt }) {
     if (!l) continue;
     if (l.status) row.status = JSON.stringify(l.status);
     if (l.lastActivity) row.lastActivity = l.lastActivity;
-    if (l.tokenUsage) row.tokenUsage = JSON.stringify(l.tokenUsage);
+    if (l.tokenUsage) row.tokenUsage = mergeTokenUsage(row.tokenUsage, l.tokenUsage);
     if (l.title) row.title = l.title;
   }
   for (const l of bySession.values()) {

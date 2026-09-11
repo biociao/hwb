@@ -203,6 +203,22 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 实时 tokenUsage 只带一部分计数器时会整列覆盖，用量面板静默塌掉 99.9%（src/dshhome/reader.js）
+- **现象**：用量面板上的历史合计突然从 109100 掉到 120，没有任何报错、没有 degraded 标记。
+- **根因**：实时通道（3s 轮询 → `sessions.tokenUsage`）是**整列替换**语义：
+  `row.tokenUsage = JSON.stringify(l.tokenUsage)`。`normalizeLiveTokenUsage` 的契约是
+  「认得出来才返回对象」，但**部分**认得出来（少一两个键）同样返回对象 —— 而缺哪个键
+  就等于把哪个键**清零**。实测：文件侧合计 109100 的会话（12400/3200/88100/5400）
+  遇到只带 `{uncachedInputTokens:100, outputTokens:20}` 的实时对象后，合计变成 120（丢 99.9%）。
+  正常路径下一轮文件索引会把累计值写回来，但 projcache 降级时实时值就是权威
+  —— 那正是这套实时保护存在的场景，于是永久错下去。
+- **修复**：`mergeLiveStatus` 改为**按 key 合并**（`mergeTokenUsage`）：实时报了哪个键就更新哪个键，
+  没报的保持投影缓存的值；实时对象四个键齐全时（dsh 的常规情形）结果与整列替换完全一致，
+  所以不会因为「保守」而丢掉实时确实报了的键。认不出来的形状（如 `{last:{…}}`）继续不动这一列。
+- **回归测试**：`tests/live-merge.test.js`（3 个新用例：部分计数、四键齐全、认不出的形状）与
+  `tests/store-token-columns.test.js`（端到端 `applyLiveStatus` → `usageSummary` 断言 93620 而不是 120）。
+  修复前两条失败。
+
 #### 实时状态保护把「已从实时列表消失的会话」永久钉在「运行中」（src/dshhome/store.js）
 - **现象**：某个会话在 dsh 里被归档/关掉之后，工作台上会一直显示它是「运行中」，而且**永不纠正**
   （直到 dsh 停止）。`/api/sessions/recent` 里它的 `status` 是 `running 运行中`、活跃时间冻在最后一次，

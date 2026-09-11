@@ -223,3 +223,34 @@ test('store: 只加了一部分派生列的库也要能补全（不留 no such c
   assert.equal(b.usageTrendGrouped({ dimension: 'total', hours: 24 }).buckets.reduce((x, y) => x + y.total, 0), 11);
   b.close();
 });
+
+// 端到端版本：实时通道只报了一部分计数器时，用量面板不能塌（审查实测塌过 109100 → 120）。
+// 这是「投影缓存（文件）」与「dsh 实时 RPC」两路数据在 sessions.tokenUsage 这一列上的交接，
+// 所以放在派生列这组测试里 —— 面板上的数字就是这四列的和。
+test('applyLiveStatus: 实时只带部分计数时，其余计数保持文件索引的值（面板不塌）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  const fileUsage = { uncachedInputTokens: 12400, outputTokens: 3200, cacheReadTokens: 88100, cacheWriteTokens: 5400 };
+  store.upsertRows([{
+    type: 'session', homeId, sessionId: 's1', project: 'p', title: 't',
+    tokenUsage: JSON.stringify(fileUsage), contextPressure: null,
+    status: JSON.stringify({ kind: 'idle', label: '空闲' }), lastActivity: now, generatedAt: now, liveOnly: 0,
+  }]);
+  assert.equal(store.usageSummary({ days: 30 }).totalTokens, 109100, '前置条件：文件索引的合计');
+
+  store.applyLiveStatus(homeId, [{
+    sessionId: 's1', cwd: '/r/p', title: 't2',
+    status: { kind: 'running', label: '运行中', subagents: 0, approval: null },
+    lastActivity: now,
+    tokenUsage: { uncachedInputTokens: 100, outputTokens: 20 }, // dsh 只报了这两项
+  }]);
+
+  assert.equal(store.usageSummary({ days: 30 }).totalTokens, 93620,
+    '实时没报的计数必须保留（没报 ≠ 归零），整列覆盖会塌成 120');
+  // 部分用量不该影响其它字段的实时覆盖
+  const row = store.recentSessions({ homeId }).find((s) => s.sessionId === 's1');
+  assert.equal((typeof row.status === 'string' ? JSON.parse(row.status) : row.status).kind, 'running');
+  assert.equal(row.title, 't2');
+  store.close();
+});
