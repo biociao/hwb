@@ -117,3 +117,35 @@ test('CLI stop：没有控制 socket 但端口被占用时如实报错，而不�
   await new Promise(r => server.close(r));
   assert.match((await run('stop')).stdout, /已停止/);
 });
+
+// 启停锁是 `wx` 创建的独占文件，`finally` 里删除 —— 但如果一条启停命令被 kill -9，
+// 锁文件就留在那里了，于是 start/stop/restart **全部**失败，只留一句「请删除此锁文件」。
+// 锁里写着持有者的 PID，所以「持有者已不存在」是可以判定的：这种情况应当自动接管。
+test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然拦住', async (t) => {
+  const { dir, run } = await fixture(t);
+  const lock = path.join(dir, 'service.lock');
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+
+  // ① 拿一个「确定已死」的 PID：起一个子进程并等它退出
+  const dead = await new Promise((resolve, reject) => {
+    const child = execFile(process.execPath, ['-e', ''], (err) => (err ? reject(err) : resolve(child.pid)));
+  });
+  fs.writeFileSync(lock, String(dead));
+  const started = await run('start');                       // 原实现：直接报「另一个启停命令持有…」
+  assert.match(started.stdout, /已启动/);
+  assert.match(started.stderr, /残留启停锁/, '应说明这是一把残留锁，而不是默默接管');
+  assert.equal(JSON.parse((await run('status')).stdout).ready, true);
+  await run('stop');
+
+  // ② 空锁文件（上次在 openSync 与 writeFileSync 之间被杀）同样算残留
+  fs.writeFileSync(lock, '');
+  await run('start');
+  await run('stop');
+
+  // ③ 持有者**活着**时必须照旧拦住 —— 新增的接管逻辑不能变成「谁都能抢锁」
+  fs.writeFileSync(lock, String(process.pid));
+  await assert.rejects(run('start'), /持有/);
+  await assert.rejects(run('stop'), /持有/);
+  fs.rmSync(lock, { force: true });
+});

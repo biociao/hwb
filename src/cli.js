@@ -177,16 +177,45 @@ async function main() {
     default: throw Error(`未知命令: ${command}\n运行 hwb --help 查看用法`);
   }
 }
+// 进程还在不在。process.kill(pid, 0) 不发信号，只做存在性检查；EPERM 表示「存在、但我们没权限
+// 给它发信号」，同样算活着。判定方向刻意保守：把「活着」误判成「死了」才会去接管锁，
+// 所以只有确定查不到该进程（ESRCH）才算死。
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return err.code === 'EPERM'; }
+}
+
+// 拿启停锁。锁文件里写着持有者的 PID，于是「上次启停被 kill -9」留下的残留锁可以识别并接管：
+// 原先这种情况会让 start/stop/restart **全部**失败，只留一句「请删除此锁文件」——
+// 用户得自己找到那个隐藏文件才能把服务救回来（实测复现）。锁是空的也算残留
+// （上次在 openSync 与 writeFileSync 之间被杀）。
+function acquireLock(lock) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { return fs.openSync(lock, 'wx', 0o600); }
+    catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      const raw = (() => { try { return fs.readFileSync(lock, 'utf8').trim(); } catch { return ''; } })();
+      const pid = Number(raw);
+      const held = Number.isInteger(pid) && pid > 0 && pidAlive(pid);
+      if (held) throw Error(`另一个启停命令（PID ${pid}）持有 ${lock}；确认它确实不在运行后，删除该锁文件即可`);
+      if (attempt === 0) {
+        // 只删这一个锁文件，不碰任何进程。两个并发接管者都清掉旧文件后，
+        // 仍然只有一个能 'wx' 成功 —— 另一个会拿到 EEXIST 并如实报「被占用」。
+        try { fs.rmSync(lock, { force: true }); } catch { /* 已被别人清掉 */ }
+        console.warn(`hwb: 发现残留启停锁 ${lock}（持有者 PID ${raw || '未知'} 已不存在），已接管`);
+        continue;
+      }
+      throw Error(`另一个启停命令持有 ${lock}；若命令曾异常退出，请确认没有启停操作后删除此锁文件`);
+    }
+  }
+  throw Error(`无法获取启停锁 ${lock}`);
+}
+
 async function dispatch() {
   if (!['start', 'stop', 'restart'].includes(process.argv[2])) return main();
   fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
   const lock = path.join(serviceDir, 'service.lock');
-  let fd;
-  try { fd = fs.openSync(lock, 'wx', 0o600); }
-  catch (err) {
-    if (err.code === 'EEXIST') throw Error(`另一个启停命令持有 ${lock}；若命令曾异常退出，请确认没有启停操作后删除此锁文件`);
-    throw err;
-  }
+  const fd = acquireLock(lock);
   try { fs.writeFileSync(fd, String(process.pid)); return await main(); }
   finally { fs.closeSync(fd); fs.rmSync(lock, { force: true }); }
 }
