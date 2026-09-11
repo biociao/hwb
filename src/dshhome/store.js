@@ -158,37 +158,21 @@ function daysAgoIso(days) {
 // 注意：加法一定要**逐项** COALESCE。写成 COALESCE(SUM(a + b + c + d), 0) 时，
 // 只要某个键缺失，整个相加就是 NULL、SUM 又忽略 NULL —— totalTokens 会变成 0。
 
-// tokenUsage（JSON 文本）→ 四个整数计数。**只用于老库升级这一次回填**；
-// 日常写入由 sessions_tok_ai / sessions_tok_au 触发器在 SQLite 内部完成（见 SCHEMA）。
-// 与 SQLite 的 json_extract **语义对齐**：
-// 非法 JSON / 缺键 / 非数值一律按 0（正是那批 json_valid 守卫在表达的东西，只是提前到写入时）。
-// 不在 JS 里做位数截断：SQLite 的 SUM 会原样累加浮点，截断会让两条路径的数字对不上。
-function tokenTotals(tokenUsage) {
-  const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  if (tokenUsage == null) return zero;
-  let value = tokenUsage;
-  if (typeof value === 'string') {
-    try { value = JSON.parse(value); } catch { return zero; }
-  }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return zero;
-  const num = (x) => {
-    if (typeof x === 'number') return Number.isFinite(x) ? x : 0;
-    if (typeof x === 'string' && x.trim() !== '') { const n = Number(x); return Number.isFinite(n) ? n : 0; }
-    return 0;
-  };
-  return {
-    input: num(value.uncachedInputTokens),
-    output: num(value.outputTokens),
-    cacheRead: num(value.cacheReadTokens),
-    cacheWrite: num(value.cacheWriteTokens),
-  };
-}
+// token 派生列的迁移版本（PRAGMA user_version）、列名与回填表达式。
+// 回填表达式与 SCHEMA 里那两个触发器**必须一致** —— 用同一段字符串生成，避免两套算法漂移。
+// （SQLite 的多语句 exec 中途失败时，前面已成功的语句是保留的，所以补列必须逐列判断。）
+const TOKEN_COLUMNS_VERSION = 1;
+const TOKEN_COLUMN_NAMES = ['tokInput', 'tokOutput', 'tokCacheRead', 'tokCacheWrite'];
+const TOKEN_EXPR = {
+  tokInput: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END",
+  tokOutput: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.outputTokens'), 0) ELSE 0 END",
+  tokCacheRead: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.cacheReadTokens'), 0) ELSE 0 END",
+  tokCacheWrite: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.cacheWriteTokens'), 0) ELSE 0 END",
+};
+const TOKEN_COLUMNS_SET = TOKEN_COLUMN_NAMES.map((c) => `${c} = ${TOKEN_EXPR[c]}`).join(', ');
 
-// 用量聚合现在直接 SUM 派生整数列（tokInput/tokOutput/tokCacheRead/tokCacheWrite）。
-// 这些列由触发器（见 SCHEMA 里的 sessions_tok_ai/au）从 tokenUsage 派生维护；等价的旧式表达式
-// （CASE WHEN json_valid(...) THEN json_extract(...)）仍在本文件的历史注释与
-// tests/store-token-columns.test.js 的独立预言机里保留，用来对拍。
-// 收益：40k 会话下八个聚合从 ~330ms 降到普通 SUM 的量级（同步 SQLite 会冻住整个服务）。
+// 用量聚合直接 SUM 派生整数列（由触发器维护，见 SCHEMA）。收益：40k 会话下八个聚合从 ~330ms
+// 降到普通 SUM 的量级（node:sqlite 是同步的，那段时间整个服务都停着）。
 const TOK = {
   input: 'COALESCE(SUM(tokInput), 0)',
   output: 'COALESCE(SUM(tokOutput), 0)',
@@ -196,18 +180,10 @@ const TOK = {
   cacheWrite: 'COALESCE(SUM(tokCacheWrite), 0)',
   total: 'COALESCE(SUM(tokInput + tokOutput + tokCacheRead + tokCacheWrite), 0)',
 };
-// 带表别名的版本（trend/grouped 的查询里表别名是 s）
-const tokOf = (alias) => ({
-  input: `COALESCE(SUM(${alias}.tokInput), 0)`,
-  output: `COALESCE(SUM(${alias}.tokOutput), 0)`,
-  cacheRead: `COALESCE(SUM(${alias}.tokCacheRead), 0)`,
-  cacheWrite: `COALESCE(SUM(${alias}.tokCacheWrite), 0)`,
-  total: `COALESCE(SUM(${alias}.tokInput + ${alias}.tokOutput + ${alias}.tokCacheRead + ${alias}.tokCacheWrite), 0)`,
-});
 
-// 「实时写入活跃」的宽限期：只要这个 home 在这个窗口内有过实时状态写入，就认为实时通道在主导
-// status/lastActivity（见 upsertRows 里的 preserveLive）。比轮询间隔（3s）宽裕得多，
-// 又足够短：通道一停，宽限期结束，文件索引重新拿到权威。
+// 「实时写入活跃」的宽限期：该 home 在这个窗口内有过实时状态写入时，文件索引的整表替换不能把
+// status/lastActivity 一起带走（见 upsertRows）。比轮询间隔（3s）宽裕，又足够短：通道一停，
+// 宽限期结束，文件索引重新拿到权威。
 const LIVE_GRACE_MS = 10_000;
 
 const int = (v, dflt) => {
@@ -252,28 +228,49 @@ export class IndexStore {
   constructor(dbPath = ':memory:') {
     this.db = new DatabaseSync(dbPath);
     this.#liveWrittenAt = new Map();
-    this.db.exec(SCHEMA);
-    this.migrate();
+    this.dbPath = dbPath;
+    try {
+      this.db.exec(SCHEMA);   // 建表 + 建触发器（在只读库上这一步就会写失败）
+      this.migrate();
+    } catch (error) {
+      // 把「初始化/迁移失败」说清楚：底层可能只是 `attempt to write a readonly database`
+      // 或 `database or disk is full`，用户看不出该怎么恢复。迁移与建表都是**幂等**的，
+      // 所以明确告诉他「修好后重启会自动继续」，而不是让他以为库坏了要重建。
+      throw new Error(`数据库初始化/迁移失败（${dbPath}）：${error?.message ?? error}。`
+        + '若是权限或磁盘空间问题，修复后重启会自动重试（建表与迁移都是幂等的）；'
+        + '若这个文件根本不是 SQLite 数据库，请改名或换一个路径。');
+    }
   }
 
-  // 把 tokenUsage 里的四个计数写进派生列（老库升级时跑一次）。
-  // 只处理 tokenUsage 非空的行；解析失败的按 0（与读路径的降级一致）。
-  #backfillTokenTotals() {
-    const rows = this.db.prepare('SELECT id, tokenUsage FROM sessions WHERE tokenUsage IS NOT NULL').all();
-    if (!rows.length) return;
-    const upd = this.db.prepare(
-      'UPDATE sessions SET tokInput = ?, tokOutput = ?, tokCacheRead = ?, tokCacheWrite = ? WHERE id = ?'
-    );
-    this.db.exec('BEGIN');
+  // 派生列的迁移：补列 + 回填，**同一个事务**，并用 `PRAGMA user_version` 记录「回填成功」。
+  //
+  // 为什么必须这样（审查实测过旧实现的失败后果）：旧的写法里四个 ALTER 各自自动提交（DDL 不在
+  // 事务里），而回填另起一个事务。回填一旦失败（磁盘满、进程被杀 —— 4 万行回填约 60ms，窗口真实
+  // 存在），列已经存在，于是下次启动那个「按列判断」的闸门不会再回填 → **所有历史用量永久为 0**，
+  // 没有任何报错、没有 degraded 标记。实测：SQLITE_FULL 之后第二次启动 usageSummary.totalTokens = 0，
+  // 而直接对 JSON 跑 json_extract 的预言机是 82000000。
+  // 另外逐列判断缺哪补哪：SQLite 的多语句 exec 在中途失败时**前面成功的语句是保留的**，
+  // 于是可能出现「四列只加了一两列」的库，那种库会让每个用量查询报 no such column（审查也复现了）。
+  // 回填表达式与触发器共用同一段 SQL（TOKEN_COLUMNS_SET）：两边各写一套算法迟早漂移。
+  // 失败时抛出去，由 server.js 打印明确提示并退出 —— 宁可启动失败并说清楚，也不要静默把整段
+  // 历史显示成 0；user_version 没抬上去 ⇒ 下次启动会自动重试（回填幂等）。
+  #migrateTokenColumns(sess) {
+    const missing = TOKEN_COLUMN_NAMES.filter((c) => !sess.includes(c));
+    const applied = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0) >= TOKEN_COLUMNS_VERSION;
+    if (missing.length === 0 && applied) return;
     try {
-      for (const row of rows) {
-        const t = tokenTotals(row.tokenUsage);
-        upd.run(t.input, t.output, t.cacheRead, t.cacheWrite, row.id);
-      }
+      // BEGIN 也要在 try 里：只读库上它自己就会抛（实测），那样就绕过下面这层包装，
+      // 用户只会看到一句 `attempt to write a readonly database`，不知道是迁移失败、更不知道该重试。
+      this.db.exec('BEGIN');
+      for (const name of missing) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`);
+      this.db.exec(`UPDATE sessions SET ${TOKEN_COLUMNS_SET} WHERE tokenUsage IS NOT NULL`);
+      this.db.exec(`PRAGMA user_version = ${TOKEN_COLUMNS_VERSION}`);
       this.db.exec('COMMIT');
     } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
+      try { this.db.exec('ROLLBACK'); } catch { /* 磁盘满时 SQLite 可能已经自动回滚 */ }
+      throw new Error(`数据库迁移失败（token 派生列）：${error?.message ?? error}。`
+        + '修复磁盘空间/权限后重启会自动重试（回填是幂等的）；在此之前请勿继续使用，'
+        + '否则历史用量会显示为 0。');
     }
   }
 
@@ -289,15 +286,7 @@ export class IndexStore {
     if (!sess.includes('status')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN status TEXT');
     }
-    if (!sess.includes('tokInput')) {
-      // 老库补列 + 用 tokenUsage 回填一次（只在加列的那一次跑）。
-      // 回填包在事务里：4 万行的老库也要在启动时一次性做完，不能拖成逐行 fsync。
-      this.db.exec(`ALTER TABLE sessions ADD COLUMN tokInput INTEGER NOT NULL DEFAULT 0;
-                    ALTER TABLE sessions ADD COLUMN tokOutput INTEGER NOT NULL DEFAULT 0;
-                    ALTER TABLE sessions ADD COLUMN tokCacheRead INTEGER NOT NULL DEFAULT 0;
-                    ALTER TABLE sessions ADD COLUMN tokCacheWrite INTEGER NOT NULL DEFAULT 0;`);
-      this.#backfillTokenTotals();
-    }
+    this.#migrateTokenColumns(sess);
     const homes = this.db.prepare("SELECT name FROM pragma_table_info('homes')").all().map((c) => c.name);
     if (!homes.includes('sortIndex')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN sortIndex INTEGER');

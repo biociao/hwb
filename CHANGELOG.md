@@ -435,6 +435,28 @@ Semantic Versioning.
 - **顺带**修掉测试夹具的一个缺陷：假的 `res` 没有 `end()`，于是「拒绝时回一句话」这种代码
   会被 try/catch 吞掉，测出来是假象。
 
+#### 迁移失败会让历史用量永久显示 0（src/dshhome/store.js，HIGH）
+- **现象**（独立审查第 10 轮，用**真实的 SQLITE_FULL** 复现，不是注入）：旧的迁移闸门是
+  「看 `tokInput` 列在不在」，而四个 `ALTER` 各自自动提交（DDL 不在事务里）、回填另起一个事务。
+  回填一旦失败（磁盘满、进程被杀 —— 4 万行回填约 60ms，窗口真实存在），列已经存在 ⇒ 下次启动
+  那个闸门不会再回填 ⇒ **所有历史用量永久为 0**，没有任何报错、没有 degraded 标记。
+  实测：第二次启动 `usageSummary.totalTokens = 0`，而直接对 JSON 跑 `json_extract` 的预言机是
+  **82000000**。用户看到的是「总 Tokens / 输入 / 输出 / 缓存命中率」整片归零。
+- **修复**：补列 + 回填放进**同一个事务**，用 `PRAGMA user_version` 记录「回填成功」——
+  没抬上去就说明没成功，下次启动**幂等重试**；逐列判断缺哪补哪（SQLite 的多语句 `exec` 中途失败时
+  **前面成功的语句是保留的**，于是可能出现「四列只加了一两列」的库，那种库会让每个用量查询报
+  `no such column`，审查也复现了）；回填表达式与触发器共用同一段 SQL（`TOKEN_COLUMNS_SET`），
+  从此不存在「两套算法漂移」（审查实测出 `true`、重复键、十六进制字符串三种输入下结果不同）。
+  失败时抛明确错误并退出：**宁可启动失败并说清楚，也不要静默把整段历史显示成 0**；
+  报错信息写明「修好权限/磁盘后重启会自动重试（幂等）」。
+- **顺带**：`#backfillTokenTotals`（JS 逐行回填）与它那个只用于它的 `tokenTotals()`、以及没有调用方的
+  `tokOf(alias)` 一起删掉 —— 「同一件事有两套实现」正是漂移的来源；`upsertRows`/其它几处的
+  `ROLLBACK` 也包了 try/catch（磁盘满时 SQLite 已自动回滚，再 ROLLBACK 会抛
+  「cannot rollback - no transaction is active」，把真正的错误盖掉）。
+- **回归测试**：`tests/store-token-columns.test.js` 两条 —— ①只读库上迁移必须**明确失败**并说明会
+  自动重试，修好后重启必须自愈且数字分毫不差（2,222,000）；②「四列只加了一部分」的库必须补全且
+  用量查询可用。修复前两条都失败。
+
 #### 降级 + 实时合并会把文件索引撑起来的会话「洗白」甚至删掉（src/dshhome/store.js，CRITICAL）
 - **现象**（独立审查第 9 轮，实测复现）：projcache 域降级时（dsh 升级到不认识的 `unit.version`，
   正是降级路径存在的原因），`normalize()` 产出 0 条会话行，于是 `mergeLiveStatus` 把**每一条**

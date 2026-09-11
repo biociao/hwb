@@ -156,3 +156,70 @@ test('store: 裸 SQL 写入 sessions 时派生列也由触发器自动维护（�
   assert.equal(store.usageSummary({ days: 1 }).totalTokens, 0, '坏 JSON 行按 0 计入（不是报错，也不是旧值）');
   store.close();
 });
+
+// 审查的 HIGH：旧的迁移闸门是「看列在不在」，而四个 ALTER 各自自动提交、回填另起一个事务。
+// 回填一旦失败（磁盘满、被杀 —— 4 万行约 60ms，窗口真实存在），列已经存在 ⇒ 下次启动不会再回填
+// ⇒ **所有历史用量永久为 0**，且没有任何报错。现在：事务 + user_version 标记 + 逐列补齐 + 幂等回填。
+test('store: 回填失败后重启必须自愈（不能把历史永久显示成 0）', async (t) => {
+  const { chmodSync } = await import('node:fs');
+  const dir = mkdtempSync(path.join(tmpdir(), 'hwb-migfail-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'hwb.db');
+  const expected = 2000 * 1111;   // 1000 + 100 + 10 + 1
+
+  // ① 造旧库形态（无派生列、user_version=0）
+  const a = new IndexStore(file);
+  const homeId = a.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  a.upsertRows(Array.from({ length: 2000 }, (_, i) => ({ type: 'session', homeId, sessionId: `s${i}`, project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: 1000, outputTokens: 100, cacheReadTokens: 10, cacheWriteTokens: 1 }),
+    contextPressure: null, status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 })));
+  assert.equal(a.usageSummary({ days: 30 }).totalTokens, expected, '夹具前提');
+  a.db.exec('DROP TRIGGER IF EXISTS sessions_tok_ai; DROP TRIGGER IF EXISTS sessions_tok_au;');
+  for (const c of ['tokInput', 'tokOutput', 'tokCacheRead', 'tokCacheWrite']) a.db.exec(`ALTER TABLE sessions DROP COLUMN ${c}`);
+  a.db.exec('PRAGMA user_version = 0');
+  a.close();
+
+  // ② 迁移写不进去（只读库）：必须**明确失败**并说清原因，而不是静默显示 0
+  chmodSync(file, 0o444);
+  let message = null;
+  try { new IndexStore(file); } catch (e) { message = e.message; }
+  chmodSync(file, 0o600);
+  assert.ok(message, '只读库上的迁移必须抛错（静默显示 0 是最坏的结局）');
+  assert.match(message, /迁移失败/, `错误信息应点名迁移，实际：${message}`);
+  assert.match(message, /自动重试/, '应告诉用户修好后重启会自动重试');
+
+  // ③ 修好之后重启：自动完成回填，数字必须分毫不差
+  const b = new IndexStore(file);
+  assert.equal(b.usageSummary({ days: 30 }).totalTokens, expected, '重启后必须自愈（而不是永久 0）');
+  assert.equal(Number(b.db.prepare('PRAGMA user_version').get().user_version), 1, '成功后才抬 user_version');
+  b.close();
+});
+
+// 多语句 exec 中途失败时，前面成功的语句是保留的 → 可能出现「四列只加了一部分」的库。
+// 那种库会让每个用量查询报 no such column；按列判断才能补全。
+test('store: 只加了一部分派生列的库也要能补全（不留 no such column）', (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'hwb-partial-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'hwb.db');
+  const a = new IndexStore(file);
+  const homeId = a.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  a.upsertRows([{ type: 'session', homeId, sessionId: 's1', project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: 5, outputTokens: 6 }), contextPressure: null,
+    status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 }]);
+  assert.equal(a.usageSummary({ days: 30 }).totalTokens, 11);
+  // 只留两列，另两列删掉 + user_version 归零（模拟「exec 中途失败」）
+  a.db.exec('DROP TRIGGER IF EXISTS sessions_tok_ai; DROP TRIGGER IF EXISTS sessions_tok_au;');
+  a.db.exec('ALTER TABLE sessions DROP COLUMN tokCacheRead');
+  a.db.exec('ALTER TABLE sessions DROP COLUMN tokCacheWrite');
+  a.db.exec('PRAGMA user_version = 0');
+  a.close();
+
+  const b = new IndexStore(file);
+  const cols = b.db.prepare("SELECT name FROM pragma_table_info('sessions')").all().map((c) => c.name);
+  for (const c of ['tokInput', 'tokOutput', 'tokCacheRead', 'tokCacheWrite']) assert.ok(cols.includes(c), `应补全 ${c}`);
+  assert.equal(b.usageSummary({ days: 30 }).totalTokens, 11, '补全后用量查询必须可用');
+  assert.equal(b.usageTrendGrouped({ dimension: 'total', hours: 24 }).buckets.reduce((x, y) => x + y.total, 0), 11);
+  b.close();
+});
