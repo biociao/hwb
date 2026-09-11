@@ -95,6 +95,20 @@ Semantic Versioning.
   这是有界且短暂的开销（单机工具、单请求），但要改成真流式需要让解析器支持异步写入端 ——
   属于后续工作，不再声称「内存占用与文件大小无关」。
 
+### Security
+
+- **日志里的 dsh 启动 token 不再落盘**（`src/lib/logger.js`）。实测本机 `~/.hwb/hwb.log` 是
+  `-rw-r--r--`（目录 `drwxr-xr-x`），里面有 **44 处** `http://127.0.0.1:<port>/?token=<launchToken>`
+  —— monitor / launcher 会把带 token 的 URL 直接写进日志字段，而持有该 token 等于持有那个
+  dsh 实例的完整控制权（dsh web 的工具能执行 shell、写文件），同机任何用户读到日志即可拿到。
+  修复分三层：① 写入前对**最终日志行**做统一脱敏（`?token=` / `token=` / `"token": "…"` 各种形态，
+  值不设长度下限 —— 宁可误脱敏也不能漏）；② 环缓冲条目与 SSE 推送同样脱敏（浏览器与 UI 也拿不到）；
+  ③ 日志文件 `0600`、状态目录 `0700`，且打开已有文件时 `fchmod` 纠正历史权限（升级路径）。
+  同时把 `hwb.db`（会话标题/路径）收紧到 `0600`，服务控制 socket 改为先保证**目录** `0700`
+  再 bind（socket 在 bind 与 chmod 之间存在一个极短的 0755 窗口，期间同机用户可以连上去发 `stop`）。
+- **回归测试**：`tests/logger-security.test.js` —— 覆盖各种 token 形态的脱敏、不误伤普通文本、
+  token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
+
 ### Fixed
 
 #### 预览代理的建立竞态会留下孤儿监听端口（src/control/launcher.js）

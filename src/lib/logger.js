@@ -162,24 +162,68 @@ function normalize(message, errOrContext, maybeContext) {
 
 function emit(level, scope, message, err, fields) {
   if (LEVELS[level] < LEVELS[config.level]) return; // 低于阈值 → 丢弃（console 与 file 都拦）
-  const line = formatLine(level, scope, message, err, fields);
+  // 对**最终字符串**再脱敏一次：这是最强的一道防线，token 无论是从 fields、message
+  // 还是 err 拼进来的，都不可能出现在落盘/console 的内容里。
+  const line = redactSecrets(formatLine(level, scope, message, err, fields));
   writeConsole(level, line);
   writeFileLine(line);
   pushRing(makeEntry(level, scope, message, err, fields));
 }
 
 // 构造结构化日志条目（供内存环缓冲 + SSE 推送到「日志区域」）。
+// dsh 的启动 URL 形如 `http://127.0.0.1:<port>/?token=<launchToken>`，持有它等于持有该实例的
+// 完整控制权（dsh web 的工具能执行 shell、写文件）。而这个 URL 会被 monitor / launcher 直接写进
+// 日志字段，日志又要落盘（~/.hwb/hwb.log）并经 SSE 推到浏览器 —— 所以 token 必须在**写入通道之前**
+// 就抹掉，而不是指望调用方记得别传。这里做统一的最后一道防线。
+//
+// 只匹配「token 的值」而不动其它内容：`?token=xxx`、`&token=xxx`、`token=xxx`、
+// `"token": "xxx"`（safeJson 之后的形态）都要覆盖，值字符集与 captureDshToken 对齐。
+const TOKEN_PATTERN = /((?:[?&\s"']|^)?token(?:=|"\s*:\s*")[\s]*)([A-Za-z0-9_-]+)/gi;
+
+export function redactSecrets(value) {
+  return String(value ?? '').replace(TOKEN_PATTERN, (m, prefix) => `${prefix}[已脱敏]`);
+}
+
+function redactFields(fields) {
+  if (!fields || typeof fields !== 'object') return fields;
+  let changed = false;
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    const redacted = redactValue(v);
+    if (redacted !== v) changed = true;
+    out[k] = redacted;
+  }
+  return changed ? out : fields;
+}
+
+function redactValue(v) {
+  if (typeof v === 'string') return redactSecrets(v);
+  if (Array.isArray(v)) {
+    let changed = false;
+    const out = v.map((x) => { const r = redactValue(x); if (r !== x) changed = true; return r; });
+    return changed ? out : v;
+  }
+  if (v && typeof v === 'object') {
+    let changed = false;
+    const out = {};
+    for (const [k, x] of Object.entries(v)) { const r = redactValue(x); if (r !== x) changed = true; out[k] = r; }
+    return changed ? out : v;
+  }
+  return v;
+}
+
 function makeEntry(level, scope, message, err, fields) {
   const entry = {
     ts: timestamp(),
     level,
     scope,
-    message,
+    message: redactSecrets(message),
   };
-  if (fields && Object.keys(fields).length) entry.fields = fields;
+  const safeFields = redactFields(fields);
+  if (safeFields && Object.keys(safeFields).length) entry.fields = safeFields;
   if (err != null) {
-    entry.error = err instanceof Error ? err.message : String(err);
-    entry.stack = err instanceof Error && err.stack ? err.stack : null;
+    entry.error = redactSecrets(err instanceof Error ? err.message : String(err));
+    entry.stack = err instanceof Error && err.stack ? redactSecrets(err.stack) : null;
   }
   return entry;
 }
@@ -195,6 +239,7 @@ function pushRing(entry) {
 function pad(level) { return level.toUpperCase().padEnd(5); }
 
 function formatLine(level, scope, message, err, fields) {
+  fields = redactFields(fields);
   const ts = timestamp();
   const tag = config.color
     ? `${ANSI[LEVEL_COLOR[level] ?? 'gray']}${pad(level)}${ANSI.reset}`
@@ -258,8 +303,12 @@ function writeConsole(level, line) {
 function openFile() {
   if (!config.file || fileFd !== null) return;
   try {
-    fs.mkdirSync(path.dirname(config.file), { recursive: true });
-    fileFd = fs.openSync(config.file, 'a');
+    // 0700/0600：日志里有本地路径、会话标题等，且这是每个用户自己的私有状态目录。
+    // 原先 openSync 不带 mode → 0666 & ~umask = 0644（实测 ~/.hwb/hwb.log 就是 -rw-r--r--），
+    // 同机其它用户可读。已存在的旧文件也要纠正权限，否则升级后仍是 0644。
+    fs.mkdirSync(path.dirname(config.file), { recursive: true, mode: 0o700 });
+    fileFd = fs.openSync(config.file, 'a', 0o600);
+    try { fs.fchmodSync(fileFd, 0o600); } catch { /* 某些文件系统不支持，忽略 */ }
   } catch (e) {
     reportFileError(e);
   }

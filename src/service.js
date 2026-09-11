@@ -1,6 +1,7 @@
 // The private control socket belongs to this process: no PID-file based killing.
 import net from 'node:net';
 import fs from 'node:fs';
+import path from 'node:path';
 import { socketFile } from './lib/service-config.js';
 let ready = false;
 const startedAt = new Date().toISOString();
@@ -18,6 +19,11 @@ const control = net.createServer(socket => {
   });
 });
 control.on('error', err => { console.error(err.message); process.exit(1); });
+// 控制 socket 在 bind 与 chmod 之间存在一个极短的 0755 窗口（实测），期间同机其它用户
+// 可以连上来发 stop —— 那会 SIGTERM 掉服务并连带杀掉所有托管的 dsh web 子进程。
+// socket 无法在 bind 前 chmod，所以先把**目录**收到 0700 来消除这个窗口的可达性：
+// 目录不可进入时，socket 的权限位就无关紧要了。
+try { fs.mkdirSync(path.dirname(socketFile), { recursive: true, mode: 0o700 }); fs.chmodSync(path.dirname(socketFile), 0o700); } catch { /* 尽力而为 */ }
 control.listen(socketFile, async () => {
   fs.chmodSync(socketFile, 0o600);
   process.once('exit', () => { try { fs.unlinkSync(socketFile); } catch {} });

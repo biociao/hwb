@@ -86,7 +86,16 @@ test('listening(): 没有 lsof 时退回 ss/netstat（老路径仍在，但会�
   assert.equal(degraded.stdout, 'NO', '缺 lsof/ss/netstat 时必然退化 —— 正是需要 lsof 分支的原因');
 });
 
+// 既没有 lsof 也没有 fuser 的环境（极简容器）里 killport 本来就无从下手，
+// 这是环境限制而不是代码缺陷 —— 明确跳过，别让 CI 在缺少工具的镜像上误报。
+async function hasPortKiller() {
+  const probe = await pExec(BASH, ['-c', 'command -v lsof >/dev/null 2>&1 || command -v fuser >/dev/null 2>&1'], { timeout: 5000 })
+    .then(() => true, () => false);
+  return probe;
+}
+
 test('killport(): 真的能回收远端端口（BSD 上 fuser 不存在时也有效）', async (t) => {
+  if (!await hasPortKiller()) { t.skip('环境里既无 lsof 也无 fuser'); return; }
   const { child, port } = await startListener();
   let alive = true;
   child.once('exit', () => { alive = false; });

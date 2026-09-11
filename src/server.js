@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -73,8 +73,12 @@ if (opts.level === 'debug') log.debug('debug 已开启');
 // 进程级 crash handler：把未捕获异常 / 未处理拒绝连同完整 stack 记入日志，便于排查。
 installCrashHandlers();
 
-if (opts.db !== ':memory:') mkdirSync(path.dirname(opts.db), { recursive: true });
+// 0700：hwb 的状态目录里有会话标题、工作区路径与日志，属于当前用户的私有数据。
+// 原先不带 mode → 0755（实测 ~/.hwb 就是 drwxr-xr-x），同机其它用户可读。
+if (opts.db !== ':memory:') mkdirSync(path.dirname(opts.db), { recursive: true, mode: 0o700 });
 const store = new IndexStore(opts.db);
+// SQLite 自己按 umask 建文件（实测 0644）。它装着全部会话元数据，收紧到 0600。
+if (opts.db !== ':memory:') { try { chmodSync(opts.db, 0o600); } catch { /* 不支持的 fs 上忽略 */ } }
 for (const homePath of opts.homes) {
   store.registerHome({ homePath });
 }
