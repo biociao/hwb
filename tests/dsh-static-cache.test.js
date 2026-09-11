@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { apply } from '../dsh-static-cache/lib/index.js';
@@ -91,4 +91,20 @@ test('条件请求命中 ETag 时返回 304', async (t) => {
   const second = fakeRes();
   await handler({ method: 'GET', url: '/assets/app-1234abcd.js', headers: { 'if-none-match': first.headers.etag } }, second);
   assert.equal(second.status, 304);
+});
+
+// stat 成功但 readFile 失败时，处理器原先会**拒绝**：dsh 的 webserver 兜住后回 400
+// 并往日志里写一段 warn+堆栈，而正确答案是 404（与目录那条同源，当时只修了目录）。
+// 触发点很现实：`npm i -g` / dsh 升级过程中资源被替换，而浏览器正好在刷新页面。
+test('readFile 失败（权限/被删/IO）返回 404，而不是让处理器拒绝', async (t) => {
+  const root = await fixture(t);
+  const target = path.join(root, 'assets', 'locked-1234.js');
+  await writeFile(target, 'console.log(2)\n');
+  await chmod(target, 0o000);            // stat 能过、readFile 报 EACCES（非 root 时）
+  const { handler } = mount(root);
+  const res = fakeRes();
+  await handler({ method: 'GET', url: '/assets/locked-1234.js', headers: {} }, res);
+  await chmod(target, 0o644);            // 便于夹具清理
+  assert.equal(res.status, 404, `不该以异常结束（实际 ${res.status}）`);
+  assert.equal(res.ended, true);
 });

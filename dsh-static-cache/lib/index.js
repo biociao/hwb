@@ -172,7 +172,19 @@ async function serveAsset(req, res, distRoot) {
     res.end()
     return
   }
-  const body = await readFile(target)
+  // readFile 失败（文件在 stat 与 read 之间被删/换、或权限不足、或磁盘错误）原先会让整个
+  // 处理器拒绝：dsh 的 webserver 兜住后回 **400** 并往日志里写一段 warn+堆栈，而正确答案是 404
+  // （与上面目录那条是同一类问题，当时只修了目录）。触发点很现实：`npm i -g` / dsh 升级过程中
+  // 资源被替换，而浏览器正好在刷新页面。
+  let body
+  try {
+    body = await readFile(target)
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'EACCES' || err.code === 'EISDIR' || err.code === 'EIO') {
+      res.writeHead(404); res.end(); return
+    }
+    throw err
+  }
   res.writeHead(200, {
     'content-type': type,
     'cache-control': CACHE_DIRECTIVE,

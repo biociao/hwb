@@ -393,3 +393,35 @@ test('writeUpload: 0 字节文件在远端也能上传（与本机行为一致�
     '整体期望 5 字节却一个分片都没有时，必须仍然报错'
   );
 });
+
+// 隐藏暂存目录（`.hwb-upload-*/part`）在每个 part 里都装着整份文件副本。
+// cleanup() 原先只清「当前那个」：stage() 会把 temp 交给 commit 闭包并置空，于是**之前**已 stage
+// 的目录谁都不管；commit() 的清理写在 link 循环**之后**，link 一失败就被跳过。
+// 两种情况下用户的项目目录里都会留下一个装着整份文件副本的隐藏目录（`ls -a`/`git status` 里都是垃圾）。
+test('localUploader: 中途失败时已 stage 的暂存目录也必须被清掉', async (t) => {
+  const { root } = await fixture(t);
+  const target = path.join(root, 'dir');            // 夹具里 dir 是空目录
+  const up = await localUploader(root, 'dir');
+  await up.begin('a.txt');
+  await up.write(Buffer.from('first-file-content'));
+  await up.stage();                       // 第一份已经 stage（写入成功、等 commit）
+  await up.begin('b.txt');
+  await up.write(Buffer.from('second'));
+  await up.cleanup();                     // 路由在解析失败时就是走这条
+  assert.deepEqual(await readdir(target), [], '暂存目录不该留在项目目录里');
+});
+
+test('localUploader: commit 失败（link 报错）也要清掉自己的暂存目录', async (t) => {
+  const { root } = await fixture(t);
+  const target = path.join(root, 'dir');
+  const up = await localUploader(root, 'dir');
+  await up.begin('c.txt');
+  await up.write(Buffer.from('payload'));
+  const staged = await up.stage();
+  // 故障注入：让 part 消失，link 会以 ENOENT（非 EEXIST）失败 —— 用来验证失败路径的清理。
+  // （不用「把目录设为不可写」来注入：那种情况下连 rm 本身都没权限，是夹具问题而非缺陷。）
+  const [stagingName] = await readdir(target);
+  await rm(path.join(target, stagingName, 'part'));
+  await assert.rejects(staged.commit(), /ENOENT/, 'link 失败应把错误抛出来');
+  assert.deepEqual(await readdir(target), [], 'commit 失败也不该留下暂存目录');
+});

@@ -22,13 +22,26 @@ function inside(root, target) {
 }
 
 export async function readLocalPreview(root, requested = '.', download = false) {
-  root = await realpath(root);
-  const target = await realpath(path.resolve(root, requested));
+  // 与 mapUploadError 同源：把 Node 的裸 errno 翻成用户能看懂的话。
+  // 之前文件被删掉后点预览，界面上显示的是 `ENOENT: no such file or directory, realpath '/...'`
+  // —— 一句英文系统错误，既没说是哪个文件、也没说该怎么办。
+  let target;
+  try {
+    root = await realpath(root);
+    target = await realpath(path.resolve(root, requested));
+  } catch (error) {
+    throw mapPreviewError(error);
+  }
   if (!inside(root, target)) throw new Error('只能预览当前项目目录内的文件');
   const base = { path: target, root, parent: target === root ? null : path.dirname(target) };
   // Nonblocking open avoids hanging on FIFOs; realpath also checks symlink escapes.
   const { constants } = await import('node:fs');
-  const handle = await open(target, constants.O_RDONLY | constants.O_NONBLOCK);
+  let handle;
+  try {
+    handle = await open(target, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    throw mapPreviewError(error);
+  }
   try {
     const st = await handle.stat();
     if (st.isDirectory()) {
@@ -187,6 +200,18 @@ export async function resolveUploadDir(root, subdir) {
   return { root, dir: target };
 }
 
+// 预览/下载路径上的同一件事：用户点开一个刚被删掉的文件时，不该看到一句英文 errno。
+function mapPreviewError(error) {
+  switch (error?.code) {
+    case 'ENOENT': return new Error('文件或目录不存在，可能已被移动或删除，请刷新后重试');
+    case 'EACCES': case 'EPERM': return new Error('没有读取该文件的权限');
+    case 'EISDIR': case 'ENOTDIR': return new Error('路径类型不匹配（文件/目录），请刷新后重试');
+    case 'ELOOP': return new Error('符号链接指向自身或层数过多');
+    case 'ENAMETOOLONG': return new Error('路径过长');
+    default: return error;
+  }
+}
+
 // 把 Node 的裸错误翻译成用户能看懂的提示：ENOENT 基本都是“目标目录不存在”。
 function mapUploadError(error) {
   if (error?.code === 'ENOENT') return new Error('上传目标目录不存在，请刷新后重试');
@@ -209,30 +234,15 @@ export async function localUploader(root, requestedDir) {
   const { dir } = await resolveUploadDir(root, requestedDir);
   const taken = await localTaken(dir);
   let temp = null, stream = null, active = null, size = 0;
+  // 已经 stage（写完、等 commit）的临时目录。stage() 会把 temp 交给 commit 闭包并置空，
+  // 于是 cleanup() 只清「当前那个」—— 中途失败时**之前**已 stage 的目录留在项目目录里，
+  // 每个都装着整份文件副本（实测：第二个 part 中断 → 目录里留下 .hwb-upload-xxxx/part）。
+  const staged = new Set();
   async function openTemp() {
     temp = await mkdtemp(path.join(dir, '.hwb-upload-'));
     stream = createWriteStream(path.join(temp, 'part'), { flags: 'wx' });
     await new Promise((resolve, reject) => { stream.once('open', resolve); stream.once('error', reject); });
   }
-  const finish = async () => {
-    if (!stream) throw new Error('上传未开始');
-    await new Promise((resolve, reject) => { stream.end(() => resolve()); stream.once('error', reject); });
-    const source = path.join(temp, 'part');
-    // active 属于 "提出的名字"，不能被重试污染：每次冲突都从它重新算下一个名字，
-    // 否则本批的第二个同名文件会越算越偏（data(2)(1).csv）。
-    let name = uniqueName(active, taken);
-    for (;;) {
-      try { await link(source, path.join(dir, name)); break; } catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        taken.add(name);
-        name = uniqueName(active, taken);
-      }
-    }
-    await unlink(source);
-    active = null;
-    stream = null;
-    return { name, size, path: path.join(dir, name) };
-  };
   const closeStream = async () => {
     const target = stream;
     await new Promise((resolve, reject) => { target.end(() => resolve()); target.once('error', reject); });
@@ -255,21 +265,28 @@ export async function localUploader(root, requestedDir) {
       const bytes = size;
       stream = null;
       temp = null;
+      staged.add(staging);
       return {
         // 同名不覆盖：link 撞名就换下一个候选名（从原始请求名重算，不会越算越偏）。
         commit: async () => {
-          let name = uniqueName(request, taken);
-          for (;;) {
-            if (taken.has(name)) { name = uniqueName(request, taken); continue; }
-            try { await link(source, path.join(dir, name)); break; } catch (e) {
-              if (e.code !== 'EEXIST') throw e;
-              taken.add(name);
-              name = uniqueName(request, taken);
+          // 整个流程（含 link 循环）都要在 try/finally 里：link 因 EACCES/ENOSPC/EMFILE 等失败时
+          // 原先会**跳过**清理，于是在用户项目目录里留下一个装着整份文件副本的隐藏目录。
+          // 注意 try 必须包住上面那个 for(;;) 里的 throw，只包 return 是不够的（实测仍残留）。
+          try {
+            let name = uniqueName(request, taken);
+            for (;;) {
+              if (taken.has(name)) { name = uniqueName(request, taken); continue; }
+              try { await link(source, path.join(dir, name)); break; } catch (e) {
+                if (e.code !== 'EEXIST') throw e;
+                taken.add(name);
+                name = uniqueName(request, taken);
+              }
             }
+            return { name, size: bytes, path: path.join(dir, name) };
+          } finally {
+            staged.delete(staging);
+            await rm(staging, { recursive: true, force: true }).catch(() => {});
           }
-          // 连临时目录一起清掉：成功后目录里不该留下任何副产物。
-          await rm(staging, { recursive: true, force: true }).catch(() => {});
-          return { name, size: bytes, path: path.join(dir, name) };
         },
       };
     },
@@ -285,7 +302,12 @@ export async function localUploader(root, requestedDir) {
     },
     async cleanup() {
       try { stream?.destroy(); } catch { /* 尽力清理 */ }
-      if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
+      // 当前正在写的 + 之前已经 stage 的，全都要清 —— 否则失败一次就在项目目录里留一份残留。
+      const all = new Set(staged);
+      if (temp) all.add(temp);
+      staged.clear();
+      temp = null;
+      for (const dirPath of all) await rm(dirPath, { recursive: true, force: true }).catch(() => {});
     },
   };
 }

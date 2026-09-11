@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, symlink, rm, truncate } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { readFilePreview, PREVIEW_BYTES, IMAGE_BYTES, DOWNLOAD_BYTES, sessionWorkspace } from '../src/lib/file-preview.js';
+import { readFilePreview, PREVIEW_BYTES, IMAGE_BYTES, DOWNLOAD_BYTES, sessionWorkspace, readLocalPreview } from '../src/lib/file-preview.js';
 import { createRouter } from '../src/api/routes.js';
 
 async function fixture(t) {
@@ -166,4 +166,21 @@ test('download 本机：Buffer 路径不做额外拷贝（同一底层内存）'
   assert.equal(Buffer.isBuffer(r.data), true);
   assert.equal(r.data.length, 3);
   assert.equal(r.size, 3);
+});
+
+// 文件被删掉之后点预览，界面上原先显示的是裸 errno：
+// `ENOENT: no such file or directory, realpath '/private/var/.../nope.txt'` —— 英文系统错误，
+// 既没说是哪个文件也没说该怎么办。与上传路径的 mapUploadError 同源处理。
+test('readLocalPreview: 常见文件系统错误翻译成人话，不再把裸 errno 抛给界面', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-preview-err-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const gone = path.join(base, 'gone.txt');
+  await assert.rejects(readLocalPreview(base, 'gone.txt'), (err) => {
+    assert.doesNotMatch(err.message, /ENOENT/, '不该把裸 errno 给用户看');
+    assert.match(err.message, /不存在|权限|类型|链接/, `应给出可理解的说明，实际：${err.message}`);
+    return true;
+  });
+  // 目录当文件下载：保持原有的中文提示
+  await mkdir(path.join(base, 'sub'), { recursive: true });
+  await assert.rejects(readLocalPreview(base, 'sub', true), /目录打包/);
 });

@@ -162,6 +162,38 @@ Semantic Versioning.
 - **回归测试**：`tests/cli.test.js` —— 刚创建的空锁必须拒（视为被持有），过期空锁必须接管；
   另外「持有者已死」与「PID 存活但心跳过期」两条照旧覆盖。修复前新用例失败。
 
+#### 本地上传会在用户项目目录里留下装着整份文件副本的隐藏目录（src/lib/file-preview.js）
+- **现象**：上传中途失败后，项目目录里留下 `.hwb-upload-xxxxxx/part` —— 每个残留都装着**整份文件**。
+  两个触发路径都实测复现：①批量上传时第二个文件失败（前面已 stage 的目录谁都不管）；
+  ②`commit()` 的 `link` 报非 EEXIST 错误（EACCES/ENOSPC/EMFILE）时清理被跳过。
+  `ls -a`/`git status` 里都是垃圾，磁盘也会持续增长。
+- **根因**：`stage()` 把已写好的临时目录交给 `commit` 闭包并把 `temp` 置空，而 `cleanup()` 只清
+  「当前那个」；`commit()` 的 `rm(staging)` 写在 link 循环**之后**，link 一抛就被跳过。
+- **修复**：uploader 记录所有已 stage 的目录，`cleanup()` 全部清掉；`commit()` 的清理改成
+  `try/finally` 包住**整个** link 循环（只包 `return` 是不够的 —— 我第一版就是这么写的，
+  实测仍然残留，因为抛错发生在循环里）。
+- **回归测试**：`tests/file-upload.test.js` 两条 —— 中途失败时已 stage 的目录也要清掉；
+  commit 失败（故障注入让 part 消失 → link 报 ENOENT）也要清掉自己的暂存目录。
+  说明：故障注入刻意不用「把目录设为不可写」——那种情况下连 `rm` 本身都没权限，
+  残留是夹具问题而非缺陷。两条修复前都失败。
+- **顺带**删掉 `localUploader.finish`：没有任何调用方（只用 `stage`/`commit`），
+  而且它读的是模块级的 `active`，被 `stage()` 置空后行为已经不对。
+
+#### 静态缓存：stat 成功但 readFile 失败会以异常结束（dsh-static-cache/lib/index.js）
+- **现象**：资源在 `stat` 与 `readFile` 之间消失/权限不足/IO 错误时，处理器拒绝 → dsh 的
+  webserver 兜住后回 **400** 并往日志里写一段 warn+堆栈，而正确答案是 404。
+  与「目录请求」是同一类问题，当时只修了目录那一条。
+- **修复**：`readFile` 包 try/catch，`ENOENT`/`EACCES`/`EISDIR`/`EIO` 一律 404。
+- **回归测试**：`tests/dsh-static-cache.test.js` —— chmod 000 的文件请求必须 404 且不再抛。
+
+#### 预览路径把裸 errno 抛给界面（src/lib/file-preview.js）
+- **现象**：文件被删掉后点预览，界面上显示
+  `ENOENT: no such file or directory, realpath '/private/var/.../nope.txt'` —— 一句英文系统错误，
+  既没说是哪个文件也没说该怎么办。
+- **修复**：新增 `mapPreviewError`（与上传路径的 `mapUploadError` 同源），把
+  ENOENT/EACCES/EPERM/EISDIR/ENOTDIR/ELOOP/ENAMETOOLONG 翻成人话；`realpath` 与 `open` 两处都包。
+- **回归测试**：`tests/file-preview.test.js` —— 不存在的文件必须给出中文说明且**不含** `ENOENT`。
+
 #### CLI 与服务：三条「谎报 / 自杀 / 永久卡住」的问题（src/cli.js + src/service.js）
 - **`status`/`doctor` 把正在服务的前台 `hwb serve` 报成「已停止」**（MEDIUM）。前台 serve 不创建
   控制 socket，而这两个命令只看 socket：看板明明在返回 200，`status` 却打印 `stopped` 并**以退出码 1
