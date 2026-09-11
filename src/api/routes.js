@@ -6,6 +6,7 @@ import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseMultipart } from '../lib/multipart.js';
+import { logger } from '../lib/logger.js';
 import { readFilePreview, resolveUploadDir, writeUpload, UPLOAD_BYTES, sessionWorkspace } from '../lib/file-preview.js';
 
 // 实例对象出站前的整形：去掉 dsh 的 token。
@@ -132,8 +133,11 @@ function dshHomeInfo(homePath) {
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000 }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1 }) {
   const connecting = new Set();
+  // 上传并发上限（见 upload 路由里的说明）。默认 1：最坏内存 ≈ 单次上限（256 MiB → ~1.1 GiB）。
+  const MAX_CONCURRENT_UPLOADS = maxConcurrentUploads;
+  let uploadsInFlight = 0;
   // 定向重索引常常是 fire-and-forget（远程要等 SSH 超时，不能阻塞响应）。
   // 但「不 await」不等于「不管」：返回的 promise 一旦拒绝就是未处理拒绝，
   // 会被 crash handler 记成 fatal 并掩盖真正的失败原因。这里统一吞掉——
@@ -245,6 +249,16 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     const upload = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/upload$/);
     if (req.method === 'PUT' && upload) {
       res.setHeader('Cache-Control', 'no-store');
+      // 上传并发闸门。解析器是**同步契约**，路由只能把整包 body 攒在内存里
+      // （实测：256 MiB 单次上传峰值 RSS 1.12 GiB ≈ 4.4×；规模审查测得 4 个满额并发 ⇒ ~4.4 GiB，
+      // 而 hwb 没有设置堆上限 ⇒ 容器直接 OOM）。把并发压到 1 之后，最坏情况回到「一次上传的大小」；
+      // 超出的请求立刻 503 + 一条 warn（不排队：排队意味着更多内存被同一个进程持有）。
+      if (uploadsInFlight >= MAX_CONCURRENT_UPLOADS) {
+        logger('api').warn('上传并发已达上限，拒绝新上传', { inFlight: uploadsInFlight, limit: MAX_CONCURRENT_UPLOADS });
+        send(res, 503, { error: `已有 ${uploadsInFlight} 个上传在进行，请稍后重试` });
+        return;
+      }
+      uploadsInFlight++;
       const home = store.getHome(upload[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
       const workspaces = store.listWorkspaces({ homeId: home.homeId });
@@ -288,7 +302,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         const listing = await readFilePreview(home, workspace.path, dir, remoteExec);
         send(res, 200, { ok: true, dir: result.dir, files: result.files,
           listing: listing.kind === 'directory' ? listing : null });
-      } catch (e) { send(res, 400, { error: e.message }); }
+      } catch (e) { send(res, 400, { error: e.message }); } finally { uploadsInFlight--; }
       return;
     }
 

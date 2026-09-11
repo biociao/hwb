@@ -450,3 +450,39 @@ test('localUploader: 过期的暂存目录会被清掉，正在写入的不会�
   await assert.rejects(stat(stale), '陈旧暂存目录应被清掉');
   assert.ok((await stat(fresh)).isDirectory(), '正在写入的暂存目录不能被误删');
 });
+
+// 上传路由把整包 body 攒在内存里（解析器是同步契约），实测 256 MiB 单次峰值 RSS 1.12 GiB，
+// 4 个满额并发 ⇒ ~4.4 GiB ⇒ 容器 OOM（规模审查实测）。现在有并发闸门（默认 1），
+// 超出的请求立刻 503，而不是让同一个进程同时持有几份满额缓冲。
+// 上传路由把整包 body 攒在内存里（解析器是同步契约，且要求 Content-Length），
+// 实测 256 MiB 单次峰值 RSS 1.12 GiB；4 个满额并发 ⇒ ~4.4 GiB ⇒ 容器 OOM（规模审查实测）。
+// 现在有并发闸门（默认 1）：超出的请求立刻 503，而不是让同一个进程同时持有几份满额缓冲。
+// 这里用**挂起的第一个请求**占住闸门（body 只推了头部、不推结尾），第二个请求必须被拒。
+test('上传：并发闸门把同时进行的上传压到上限（超出立刻 503）', async (t) => {
+  const { root } = await fixture(t);
+  const route = makeRoute(root);
+  const first = multipartBody('B', [{ name: 'a.txt', data: 'xxxxxxxxxx' }]);
+
+  // 第一个请求：只推 head 部分（不结束），解析器会一直等剩下的 body
+  const req1 = new Readable({ read() {} });
+  req1.on('error', () => {});
+  req1.method = 'PUT';
+  req1.headers = { 'content-length': String(first.length), 'content-type': 'multipart/form-data; boundary=B' };
+  const res1 = { headers: {}, setHeader() {}, writeHead(s) { this.status = s; }, end() {}, destroy() {} };
+  const pending = route(req1, res1, new URL(`http://127.0.0.1/api/homes/${HOME_ID}/upload?sessionId=s&dir=dir`)).catch(() => {});
+  req1.push(first.subarray(0, 60));   // 只给头部
+  await new Promise((r) => setTimeout(r, 100));
+
+  // 第二个请求：完整的 body，但闸门被占着 → 必须 503
+  const second = await request(route, { body: multipartBody('B', [{ name: 'b.txt', data: 'y' }]), query: 'sessionId=s&dir=dir' });
+  assert.equal(second.status, 503, `并发超过上限时必须立刻 503（实际 ${JSON.stringify(second)}）`);
+  assert.match(String(second.body?.error ?? ''), /上传/, '错误里要说明是上传并发限制');
+
+  // 放行第一个：推完剩下的 body，它必须正常完成（闸门释放）
+  req1.push(first.subarray(60));
+  req1.push(null);
+  await pending;
+  assert.equal(res1.status, 200, '第一个上传应正常完成');
+  const after = await request(route, { body: multipartBody('B', [{ name: 'c.txt', data: 'z' }]), query: 'sessionId=s&dir=dir' });
+  assert.equal(after.status, 200, '闸门释放后新的上传应被放行');
+});
