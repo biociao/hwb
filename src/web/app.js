@@ -7,7 +7,7 @@ import { renderRecentSessions } from './components/recent-sessions.js';
 import { connectedHomes, tabHomes } from './instance-state.js';
 import { planPaneNavigation, planPaneRecovery, updatePaneSession } from './instance-navigation.js';
 import { renderInstanceGrid } from './components/instance-grid.js';
-import { renderUsageCard, usageTrendHtml, USAGE_PERIODS } from './components/usage-card.js';
+import { renderUsageCard, usageTrendHtml, fitTrendLabels, USAGE_PERIODS } from './components/usage-card.js';
 import { renderHomeForm, renderOnboarding, renderSettingsForm, applyHomeMode } from './components/add-home.js';
 import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLogView, logPanelHtml } from './components/log-panel.js';
 import { captureFormDraft, restoreFormDraft } from './components/form-draft.js';
@@ -238,6 +238,7 @@ async function renderDashboard(sequence = refreshSequence) {
     usage: renderUsageCard(usage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
   });
+  fitTrendLabels(dashboardEl); // X 轴标签按实测宽度收边/去重叠（见 usage-card.js）
   logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
   if (showAddForm) {
     dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm());
@@ -280,7 +281,10 @@ async function refreshUsageCard() {
   lastUsage = usage;
   lastUsageKey = key;
   const el = document.getElementById('usage-card');
-  if (el) el.innerHTML = renderUsageCard(usage, usageDim, lastUsageKey);
+  if (el) {
+    el.innerHTML = renderUsageCard(usage, usageDim, lastUsageKey);
+    fitTrendLabels(el);
+  }
 }
 
 // —— Token 构成线（新增输入/缓存命中/缓存创建/输出）与趋势图数据点的悬停 tooltip ——

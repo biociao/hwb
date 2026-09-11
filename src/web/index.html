@@ -219,10 +219,14 @@
     .trend-dot:hover { transform: translate(-50%, 50%) scale(1.5); }
     /* X 轴：标签按**时间**定位（left% 与散点同一个函数），不是等分单元格 —— 见 usage-card.js 的注释 */
     .trend-x { position: relative; height: 14px; margin-top: 2px; }
+    /* 默认居中在数据点上（与散点同一个 left%）。贴边的标签由 fitTrendLabels() 在渲染后
+       按**实测**宽度加上 .trend-xlabel-left/right 改为向内对齐，相邻压字的直接隐藏 ——
+       静态常量算不出真实宽度（实测 542px 绘图区里 12% 的间隔仍重叠 16px）。 */
     .trend-xlabel { position: absolute; top: 0; font-size: 10px; color: var(--dim); white-space: nowrap;
                     font-variant-numeric: tabular-nums; transform: translateX(-50%); }
     .trend-xlabel-left { transform: translateX(0); }
     .trend-xlabel-right { transform: translateX(-100%); }
+    .trend-xlabel[hidden] { display: none; }
     .trend-caption { margin-top: 6px; font-size: 11px; color: var(--dim); }
     .trend-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
     .trend-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--dim); }

@@ -278,9 +278,9 @@ test('usage-card: x 轴标签与散点用同一个定位函数（不随空桶错
   const { usageTrendHtml } = await import('../src/web/components/usage-card.js');
   const H = 3_600_000, t0 = Date.parse('2026-09-01T00:00:00.000Z');
   const mk = (i, total) => ({ ts: new Date(t0 + i * H).toISOString(), groups: total ? { '合计': total } : {}, total });
-  // 稀疏窗口：60 个桶里只有**末尾** 5 个有数据（等价于审查实测的「30 天窗口、最近几小时才有数据」）
+  // 审查实测的那个窗口：60 个桶里只有 5 个非空，位置在 72.9/86.4/96.6/98.3/100%（桶序号 43/51/57/58/59）
   const buckets = Array.from({ length: 60 }, (_, i) => mk(i, 0));
-  for (const i of [55, 56, 57, 58, 59]) buckets[i] = mk(i, 100 + i);
+  for (const i of [43, 51, 57, 58, 59]) buckets[i] = mk(i, 100 + i);
   const html = usageTrendHtml({ trendBy: { total: { buckets, hours: 24, stepMs: H } } }, 'total');
 
   const dotLefts = [...html.matchAll(/class="trend-dot" style="left:([\d.]+)%/g)].map((m) => Number(m[1]));
@@ -291,9 +291,77 @@ test('usage-card: x 轴标签与散点用同一个定位函数（不随空桶错
   for (const l of labelLefts) {
     assert.ok(dotLefts.some((d) => Math.abs(d - l) < 0.01), `标签 ${l}% 必须落在某个数据点上，散点在 ${dotLefts.join('/')}%`);
   }
-  // 等分位置（i/(n-1)）不该再出现：数据都在末尾，第一个标签就应该在 93% 附近，而不是 0%
-  assert.ok(labelLefts[0] > 90, `稀疏窗口下第一个标签应贴近真实数据位置，实际 ${labelLefts[0]}%`);
+  // 等分位置（i/(n-1)）不该再出现：数据都在窗口后段，第一个标签就该在 72.9% 附近，而不是 0%
+  assert.ok(labelLefts[0] > 60, `稀疏窗口下第一个标签应贴近真实数据位置，实际 ${labelLefts[0]}%`);
   assert.doesNotMatch(html, /trend-xcell/, '等分单元格已废弃');
+});
+
+// 相邻标签是否压字、贴边标签是否被裁掉，都取决于**真实宽度**（字体 + 卡片宽度），
+// 模板字符串里算不出来：实测同一组数据在 542px 的绘图区里，间隔 12%（65px）仍会让两个标签重叠 16px。
+// 所以渲染后按实测矩形收边 + 去重叠。假 DOM 在这里足够用（只用到 querySelector/
+// querySelectorAll/getBoundingClientRect/classList/hidden）。
+function fakeAxis({ labels, plot }) {
+  const nodes = labels.map(({ left, right, hidden = false }) => {
+    const classes = new Set();
+    return {
+      hidden,
+      getBoundingClientRect: () => ({ left, right, width: right - left }),
+      classList: { add: (c) => classes.add(c), contains: (c) => classes.has(c) },
+      classes,
+    };
+  });
+  return {
+    nodes,
+    querySelector: (sel) => {
+      if (sel === '.trend-x') return { querySelectorAll: () => nodes };
+      if (sel === '.trend-plot') return { getBoundingClientRect: () => plot };
+      return null;
+    },
+  };
+}
+
+test('fitTrendLabels: 重叠的标签按实测宽度去掉，末尾那个必须留下', async () => {
+  const { fitTrendLabels } = await import('../src/web/components/usage-card.js');
+  // 绘图区 [66, 608]；三个标签宽 60px，后两个重叠 12px（488→560 与 548→608）
+  const root = fakeAxis({
+    plot: { left: 66, right: 608, width: 542 },
+    labels: [{ left: 407, right: 467 }, { left: 500, right: 560 }, { left: 548, right: 608 }],
+  });
+  fitTrendLabels(root);
+  const visible = root.nodes.filter((n) => !n.hidden);
+  assert.equal(visible.length, 2, `应去掉 1 个重叠标签，实际留下 ${visible.length}`);
+  assert.equal(root.nodes[2].hidden, false, '末尾标签（「现在」）不能被删掉');
+  assert.equal(root.nodes[1].hidden, true, '与末尾重叠的那个先让位');
+  for (let i = 1; i < visible.length; i++) {
+    assert.ok(visible[i].getBoundingClientRect().left >= visible[i - 1].getBoundingClientRect().right,
+      '留下来的标签之间不得重叠');
+  }
+});
+
+test('fitTrendLabels: 贴边标签改为向内对齐，不越出绘图区', async () => {
+  const { fitTrendLabels } = await import('../src/web/components/usage-card.js');
+  const root = fakeAxis({
+    plot: { left: 66, right: 608, width: 542 },
+    labels: [{ left: 40, right: 100 }, { left: 574, right: 634 }], // 两侧各溢出 26px
+  });
+  fitTrendLabels(root);
+  assert.equal(root.nodes[0].classes.has('trend-xlabel-left'), true, '左端标签应左对齐');
+  assert.equal(root.nodes[1].classes.has('trend-xlabel-right'), true, '右端标签应右对齐');
+  assert.equal(root.nodes[0].hidden, false);
+  assert.equal(root.nodes[1].hidden, false);
+});
+
+test('fitTrendLabels: 布局正常时不动任何标签；缺元素/缺 DOM 时不抛', async () => {
+  const { fitTrendLabels } = await import('../src/web/components/usage-card.js');
+  const root = fakeAxis({
+    plot: { left: 66, right: 608, width: 542 },
+    labels: [{ left: 100, right: 150 }, { left: 300, right: 350 }, { left: 500, right: 550 }],
+  });
+  fitTrendLabels(root);
+  assert.ok(root.nodes.every((n) => !n.hidden), '没有重叠就不该删');
+  assert.ok(root.nodes.every((n) => n.classes.size === 0), '没有贴边就不该改锚点');
+  fitTrendLabels(null);
+  fitTrendLabels({ querySelector: () => null });
 });
 
 // 按维度拆分时，绝大多数「分组 × 桶」都是 0：画出来是一排 8px 圆点全叠在 0% 基线上，

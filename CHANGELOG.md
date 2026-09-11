@@ -202,6 +202,19 @@ Semantic Versioning.
 - **回归测试**：`tests/logger-security.test.js` —— 覆盖各种 token 形态的脱敏、不误伤普通文本、
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
+### Added
+#### 真浏览器渲染检查（scripts/render-check.mjs + scripts/README-render-check.md）
+- 前端是「拼 HTML + innerHTML」，有一类缺陷**只在真实布局里存在**（坐标轴错位、空状态少按钮、
+  标签压字/贴边裁切、拟合函数没被调用）。本项目的多轮审查里最有价值的前端发现全部来自真浏览器，
+  而此前一直没有一个可复用的检查手段：`--dump-dom` 要等网络空闲，而前端有一条常驻 SSE ⇒
+  实测 30s 超时、0 字节输出（另外 `--user-data-dir` 必须显式给，否则 headless 起不来）。
+- 现在用 CDP 驱动 headless Chrome（Node 22 自带 WebSocket，**零依赖**）：`--url` +
+  `--expr-file` 在页面里跑一段 async 代码，取回 JSON 结果，并收集 `console.error` 与未捕获异常；
+  退出码区分「断言失败」与「启动/连接失败」。
+- 本轮用它端到端验证了下面几条前端修复（隔离实例 + 假 home，真实数据、真实 SSE）：
+  空窗口仍有 5 个周期按钮、点击 30 天后标签与散点偏差 0.00px 且不重叠不越界、
+  无 0 值散点、日志面板有历史行、添加实例的 warning 在 SSE 刷新后仍在。
+
 ### Fixed
 #### 用量卡的空状态是个死胡同：周期按钮在早退之后，用户永远放宽不了窗口（src/web/components/usage-card.js）
 - **现象**：默认 24h 窗口内没有数据、更早有数据的用户，卡片只显示一句「暂无 token 用量数据

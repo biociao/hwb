@@ -40,6 +40,7 @@ const DIM_LABELS = { total: '总 Tokens', project: '项目', provider: 'LLM prov
 // 稳定的曲线/点颜色：按分组标签记色，跨重渲染同色（复用实例/项目 chip 配色）。
 const colorOf = (label) => chipColor(label).fg;
 
+
 // 统计周期：过去 24h / 3天 / 7天 / 14天 / 30天。
 // hours 驱动「用量趋势」点图，days 驱动「汇总 + 按项目」统计，两者统一切换保持一致。
 export const USAGE_PERIODS = [
@@ -166,19 +167,21 @@ export function usageTrendHtml(usage, dim = 'total') {
         data-name="${axisLabel(data[i].ts, stepMs)} · ${esc(s.g)}" data-tok="${esc(fmtTokens(v))}" data-pct="${pct.toFixed(1)}"></i>`;
   })).join('');
 
-  // X 轴标签稀疏显示：每约 8 个点显示一个，末尾必显示。
-  // **必须与散点用同一个 x 函数**（pxAt）：散点按时间定位，而标签原先是 n 个 flex:1 的等分单元格
-  // —— 只要有空桶两者就对不上。独立审查用真浏览器实测（30 天周期、60 桶里只有 5 个非空）：
+  // X 轴标签：**必须与散点用同一个 x 函数**（pxAt）。散点按时间定位，而标签原先只是 n 个 flex:1
+  // 的等分单元格 —— 只要有空桶两者就对不上。独立审查用真浏览器实测（30 天周期、60 桶里只有 5 个非空）：
   // 标签中心在 9.9/29.9/50.0/70.1/90.1%，对应散点却在 72.9/86.4/96.6/98.3/100.0% ——
   // 所有数据都堆在「09-11 20:00」底下，而「09-03 20:00」的标签悬在空白上，读者会把用量算到错的日子。
+  //
+  // 这里只负责**按时间定位 + 稀疏取点**；「贴边裁切」与「相邻压字」交给渲染后的实测拟合
+  // （fitTrendLabels）：两者都取决于真实宽度，静态常量给不出正确答案 —— 实测同一组数据在
+  // 542px 的绘图区里，12% 的间隔（65px）仍会让两个标签重叠 16px。
   const step = Math.max(1, Math.ceil(n / 8));
-  const xcells = data.map((b, i) => {
-    if (!(i % step === 0 || i === n - 1)) return '';
-    const left = px(i);
-    // 贴边的标签改为向内对齐（右端右对齐、左端左对齐），否则一半会跑到绘图区外被裁掉。
-    const anchor = left > 88 ? 'right' : (left < 12 ? 'left' : 'center');
-    return `<span class="trend-xlabel trend-xlabel-${anchor}" style="left:${left}%">${axisLabel(b.ts, stepMs)}</span>`;
-  }).join('');
+  const shownLabels = data
+    .map((b, i) => ({ ts: b.ts, left: px(i), last: i === n - 1 }))
+    .filter((_, i) => i % step === 0 || i === n - 1);
+  const xcells = shownLabels.map(({ ts, left }) =>
+    `<span class="trend-xlabel" style="left:${left}%">${axisLabel(ts, stepMs)}</span>`).join('');
+
   // Y 轴刻度（0/25/50/75/100% of max）+ 网格线。
   const ticks = [1, 0.75, 0.5, 0.25, 0];
   const yhtml = ticks.map(
@@ -201,6 +204,42 @@ export function usageTrendHtml(usage, dim = 'total') {
     </div>
     <div class="trend-caption">${rangeLabel(hours)} · 每 ${granLabel(stepMs)} 一个数据点${isStacked ? ` · 按${DIM_LABELS[dim]}拆分` : ''}</div>
     ${isStacked ? `<div class="trend-legend">${legend}</div>` : ''}`;
+}
+
+// —— 渲染后拟合（需要真实布局，浏览器里调用）——
+// ① 贴边钳制：居中定位会让最左/最右的标签有一半跑到绘图区外，改成向内对齐；
+// ② 相邻压字：真量一遍，重叠的标签删掉（保留最后一个 —— 它就是「现在」）。
+// 放在 JS 里按实测宽度做，是因为轴标签宽度取决于字体与卡片宽度，模板字符串里无从得知。
+export function fitTrendLabels(root) {
+  const el = root?.querySelector?.('.trend-x');
+  const plot = root?.querySelector?.('.trend-plot');
+  if (!el || !plot || typeof plot.getBoundingClientRect !== 'function') return;
+  const bounds = plot.getBoundingClientRect();
+  const labels = [...el.querySelectorAll('.trend-xlabel')].filter((l) => !l.hidden);
+  if (!labels.length) return;
+  // ① 贴边
+  for (const l of labels) {
+    const r = l.getBoundingClientRect();
+    if (r.right > bounds.right + 0.5) l.classList.add('trend-xlabel-right');
+    else if (r.left < bounds.left - 0.5) l.classList.add('trend-xlabel-left');
+  }
+  // ② 重叠（重新量一遍：上一步可能改了锚点、位置随之变化）
+  let prevRight = -Infinity;
+  let prevNode = null;
+  for (let i = 0; i < labels.length; i++) {
+    const r = labels[i].getBoundingClientRect();
+    if (r.left < prevRight - 0.5) {
+      if (i === labels.length - 1) {
+        // 末尾那个必须留下：挤掉与它重叠的前一个
+        if (prevNode) prevNode.hidden = true;
+      } else {
+        labels[i].hidden = true;
+        continue;
+      }
+    }
+    prevRight = r.right;
+    prevNode = labels[i];
+  }
 }
 
 // 维度切换按钮组：合计 / 按项目 / 按 provider / 按 Model / 按实例。范围说明由外层渲染（trend-range 同级）。

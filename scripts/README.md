@@ -25,6 +25,7 @@
 | `dsh-remote-web.sh` | 在**本地**一键完成: SSH 到远端拉起 `dsh web`、抓回 token、建隧道、打印可直接打开的 URL | [`README-dsh-remote-web.md`](README-dsh-remote-web.md) |
 | `dsh-http-cache.Caddyfile` | 用 Caddy 给远端 dsh web 加一层 HTTP 缓存反代(静态资源强缓存 + 压缩) | [`README-http-cache.md`](README-http-cache.md) |
 | `dsh-http-cache.nginx.conf` | 同上, nginx 版本 | [`README-http-cache.md`](README-http-cache.md) |
+| `render-check.mjs` | 前端「真浏览器」渲染检查(CDP 驱动 headless Chrome, 不依赖 --dump-dom) | [`README-render-check.md`](README-render-check.md) |
 
 ## 快速部署(脚本版, 改动最小)
 
