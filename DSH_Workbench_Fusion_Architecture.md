@@ -195,12 +195,24 @@ CREATE TABLE sessions (
   workspaceId TEXT,
   workspaceTitle TEXT,
   project TEXT,
-  tokenUsage TEXT,             -- JSON
+  tokenUsage TEXT,             -- JSON（真相）
+  -- 派生列：tokenUsage 里四个计数的整数形式。由触发器从 tokenUsage 维护（见下），
+  -- 存在的唯一理由是性能：用量面板要跑八个聚合，逐行 json_extract 在真实规模下很贵
+  -- （40k 会话实测 ~330ms；而 node:sqlite 是同步的，那段时间整个服务停着）。
+  tokInput INTEGER NOT NULL DEFAULT 0,
+  tokOutput INTEGER NOT NULL DEFAULT 0,
+  tokCacheRead INTEGER NOT NULL DEFAULT 0,
+  tokCacheWrite INTEGER NOT NULL DEFAULT 0,
   contextPressure TEXT,        -- JSON
   lastActivity TEXT,
   generatedAt TEXT,
   UNIQUE(homeId, sessionId)
 );
+
+-- 派生列由触发器维护，而不是由应用代码写：这样任何写入者（裸 SQL、外部工具改库）都不会
+-- 让两列与 tokenUsage 漂移。（当前实现只写 tokenUsage；触发器负责派生列。）
+CREATE TRIGGER sessions_tok_ai AFTER INSERT ON sessions BEGIN ... END;
+CREATE TRIGGER sessions_tok_au AFTER UPDATE OF tokenUsage ON sessions BEGIN ... END;
 
 -- workspaces: 工作区（无会话的项目也展示）
 CREATE TABLE workspaces (...);
@@ -216,6 +228,10 @@ CREATE TABLE model_tiers (...);
 - `idx_sessions_project` — 按项目聚合
 - `idx_sessions_activity` — Recent 排序
 - `idx_sessions_home` — 按实例过滤
+- `homes_access_port` — 接入端口唯一（部分索引）
+
+> 用量聚合现在 SUM 派生整数列，不再逐行 `json_extract`（同一份 40k 数据上等效 5 条聚合
+> 175ms → 76ms；代价是每行插入多一次 UPDATE：20k 行 43ms → 172ms）。
 
 ### 4.6 远端只读索引（与本地共用同一套 schema）
 
@@ -574,8 +590,16 @@ hwb/
 
 ## 11. 安全与数据卫生
 
-- **Manager 监听 127.0.0.1**，无鉴权，不暴露公网（同旧项目）
-- **API Key 永不越界**：`.credentials.yaml` 中的 key 只用于服务端查余额，浏览器只收到 `{ provider, remaining, currency }`
+- **Manager 监听 127.0.0.1**，无鉴权，不暴露公网（同旧项目）。
+  但**回环不是访问控制**：同机其它用户也能连上这个端口，因此不要把端口暴露到回环之外。
+  写方法统一要求同站来源、`/api/*` 只接受回环 Host（DNS rebinding 防护），非浏览器客户端
+  （curl）不带这两个头，照常可用 —— 这是单人本机工具的定位，不是多用户服务。
+- **API Key 永不越界**：`.credentials.yaml` 中的 key 只用于服务端查余额，浏览器只收到 `{ provider, remaining, currency }`；
+  分类错误也**只给分类结果**（原始错误消息可能带请求内容），且日志侧已按「键名」与「凭据形状」双层脱敏。
+- **dsh token 的暴露面**：读接口（`GET /api/homes` 与更新响应）都不回传 token —— 实例级与连接端点级
+  都不回传，端点只给 `tokenSet: true`（端点编辑器因此把输入框留空显示为「已配置」，留空 = 保持不变，
+  清除要显式表达）。唯一的例外是打开实例必经的 `POST /homes/{id}/open`：它必须返回带 token 的
+  iframe 入口 URL。也就是说边界是「谁能访问这个端口」，而不是「响应里有没有这个字段」。
 - **远程读取只读**：SSH 单条命令只提取元数据，不注入密钥，不修改远程文件
 - **进程指纹**：若保留 guard，作为**自主选择**而非继承法则，明确写入文档
 
