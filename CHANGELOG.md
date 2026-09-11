@@ -411,6 +411,18 @@ Semantic Versioning.
 - **回归测试**：`tests/api-server-hardening.test.js` —— HEAD 必须 200 且无 body、`/api/*` 必须
   `no-store` + nosniff、404 也要带 JSON content-type 与 no-store。修复前失败。
 
+#### 两处「原因存在但用户看不到」的静默（src/lib/logger.js + src/lib/balance.js）
+- **日志轮转失败完全静默**：`rotate()` 里三处 `rename` 各自 `catch {}` —— 轮转失败意味着日志文件
+  **无上限增长**，而没有任何人知道。修复：失败时用 `console.error` 提示一次（这里在日志写入通道
+  内部，回调结构化 logger 会递归，所以刻意用它），并说明「文件会继续增长」。
+- **「凭据文件读不出来」与「没配 key」在界面上长得一样**：`readCredentials` 的 catch 直接
+  `return []`，于是权限不足 / 是符号链接 / 超过上限 / 是 FIFO 或目录，全都表现为额度卡片上的
+  `key not found`。修复：非 `ENOENT` 的原因记一条结构化 warn（只带相对路径与原因，不带文件内容），
+  ENOENT 保持安静（那是正常状态）。
+- **回归测试**：`tests/logger.test.js`（把日志目录改成不可写触发轮转失败，断言恰好提示一次且写入
+  本身仍成功）、`tests/quota.test.js`（目录当凭据文件 → 一条 warn 且原因写着「不是普通文件」；
+  文件不存在 → 一条日志都没有）。修复前两条都失败。
+
 #### 额度失败的原因永远进不了日志（src/dshhome/quota.js + src/lib/balance.js）
 - **现象**（我自己复查 `quota.js` 时发现，实测复现）：`logger(scope)` 返回的是**对象**
   （`.warn`/`.error`/…），而 `quota.js` 里两处写成了 `log('...', {...})` 当函数调用 ——

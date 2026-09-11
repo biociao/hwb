@@ -19,7 +19,14 @@ export function readCredentials(homePath) {
     //    这正是 read-home.js 那边修过的同一个故障模式，凭据这条路径当时漏了。
     //  · 顺带拿到「非普通文件/符号链接/超限」的拒绝与大文件上限。
     text = readMetadataFile(homePath, '.credentials.yaml');
-  } catch {
+  } catch (error) {
+    // 「文件不存在」是正常状态（用户没配 key）；但「存在却读不出来」（权限、符号链接、超过上限、
+    // 是 FIFO/目录）会让额度面板只显示「key not found」—— 与「真的没配」完全无法区分。
+    // 这里把非 ENOENT 的原因记一条结构化日志（消息里只有相对路径，没有文件内容）。
+    if (error?.code !== 'ENOENT') {
+      try { log.warn('凭据文件读取失败', { homePath, error: String(error?.message ?? error).slice(0, 200) }); }
+      catch { /* 日志失败不影响返回 */ }
+    }
     return [];
   }
   // 剥掉 UTF-8 BOM：JS 的 `\s` 匹配 U+FEFF，于是 `\uFEFFrefs:` 会走错分支、inRefs 永远为 false，

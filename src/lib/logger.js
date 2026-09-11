@@ -435,11 +435,20 @@ function rotate() {
   const f = config.file;
   // 丢弃最旧一代（.KEEP_ROTATED），再把备份整体右移一位：.1 -> .2（若有），当前文件 -> .1。
   // 注意当前活文件是 f（索引 0），不是 f.0——之前误把 f.0 当成活文件导致永不轮转。
-  try { if (fs.existsSync(`${f}.${KEEP_ROTATED}`)) fs.rmSync(`${f}.${KEEP_ROTATED}`, { force: true }); } catch { /* best-effort */ }
-  try { if (fs.existsSync(`${f}.1`)) fs.renameSync(`${f}.1`, `${f}.2`); } catch { /* best-effort */ }
-  try { fs.renameSync(f, `${f}.1`); } catch { /* best-effort */ }
+  let failed = null;
+  const attempt = (what, fn) => { try { fn(); } catch (e) { failed ??= { what, e }; } };
+  attempt('清理最旧一代', () => { if (fs.existsSync(`${f}.${KEEP_ROTATED}`)) fs.rmSync(`${f}.${KEEP_ROTATED}`, { force: true }); });
+  attempt('.1 -> .2', () => { if (fs.existsSync(`${f}.1`)) fs.renameSync(`${f}.1`, `${f}.2`); });
+  attempt('当前文件 -> .1', () => fs.renameSync(f, `${f}.1`));
   openFile();
+  // 失败必须说出来：日志不会轮转意味着文件**无上限增长**，而这条路径原先完全静默。
+  // 用 console.error 而不是结构化日志 —— 这里正在日志的写入通道内部，回调 logger 会递归。
+  if (failed && !rotateErrorLogged) {
+    rotateErrorLogged = true;
+    console.error(`[logger] 日志轮转失败（${failed.what}），文件会继续增长: ${failed.e?.message ?? failed.e}`);
+  }
 }
+let rotateErrorLogged = false;
 
 function reportFileError(e) {
   if (fileErrorLogged) return;

@@ -241,3 +241,33 @@ test('quota: provider 失败会进结构化日志（带上下文、不含 key �
   assert.doesNotMatch(JSON.stringify(logs), /sk-naked-secret/, '日志里不得出现 key');
   assert.equal(failed.some((l) => l.fields.ref === 'NOT_CONFIGURED'), false, '「还没配 key」不该记成失败');
 });
+
+// 「凭据文件读不出来」与「没配 key」原先在界面上都是「key not found」，完全无法区分。
+// 现在非 ENOENT 的失败会记一条带路径的结构化日志（文件不存在仍保持安静）。
+test('balance: 凭据文件存在但读不出来时给出原因，而不是当成「没配 key」', async (t) => {
+  const { initLogger, getLogs, clearLogs } = await import('../src/lib/logger.js');
+  const { readCredentials } = await import('../src/lib/balance.js');
+  const { mkdtemp, rm, writeFile, chmod } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  initLogger({ level: 'debug', file: false, silent: true });
+
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-cred-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  // ① 文件不存在 → 保持安静
+  clearLogs();
+  assert.deepEqual(readCredentials(dir), []);
+  assert.equal(getLogs({ limit: 20 }).length, 0, '「没配」是正常状态，不该记日志');
+  // ② 目录当成凭据文件（不是普通文件）→ 记一条 warn，且说明原因
+  const weird = path.join(dir, 'weird');
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(path.join(weird, '.credentials.yaml'), { recursive: true });
+  clearLogs();
+  assert.deepEqual(readCredentials(weird), []);
+  const logs = getLogs({ limit: 20 });
+  assert.equal(logs.length, 1, `应有一条日志，实际 ${logs.length}`);
+  assert.equal(logs[0].level, 'warn');
+  assert.match(logs[0].message, /凭据文件读取失败/);
+  assert.match(String(logs[0].fields.error), /不是普通文件/, '原因要说清楚');
+  assert.equal(logs[0].fields.homePath, weird);
+});

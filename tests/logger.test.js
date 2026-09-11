@@ -204,3 +204,30 @@ test('logger: initLogger seeds ring from the log file tail', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// 日志轮转失败原先三处 rename 全部静默吞错：文件会**无上限增长**而没有任何人知道。
+test('logger: 轮转失败时给出一次可见的提示（不再静默）', async (t) => {
+  const { mkdtemp, rm, chmod, writeFile, stat } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const { initLogger, logger: log } = await import('../src/lib/logger.js');
+
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-rotate-'));
+  t.after(async () => { await chmod(dir, 0o700).catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const file = path.join(dir, 'hwb.log');
+  await writeFile(file, 'x\n');
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => { errors.push(args.join(' ')); };
+  t.after(() => { console.error = original; });
+
+  initLogger({ level: 'info', file, color: false, silent: true, rotateBytes: 1 });
+  await chmod(dir, 0o500);           // 目录不可写 → rename 必然失败
+  log('t').info('触发轮转');
+  console.error = original;
+  await chmod(dir, 0o700);
+
+  assert.equal(errors.filter((e) => /日志轮转失败/.test(e)).length, 1,
+    `应恰好提示一次轮转失败，实际 ${JSON.stringify(errors)}`);
+  assert.ok((await stat(file)).size > 0, '写入本身仍然成功（只是没能轮转）');
+});
