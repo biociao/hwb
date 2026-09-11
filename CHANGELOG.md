@@ -461,6 +461,20 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   `scripts/render-check-dim-switch.js` 用真浏览器量两条路径（修复前「切维度后」失败）。
 
 ### Fixed
+#### 大库上 `recentProjects` 会让整个服务停几十秒：缺一个索引（规模审查实测）
+- **实测（400k 会话 / 50k workspace）**：`recentProjects(7d,20)` 单独查询就要 **44,311ms**，
+  其中「孤立 workspace」那一半 **35,340ms 却只产出 0 行**；HTTP 并发探针测到**整个服务停顿 9,758ms**
+  （平时 p50 0.3ms）。而这两条路由**没有任何 memo**，前端每次 SSE `index:updated`（有实例在跑时每 3s）都会调它。
+- **根因**：`sessions` 上只有 `idx_sessions_home(homeId)`，孤立 workspace 那一半只能 `SCAN workspaces`
+  逐行关联（EXPLAIN 实测：BLOOM FILTER + 3× 相关标量子查询 + TEMP B-TREE FOR ORDER BY）。
+- **修复**：SCHEMA 增加 `idx_sessions_home_ws ON sessions(homeId, workspaceId)`（新库一建就有；
+  既有库在下一次打开时由 `CREATE INDEX IF NOT EXISTS` 自动补上）。实测：那一半 **35,340ms → 43ms**，
+  整个查询 **44,311ms → 1,224ms**；测试规模的对照（20k/4k）368ms → 6ms。
+- **回归测试**：`tests/store.test.js` —— **自校准 A/B**：同一份数据先量（带索引）再 `DROP INDEX` 量，
+  断言去掉索引后至少慢 3 倍，且两次结果一致。不用绝对时间阈值（那在慢机器上会变假失败）。
+  实测修复前该用例失败。
+
+### Fixed
 #### 测试网上的洞：7 条**存在但没人守**的守卫 + 1 条假失败（测试质量审查，全部按变异验证）
 - 审查方式是「把守卫改坏，看套件会不会红」。以下每一条改坏之后**整个套件仍然全绿**（610/609/0），
   也就是说它们在生产里坏了也没人知道 —— 每一条都补了会红的回归测试（并把变异重跑一遍确认）：

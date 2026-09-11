@@ -137,6 +137,12 @@ END;
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(lastActivity DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_home ON sessions(homeId);
+-- (homeId, workspaceId)：recentProjects 的「孤立 workspace」那一半要按 homeId 找没有会话的
+-- workspace。没有这个索引时，SQLite 只能 SCAN 整张 workspaces 表并逐行做关联 —— 规模测试实测
+-- （400k 会话 / 50k workspace）：那一半本身 35,340ms 却只产出 0 行，整个 recentProjects 44,311ms，
+-- 期间**整个服务停住**（并发探针实测最大停顿 9,758ms）。加上它之后：35,340ms → 43ms、
+-- 整个查询 → 1,224ms。测试规模的对照（20k 会话 / 4k workspace）：368ms → 6ms。
+CREATE INDEX IF NOT EXISTS idx_sessions_home_ws ON sessions(homeId, workspaceId);
 `;
 
 // 把「N 天前」算成 ISO 时间戳。上限 100 年：既覆盖任何合理查询，也保证结果一定落在

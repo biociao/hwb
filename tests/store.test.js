@@ -451,3 +451,40 @@ test('usageTrend/usageTrendGrouped: 未来时间戳不再被趋势图丢掉（�
   assert.equal(grouped, sum, `分组趋势应与汇总一致，实际 grouped=${grouped}`);
   store.close();
 });
+
+// `recentProjects` 的「孤立 workspace」那一半需要 `sessions(homeId, workspaceId)`：
+// 没有它时 SQLite 只能 SCAN 整张 workspaces 表逐行关联。规模审查实测（400k 会话 / 50k workspace）：
+// 那一半本身 **35,340ms** 却产出 0 行，整个查询 44,311ms，期间整个服务停住（并发探针最大停顿 9,758ms）；
+// 加上索引后 35,340ms → 43ms。
+// 这条测试用**自校准 A/B**（同一份数据、同一台机器，只差这个索引）而不是绝对时间阈值 ——
+// 后者在慢机器/负载下会变成假失败。实测对照（20k 会话 / 4k workspace）：368ms → 6ms。
+test('store: recentProjects 的孤立 workspace 查询依赖 idx_sessions_home_ws（自校准 A/B）', () => {
+  const store = new IndexStore(':memory:');
+  const now = new Date().toISOString();
+  for (let h = 0; h < 4; h++) {
+    const homeId = store.registerHome({ homePath: `/p${h}` });
+    const rows = [{ type: 'home', homeId, homePath: `/p${h}`, generatedAt: now, degraded: [] }];
+    for (let w = 0; w < 500; w++) rows.push({ type: 'workspace', homeId, workspaceId: `w${h}-${w}`, title: `W${w}`, path: `/r/p${w}`, project: `p${w}`, archived: 0, sessionCount: 0 });
+    // 只给一半 workspace 造会话：另一半是「孤儿」（recentProjects 仍要按项目聚合出来）
+    for (let s = 0; s < 2500; s++) {
+      rows.push({ type: 'session', homeId, sessionId: `s${h}-${s}`, workspaceId: `w${h}-${s % 250}`, workspaceTitle: 'T',
+        project: `p${s % 250}`, title: `t${s}`, tokenUsage: null, contextPressure: null, status: null,
+        lastActivity: now, generatedAt: now, liveOnly: 0 });
+    }
+    store.upsertRows(rows);
+  }
+  // SCHEMA 里必须带这个索引（新库一建就有）
+  const idx = store.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sessions_home_ws'").get();
+  assert.ok(idx, 'SCHEMA 必须建 idx_sessions_home_ws（否则大库上 recentProjects 会整表扫）');
+
+  const timed = () => { const t = process.hrtime.bigint(); const rows = store.recentProjects({ days: 3650, limit: 50 }); return { ms: Number(process.hrtime.bigint() - t) / 1e6, rows }; };
+  const withIndex = timed();
+  store.db.exec('DROP INDEX idx_sessions_home_ws');
+  const without = timed();
+
+  assert.ok(withIndex.rows.length > 0 && without.rows.length === withIndex.rows.length,
+    `两种情况下结果必须一致（${withIndex.rows.length} vs ${without.rows.length}）`);
+  assert.ok(without.ms > withIndex.ms * 3,
+    `去掉索引后必须明显更慢（有索引 ${withIndex.ms.toFixed(1)}ms、无索引 ${without.ms.toFixed(1)}ms）—— 这条断言就是在守那个索引`);
+  store.close();
+});
