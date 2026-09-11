@@ -570,3 +570,30 @@ test('CLI: start 之前会把超限的 service.log 轮转掉（否则它可以�
   assert.match(fs.readFileSync(`${log}.1`, 'utf8').slice(0, 40), /OLD-SERVICE-LOG-MARKER/, '轮转的是旧内容');
   assert.ok(fs.statSync(log).size < 1024 * 1024, `轮转后新日志应当是空的/很小（实际 ${fs.statSync(log).size}）`);
 });
+
+// 前台 serve 退出时必须清掉 service.port —— 否则下一次 stop/status 会被陈旧记录带偏
+// （比如记录端口被无关程序占用，就会报一个与 hwb 无关的错）。
+// 顺带记一条**设计**决定（不是这条断言能验证的）：清理只挂 'exit'，不再单独挂 SIGINT ——
+// 挂上它就等于接管了默认的「Ctrl-C 退出」行为，一旦某条路径上 server.js 没装上自己的处理器，
+// 进程就会变成 Ctrl-C 也退不掉；而 'exit' 在 process.exit() 与正常结束时都会跑，本来就能覆盖。
+test("CLI: 前台 serve 退出时会清掉 service.port（exit 钩子清理）", async (t) => {
+  const { dir, run } = await fixture(t);
+  const cfgPort = await port();
+  const servePort = await port();
+  await run('config', 'set', 'port', String(cfgPort));
+  const child = spawn(process.execPath, [cli, 'serve', '--port', String(servePort)],
+    { env: { ...process.env, HWB_DIR: dir }, stdio: 'ignore' });
+  let up = false;
+  for (let i = 0; i < 60 && !up; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    up = await fetch(`http://127.0.0.1:${servePort}/api/homes`).then((r) => r.ok, () => false);
+  }
+  assert.equal(up, true, '前置条件：前台 serve 已就绪');
+  assert.ok(fs.existsSync(path.join(dir, 'service.port')), '生效端口应已记录');
+
+  const exited = new Promise((r) => child.on('exit', (code) => r(code)));
+  child.kill('SIGTERM');   // 与 Ctrl-C 走同一条 shutdown 路径
+  const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r('timeout'), 12000))]);
+  assert.equal(code, 0, `SIGTERM 后应自行退出（实际 ${code}）`);
+  assert.ok(!fs.existsSync(path.join(dir, 'service.port')), '退出时必须清掉端口记录（否则下一次 stop/status 会被陈旧记录带偏）');
+});

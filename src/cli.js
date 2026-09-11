@@ -261,8 +261,10 @@ async function main() {
     try {
       fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(servicePortFile, String(effectivePort(argv)), { mode: 0o600 });
+      // 只挂 'exit'：它在 process.exit()（server.js 的 shutdown 就是这么退出的）与正常结束时都会跑，
+      // 所以 Ctrl-C 也能清掉。**不要**再单独挂 SIGINT —— 挂上它就等于接管了默认的「Ctrl-C 退出」行为，
+      // 一旦某条路径上 server.js 没装上自己的处理器，进程就会变成 Ctrl-C 也退不掉。
       process.on('exit', () => { try { fs.rmSync(servicePortFile, { force: true }); } catch { /* 尽力而为 */ } });
-      process.on('SIGINT', () => { try { fs.rmSync(servicePortFile, { force: true }); } catch { /* 尽力而为 */ } });
     } catch { /* 只读目录等情况：忽略，别的命令会退回配置端口 */ }
     process.argv = [process.execPath, path.join(root, 'src/server.js'), ...argv];
     await import('./server.js'); return;
