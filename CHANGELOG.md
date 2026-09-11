@@ -86,8 +86,14 @@ Semantic Versioning.
   实测把文件字节写到 `sshBash` 的 stdin 不可行：`bash -s` 会把脚本之后的字节当命令执行
   （表现为 `...: command not found`，Python 一个字节都读不到）；而「长度前缀」之类的 stdin 协议
   又会被 bash 的预读吞掉，无法保证字节边界。分片参数传输没有这个问题，也不受 macOS 单参数上限影响。
-- 上传的 multipart 解析是流式的（`src/lib/multipart.js`）：边解析边把文件字节交给写入端，
-  内存占用与文件大小无关；缺失 `Content-Length` 时直接拒绝，以保证写盘前就能设限。
+- 上传的 multipart **解析器**是流式的（`src/lib/multipart.js`）：边解析边把文件字节交给写入端，
+  缓冲区只保留「可能是分隔符开头」的尾巴。缺失 `Content-Length` 时直接拒绝，以保证写盘前就能设限。
+- **订正**：解析器是流式的，但**上传路由目前会把整份文件先攒在内存里**再交给写入端
+  （`src/api/routes.js` 的 `onFileStart`/`write` 把每个 chunk 推进数组）。原因是解析器的
+  `write(chunk)` 回调是同步契约，而落盘写入（`uploader.write`）是异步的，路由无法在回调里 await。
+  实测 64 MiB 上传会在解析期间保留约 64 MiB 的 chunk 数组；上限 256 MiB 时是同一个量级。
+  这是有界且短暂的开销（单机工具、单请求），但要改成真流式需要让解析器支持异步写入端 ——
+  属于后续工作，不再声称「内存占用与文件大小无关」。
 
 ### Fixed
 
