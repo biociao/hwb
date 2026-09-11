@@ -91,6 +91,42 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 远端是 macOS/BSD 时端口检测恒为「未监听」，实例却报 running（src/control/remote.js）
+- **现象**：`listening()` 只用 `ss -tln` / `netstat -tln`，`killport()` 只用 `fuser` —— 三者都是
+  Linux 专有。远端若是 macOS，检测恒为 false、回收是空操作：`ensure` 模式于是跳过「复用已在跑的服务」
+  又去起一个新 dsh（端口被占起不来），日志轮询等满 40s 拿到 `__NO_TOKEN__`，最后 hwb 把这个实例
+  报成 `running` —— **仪表盘一片绿，iframe 里是 401**。
+- **实测复现**（本机 macOS，起一个真实监听后对比）：
+  `{ ss || netstat -tln; } | grep :<port>` → NOT_DETECTED，`lsof -nP -iTCP:<port> -sTCP:LISTEN` → DETECTED。
+- **修复**：`lsof` 在 macOS 与 Linux 上都有、输出形态一致，改为首选分支；缺失时才退回 ss/netstat。
+  `killport` 同样先用 `lsof -t` 取 pid 再逐个 `kill`（不用 `xargs -r` —— BSD 的 xargs 没有这个 flag）。
+  旧脚本 `scripts/dsh-remote-web.sh` 早就因为同样的原因用了 lsof。
+- **回归测试**：`tests/remote-port-detect.test.js` —— 把脚本里的 `listening()`/`killport()` 抽出来在
+  真 bash 里跑：真实监听 → DETECTED、空闲端口 → NOT_DETECTED、缺工具环境 → 如实退化、
+  `killport` 真的回收端口（起一个独立子进程当靶子）。
+
+#### 旧版 dsh 能远端连、本机连不上（`--no-open`，src/control/launcher.js）
+- `--no-open` 是**新版** dsh 才有的参数。`remote.js` 早就为此在远端路径里刻意不发它，
+  但本机路径一直硬发 —— 同一台旧版 dsh 于是「远端能用、本机报 unknown option '--no-open'」。
+- **修复**：识别到该错误时摘掉参数重试一次（不带 `--no-open` 最多多弹一个浏览器标签，远比连不上好）；
+  与 `--no-open` 无关的启动失败**不**重试。
+- **回归测试**：`tests/launcher-no-open-compat.test.js` —— 假 dsh 见到 `--no-open` 就退出 2、
+  否则正常起服务并打印 token 行；断言旧版路径重试成功后拿到 token、新版路径只被调用一次、
+  其它错误不触发重试。
+
+#### nginx 缓存配置给每个普通请求都强加 `Connection: upgrade`（scripts/dsh-http-cache.nginx.conf）
+- 原先在 `location /` 里无条件 `proxy_set_header Connection "upgrade"`：页面、JSON、SSE 等普通
+  请求全都带着 `Connection: upgrade` 发给上游，既不符合 HTTP 语义，也让 nginx 无法对上游做
+  keep-alive（每个请求新建连接）。改为 `map $http_upgrade $connection_upgrade`，按请求决定。
+- 同时把那两个配置脚本补齐到 `scripts/README.md` 的文件表里（原先只列了 2 个，实际 5 个），
+  并在 `README-http-cache.md` 说明 nginx 版的 `map` 块属于 http 上下文、放错层级会报
+  `"map" directive is not allowed here`。
+
+#### 测试自身的脆弱点：`withListening` 匹配单行字面量（tests/remote.test.js）
+- 它用一行字面量替换脚本里的 `listening()`；该函数一旦改成多行（本次就是），替换会**静默失配** ——
+  stub 没生效、真实检测照跑，测试仍然跑但测的已不是它以为的东西。这恰好在本机暴露为失败
+  （真实 lsof 检测到 3080 上确实有服务在跑）。改为整段正则替换。
+
 #### SSE 刷新会清空「添加实例」表单并抢走焦点（src/web/app.js + src/web/components/form-draft.js）
 - **现象**：dashboard 每轮刷新都整块重建 `innerHTML`；有实例在跑时 live-poller 约每 3s 广播一次
   `index:updated`，于是重建后插入的是一个**全新的空表单**，且无条件 `.focus()` 到 `homePath`。

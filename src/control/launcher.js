@@ -220,11 +220,26 @@ export class Launcher {
     if (home.localPort && Number.isInteger(Number(home.localPort)) && Number(home.localPort) > 0) {
       return this.#connectLocalExisting(home);
     }
+    try {
+      return await this.#spawnLocalDsh(home, true);
+    } catch (error) {
+      // `--no-open` 是**新版** dsh 才有的参数：remote.js 早就为此在远端路径里刻意不发它
+      // （见那里的兼容说明），但本机路径一直硬发 —— 于是同一台旧版 dsh 远端能用、本机连不上，
+      // 报错只有一句 `unknown option '--no-open'`。这里识别到就摘掉该参数重试一次；
+      // 不带 `--no-open` 最多是多弹一个浏览器标签，远比连不上好。
+      if (!/--no-open/.test(error.message) || !/unknown option|unrecognized|invalid option/i.test(error.message)) throw error;
+      log.warn('本机 dsh 不支持 --no-open，去掉该参数重试一次', { homeId: home.homeId });
+      return await this.#spawnLocalDsh(home, false);
+    }
+  }
+
+  // noOpen=false 时不传 --no-open（兼容不认识该 flag 的旧版 dsh）。
+  async #spawnLocalDsh(home, noOpen) {
     const port = await freePort();
     // 用裸 `dsh web` 别名启动（新版等价于 `--profile web`，旧版 v0.1.x 原生支持），显式 `--port`。
-    // 本机保留 `--no-open`：本地 dsh 为主机自己装的（通常已升级到 ≥0.1.2-rc.1），
-    // 且我们要避免 hwb 之外再弹一个浏览器标签。
-    const proc = spawn('dsh', ['web', '--port', String(port), '--no-open'], {
+    // 本机默认带 `--no-open`，避免 hwb 之外再弹一个浏览器标签。
+    const args = ['web', '--port', String(port), ...(noOpen ? ['--no-open'] : [])];
+    const proc = spawn('dsh', args, {
       env: { ...process.env, DSH_HOME: home.homePath },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

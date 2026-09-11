@@ -92,8 +92,33 @@ for d in "$HOME/.nvm/versions/node/"*/bin "$HOME/.npm-global/bin" "$HOME/.local/
   [ -d "$d" ] || continue
   case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH";; esac
 done
-listening() { { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E "[.:]$port[[:space:]]" >/dev/null 2>&1; }
-killport() { if command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; sleep 1; fi; }
+# 端口监听检测 / 回收。必须跨 Linux 与 BSD(macOS) 远端都能用:
+#   · 原生实现只用 ss + netstat -tln + fuser —— 三者都是 Linux 专有。远端若是 macOS,
+#     listening() 恒为 false、killport() 是空操作:ensure 模式于是跳过「复用已在跑的服务」
+#     又去起一个 dsh(端口被占起不来),日志轮询等满 40s 拿到 __NO_TOKEN__,
+#     最后 hwb 却把这个实例报成 running —— 仪表盘一片绿,iframe 里是 401。
+#   · lsof 在 macOS 与 Linux 上都有,-nP -iTCP:<port> -sTCP:LISTEN 的输出形态也一致,
+#     所以优先用它;lsof 不存在时才退回 ss/netstat。
+#     (旧脚本 scripts/dsh-remote-web.sh 早就因为同样的原因用了 lsof。)
+listening() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E "[.:]$port[[:space:]]" >/dev/null 2>&1
+}
+killport() {
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+      # 不用 xargs(BSD 的 xargs 没有 -r),逐个 kill 才是可移植写法。
+      for p in $pids; do kill "$p" >/dev/null 2>&1 || true; done
+      sleep 1
+      return 0
+    fi
+  fi
+  if command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; sleep 1; fi
+}
 # ensure + 已在跑:若日志有 token 则复用;否则(旧版 dsh / 日志未写 token)不动它,返回裸 URL 哨兵。
 if { [ "$mode" = "ensure" ] || [ "$mode" = "connect" ]; } && listening; then
   tok="$(grep -oE '\?token=[A-Za-z0-9_-]+' "$log" 2>/dev/null | tail -1 || true)"

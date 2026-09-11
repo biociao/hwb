@@ -77,7 +77,10 @@ test('selfServiceHint: 尊重用户配置的 remoteCmd/remoteLog', () => {
 // 所以这里通过替换 REMOTE_START 里的 `listening()` 定义来桩定端口探测：
 //   return 0 → listening（真）；return 1 → 未 listening（假）。
 
-const LISTENING_REAL = "listening() { { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E \"[.:]$port[[:space:]]\" >/dev/null 2>&1; }";
+// 用正则整段替换 listening() 函数体，而不是匹配一行字面量：
+// 该函数已经是多行的（lsof 优先 + ss/netstat 兜底），写死单行会在实现一改动时静默失配，
+// 于是 stub 没生效、真实检测照跑 —— 测试仍然「通过/失败」但测的已经不是它以为的东西。
+const LISTENING_REAL = /listening\(\) \{[\s\S]*?\n\}/;
 const LISTENING_TRUE = 'listening() { return 0; }';
 const LISTENING_FALSE = 'listening() { return 1; }';
 
