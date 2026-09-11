@@ -335,3 +335,81 @@ test('实时列表非空时也要清掉消失的 liveOnly 行（幽灵会话）'
   assert.equal(store.usageSummary({ days: 30 }).sessionCount, usageBefore - 1, '计数也要跟着降下来');
   store.close();
 });
+
+// 启动路径上的 `CREATE UNIQUE INDEX homes_access_port` 在库里有重复 accessPort 时会失败 ——
+// 而它在启动路径上，于是**每次启动都失败**，用户只能自己拿 sqlite 去改库。
+// （重复值只可能来自手改库/早期版本：列、索引、#checkAccessPort 与 API 409 是同一批加的。）
+test('store: 库里存在重复接入端口时也要能启动（先清重再建唯一索引）', async (t) => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'hwb-dupport-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'hwb.db');
+
+  // 先用正常途径建库，然后手工制造重复端口（模拟外部工具改库）
+  const a = new IndexStore(file);
+  // 必须是 remote：接入端口只对远端实例有意义，迁移会把本机实例的 accessPort 清成 NULL
+  const h1 = a.registerHome({ homePath: 'ssh://bot@x/1', hostType: 'remote', host: 'bot@x' });
+  const h2 = a.registerHome({ homePath: 'ssh://bot@x/2', hostType: 'remote', host: 'bot@x' });
+  a.db.exec('DROP INDEX IF EXISTS homes_access_port');
+  a.db.prepare('UPDATE homes SET accessPort = 4400 WHERE homeId IN (?, ?)').run(h1, h2);
+  // 夹具前提：确实有两条重复
+  assert.equal(a.db.prepare('SELECT COUNT(*) AS n FROM homes WHERE accessPort = 4400').get().n, 2);
+  a.close();
+
+  const b = new IndexStore(file);   // 修复前：这里会抛 UNIQUE constraint failed
+  const ports = b.db.prepare('SELECT homeId, accessPort FROM homes ORDER BY homeId').all();
+  assert.equal(ports.filter((r) => r.accessPort === 4400).length, 1, '重复端口应只保留一个');
+  assert.ok(b.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='homes_access_port'").get(), '索引应已建好');
+  b.close();
+});
+
+// 一行缺字段不该让该 home 的**整批**行回滚：node:sqlite 拒绝绑定 undefined，抛的是
+// 「Provided value cannot be bound to SQLite parameter N」，而它在 upsertRows 的事务里 ——
+// 于是一个字段缺失就让这个实例这一轮什么都写不进去（还带上一句 JS 层的 degraded 信息）。
+test('store: 某个会话行缺字段时，该 home 的其余行仍要写入', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  const base = { type: 'session', homeId, project: 'p', title: null, tokenUsage: null,
+    status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 };
+  store.upsertRows([
+    { ...base, sessionId: 'ok-1', workspaceId: null, workspaceTitle: null, contextPressure: null },
+    // contextPressure 故意缺失（undefined）—— 模拟上游少给一个字段
+    { ...base, sessionId: 'missing-field', workspaceId: null, workspaceTitle: null },
+    { ...base, sessionId: 'ok-2', workspaceId: null, workspaceTitle: null, contextPressure: null },
+  ]);
+  const ids = store.db.prepare('SELECT sessionId FROM sessions ORDER BY sessionId').all().map((r) => r.sessionId);
+  assert.deepEqual(ids, ['missing-field', 'ok-1', 'ok-2'], `三行都该写入，实际 ${JSON.stringify(ids)}`);
+  store.close();
+});
+
+// projcache 降级 + workspace.json 刷新后删掉了某个 workspace：被保留的会话行里还留着它的 id，
+// 于是 sessionWorkspace() 返回 null —— preview/upload 对一个完全正常的会话报
+// 「尚未关联可用的 project 工作区」。
+test('store: 降级期间被保留的会话，其指向已消失 workspace 的归属要被清掉（不留悬空链接）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  const sess = (workspaceId, workspaceTitle) => ({ type: 'session', homeId, sessionId: 's1', workspaceId, workspaceTitle,
+    project: 'p', title: null, tokenUsage: null, contextPressure: null, status: JSON.stringify({ kind: 'idle' }),
+    lastActivity: now, generatedAt: now, liveOnly: 0 });
+  const ws = (workspaceId) => ({ type: 'workspace', homeId, workspaceId, title: 'w', path: `/r/${workspaceId}`, project: 'p', archived: false, sessionCount: 1 });
+
+  // ① 健康：s1 归属 ws-1
+  store.upsertRows([{ type: 'home', homeId, homePath: '/m', degraded: [], generatedAt: now }, ws('ws-1'), sess('ws-1', 'w')]);
+  assert.equal(store.db.prepare('SELECT workspaceId FROM sessions').get().workspaceId, 'ws-1');
+
+  // ② projcache 降级（sessions 被保留）+ workspace.json 刷新后只剩 ws-2
+  assert.equal(store.recentSessions({ homeId })[0].workspaceId, 'ws-1', '前提：降级前会话归属 ws-1');
+  store.upsertRows([{ type: 'home', homeId, homePath: '/m', degraded: [{ domain: 'projcache', error: 'v4' }], generatedAt: now },
+    ws('ws-2')]);
+  const after = store.db.prepare('SELECT workspaceId FROM sessions').get();
+  assert.equal(after.workspaceId, null, `指向已消失 workspace 的归属应被清掉，实际 ${after.workspaceId}`);
+  // 这里 workspaces 域**没有**降级，所以工作区表按新快照刷新了（ws-1 消失、ws-2 出现）——
+  // 正是这个组合会让被保留的会话行留下指向 ws-1 的悬空链接。
+  const wsIds = store.db.prepare('SELECT workspaceId FROM workspaces').all().map((w) => w.workspaceId);
+  assert.deepEqual(wsIds, ['ws-2'], `工作区表应按新快照刷新，实际 ${JSON.stringify(wsIds)}`);
+  store.close();
+});

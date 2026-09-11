@@ -435,6 +435,25 @@ Semantic Versioning.
 - **顺带**修掉测试夹具的一个缺陷：假的 `res` 没有 `end()`，于是「拒绝时回一句话」这种代码
   会被 try/catch 吞掉，测出来是假象。
 
+#### 三条 LOW 的健壮性（src/dshhome/store.js）
+- **重复接入端口让每次启动都失败**：`CREATE UNIQUE INDEX homes_access_port` 在库里有重复值时失败，
+  而它在启动路径上 → 用户只能自己拿 sqlite 改库。重复值只可能来自手改库/早期版本
+  （列、索引、`#checkAccessPort` 与 API 409 是同一批加的）。修复：建索引前先去掉重复
+  （保留 `sortIndex` 最小的那条，其余置空并记一条 warn）。测试：`tests/store-degraded.test.js`
+  用远端实例造重复端口 → 重开必须成功且只剩一个（修复前抛 `UNIQUE constraint failed`）。
+- **一行缺字段拖垮该 home 的整批写入**：node:sqlite 拒绝绑定 `undefined`，抛
+  「Provided value cannot be bound to SQLite parameter N」，而它在 `upsertRows` 的事务里 ——
+  一行缺字段就让该实例这一轮什么都写不进去。修复：每个绑定点显式 `?? null`。
+  **注意**：我第一版是「遍历键把 undefined 换成 null」，那是错的 —— 字段**整个缺失**时键根本不出现，
+  所以那种做法兜不住（我自己的测试立刻证明了这一点）。测试：三行里有一行缺字段，三行都必须写入。
+- **悬空的工作区归属**：projcache 降级（会话行被保留）+ workspace.json 刷新后删掉了某个 workspace
+  时，被保留的行还留着它的 id → `sessionWorkspace()` 返回 null，preview/upload 对一个完全正常的
+  会话报「尚未关联可用的 project 工作区」。修复：保留行为存在时清理指向不存在 workspace 的归属。
+  关键细节：加 `EXISTS (SELECT 1 FROM workspaces ...)` 这半句 —— workspace.json 缺失/降级时一条
+  workspace 行都没有，那种情况下我们**不掌握**清单，不能凭子查询为空就断定链接悬空
+  （第一版没有这半句，立刻把另一个测试里正确的归属清掉了）。
+  测试：projcache 降级 + 工作区表刷新后，会话归属被清成 NULL，而工作区表本身按新快照刷新。
+
 #### 子进程死后 API 仍报「已连接」；同名实例在图上被合并；未来时间戳只算进汇总（第 10 轮审查）
 - **hwb 自己拉起的 `dsh web` 子进程死掉时，共享注册表不更新**（MEDIUM）：卡片显示「已连接」、
   标签页圆点是绿的、iframe 指向一个已经没人监听的端口，服务端「已连接实例」的过滤也照样把它算进去 ——

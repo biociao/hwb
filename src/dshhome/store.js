@@ -302,6 +302,19 @@ export class IndexStore {
     }
     if (!homes.includes('accessPort')) this.db.exec('ALTER TABLE homes ADD COLUMN accessPort INTEGER');
     this.db.exec("UPDATE homes SET accessPort = NULL WHERE hostType != 'remote' AND accessPort IS NOT NULL");
+    // 先去掉重复的 accessPort 再建唯一索引：手改过库（或早期版本写坏）时，重复值会让这条
+    // DDL 失败 —— 而它在启动路径上，于是**每次启动都失败**，用户只能自己拿 sqlite 去改库。
+    // 保留 sortIndex 最小（界面顺序靠前）的那条，其余置空；用户重新分配即可。
+    const dupPorts = this.db.prepare(
+      'SELECT accessPort FROM homes WHERE accessPort IS NOT NULL GROUP BY accessPort HAVING COUNT(*) > 1'
+    ).all();
+    for (const d of dupPorts) {
+      const keep = this.db.prepare(
+        'SELECT homeId FROM homes WHERE accessPort = ? ORDER BY COALESCE(sortIndex, 2147483647), homeId LIMIT 1'
+      ).get(d.accessPort);
+      this.db.prepare('UPDATE homes SET accessPort = NULL WHERE accessPort = ? AND homeId <> ?').run(d.accessPort, keep.homeId);
+      log.warn('发现重复的接入端口，已保留一个并清空其余（可在界面重新分配）', { accessPort: d.accessPort, kept: keep.homeId });
+    }
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS homes_access_port ON homes(accessPort) WHERE accessPort IS NOT NULL');
     if (!homes.includes('remoteHome')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteHome TEXT');
@@ -528,6 +541,7 @@ export class IndexStore {
     const homeRows = rows.filter((r) => r.type === 'home');
     const preservedSessions = new Map(); // homeId -> Map(sessionId -> 上一版的 workspace 归属)
     const preservedLiveStatus = new Map(); // homeId -> [{sessionId,status,lastActivity}]（见下）
+    const linkCleanupHomes = new Set();    // 需要清理悬空 workspace 归属的 home（见下）
 
     this.db.exec('BEGIN');
     try {
@@ -541,6 +555,11 @@ export class IndexStore {
         // 这里把上一版的归属回填到新行上（workspace 域恢复后会被新数据自然覆盖）。
         // 注意必须在下面的 DELETE **之前**读：workspace 降级时 sessions 本身仍会被替换掉。
         if (protectedTables.has('workspaces')) preservedSessions.set(home.homeId, this.#sessionWorkspaceLinks(home.homeId));
+        // sessions 被保护（保留旧行）时，旧行里的 workspaceId 可能指向这次刷新后**已消失**的
+        // workspace —— 那会让 sessionWorkspace() 返回 null，preview/upload 对完全正常的会话报
+        // 「尚未关联可用的 project 工作区」。两种触发路径都要清理：workspaces 降级（链接是回填的）
+        // 与 sessions 降级（链接是上一次索引留下的）。
+        if (protectedTables.has('sessions') || protectedTables.has('workspaces')) linkCleanupHomes.add(home.homeId);
         // 实时状态保护：索引器写的是文件快照（projcache 的**冻结**值，可能是几分钟前的），
         // 而轮询器每 3s 写实时值。整表替换会把实时状态一起删掉再用文件值重建 ——
         // 于是「索引器刚跑完，徽标就退回陈旧状态」（实测：dsh 报 running、轮询器刚写「运行中」，
@@ -610,46 +629,66 @@ export class IndexStore {
            degraded = excluded.degraded`
       );
 
-      for (const row of rows) {
-        switch (row.type) {
+      for (const rawRow of rows) {
+        // 注意：这里不能靠「遍历键把 undefined 换成 null」—— 字段**整个缺失**时键根本不出现，
+        // 那种行照样会把 undefined 绑给 SQLite 并抛「Provided value cannot be bound to SQLite
+        // parameter N」，于是在事务里让该 home 的整批行回滚。所以下面每个绑定点都显式 `?? null`。
+        const row = rawRow;
+        switch (row?.type) {
           case 'home':
             upHome.run(
-              row.homeId,
-              row.homePath,
-              row.degraded.length === 0 ? 'ok' : 'degraded',
-              row.generatedAt,
-              JSON.stringify(row.degraded)
+              row.homeId ?? null,
+              row.homePath ?? null,
+              (row.degraded ?? []).length === 0 ? 'ok' : 'degraded',
+              row.generatedAt ?? null,
+              JSON.stringify(row.degraded ?? [])
             );
             break;
           case 'session': {
             const link = row.workspaceId == null ? preservedSessions.get(row.homeId)?.get(row.sessionId) : null;
             insSession.run(
-              row.homeId, row.sessionId,
+              row.homeId ?? null, row.sessionId ?? null,
               row.workspaceId ?? link?.workspaceId ?? null,
               row.workspaceTitle ?? link?.workspaceTitle ?? null,
               // project 同理：workspace 域降级时它退化成 basename(cwd)，回填上一版更准的值。
-              link?.project ?? row.project,
-              row.title ?? null, row.tokenUsage, row.contextPressure, row.status, row.lastActivity, row.generatedAt,
+              link?.project ?? row.project ?? null,
+              row.title ?? null, row.tokenUsage ?? null, row.contextPressure ?? null, row.status ?? null,
+              row.lastActivity ?? null, row.generatedAt ?? null,
               row.liveOnly ? 1 : 0
             );
             break;
           }
           case 'workspace':
             insWorkspace.run(
-              row.homeId, row.workspaceId, row.title, row.path,
-              row.project, row.archived ? 1 : 0, row.sessionCount
+              row.homeId ?? null, row.workspaceId ?? null, row.title ?? null, row.path ?? null,
+              row.project ?? null, row.archived ? 1 : 0, row.sessionCount ?? null
             );
             break;
           case 'provider':
-            insProvider.run(row.homeId, row.ref, row.provider);
+            insProvider.run(row.homeId ?? null, row.ref ?? null, row.provider ?? null);
             break;
           case 'modelTier':
-            insTier.run(row.homeId, row.tierId, row.active ? 1 : 0, row.provider, row.model);
+            insTier.run(row.homeId ?? null, row.tierId ?? null, row.active ? 1 : 0, row.provider ?? null, row.model ?? null);
             break;
         }
       }
       // 把实时状态写回（替换期间被 DELETE 带走了）。新行里没有这条会话（文件快照里没有）也不用管：
       // 它要么是 liveOnly 行、由下一次轮询重建，要么本来就不该有。
+      // 保留的 workspace 归属也可能已经悬空：workspace 域降级 + workspace.json 刷新后删掉了某个
+      // workspace，而 sessions 行里还留着它的 id → sessionWorkspace() 返回 null，
+      // preview/upload 会对一个完全正常的会话报「尚未关联可用的 project 工作区」。
+      // 这里清理掉指向不存在 workspace 的归属（顺带也能修好库里既有的悬空链接）。
+      for (const hid of linkCleanupHomes) {
+        // EXISTS 那半句很重要：workspace.json 缺失/降级时该 home 一条 workspace 行都没有，
+        // 那种情况下我们**并不掌握**工作区清单，不能凭「子查询里没有」就断定链接悬空
+        // （否则会把本来正确的归属一并清掉）。只有确实有工作区数据时才做清理。
+        this.db.prepare(
+          `UPDATE sessions SET workspaceId = NULL, workspaceTitle = NULL
+            WHERE homeId = ? AND workspaceId IS NOT NULL
+              AND EXISTS (SELECT 1 FROM workspaces WHERE homeId = ?)
+              AND workspaceId NOT IN (SELECT workspaceId FROM workspaces WHERE homeId = ?)`
+        ).run(hid, hid, hid);
+      }
       for (const [hid, list] of preservedLiveStatus) {
         const upd = this.db.prepare('UPDATE sessions SET status = ?, lastActivity = ? WHERE homeId = ? AND sessionId = ?');
         for (const r of list) upd.run(r.status, r.lastActivity, hid, r.sessionId);
