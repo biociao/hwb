@@ -492,6 +492,15 @@ Semantic Versioning.
 
 ### Fixed
 
+#### registry.applyProbe 在恢复成功后仍挂着旧错误（src/control/registry.js）
+- `if (cur.lastError) next.lastError = cur.lastError;` 是**无条件**覆盖的：成功分支明明写了
+  `lastError: null`，却又被旧值盖回去。于是会出现「phase=running、attempts 归零，却还挂着一条
+  『SSH 连接已断开』」的自相矛盾状态（这条错误会被 Monitor 的降级日志打出来，误导排查）。
+  改为只在**新状态没有显式给出** lastError 时沿用 —— 失败分支只写 phase/attempts，沿用上一条
+  有助于排查；成功分支显式清空，必须生效。
+- 顺带修掉 registry 头注释里仍写着 `crashed`（该阶段已被移除）与「持续失败封顶 crashed」的旧描述。
+- **回归测试**：`tests/monitor.test.js` 新增「失败沿用 / 恢复清空 / 显式新错误优先」三条断言。
+
 #### 格式化辅助函数是非数值文本进入 innerHTML 的通道（src/web/store.js + components/usage-card.js）
 - `fmtTokens` 的最后一个分支是 `String(n)`：只要调用方传进非数字，任意文本就会**原样**进入页面 ——
   而它在用量卡与项目栏里都是**不转义**的插值点（因为「这个值就是个数字」）。

@@ -1,6 +1,6 @@
 // —— 实例注册表（M6·控制平面状态机）——
-// 为每个 instance 维护唯一权威的控制状态：phase（unknown/probing/running/degraded/
-// crashed/stopped）+ web/tunnel 的端口、pid、URL，以及 degraded 重连的退避计数。
+// 为每个 instance 维护唯一权威的控制状态：phase（unknown / probing / running /
+// degraded / stopped / gone）+ web/tunnel 的端口、pid、URL，以及 degraded 重连的退避计数。
 // 前端通过 monitor.get 映射到 runtime 形状；launcher 打开/关闭时写入。
 
 // 实际会出现的阶段。Monitor 只会产出 running/degraded/stopped/gone（`crashed` 从未被设置，
@@ -65,7 +65,7 @@ export class InstanceRegistry {
     let next;
 
     if (!ok) {
-      // 隧道/进程不可用 → degraded，退避计数递增；持续失败封顶 crashed。
+      // 隧道/进程不可用 → degraded，退避计数递增（退避本身在 Monitor 里按 nextBackoffMs 施加）。
       if (cur.phase === 'running' || cur.phase === 'degraded') {
         next = { phase: 'degraded', attempts: cur.attempts + 1 };
       } else {
@@ -82,7 +82,10 @@ export class InstanceRegistry {
         ...(deeplink !== undefined && { deeplink }),
       };
     }
-    if (cur.lastError) next.lastError = cur.lastError;
+    // 只有新状态**没有显式给出** lastError 时才沿用上一条：失败分支只写 phase/attempts，
+    // 沿用上次的错误说明有助于排查；而成功分支显式写了 lastError: null，必须让它生效 ——
+    // 原实现无条件覆盖，于是「已恢复 running、attempts 归零」的同时还挂着一条旧错误。
+    if (next.lastError === undefined && cur.lastError) next.lastError = cur.lastError;
     return this.set(homeId, next);
   }
 

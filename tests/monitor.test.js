@@ -265,6 +265,26 @@ test('registry: degraded backoff escalates and resets on recovery', () => {
   assert.equal(reg.nextBackoffMs('h1'), 1000); // 归零后回到 1s 基线
 });
 
+// lastError 的沿用规则：失败时沿用上一条（便于排查），成功时必须清掉 ——
+// 否则会出现「phase=running、attempts=0，却还挂着一条旧错误」的自相矛盾状态。
+test('registry: lastError 在失败时沿用、在恢复时清空', () => {
+  const reg = new InstanceRegistry();
+  reg.seed('h1');
+  reg.set('h1', { phase: 'degraded', lastError: 'SSH 连接已断开' });
+
+  reg.applyProbe('h1', { ok: false });
+  assert.equal(reg.get('h1').lastError, 'SSH 连接已断开', '失败分支只写 phase/attempts，应沿用上一条错误');
+
+  reg.applyProbe('h1', { ok: true, url: 'http://x', port: 1, pid: 1 });
+  assert.equal(reg.get('h1').phase, 'running');
+  assert.equal(reg.get('h1').lastError, null, '恢复后必须清空旧错误，不能与 running 并存');
+
+  // 显式传入新错误时以新值为准
+  reg.set('h1', { lastError: '新错误' });
+  reg.applyProbe('h1', { ok: true, url: 'http://x', port: 1, pid: 1 });
+  assert.equal(reg.get('h1').lastError, null);
+});
+
 test('guard: fingerprint avoids killing dead/reused-pid processes', async () => {
   const { fingerprint, expectedCommand } = await import('../src/control/guard.js');
   // 我们持有且仍存活的子进程 → 可 kill
