@@ -787,10 +787,11 @@ export class IndexStore {
     // 实测在实时列表里移除一条会话后，它整整 70 秒（直到下一轮文件索引）都还在，
     // 而在 projcache 降级时是**永久**的（文件索引永远覆盖不了它）。
     // 逐行删而不是 `sessionId NOT IN (...)`：实时列表可能有几千条，SQL 变量数有上限。
+    let ghostsDeleted = false;
     const ghosts = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND liveOnly = 1').all(homeId);
     if (ghosts.length) {
       const del = this.db.prepare('DELETE FROM sessions WHERE id = ?');
-      for (const g of ghosts) if (!liveIds.has(g.sessionId)) del.run(g.id);
+      for (const g of ghosts) if (!liveIds.has(g.sessionId)) { del.run(g.id); ghostsDeleted = true; }
     }
     // 降级窗口里的「幽灵徽标」：上面的清状态原先**只**在「实时列表为空」那一分支执行，可是
     // 只要 dsh 里还有任意一条会话活着，列表就非空 —— 而从列表里消失的 file-backed 行既不会被
@@ -799,14 +800,36 @@ export class IndexStore {
     // 3 轮轮询 + 3 轮文件索引仍是 running；而 projcache 一恢复就立刻自愈 ——
     // 也就是说窗口 = 「dsh 升级到 hwb 还不认识的 unit.version」这段时间（天到周）。
     // 清的是状态徽标而不是行：数据仍在，UI 退回「空闲」。
+    let clearedStale = false;
     if (degradedTables(this.getHome(homeId)?.degraded).has('sessions')) {
       const stale = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(homeId);
       const clear = this.db.prepare('UPDATE sessions SET status = NULL WHERE id = ?');
-      for (const r of stale) if (!liveIds.has(r.sessionId)) clear.run(r.id);
+      for (const r of stale) if (!liveIds.has(r.sessionId)) { clear.run(r.id); clearedStale = true; }
     }
     const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
       .map((row) => ({ ...row, type: 'session' }));
-    this.upsertRows(mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() }));
+    // 逐行比对「实时通道拥有的那几列」：都没变时**跳过整表写**。
+    // 为什么值得：upsertRows 对一个 home 是「整表替换」，代价正比于该实例的**总会话数**
+    // （规模审查实测：40k/10 实例时每轮 891ms ≈ 每 3s 一次约 30% 的同步阻塞；单个 home 有
+    // 200k 会话时单次 3,494ms）。而一个**空闲**的 dsh（没有新 prompt、没有状态迁移）每 3s
+    // 送来的内容与库里一模一样 —— 那 891ms 纯属白跑。
+    // 只做「全等就跳过」这一档：任何一处不同就仍然走原来的整表替换路径（语义完全不变），
+    // 所以这条优化不可能改变写入结果。幽灵清理与降级清理仍然照做（它们有自己的计数）。
+    const before = new Map();
+    for (const row of rows) {
+      if (liveIds.has(row.sessionId)) before.set(row.sessionId, JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]));
+    }
+    const merged = mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() });
+    const unchanged = merged.length === rows.length && merged.every((row) => {
+      const prev = before.get(row.sessionId);
+      return prev === undefined ? false
+        : prev === JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]);
+    });
+    if (!unchanged || ghostsDeleted || clearedStale) {
+      this.upsertRows(merged);
+    } else {
+      log.debug('实时状态与库里完全一致，跳过整表写', { homeId, sessions: rows.length });
+    }
     this.#liveWrittenAt.set(homeId, Date.now());
   }
 

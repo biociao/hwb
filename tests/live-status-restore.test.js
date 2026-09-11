@@ -167,3 +167,36 @@ test('未降级时：不在实时列表的会话仍由文件索引纠正（不�
   assert.equal(kindOf(store, homeId, 's2'), 'running');
   store.close();
 });
+
+// 空闲的 dsh 每 3s 送来的内容与库里一模一样，而 upsertRows 是「整表替换」——
+// 代价正比于该实例的**总会话数**（规模审查实测：40k/10 实例 891ms/轮，约占每轮 30% 的同步阻塞；
+// 单 home 200k 会话时单次 3,494ms）。全等时跳过整表写，任何一处不同仍然走原路径（语义不变）。
+test('applyLiveStatus: 实时内容与库里完全一致时跳过整表写（省掉空闲时每 3s 的一次全量 upsert）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/mock/home' });
+  indexSnapshot(store, '/mock/home', fileSnapshot(homeId), null);
+
+  let calls = 0;
+  const orig = store.upsertRows.bind(store);
+  store.upsertRows = (...args) => { calls++; return orig(...args); };
+
+  // 第一次：实时状态与文件侧不同（s1/s2 都变 running）→ 必须写
+  // 注意：这里**复用同一组对象**做第二次调用。第一版我用 liveSession() 重新造了一组，
+  // 以为「内容一样」—— 但 lastActivity 是 new Date().toISOString()，两次只差几毫秒就不相等，
+  // 于是这条用例随机失败（我自己的测试踩了「时间相关」这个坑，和审查在别处指出的是同一类）。
+  const live = [liveSession('s1'), liveSession('s2')];
+  store.applyLiveStatus(homeId, live);
+  assert.equal(calls, 1, '有变化时必须照常写');
+  assert.equal(kindOf(store, homeId, 's1'), 'running');
+
+  // 第二次：**逐字节相同**的载荷（同一组对象）→ 全等，跳过整表写
+  store.applyLiveStatus(homeId, live);
+  assert.equal(calls, 1, '内容完全一致时不该再写（这就是省下来的那一次全量 upsert）');
+  assert.equal(kindOf(store, homeId, 's1'), 'running', '跳过写入不影响已有状态');
+
+  // 第三次：状态真的变了（s1 变 idle）→ 必须写
+  store.applyLiveStatus(homeId, [{ ...live[0], status: { kind: 'idle', label: '空闲', subagents: 0, approval: null } }, live[1]]);
+  assert.equal(calls, 2, '状态变了必须写');
+  assert.equal(kindOf(store, homeId, 's1'), 'idle');
+  store.close();
+});
