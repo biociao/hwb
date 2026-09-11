@@ -288,6 +288,18 @@ Semantic Versioning.
 - **回归测试**：`tests/logger-security.test.js` 的 leaks 列表补上这 10 种形态（含幂等断言）。修复前失败。
 
 ### 变更说明（证据，不是猜测）
+#### 用**真实 dsh** 复验了「本机连接」这条路（此前几轮只能对着假 dsh 验证）
+- 起了一个**隔离**的真实 dsh（`DSH_HOME=/tmp/… dsh web --port 4393 --no-open`，用完即杀）：
+  · stdout 行就是 `dsh web: http://127.0.0.1:4393/?token=<43 字符>` —— hwb 的 `captureDshToken`
+    对这条真实行的解析实测得到 `?token=…` 片段，`localWebUrl()` 拼出的入口可直接打开；
+  · `--no-open` 被当前 dsh 接受（此前只有「旧版不认 → 摘掉重试」的兼容路径被测过）；
+  · 裸 URL → **401**，`probeAlive()` 判不可用（`httpProbe()` 判可用，两种口径如文档所述）；
+  · `authFetch(带 token 的入口)` → **200**，拿到 24 KB 的真实 dsh 页面（token→cookie 交接成立）。
+- 顺带用真实 home 复核了两个域的读取假设：`workspace.json`（`unit.version 2`、
+  `global.{initialized,workspaceIds,archivedSessionIds}`、`tables.workspaces[id].{path,title,sessionIds,createdAt,updatedAt}`）
+  与 `model-tier.json`（`schema 2`、`activeId`、`schemes[].tiers`）都与 hwb 的解析器逐字段吻合。
+
+### 变更说明（证据，不是猜测）
 #### projcache 的版本支持从「只认 3」放宽到「3/4/5」——否则新版 dsh 写过的 home 会被判降级
 - **证据**：dsh 自己的域声明是
   `projectionCacheDomainSpec = { name: 'session_projcache', version: 5, compatibleVersions: [3, 4],
