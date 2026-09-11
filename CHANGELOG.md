@@ -243,6 +243,28 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 实时投影只接受「解开形态」：包装形态会把「已完成」判成「空闲」（src/dshhome/live-status.js）
+- **风险（审查标记为最值得跟进的 UNVERIFIED）**：文件侧的投影值形状是**带版本包装**的
+  `{ver,seq,val}`，而 `/api/session/list` 的 `projections.values.*` 究竟是哪一层，本项目没有
+  可对照的实例可以确定（`normalizeLiveTokenUsage` 的注释自陈过这一点，所以 tokenUsage 三种形态都接受）。
+  其余字段（goal / todos / plan / subagent / permissions / sessionListMetadata / title）当时只接受
+  **解开形态** —— 若实际是包装形态，实时通道会把 goal.phase=complete 读不到 → 系统性把「已完成」
+  降级成「空闲」、丢掉 in_progress todo，而且每 3s 重写一次、宽限期内赢过文件侧的正确值
+  （与「实时 approval 绕过守卫」同一类不自愈缺陷）。
+- **修复**：`unwrapProjection()` 统一解一层（对象且有 `val` 才解），逐字段应用；
+  已经解开形态的载荷不受影响（测试里有对照组）。
+- **回归测试**：`tests/live-status.test.js` —— 包装形态下 goal/todos/subagent/approval/title/
+  lastPromptAt 都必须被正确识别。修复前失败。
+
+#### 凭据里的 YAML 引号被当成 key 的一部分（src/lib/balance.js）
+- **现象**：`deepseek_API_KEY: "sk-x"` 是完全合法的 YAML，但原实现只 trim 空白，
+  于是把引号一起发出去 → 上游 401 → UI 显示「凭证被拒绝（401/403）」，用户以为自己的 key 失效
+  （审查提出的 nit，但症状是误导性的）。
+- **修复**：`yamlScalar()` 按 YAML 规则取值（配对引号去掉；普通标量里由**空白**引出的 `#` 之后是注释，
+  紧跟内容的 `#` 属于值本身）。
+- **回归测试**：`tests/quota.test.js`（双引号/单引号/行尾注释/值内 `#` 四种写法）。修复前失败。
+
+### Fixed
 #### 日志权限收紧漏了轮转代与「已存在的目录」（src/lib/logger.js）
 - **现象（审查实测）**：先造出升级前的遗留状态（目录 0755、live/.1/.2 全 0644，`.1` 里有
   `?token=OLDTOKEN1`），再让日志轮转一次 —— 结果是 `live=0600`、**`.1=0600`、`.2 仍是 0644**，

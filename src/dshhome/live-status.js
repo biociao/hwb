@@ -174,6 +174,19 @@ export function normalizeLiveTokenUsage(raw) {
   return Object.keys(out).length ? out : null;
 }
 
+// 投影值可能是**带版本包装**的 `{ver,seq,val}`（文件侧就是这个形状）。
+// tokenUsage 早就按「三种形态都接受」归一，但 goal / todos / plan / subagent / permissions /
+// sessionListMetadata 当时只接受**解开后的**形态 —— 本项目没有可对照的 live dsh，谁也不知道
+// `/api/session/list` 给的是哪一层（见 normalizeLiveTokenUsage 的注释）。若实际是包装形态，
+// 实时通道会把「已完成」系统性降级成「空闲」、丢掉 in_progress todo，而且**每 3s 重写一次**、
+// 在宽限期内赢过文件侧的正确值 —— 与「实时 approval 绕过守卫」同一类「不自愈」的缺陷。
+// 解一层即可：没有 `val` 字段的值原样返回（解开形态的载荷不受影响）。
+// 只对**对象**解（数组、字符串、null 原样返回）。
+function unwrapProjection(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  return 'val' in value ? value.val : value;
+}
+
 function toLiveRow(item) {
   const raw = item?.sessionId ?? item?.id ?? null;
   // sessionId 必须是**非空字符串**。它是唯一没做类型校验的绑定点，而外层 applyLiveStatus 走的是
@@ -183,7 +196,18 @@ function toLiveRow(item) {
   // 数字虽然能写进去（被 TEXT affinity 改写），但那也不是 sessionId，一并拒绝。
   const sid = typeof raw === 'string' && raw.trim() !== '' ? raw : null;
   if (!sid) return null;
-  const values = item?.projections?.values ?? {};
+  const rawValues = item?.projections?.values ?? {};
+  const values = {
+    ...rawValues,
+    sessionStats: unwrapProjection(rawValues.sessionStats) ?? {},
+    goal: unwrapProjection(rawValues.goal ?? null),
+    todos: unwrapProjection(rawValues.todos),
+    plan: unwrapProjection(rawValues.plan),
+    subagent: unwrapProjection(rawValues.subagent),
+    permissions: unwrapProjection(rawValues.permissions),
+    sessionListMetadata: unwrapProjection(rawValues.sessionListMetadata) ?? {},
+    title: unwrapProjection(rawValues.title),
+  };
   const stats = values.sessionStats ?? {};
   const goal = values.goal ?? null;
   const todos = Array.isArray(values.todos) ? values.todos : [];

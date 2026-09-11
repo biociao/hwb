@@ -8,6 +8,19 @@ const log = logger('balance');
 
 const KEY_LINE = /^([A-Za-z0-9_]+)\s*:\s*(.+)$/;
 
+// YAML 标量取值。`KEY: "sk-x"`、`KEY: 'sk-x'`、`KEY: sk-x  # 注释` 都是合法 YAML，
+// 而原实现只 trim 空白 —— 带引号的 key 会把引号一起发出去 → 上游回 401 →
+// UI 显示「凭证被拒绝（401/403）」，用户会以为自己的 key 失效（审查提出的 nit，
+// 但症状是**误导性的**，而写法本身完全合法）。这里按 YAML 的规则解析标量。
+export function yamlScalar(raw) {
+  const v = String(raw ?? '').trim();
+  const quoted = v.match(/^(['"])([\s\S]*)\1\s*(?:#.*)?$/);
+  if (quoted) return quoted[2];
+  // 普通标量里的注释必须由**空白**引出（`sk-x#y` 里的 # 属于值本身）
+  const plain = v.match(/^(.*?)\s+#.*$/s);
+  return plain ? plain[1].trim() : v;
+}
+
 // 读取 refs: 块下的完整 key 值（与 parseCredentialsYaml 同一布局，但保留 value）。
 export function readCredentials(homePath) {
   let text;
@@ -40,13 +53,13 @@ export function readCredentials(homePath) {
       inRefs = /^refs\s*:\s*$/.test(raw.trim());
       if (!inRefs) {
         const m = raw.trim().match(KEY_LINE);
-        if (m && m[1].endsWith('_API_KEY')) creds.push({ ref: m[1], key: m[2].trim() });
+        if (m && m[1].endsWith('_API_KEY')) creds.push({ ref: m[1], key: yamlScalar(m[2]) });
       }
       continue;
     }
     if (!inRefs) continue;
     const m = raw.trim().match(KEY_LINE);
-    if (m && m[1].endsWith('_API_KEY')) creds.push({ ref: m[1], key: m[2].trim() });
+    if (m && m[1].endsWith('_API_KEY')) creds.push({ ref: m[1], key: yamlScalar(m[2]) });
   }
   return creds;
 }

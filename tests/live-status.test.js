@@ -84,3 +84,51 @@ test('rpc 响应超上限时判为失败（不把超大对象读进内存、不�
     assert.equal(ok?.[0]?.sessionId, 's1');
   } finally { globalThis.fetch = saved; }
 });
+
+// 投影值可能是**带版本包装**的 `{ver,seq,val}`（文件侧就是这个形状），而 `projections.values.*`
+// 给的是哪一层本项目无法确定（tokenUsage 早就按三种形态归一，其余字段当时只接受解开形态）。
+// 若实际是包装形态，实时通道会把「已完成」系统性降级成「空闲」、丢掉 in_progress todo，
+// 而且每 3s 重写一次、宽限期内赢过文件侧的正确值 —— 与 approval 那条同一类「不自愈」缺陷。
+test('toLiveRow: 包装形态（{ver,seq,val}）的投影值同样被解开', async () => {
+  const { LiveStatusReader } = await import('../src/dshhome/live-status.js');
+  const saved = globalThis.fetch;
+  try {
+    const wrap = (val) => ({ ver: 1, seq: 3, val });
+    globalThis.fetch = async () => Response.json({
+      type: 'server-response',
+      result: {
+        ok: true,
+        value: {
+          items: [{
+            sessionId: 's1', cwd: '/r',
+            projections: {
+              values: {
+                goal: wrap({ goal: { phase: 'complete' } }),
+                todos: wrap([{ status: 'completed' }, { status: 'completed' }]),
+                title: wrap('包装标题'),
+                plan: wrap({ running: null }),
+                subagent: wrap({ a: {} }),
+                permissions: wrap({ approval: 'never' }),
+                sessionListMetadata: wrap({ lastPromptAt: 1_700_000_000_000 }),
+              },
+            },
+          }],
+        },
+      },
+    });
+    const rows = await new LiveStatusReader().read('http://127.0.0.1:1/', {});
+    assert.equal(rows[0].status.kind, 'completed', '包装形态下的 goal.phase=complete 必须被认出来');
+    assert.equal(rows[0].status.subagents, 1, 'subagent 计数要能穿透包装');
+    assert.equal(rows[0].status.approval, 'never', 'approval 也要解一层');
+    assert.equal(rows[0].title, '包装标题');
+    assert.equal(rows[0].lastActivity, new Date(1_700_000_000_000).toISOString(), 'lastPromptAt 同样');
+
+    // 对照：解开形态照旧
+    globalThis.fetch = async () => Response.json({
+      type: 'server-response',
+      result: { ok: true, value: { items: [{ sessionId: 's2', cwd: '/r', projections: { values: { goal: { phase: 'complete' } } } }] } },
+    });
+    const flat = await new LiveStatusReader().read('http://127.0.0.1:1/', {});
+    assert.equal(flat[0].status.kind, 'completed');
+  } finally { globalThis.fetch = saved; }
+});

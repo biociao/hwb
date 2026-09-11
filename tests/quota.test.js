@@ -271,3 +271,29 @@ test('balance: 凭据文件存在但读不出来时给出原因，而不是当�
   assert.match(String(logs[0].fields.error), /不是普通文件/, '原因要说清楚');
   assert.equal(logs[0].fields.homePath, weird);
 });
+
+// YAML 里 `KEY: "sk-x"` / `'sk-x'` / `sk-x  # 注释` 都是合法写法，原先只 trim 空白 ——
+// 带引号的 key 会把引号一起发出去 → 上游 401 → UI 显示「凭证被拒绝（401/403）」，
+// 用户以为自己的 key 失效（审查提出的 nit，但症状是误导性的）。
+test('readCredentials: 引号与行尾注释按 YAML 规则取值', async () => {
+  const { mkdtemp, writeFile, rm, mkdir } = await import('node:fs/promises');
+  const { readCredentials, yamlScalar } = await import('../src/lib/balance.js');
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-cred-'));
+  try {
+    await mkdir(path.join(dir, 'storages'), { recursive: true });
+    await writeFile(path.join(dir, '.credentials.yaml'), [
+      'refs:',
+      '  deepseek_API_KEY: "sk-double"',
+      "  openai_API_KEY: 'sk-single'",
+      '  anthropic_API_KEY: sk-plain   # 行尾注释',
+      '  volc_API_KEY: sk-hash#inside',
+      '',
+    ].join('\n'));
+    const creds = new Map(readCredentials(dir).map((c) => [c.ref, c.key]));
+    assert.equal(creds.get('deepseek_API_KEY'), 'sk-double', '双引号要去掉');
+    assert.equal(creds.get('openai_API_KEY'), 'sk-single', '单引号要去掉');
+    assert.equal(creds.get('anthropic_API_KEY'), 'sk-plain', '行尾注释要去掉');
+    assert.equal(creds.get('volc_API_KEY'), 'sk-hash#inside', '紧跟内容的 # 属于值本身');
+    assert.equal(yamlScalar('  "x"  '), 'x');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
