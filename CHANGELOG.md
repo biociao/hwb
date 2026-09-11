@@ -145,6 +145,11 @@ Semantic Versioning.
   `package.json` 的 `engines`、`hwb doctor`、`hwb` 启动预检、CLI `--help` 文案现在同源，不再各写一份。
 - `hwb doctor` 原先把版本判断内联成 `major < 22 || (major === 22 && minor < 5)`，与新模块重复；
   改为复用同一判断，避免两处漂移。
+- **端到端复验**（本轮）：本机另有一个 Node **20.11.0**（低于门槛、且没有 `node:sqlite`），
+  用它真跑了一遍 —— `--version` 与 `--help` 照常可用（逃生口，便于在旧 Node 上诊断），
+  `hwb start` 与直接 `node src/server.js` 都以退出码 1 给出可照做的说明
+  （「需要 Node.js ≥ 22.5.0（当前 20.11.0）… 请升级后重试：nvm install 22」），
+  而**不是**那句难懂的 `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`。
 
 #### 文件预览侧栏支持拖拽上传（src/web/components/file-preview.js + src/lib/file-preview.js + src/api/routes.js）
 - 浏览目录时侧栏显示上传区：拖拽文件到侧栏即上传到**当前预览目录**，也可点「选择文件上传」；
