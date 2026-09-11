@@ -270,10 +270,20 @@ unknown → probing → running → degraded（对外呈现为 unreachable）→
           stopped   stopped   stopped
 ```
 
-- **running**: dsh web 进程存活，HTTP 端口响应
-- **degraded**: 隧道断开或进程无响应，退避重连中；对外 runtime 呈现为 `unreachable`
+- **running**: dsh web 进程存活，**并且入口鉴权通过**。判据是 `prober.probeAlive()`
+  （`status < 500` **且不是** 401/403）—— 401 栅栏页面说明 token 失效/填错，对用户来说和挂了没区别：
+  原先心跳用 `httpProbe`（`status < 500`），于是 token 填错时界面一片绿、iframe 里是 401（实测）。
+  注意 `httpProbe` 的口径**故意不同**：它服务的是「那个端口上有没有 dsh web 在听」这类判断，
+  那里 401 恰恰是「在听」的证据（`Launcher.#connectRemote` 的端口探测继续用它）。
+- **degraded**: 隧道断开、鉴权失败或进程无响应，退避重连中；对外 runtime 呈现为 `unreachable`
 - **stopped**: 用户显式停止，或实例未连接
 - **gone**: 本地 home 目录已不存在
+
+> `stop()` 是**确认式**的：SIGTERM → 等 3s → SIGKILL → 再等 2s；只有子进程确实退出才写
+> `phase: 'stopped'` 并丢弃句柄。杀不掉就保留句柄、注册表保持 running，并向调用方抛错
+> （API 回 500 带 pid 与端口）—— 「报 success 而进程还活着」是本项目明确要避免的一类缺陷。
+> 退出路径同理：`shutdown()` 先 `await launcher.stopAll()` 再 `process.exit(0)`，
+> 否则忽略 SIGTERM 的 dsh web 会变成孤儿（父进程没了、端口还占着）。
 
 > 说明：`PHASES` 里保留了 `crashed` 这个名字，但 `Monitor.#runCheck` 只产出
 > `running` / `degraded` / `stopped` / `gone`（见 `src/control/monitor.js`），代码从不设置 `crashed`。

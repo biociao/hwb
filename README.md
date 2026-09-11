@@ -336,9 +336,9 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 | `DELETE` | `/api/homes/{homeId}` | 移除实例（只删 hwb 索引，不碰 dsh 文件） |
 | `POST` | `/api/homes/order` | 持久化拖拽排序 |
 | `POST` | `/api/homes/{homeId}/reindex` | 强制重新索引 |
-| `POST` | `/api/homes/{homeId}/open` | 打开实例（本机拉起 / 远端建隧道） |
+| `POST` | `/api/homes/{homeId}/open` | 打开实例（本机拉起 / 远端建隧道）。**连接前会验证入口鉴权**：token 失效/填错时返回 500 并说明补救办法，而不是把 401 栅栏页记成「已连接」 |
 | `POST` | `/api/homes/{homeId}/restart` | 重启实例 |
-| `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web） |
+| `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web）。**确认式**：SIGTERM→3s→SIGKILL→2s，只有进程真的退出才回 `{ok:true}`；收不掉则回 500（带 pid/端口）且保留句柄。远端停止失败时也会以 500 上报（本地连接仍已断开） |
 | `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
 | `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`） |
 | `GET` | `/api/workspaces` | 工作区列表 |
