@@ -1,6 +1,7 @@
 import { logger } from '../lib/logger.js';
 import { msToIso } from '../lib/time.js';
 import { normalizeApproval } from '../lib/status.js';
+import { stripNul } from '../lib/normalize.js';
 
 const log = logger('live-status');
 
@@ -194,7 +195,9 @@ function toLiveRow(item) {
   // 「Provided value cannot be bound to SQLite parameter 2」（审查实测：`true`/`{}`/`[]` 都抛，
   // committed rows = 0），而库里的行保持上一轮的值 —— 显示的是**错**的状态，不只是旧状态。
   // 数字虽然能写进去（被 TEXT affinity 改写），但那也不是 sessionId，一并拒绝。
-  const sid = typeof raw === 'string' && raw.trim() !== '' ? raw : null;
+  // 顺手剥掉 NUL：node:sqlite 绑 TEXT 时按 C 字符串处理，值里的 U+0000 会把后面**静默截掉**
+  // （实测：`run('A\u0000B')` 读回 `'A'`）。外部 dsh 的 title 里带 NUL 时不该只剩第一个字符。
+  const sid = typeof raw === 'string' && stripNul(raw).trim() !== '' ? stripNul(raw) : null;
   if (!sid) return null;
   const rawValues = item?.projections?.values ?? {};
   const values = {
@@ -228,7 +231,7 @@ function toLiveRow(item) {
   return {
     sessionId: sid,
     // cwd 用于给「projcache 里还没有的新会话」推导 project 归属（basename(cwd)，与 normalize 一致）。
-    cwd: typeof item.cwd === 'string' && item.cwd ? item.cwd : null,
+    cwd: typeof item.cwd === 'string' && item.cwd ? stripNul(item.cwd) : null,
     status: {
       kind,
       label: labels[kind],
@@ -239,7 +242,7 @@ function toLiveRow(item) {
     },
     lastActivity: msToIso(lastPromptAt),
     tokenUsage: normalizeLiveTokenUsage(values.tokenUsage),
-    title: typeof values.title === 'string' ? values.title : null,
+    title: typeof values.title === 'string' ? stripNul(values.title) : null,
   };
 }
 

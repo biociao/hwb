@@ -243,6 +243,26 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 文本字段里的 U+0000 会在写库时被静默截断（src/lib/normalize.js + src/dshhome/live-status.js）
+- **现象**：`node:sqlite` 绑 TEXT 时按 C 字符串处理 —— 值里的 U+0000 会把**后面全部截掉**，
+  而且没有报错、没有 degraded、界面上看不出少了什么。实测（审查）：`run('A\u0000B')` 读回 `'A'`，
+  `run('\u0000leading')` 读回 `''`；实时通道里一个带 NUL 的长标题落库后只剩第一个字符。
+- **修复**：在**产出侧**统一剥掉 NUL（`normalize.js` 的 `stripNul()`，会话/工作区/provider 的文本字段 +
+  实时通道的 sessionId/cwd/title）。JSON 列不受影响（`JSON.stringify` 会把 NUL 转义成文本）。
+- **回归测试**：`tests/normalize.test.js`（`A\0B` 必须落成 `AB`，开头是 NUL 也要保留其余部分）。修复前失败。
+
+#### 脱敏在若干前缀标点前失效（src/lib/logger.js）
+- **现象（审查实测）**：键名前缀字符类是 `[?&\s"']|^|[\w-]`，于是
+  `(token=S)`、`a,b,token=S`、`x;token=S`、`{token=S}`、`[token=S]`、`err:token=S`、`a=token=S`、
+  `path/token=S`、`#token=S` 这些形态**都不会被脱敏**；`{"Authorization":"Bearer <v>"}`（JSON 引号形态）
+  同样漏掉。
+- **可达性说明**：审查同时确认现有调用点里没有会产生这些形态的地方（主路径 `?token=` 是覆盖的），
+  所以这是**加固**而不是已发生的泄漏 —— 但日志脱敏是「多一层就少一份凭据」的事，值得补齐。
+- **修复**：前缀类放宽为「任意字符或行首」（单词后缀仍认），`AUTH_SCHEME` 容忍 JSON 引号。
+  实测 15 种形态全部脱敏且保持幂等。
+- **回归测试**：`tests/logger-security.test.js` 的 leaks 列表补上这 10 种形态（含幂等断言）。修复前失败。
+
+### Fixed
 #### 实时投影只接受「解开形态」：包装形态会把「已完成」判成「空闲」（src/dshhome/live-status.js）
 - **风险（审查标记为最值得跟进的 UNVERIFIED）**：文件侧的投影值形状是**带版本包装**的
   `{ver,seq,val}`，而 `/api/session/list` 的 `projections.values.*` 究竟是哪一层，本项目没有

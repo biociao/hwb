@@ -200,7 +200,11 @@ function emit(level, scope, message, err, fields) {
 const VALUE = `[^\\s&"',;)\\]}\\[]+`;
 const SECRET_KEY = '(?:token|access_token|refresh_token|pat|api[-_]?key|secret|password|passwd)';
 // 形如 `token=…` / `token: …` / `"token": "…"` / `DCS_PAT=…`（键名允许是单词后缀）
-const KEY_VALUE = new RegExp(`((?:[?&\\s"']|^|[\\w-])(?:${SECRET_KEY})(?:\\s*[:=]\\s*|"\\s*:\\s*"))(${VALUE})`, 'gi');
+// 前缀字符类要**放得足够宽**：审查实测原先的 `[?&\s"']|^|[\w-]` 漏掉了
+// `(token=S)`、`a,b,token=S`、`x;token=S`、`{token=S}`、`err:token=S`、`a=token=S`、`path/token=S`
+// 这些形态（前缀字符是 `( , ; { : = /` 之一）—— 也就是说「带键名的凭据」只在少数几种标点前面才被脱敏。
+// 改成「任意一个字符或行首」：`[\w-]` 带来的「单词后缀也认」（DCS_PAT=…）依然成立。
+const KEY_VALUE = new RegExp(`((?:^|[\\s\\S])(?:${SECRET_KEY})(?:\\s*[:=]\\s*|"\\s*:\\s*"))(${VALUE})`, 'gi');
 // Authorization 单独处理：必须把 scheme 也放进前缀一起吃掉，否则会「脱敏 Bearer、留下真 token」。
 // 这里**不**把裸 `token ` 当分隔符 —— 那会把普通散文里的「token 只是…」也吃掉（过度脱敏，
 // 而且让日志变得难读）。命令行形态由下面的 SPACED_FLAG 覆盖。
@@ -209,7 +213,9 @@ const KEY_VALUE = new RegExp(`((?:[?&\\s"']|^|[\\w-])(?:${SECRET_KEY})(?:\\s*[:=
 // 注意 `authorization...` 这一段是**必需**的：写成可选就等于「任何 beacon/bearer 开头的散文都会被脱敏」
 // （实测 `the bearer of bad news` 被吃掉一半）。裸 `Bearer <值>` 由下面的 BEARER_BARE 负责，
 // 且带「值至少 16 个凭据字符」的前提。
-const AUTH_SCHEME = new RegExp(`((?:authorization\\s*[:=]\\s*(?:bearer|basic)\\s+))(${VALUE})`, 'gi');
+// 允许 JSON 引号形态：`{"Authorization":"Bearer <v>"}` —— 原先 `[:=]` 之后紧跟引号就匹配不上，
+// 于是这种（很常见的）形态整条漏掉。
+const AUTH_SCHEME = new RegExp(`((?:authorization\\s*[:=]\\s*["']?\\s*(?:bearer|basic)\\s+))(${VALUE})`, 'gi');
 // 没有 scheme 的形态（`authorization: <v>`）。负向断言排除 scheme 词，否则同样会在第二次替换时
 // 把 `Bearer` 当值吃掉。
 const AUTH_BARE = new RegExp(`((?:authorization\\s*[:=]\\s*))((?!(?:bearer|basic|token)\\b)${VALUE})`, 'gi');

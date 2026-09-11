@@ -132,6 +132,18 @@ test('logger: 脱敏覆盖更多键名与值形态，且幂等、不误伤散文
     ['JSON 形态', '"token": "json-shaped-value"'],
     ['password', 'password=hunter2'],
     ['cookie', 'dsh_token=abcdef123456;'],
+    // 前缀标点的形态（审查实测原先漏掉）：键名前的字符是 ( , ; { [ : = / # 时不再漏
+    ['括号内', '(token=abc123)'],
+    ['逗号后', 'a,b,token=abc123'],
+    ['分号后', 'x;token=abc123'],
+    ['花括号', '{token=abc123}'],
+    ['方括号', '[token=abc123]'],
+    ['冒号后（非键名）', 'err:token=abc123'],
+    ['等号后', 'a=token=abc123'],
+    ['路径中', 'path/token=abc123'],
+    ['井号后', '#token=abc123'],
+    // JSON 引号形态的 Authorization（原先 `[:=]` 之后紧跟引号就匹配不上）
+    ['JSON Authorization', '{"Authorization":"Bearer sk-live-abcdef123456"}'],
   ];
   for (const [label, text] of leaks) {
     const out = redactSecrets(text);
