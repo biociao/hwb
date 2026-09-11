@@ -479,6 +479,13 @@ Semantic Versioning.
 
 ### Tests
 
+- 补上「导出但主流程从未调用、且没有测试」的几个探测/校验函数的用例
+  （`prober.isAlive` / `sshProbe` / `httpProbe`、`guard.verifyProcess` / `expectedCommand`、
+  `logger.setLevel` / `getLevel`）。这几个模块的头部都写着「均为独立可测函数」，但此前既没被接线
+  也没被测试 —— 那是最差的组合：既占维护成本，又让人以为主流程真的走了 ps 校验 / PID 存活探测。
+  依赖外部 `ps` 的用例在沙箱里会自动跳过（`spawn ps` 被拒是环境限制，不是缺陷）。
+
+
 - 前端插值面的转义固化为回归测试（`tests/web-render-safety.test.js`）：端点编辑器（host/id/homeId）、
   实例设置表单与添加表单、日志面板的**每个字段**都按「不可信输入」喂一遍，断言不产出真实标签。
   这些数据来自 dsh 元数据与远端实例；此前只做过手工审计，而没有测试意味着下次改动又会悄悄开个口子。
