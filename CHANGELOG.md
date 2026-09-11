@@ -249,6 +249,14 @@ Semantic Versioning.
 - **修复**：先收掉多余的前导斜杠再解析；越界防护本身不变。
 - **回归测试**：`tests/dsh-static-cache.test.js` —— 双斜杠必须 200，同时 `%2e%2e/` 的越界尝试照旧被拒。
 
+#### 「在 Finder 中打开工作区」把裸 errno 抛给界面（src/lib/open-workspace.js）
+- **现象**：工作区目录被移动/删除后点「在 Finder 中打开」，界面上显示
+  `ENOENT: no such file or directory, stat '/x/y'` —— 与预览/下载那条同源的问题
+  （同一轮里修了预览，这处漏了）。
+- **修复**：`stat` 包 try/catch，`ENOENT` → 「工作区目录不存在，可能已被移动或删除」、
+  `EACCES`/`EPERM` → 「没有访问该目录的权限」，其它错误照旧抛出。
+- **回归测试**：`tests/open-workspace.test.js` —— 不存在的目录必须给出中文说明且不含 `ENOENT`。
+
 #### 预览路径把裸 errno 抛给界面（src/lib/file-preview.js）
 - **现象**：文件被删掉后点预览，界面上显示
   `ENOENT: no such file or directory, realpath '/private/var/.../nope.txt'` —— 一句英文系统错误，
