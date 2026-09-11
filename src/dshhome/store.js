@@ -263,9 +263,10 @@ export class IndexStore {
     }
   }
 
-  getHome(homeId) {
-    return this.listHomes().find((h) => h.homeId === homeId) ?? null;
-  }
+  // 注意：getHome 定义在下方 listHomes 附近（两者共用 HOME_SELECT）。
+  // 这里原先还有一份 `getHome() { return this.listHomes().find(...) }`，改成点查时忘删 ——
+  // JS 里后定义的会静默覆盖先定义的，所以行为是对的，但留着一份永不执行的旧实现极其危险：
+  // 下次有人改上面那份会以为改的就是真正生效的那个。已删除。
 
   removeHome(homeId) {
     this.db.exec('BEGIN');

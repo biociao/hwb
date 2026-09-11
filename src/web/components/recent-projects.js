@@ -8,7 +8,7 @@ export function renderRecentProjects(projects, homes = []) {
     const instName = inst ? (inst.alias || inst.homePath) : null;
     const instColor = inst ? chipColor(p.homeId) : null;
     return `
-    <div class="row clickable" data-action="drill-in" data-kind="project" data-home-id="${esc(p.homeId)}"
+    <div class="row clickable" role="button" tabindex="0" data-action="drill-in" data-kind="project" data-home-id="${esc(p.homeId)}"
          data-session-id="${esc(p.sessionId ?? '')}" data-project="${esc(p.project)}"
          title="点击打开该项目所在实例的最新会话">
       <div class="t">

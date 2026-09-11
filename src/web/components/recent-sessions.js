@@ -28,7 +28,7 @@ export function renderRecentSessions(sessions) {
   return `<div class="rows">${sessions.map((s) => {
     const projColor = s.project ? chipColor(s.project) : null;
     return `
-    <div class="row clickable" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}"
+    <div class="row clickable" role="button" tabindex="0" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}"
          data-session-id="${esc(s.sessionId)}" data-title="${esc(s.title || '')}" data-project="${esc(s.project ?? '')}"
          title="点击钻入该会话">
       <div class="t">

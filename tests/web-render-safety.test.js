@@ -110,3 +110,19 @@ test('instance-grid: 降级原因里的 HTML 被转义（错误文本可能含�
   assert.doesNotMatch(html, INJECTED_TAG);
   assert.match(html, /&lt;img/);
 });
+
+// 键盘可达性：drill-in 行是 <div> + 委托 click —— 只给了鼠标用户。补 role/tabindex 后
+// 才能被 Tab 聚焦、被 Enter/Space 激活（见 app.js 的 keydown 委托）。
+test('recent-projects/sessions: 可点击行带 role=button 与 tabindex=0', () => {
+  const projectHtml = renderRecentProjects(
+    [{ homeId: 'abcdef1234567890', project: 'p', sessionId: 's', lastActivity: null, sessionCount: 1, inputTokens: 0, outputTokens: 0 }],
+    [],
+  );
+  assert.match(projectHtml, /data-action="drill-in"[^>]*/, 'sanity');
+  assert.match(projectHtml, /role="button"/);
+  assert.match(projectHtml, /tabindex="0"/);
+
+  const sessionHtml = renderRecentSessions([session({ kind: 'idle', label: '空闲', subagents: 0 })]);
+  assert.match(sessionHtml, /role="button"/);
+  assert.match(sessionHtml, /tabindex="0"/);
+});

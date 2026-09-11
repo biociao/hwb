@@ -91,6 +91,28 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 拖拽排序提交的是「部分顺序」，会把刚排好的顺序打乱（src/web/app.js）
+- `handleDragEnd` 只从 DOM 里读 `tab[draggable=true]` 的顺序，而 DOM 里只有 `tabHomes`
+  （运行中 / 仍持有入口的实例）—— 未连接的实例不在其中，但 `sortIndex` 是**全局**的。
+  于是 `setHomeOrder` 只给可见的那批写 0..k-1，隐藏实例保留旧索引并与新索引撞车，
+  刷新后 `ORDER BY sortIndex` 把用户刚排好的标签页再次打乱；同时 `lastHomes` 被裁成可见子集，
+  Instances 栏里的其余实例要等下一次刷新才回来。
+- **修复**：提交全量顺序 —— 可见的按 DOM 顺序在前，其余保持原有相对顺序跟在后面。
+
+#### 实例/会话行只能鼠标点击，键盘用户无法钻入（src/web/app.js + recent-*.js）
+- Recent Projects / Recent Sessions 的行是 `<div class="row clickable">` 配一个委托到 `body`
+  的 click 处理器：没有 `tabindex`、没有 `role`，Tab 键够不到，也没有 Enter/Space 激活路径。
+- **修复**：行上补 `role="button" tabindex="0"`，并在 `app.js` 里对同一批 `[data-action]` 元素
+  加 Enter/Space 委托（只处理焦点就在该元素上的情况，不劫持内部控件的按键）。
+
+#### 我自己引入的重复方法定义（src/dshhome/store.js）
+- 第 4 轮把 `getHome` 从 `listHomes().find(...)` 改成点查时，新实现被插到 `listHomes` 旁边，
+  **旧的那份留在原处没删**。JS 里后定义会静默覆盖先定义：行为是对的（测试全绿），
+  但文件里躺着一份永不执行的旧实现 —— 下次有人改上面那份，会以为改的就是真正生效的那个。
+- **修复**：删掉死代码。**并补一条结构性测试** `tests/no-duplicate-methods.test.js`：
+  扫描 `src/**/*.js`，同一个类里出现重复方法名即失败（同时自带扫描器自身的正/反向用例，
+  避免它退化成永远通过的假测试）。
+
 #### 实时列表变空时工作台仍显示上一个会话的「运行中」（src/dshhome/store.js + reader.js）
 - 一次**成功**的实时读取返回空数组，含义是「dsh 当前没有会话」——这与读取失败（poller 传 `null`，
   根本不会调到 `applyLiveStatus`）是两回事。原先空数组被直接 `return`，于是**纯实时行**

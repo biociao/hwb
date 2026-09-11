@@ -618,6 +618,19 @@ async function handleAction(e) {
 
 document.body.addEventListener('click', handleAction);
 
+// 键盘可达性：Recent Projects / Recent Sessions 的行是 <div class="row clickable"> 配一个
+// 委托到 body 的 click 处理器 —— 只有鼠标能用。这里给同一批 [data-action] 元素补上键盘激活
+// （Enter / Space），并让它们在标记里带 role=button + tabindex=0（见两个 recent-* 组件）。
+const ACTIVATABLE = new Set(['drill-in', 'nav-instance', 'nav-dashboard']);
+document.body.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const el = e.target.closest?.('[data-action]');
+  if (!el || !ACTIVATABLE.has(el.dataset.action)) return;
+  if (e.target !== el) return; // 只处理「焦点就在这个可激活元素上」，不劫持内部控件的按键
+  e.preventDefault(); // Space 默认会滚动页面
+  handleAction({ target: el });
+});
+
 // —— 实例 tab 拖拽排序（HTML5 DnD）——
 function getDragAfterElement(container, x) {
   const els = [...container.querySelectorAll('.tab[draggable=true]:not(.dragging)')];
@@ -659,8 +672,15 @@ async function handleDragEnd() {
   const dragged = dragHomeId;
   dragHomeId = null;
   if (!dragged) return;
-  // 从 DOM 读出新顺序，重排 lastHomes 并持久化
-  const ids = [...tabs.querySelectorAll('.tab[draggable=true]')].map((t) => t.dataset.homeId);
+  // 从 DOM 读出可见标签的新顺序。但 DOM 里只有 tabHomes（运行中/仍持有入口的实例），
+  // 未连接的实例不在其中，而 sortIndex 是**全局**的：只提交可见的那批会留下旧索引与新索引撞车，
+  // 刷新后 ORDER BY sortIndex 会把用户刚排好的顺序再次打乱；lastHomes 也会被裁成可见子集，
+  // 让 Instances 栏里的其余实例消失到下一次刷新。
+  // 因此提交全量：可见的按 DOM 顺序在前，其余保持它们原有的相对顺序跟在后面。
+  const visible = [...tabs.querySelectorAll('.tab[draggable=true]')].map((t) => t.dataset.homeId);
+  const visibleSet = new Set(visible);
+  const hidden = lastHomes.map((h) => h.homeId).filter((id) => !visibleSet.has(id));
+  const ids = [...visible, ...hidden];
   const byId = new Map(lastHomes.map((h) => [h.homeId, h]));
   lastHomes = ids.map((id) => byId.get(id)).filter(Boolean);
   suppressNavClick = true;
