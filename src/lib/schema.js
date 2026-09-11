@@ -1,10 +1,21 @@
 import { deriveSessionStatus } from './status.js';
 import { msToIso } from './time.js';
 
+// 每个域**允许**的版本清单（不是「唯一版本」）。依据来自 dsh 自己的域声明，而不是猜：
+//   · `session_projcache`：`projectionCacheDomainSpec = { name, version: 5, compatibleVersions: [3, 4],
+//     layout: 'per-record', tables: { sessions: checkpointRecord } }`
+//     （dsh-session-projection-cache/lib/index.js:86-90）。记录形状在 3/4/5 之间**对 hwb 用到的字段
+//     完全一致**：`{ identity: { createdAt, cwd? }, rows: { <key>: { ver, seq, val } } }`
+//     （同包 lib/types/spec.d.ts:40-66）；4/5 只多了可选的 lineage 字段（isSeeded/inheritedEventCount），
+//     而 hwb 只读 `identity.cwd` / `identity.createdAt` / `rows[*].val`。
+//     为什么必须放宽：dsh 认为 3/4/5 都可读（它自己声明 compatible），而 hwb 原先只认 3 ——
+//     一旦某个 home 的文件被新版 dsh 标成 4 或 5，hwb 就会把该域判 degraded、**整块停止更新**
+//     （「实例看起来空了」那一类，只是这次不是版本未知、而是我们没列出来）。
+//   · `workspace`：dsh-workspace 当前写 `version: 2`（lib/index.js:226）—— 与这里一致。
 export const SUPPORTED_VERSIONS = {
-  workspace: 2,
-  projcache: 3,
-  modelTier: 2,
+  workspace: [2],
+  projcache: [3, 4, 5],
+  modelTier: [2],
 };
 
 const fail = (error) => ({ ok: false, error });
@@ -33,8 +44,8 @@ function unitVersion(data, file) {
 export function validateWorkspaceJson(data) {
   const u = unitVersion(data, 'workspace.json');
   if (u.error) return fail(u.error);
-  if (u.version !== SUPPORTED_VERSIONS.workspace) {
-    return fail(`workspace.json: unsupported version ${u.version} (supported: ${SUPPORTED_VERSIONS.workspace})`);
+  if (!SUPPORTED_VERSIONS.workspace.includes(u.version)) {
+    return fail(`workspace.json: unsupported version ${u.version} (supported: ${SUPPORTED_VERSIONS.workspace.join('/')})`);
   }
   const table = data.tables?.workspaces;
   if (table === null || typeof table !== 'object' || Array.isArray(table)) {
@@ -60,8 +71,8 @@ export function validateWorkspaceJson(data) {
 export function validateProjcacheJson(data) {
   const u = unitVersion(data, 'session_projcache.json');
   if (u.error) return fail(u.error);
-  if (u.version !== SUPPORTED_VERSIONS.projcache) {
-    return fail(`session_projcache.json: unsupported version ${u.version} (supported: ${SUPPORTED_VERSIONS.projcache})`);
+  if (!SUPPORTED_VERSIONS.projcache.includes(u.version)) {
+    return fail(`session_projcache.json: unsupported version ${u.version} (supported: ${SUPPORTED_VERSIONS.projcache.join('/')})`);
   }
   const table = data.tables?.sessions;
   if (table === null || typeof table !== 'object' || Array.isArray(table)) {
@@ -114,8 +125,8 @@ export function validateModelTierJson(data) {
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     return fail('model-tier.json: root must be an object');
   }
-  if (data.schema !== SUPPORTED_VERSIONS.modelTier) {
-    return fail(`model-tier.json: unsupported schema ${data.schema} (supported: ${SUPPORTED_VERSIONS.modelTier})`);
+  if (!SUPPORTED_VERSIONS.modelTier.includes(data.schema)) {
+    return fail(`model-tier.json: unsupported schema ${data.schema} (supported: ${SUPPORTED_VERSIONS.modelTier.join('/')})`);
   }
   if (typeof data.activeId !== 'string' || data.activeId === '') {
     return fail('model-tier.json: missing activeId');

@@ -288,6 +288,26 @@ Semantic Versioning.
 - **回归测试**：`tests/logger-security.test.js` 的 leaks 列表补上这 10 种形态（含幂等断言）。修复前失败。
 
 ### 变更说明（证据，不是猜测）
+#### projcache 的版本支持从「只认 3」放宽到「3/4/5」——否则新版 dsh 写过的 home 会被判降级
+- **证据**：dsh 自己的域声明是
+  `projectionCacheDomainSpec = { name: 'session_projcache', version: 5, compatibleVersions: [3, 4],
+  layout: 'per-record', tables: { sessions: checkpointRecord } }`
+  （`dsh-session-projection-cache/lib/index.js:86-90`），即 **dsh 自己就认为 3/4/5 都可读**；
+  而记录形状在三个版本之间**对 hwb 用到的字段完全一致**：
+  `{ identity: { createdAt, cwd? }, rows: { <key>: { ver, seq, val } } }`
+  （同包 `lib/types/spec.d.ts:40-66`），4/5 只多了可选的 lineage 字段
+  （`isSeeded` / `inheritedEventCount`），而 hwb 只读 `identity.cwd` / `identity.createdAt` / `rows[*].val`。
+- **风险**：hwb 原先只认 3。一旦某个 home 的文件被新版 dsh 标成 4 或 5，hwb 会把该域判 `degraded`、
+  **整块停止更新** —— 与「dsh 升级后实例看起来空了」同一类，只是这次不是版本未知，而是我们没列出来。
+  （本机实测：当前用户 home 的 `session_projcache.json` 仍是 `version: 3`，但声明里的当前版本已是 5。）
+- **修复**：`SUPPORTED_VERSIONS` 从「单一版本」改成「允许清单」：`projcache: [3,4,5]`、
+  `workspace: [2]`（dsh-workspace 当前写 2，实测一致）、`modelTier: [2]`；
+  错误信息里把清单连起来展示（`supported: 3/4/5`）。
+- **回归测试**：`tests/schema.test.js` —— 3/4/5 都必须被接受且解析出同样的字段（含 4/5 才有的可选
+  lineage 字段），0/1/2/6/99 必须拒绝。修复前失败。
+
+### 变更说明（证据，不是猜测）
+#### 实时 `/api/session/list` 的投影形状
 #### 实时 `/api/session/list` 的投影形状：用 **dsh 自己的类型声明**定案（此前几轮一直写着「无法确定」）
 - 前几轮的注释与审查都停在「`projections.values.*` 到底是解开值还是 `{ver,seq,val}` 包装，本项目
   没有可对照的 live dsh，无法确定」。这一轮直接读了本机安装的 dsh（`~/.nvm/.../node_modules/
