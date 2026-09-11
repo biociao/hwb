@@ -1,6 +1,10 @@
 import { esc, fmtTokens, chipColor } from '../store.js';
 
-const fmtPct = (n) => `${(n * 100).toFixed(1)}%`;
+// 非数字时 toFixed 会抛（整卡渲染失败）；同时这里也是 innerHTML 的插值点，统一兜住。
+const fmtPct = (n) => {
+  const v = Number(n);
+  return Number.isFinite(v) ? `${(v * 100).toFixed(1)}%` : '—';
+};
 
 // —— 单条构成线：新增输入 / 缓存命中 / 缓存创建 / 输出 按占比分段显示在同一条线上。
 //    各项以不同颜色区分，悬停可查看该项的实际用量与占比
@@ -194,7 +198,7 @@ export function renderUsageCard(usage = {}, activeDim = 'total', activePeriodKey
   const stepMs = totalTrend?.stepMs ?? 3_600_000;
   return `
     <div class="usage-grid">
-      <div class="usage-big"><span class="num">${fmtTokens(summary.totalTokens)}</span><span class="cap">总 Tokens · ${summary.days}天</span></div>
+      <div class="usage-big"><span class="num">${fmtTokens(summary.totalTokens)}</span><span class="cap">总 Tokens · ${esc(summary.days)}天</span></div>
       <div class="usage-stat"><span class="n">${fmtTokens(summary.inputTokens)}</span><span class="c">新增输入</span></div>
       <div class="usage-stat"><span class="n">${fmtTokens(summary.outputTokens)}</span><span class="c">Output</span></div>
       <div class="usage-stat"><span class="n">${fmtTokens(summary.cacheRead)}</span><span class="c">缓存命中</span></div>
@@ -202,7 +206,7 @@ export function renderUsageCard(usage = {}, activeDim = 'total', activePeriodKey
     </div>
     <div class="meta">
       <span class="chip ok">缓存命中率 ${fmtPct(summary.cacheHitRate)}</span>
-      <span>${summary.sessionCount} 活跃会话</span>
+      <span>${esc(summary.sessionCount)} 活跃会话</span>
     </div>
     ${usageStreamHtml(summary)}
     <div class="usage-trend-block">

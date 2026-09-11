@@ -126,3 +126,35 @@ test('recent-projects/sessions: 可点击行带 role=button 与 tabindex=0', () 
   assert.match(sessionHtml, /role="button"/);
   assert.match(sessionHtml, /tabindex="0"/);
 });
+
+// 格式化辅助函数也是 innerHTML 的插值点。`fmtTokens` 原先最后一个分支是 `String(n)` ——
+// 只要传进非数字，任意文本就会原样进入页面（多个调用点不转义，因为「这个值就是个数」）。
+// 用量数据来自 dsh 元数据经 SQL 聚合、正常情况下必然是数字，但「正常情况下」不该是唯一防线。
+test('fmtTokens: 非数值输入不会把任意文本透进 HTML', async () => {
+  const { fmtTokens } = await import('../src/web/store.js');
+  assert.equal(fmtTokens(null), '—');
+  assert.equal(fmtTokens(undefined), '—');
+  assert.equal(fmtTokens(''), '—');
+  assert.equal(fmtTokens('<img src=x onerror=alert(1)>'), '—', '任意文本必须被兜成占位符');
+  assert.equal(fmtTokens({}), '—');
+  assert.equal(fmtTokens(NaN), '—');
+  assert.equal(fmtTokens(Infinity), '—');
+  assert.equal(fmtTokens('not a number'), '—');
+  // 正常数值行为不变
+  assert.equal(fmtTokens(0), '0');
+  assert.equal(fmtTokens(999), '999');
+  assert.equal(fmtTokens(1500), '1.5k');
+  assert.equal(fmtTokens(2_500_000), '2.5M');
+  assert.equal(fmtTokens('1500'), '1.5k', '数字字符串照常格式化');
+});
+
+test('renderUsageCard: 被污染的用量字段不会产出可执行 HTML', async () => {
+  const { renderUsageCard } = await import('../src/web/components/usage-card.js');
+  const evil = '"><img src=x onerror=alert(1)>';
+  const html = renderUsageCard({
+    summary: { sessionCount: evil, totalTokens: evil, inputTokens: evil, outputTokens: evil,
+      cacheRead: evil, cacheWrite: evil, cacheHitRate: evil, days: evil },
+    trendBy: { total: { hours: 24, stepMs: 3_600_000, buckets: [] } },
+  }, 'total', '24h');
+  assert.doesNotMatch(html, INJECTED_TAG, '用量卡同样不能出现真实注入标签');
+});

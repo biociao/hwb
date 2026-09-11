@@ -29,11 +29,16 @@ export function subscribe(cb, onState, onLog) {
   return es;
 }
 
+// 只接受数值。最后那个分支原先是 `String(n)` —— 只要调用方把一个非数字传进来，
+// 它就会原样变成 innerHTML 里的内容（好几个调用点都不转义，因为「这个值就是个数」）。
+// 用量数据来自 dsh 元数据经 SQL 聚合，正常情况下必然是数字；但「正常情况下」不该是唯一的防线，
+// 这里统一兜住：无法转成有限数就显示占位符，绝不把任意文本透出去。
 export function fmtTokens(n) {
-  if (n == null) return '—';
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
+  const v = Number(n);
+  if (n == null || n === '' || !Number.isFinite(v)) return '—';
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
+  return String(v);
 }
 
 export function timeAgo(iso) {

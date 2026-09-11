@@ -479,6 +479,16 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 格式化辅助函数是非数值文本进入 innerHTML 的通道（src/web/store.js + components/usage-card.js）
+- `fmtTokens` 的最后一个分支是 `String(n)`：只要调用方传进非数字，任意文本就会**原样**进入页面 ——
+  而它在用量卡与项目栏里都是**不转义**的插值点（因为「这个值就是个数字」）。
+  与第 1 轮修的 `approval` 是同一类问题：值来自 dsh 元数据经 SQL 聚合，正常情况下必然是数字，
+  但「正常情况下」不该是唯一的防线。
+- **修复**：`fmtTokens` 只接受可转成有限数的输入，否则返回占位符；`fmtPct` 同样（非数字时
+  `toFixed` 会直接抛，整卡渲染失败）；`summary.days` / `sessionCount` 两处插值补 `esc` 兜底。
+- **回归测试**：`tests/web-render-safety.test.js` 新增 `fmtTokens` 的各种非数值输入，
+  以及「被污染的用量字段渲染后不出现真实注入标签」。
+
 #### dsh-remote-index / dsh-merged-index 两个独立工具（此前完全没有测试覆盖）
 - **`dsh-instance-index.mjs` 整包解压只为读一行**：`zstdDecompressSync(整个文件)` 与本文件自称的
   「lightweight / 只读 session header」完全不符。实测一个 19 KB 的 `session.jsonl.zstd`
