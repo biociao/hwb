@@ -838,6 +838,9 @@ export class IndexStore {
       // 整表替换实际改变的只有 status/lastActivity/tokenUsage/title/generatedAt（其余列的值
       // 都等于库里原值）。这里逐行改这几列，结果与整表替换一致（有差分测试守着）。
       // 有新增行（实时列表里有库里还没有的会话）或幽灵行要删时仍走整表替换 —— 那条路径要插入/删除行。
+      // 一处**有意**的差异：整表替换会把所有行的 generatedAt 刷成本次时间，这里只刷变化行。
+      // 该列目前**没有任何读取方**（grep 过 api/ 与 web/：只写不读），所以不影响行为；
+      // 若将来要用它做「本行何时被刷新」的判断，记得把这条优化一起考虑（见 #updateLiveRows）。
       this.#updateLiveRows(homeId, changed);
       log.debug('实时状态只写了变化的行', { homeId, changed: changed.length, total: rows.length });
     } else {
