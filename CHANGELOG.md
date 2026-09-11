@@ -149,6 +149,39 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### dsh-remote-index：取一行的非 zstd 分支会把整个会话读进内存（dsh-remote-index/dsh-instance-index.mjs）
+- **现象**：脚本自称「lightweight / 只读 session header」，但非 zstd 分支用 `readFile` 把整个
+  `session.jsonl` 读进内存再取第一行。实测一个 300 MB 的 `session.jsonl`：峰值 RSS
+  **44 MB → 360 MB**（同一台机器、同一条命令，只换这个文件）。而这个脚本是经 ssh 在**远端主机**
+  上跑的 —— 大会话足以把远端的 dsh 一起拖下水。
+- **根因**：同一个故障模式此前只在 zstd 分支上修过（那份注释还写着「改成流式解压」），
+  并列的 `if (suffix !== ".jsonl.zstd")` 分支漏掉了。
+- **修复**：两条分支统一走 `createReadStream`（zstd 分支再套一层解压流），拿到第一个换行或
+  超过 64 KiB 就销毁所有流。修复后同样的 300 MB 文件：峰值 RSS **44 MB**（与空目录基线相同）。
+- **回归测试**：`tests/dsh-remote-index.test.js` —— 8 MiB 的 session 文件仍能正确解析头部；
+  并对实现做一条结构断言：取头部的函数里**不许出现 `readFile(`**、必须用 `createReadStream`。
+  回退修复后该用例失败。（内存数字本身不写成断言：GC/平台差异会抖。）
+
+#### dsh-remote-index：一个实例的坏输出会让整轮刷新作废、JSON 模式静默空输出（dsh-remote-index/dsh-merged-index.mjs）
+- **现象**：三个独立缺陷，实测复现：
+  · 某个实例的 stdout 混入带 `{` 的登录 banner（如 `Welcome to {buildhost} - node 22`）时，
+    `parseIndexOutput` 的「从第一个 `{` 开始」兜底也被打穿 → 异常冒到 `tickGuarded` →
+    **整轮刷新被丢弃**：旁边完全健康的实例也一整轮不刷新，`--watch` 的 HTML 永远停在旧快照。
+  · JSON 模式（无 `--html`）下失败时 **stdout 什么都不输出、退出码却是 0** ——
+    `hwb-index > index.json` 的下游得到一个**空的** index.json 且毫不知情。
+  · `spawnSync` 默认 `maxBuffer` 只有 1 MiB，而索引 JSON 约 350 B/会话（会话在扁平列表与
+    按项目嵌套里各出现一次），约 1.4k 会话就越过上限；ENOBUFS 时 `status` 为 null、`stderr`
+    为空，界面上只显示「离线 · **exit null**」——既不说明原因也看不出该改什么。
+- **修复**：①`collectInstance` 把解析失败收敛成该实例的 `error`（与 ssh 非零退出同一条路），
+  故障隔离在实例粒度；②JSON 模式失败时输出结构化失败文档（`{error, offline, projects, sessions,
+  resources}`）并置退出码 1，让「空文件 + 成功」不再可能；③显式给 `maxBuffer` 256 MiB，
+  并把 `res.error` 单独处理（ENOBUFS 时说明「索引输出超过 maxBuffer 上限」）。
+  另外顺手处理 stdout 的 EPIPE（`… | head` 是正常用法，不该崩在未捕获异常上）。
+- **回归测试**：`tests/dsh-remote-index.test.js` 三条 —— 坏实例与健康实例并存时健康实例必须在
+  `resources` 里、坏实例单独进 `offline`；>1 MiB 的索引实例必须在线（用例里先断言夹具输出
+  确实超过 1 MiB，避免这条测试自己变成空测试）；instances.json 缺失时必须非零退出且
+  stdout 是可解析的失败文档。回退后三条全部失败（第二条的错误信息正是 `exit null`）。
+
 #### 远端实例的上传整条通道不可达（src/api/routes.js + src/lib/file-preview.js）
 - **现象**：远端实例上传**永远 400**，而本机实例正常。实测：本机 `200` / 远端
   `400 {"error":"ENOENT: no such file or directory, realpath '/home/bot/projects/remote-project'"}`。

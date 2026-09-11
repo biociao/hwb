@@ -17,6 +17,9 @@ import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const indexerPath = join(here, "dsh-instance-index.mjs");
+// 一个实例的索引 JSON 上限。默认的 1 MiB 太小（大实例会被判成「离线: exit null」）。
+const MAX_INDEX_BYTES = 256 * 1024 * 1024;
+
 const indexerSource = await readFile(indexerPath, "utf8");
 
 function arg(name, fallback) {
@@ -28,10 +31,19 @@ async function collectInstance(inst) {
   const args = ["--root", inst.sessionsRoot, "--cache", inst.cacheRoot, "--instance", inst.id];
   let res;
   if (!inst.host) {
-    res = spawnSync(inst.nodeBin || "node", [indexerPath, ...args], { encoding: "utf8" });
+    res = spawnSync(inst.nodeBin || "node", [indexerPath, ...args], { encoding: "utf8", maxBuffer: MAX_INDEX_BYTES });
   } else {
     // Publish the indexer to the remote via stdin:  ssh host <nodeBin> - <args>  <script-source>
-    res = spawnSync("ssh", [inst.host, inst.nodeBin || "node", "-", ...args], { input: indexerSource, encoding: "utf8" });
+    res = spawnSync("ssh", [inst.host, inst.nodeBin || "node", "-", ...args],
+      { input: indexerSource, encoding: "utf8", maxBuffer: MAX_INDEX_BYTES });
+  }
+  if (res.error) {
+    // spawnSync 的默认 maxBuffer 只有 1 MiB：索引 JSON 约 350 B/会话，且会话在
+    // 「扁平列表」与「按项目嵌套」里各出现一次 —— 大约 1.4k 个会话就越过上限，
+    // 于是 ENOBUFS。此时 status 是 null、stderr 是空的，原先掉进下面的分支后
+    // 界面上只显示「exit null」：既不说明原因，也看不出该改什么。
+    return { instance: inst.id, error: `${res.error.code || res.error.message}`
+      + (res.error.code === "ENOBUFS" ? "（索引输出超过 maxBuffer 上限）" : "") };
   }
   if (res.status !== 0) {
     // Mark the instance as unreachable rather than throwing: a transient SSH
@@ -39,7 +51,16 @@ async function collectInstance(inst) {
     // snapshot for this instance and flags it offline.
     return { instance: inst.id, error: (res.stderr || "").trim().slice(0, 300) || `exit ${res.status}` };
   }
-  const data = parseIndexOutput(res.stdout);
+  let data;
+  try {
+    data = parseIndexOutput(res.stdout);
+  } catch (error) {
+    // 解析失败只让**这一个**实例离线。整个脚本的设计意图就是「单个实例的抖动不该拖垮看板」
+    // （ssh 非零退出已经这么处理了），但 parse 失败原先会冒到 runOnce → tickGuarded：
+    // 于是**一个**混进登录 banner 的实例会让旁边完全健康的实例也一整轮不刷新，
+    // --watch 的 HTML 永远停在旧快照上。故障要隔离在实例粒度。
+    return { instance: inst.id, error: String(error.message || error).slice(0, 300) };
+  }
   return { instance: inst.id, ...data };
 }
 
@@ -228,12 +249,29 @@ async function tick() {
 async function tickGuarded() {
   try {
     await tick();
+    return true;
   } catch (error) {
     process.stderr.write(`[${when(Date.now())}] 本轮刷新失败，等下一轮：${error.message}\n`);
+    // JSON 模式（没有 --html）下 stdout 是给机器消费的（`hwb-index > index.json`）。
+    // 原先失败时**什么都不输出**、命令却以 0 退出 —— 下游拿到一个空的 index.json 且毫不知情，
+    // 而「空文件 + 成功退出」是最难排查的一种失败。现在给出结构化的失败文档 + 非零退出码。
+    if (!htmlPath) {
+      process.stdout.write(JSON.stringify({
+        error: String(error.message || error).slice(0, 300), offline: [], projects: [], sessions: [], resources: [],
+      }));
+    }
+    return false;
   }
 }
 
-await tickGuarded();
+// stdout 被下游提前关闭是**正常用法**（`hwb-index | head`、`| grep -q`），
+// 默认行为却是未捕获的 EPIPE 异常 + 一堆栈帧。EPIPE 安静退出，其它错误照常抛。
+process.stdout.on("error", (error) => {
+  if (error.code === "EPIPE") process.exit(0);
+  throw error;
+});
+
+if (!await tickGuarded()) process.exitCode = 1;
 if (watchSec > 0) {
   setInterval(tickGuarded, watchSec * 1000);
 }

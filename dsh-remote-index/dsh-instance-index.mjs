@@ -41,26 +41,31 @@ const activeTolMs = Number(arg("--active-tol", "90000")); // "recently active" w
 const HEADER_LIMIT = 64 * 1024;
 
 async function readHeaderFirstLine(path, suffix) {
-  if (suffix !== ".jsonl.zstd") {
-    const buf = await readFile(path);
-    const nl = buf.indexOf(0x0a);
-    return buf.subarray(0, nl === -1 ? buf.length : nl).toString("utf8");
-  }
+  // 两条分支都要**流式**。这里曾经只有 zstd 分支是流式的：非 zstd 分支用 readFile 把整个
+  // session.jsonl 读进内存，只为取第一行 —— 实测一个 300 MB 的 session.jsonl 峰值 RSS 344 MB
+  // （基线 13 MB）。本脚本是经 ssh 在**远端主机**上跑的，大会话足以把远端的 dsh 一起拖下水
+  // （与 zstd 那条注释里写的是同一个故障模式，只是当时漏了这一个分支）。
   return new Promise((resolve, reject) => {
-    const stream = createReadStream(path);
-    const unzstd = createZstdDecompress();
+    const raw = createReadStream(path);
+    const streams = [raw];
+    let source = raw;
+    if (suffix === ".jsonl.zstd") {
+      const unzstd = createZstdDecompress();
+      streams.push(unzstd);
+      raw.pipe(unzstd);
+      source = unzstd;
+    }
     const chunks = [];
     let total = 0;
     let settled = false;
     const finish = (err) => {
       if (settled) return;
       settled = true;
-      stream.destroy();
-      unzstd.destroy();
+      for (const s of streams) s.destroy();
       if (err) return reject(err);
       resolve(Buffer.concat(chunks).toString("utf8"));
     };
-    unzstd.on("data", (chunk) => {
+    source.on("data", (chunk) => {
       // 换行不会跨 chunk，所以在单个 chunk 内找即可。
       const nl = chunk.indexOf(0x0a);
       if (nl !== -1) { chunks.push(chunk.subarray(0, nl)); return finish(null); }
@@ -68,10 +73,8 @@ async function readHeaderFirstLine(path, suffix) {
       total += chunk.length;
       if (total > HEADER_LIMIT) return finish(null);
     });
-    unzstd.on("end", () => finish(null));
-    unzstd.on("error", finish);
-    stream.on("error", finish);
-    stream.pipe(unzstd);
+    source.on("end", () => finish(null));
+    for (const s of streams) s.on("error", finish);
   });
 }
 

@@ -158,3 +158,104 @@ test('merged-index: 单轮失败不会让 --watch 进程退出，而是记录并
   child.kill('SIGTERM');
   await new Promise((r) => child.once('exit', r));
 });
+
+// 取「第一行」这件事曾经只在 zstd 分支上是流式的：非 zstd 分支用 readFile 把整个
+// session.jsonl 读进内存再取第一行。实测一个 300 MB 的 session.jsonl：峰值 RSS 从基线
+// 44 MB 涨到 **360 MB**（这个脚本还会经 ssh 在远端主机上跑，大会话能把远端的 dsh 一起拖下水）。
+// 内存数字不适合写成断言（GC/平台差异会抖），所以这里钉两件确定的事：
+//   ① 行为：超过 HEADER_LIMIT 的大文件仍能正确取到头部（并在此后停止读取）；
+//   ② 结构：取头部的实现里不许出现 readFile（整文件读）。
+test('instance-index: 大 session.jsonl 的头部读取必须是流式的（不整文件读进内存）', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-idxbig-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const dir = path.join(base, 'tree', SESSION_DIR);
+  await mkdir(dir, { recursive: true });
+  const header = JSON.stringify({ type: 'session', id: SESSION_ID, cwd: '/home/bot/proj-a', createdAt: 1700000000000 });
+  // 头部 + 远超 HEADER_LIMIT(64 KiB) 的后续内容
+  await writeFile(path.join(dir, 'session.jsonl'), `${header}\n${'y'.repeat(8 * 1024 * 1024)}\n`);
+  const { stdout } = await exec(process.execPath, [INSTANCE_INDEX, '--root', path.join(base, 'tree'),
+    '--cache', path.join(base, 'cache'), '--instance', 'big'], { timeout: 30000 });
+  const parsed = JSON.parse(stdout);
+  const session = parsed.projects[0].sessions[0];
+  assert.equal(session.id, SESSION_ID, '大文件里的头部仍应被正确解析');
+  // sizeBytes 是 fmtBytes() 的展示值（8 MB 文件 → 8）
+  assert.ok(session.sizeBytes >= 8, `sizeBytes 应反映真实文件大小，实际 ${session.sizeBytes}`);
+
+  const src = await readFile(INSTANCE_INDEX, 'utf8');
+  const fn = src.slice(src.indexOf('async function readHeaderFirstLine'), src.indexOf('function parseHeader'));
+  assert.doesNotMatch(fn, /readFile\(/, '取头部的实现不得整文件读入 —— 那是 300 MB → 360 MB RSS 的来源');
+  assert.match(fn, /createReadStream/, '必须走流式读取');
+});
+
+// 独立的复现用夹具：两个实例，其中一个的输出坏掉（banner 里带 `{`，把「从第一个 { 开始解析」
+// 这条兜底也打穿）或者给出一个超大索引。
+async function makeTwoInstances(t, { big = false } = {}) {
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-mrg-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const tree = path.join(base, 'tree');
+  const cache = path.join(base, 'cache');
+  await mkdir(tree, { recursive: true });
+  const binDir = path.join(base, 'bin');
+  await mkdir(binDir, { recursive: true });
+  const badBin = path.join(binDir, 'node-banner');
+  await writeFile(badBin, `#!/bin/bash\necho "Welcome to {buildhost} - node 22"\nexec "${process.execPath}" "$@"\n`);
+  await chmod(badBin, 0o755);
+  const bigBin = path.join(binDir, 'node-big');
+  // 输出 >1 MiB 的**合法**索引 JSON，越过 spawnSync 默认的 maxBuffer
+  // （会话在「扁平列表」与「按项目嵌套」里各出现一次，所以实际 JSON 会翻倍）
+  await writeFile(bigBin, `#!/bin/bash\nexec "${process.execPath}" -e `
+    + `'let s=[];for(let i=0;i<9000;i++)s.push({id:"session-"+i+"-aaaaaaaaaaaaaaaaaaaaaaaaaaaa",`
+    + `cwd:"/home/bot/projects/some-project",title:"a fairly long session title",sizeBytes:1});`
+    + `process.stdout.write(JSON.stringify({instance:"big",resources:["big"],projects:[],sessions:s}))' "$@"\n`);
+  await chmod(bigBin, 0o755);
+  const instances = path.join(base, 'instances.json');
+  await writeFile(instances, JSON.stringify({ instances: [
+    { id: 'good', nodeBin: process.execPath, sessionsRoot: tree, cacheRoot: cache },
+    big ? { id: 'big', nodeBin: bigBin, sessionsRoot: tree, cacheRoot: cache }
+        : { id: 'bad', nodeBin: badBin, sessionsRoot: tree, cacheRoot: cache },
+  ] }));
+  return { base, instances, bigBin, badBin };
+}
+
+// 一个实例的输出坏掉时，原先 parse 失败会冒到 tickGuarded，**整轮被丢弃** ——
+// 旁边完全健康的实例也一整轮不刷新，--watch 的 HTML 永远停在旧快照上。
+// 脚本自己的注释写着「单个实例的抖动不该拖垮看板」（ssh 非零退出就是这么处理的），
+// 故障必须隔离在实例粒度。
+test('merged-index: 坏输出的实例只让它自己离线，健康实例照常刷新', async (t) => {
+  const { instances } = await makeTwoInstances(t);
+  const data = JSON.parse((await runMerged(instances)).trim().split('\n').pop());
+  assert.ok(data.resources.includes('good'), `健康实例必须仍在，实际 resources=${JSON.stringify(data.resources)}`);
+  const offline = data.offline.map((o) => o.instance);
+  assert.deepEqual(offline, ['bad'], `只有坏实例该离线，实际 ${JSON.stringify(data.offline)}`);
+  assert.match(data.offline[0].error, /不是 JSON|banner/, '离线原因要说人话');
+});
+
+// spawnSync 默认 maxBuffer 是 1 MiB，而索引 JSON 约 350 B/会话（会话在扁平列表与按项目
+// 嵌套里各出现一次）—— 大约 1.4k 个会话就越过上限，ENOBUFS 时 status 为 null、stderr 为空，
+// 原先界面上只显示「exit null」。现在给出 256 MiB 的上限，并在真超限时说明原因。
+test('merged-index: 索引输出大于 1 MiB 的实例不会被判成「离线 exit null」', async (t) => {
+  const { instances, bigBin } = await makeTwoInstances(t, { big: true });
+  // 先确认夹具真的越过了默认 maxBuffer（1 MiB）——否则这条测试会「恒定通过」而什么都测不到
+  const raw = await exec(bigBin, [], { maxBuffer: 64 * 1024 * 1024, timeout: 30000 });
+  assert.ok(raw.stdout.length > 1024 * 1024, `夹具输出必须超过 1 MiB，实际 ${raw.stdout.length} 字节`);
+
+  const data = JSON.parse((await runMerged(instances)).trim().split('\n').pop());
+  assert.ok(data.resources.includes('big'), `大索引实例应在线，实际 ${JSON.stringify(data.offline)}`);
+  assert.equal(data.sessions.length, 9000);
+});
+
+// JSON 模式（无 --html）下 stdout 是给机器消费的：`hwb-index > index.json`。
+// 原先失败时什么都不输出、却以 0 退出 —— 下游拿到**空的** index.json 且毫不知情。
+test('merged-index: JSON 模式失败时给出结构化错误并非零退出（不再静默空输出）', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-mrgf-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  let failure = null;
+  try {
+    await exec(process.execPath, [MERGED_INDEX, '--instances', path.join(base, 'missing.json')], { timeout: 30000 });
+  } catch (error) { failure = error; }
+  assert.ok(failure, 'instances.json 不存在时必须以非零码退出');
+  assert.notEqual(failure.code, 0);
+  const out = JSON.parse(failure.stdout.trim().split('\n').pop());
+  assert.match(out.error, /ENOENT/, 'stdout 应是结构化的失败文档，而不是空文件');
+  assert.deepEqual(out.projects, []);
+});
