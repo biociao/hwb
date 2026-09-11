@@ -1,4 +1,5 @@
 import { deriveSessionStatus } from './status.js';
+import { msToIso } from './time.js';
 
 export const SUPPORTED_VERSIONS = {
   workspace: 2,
@@ -12,9 +13,9 @@ function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
-function msToIso(v) {
-  return typeof v === 'number' && Number.isFinite(v) ? new Date(v).toISOString() : null;
-}
+// msToIso：毫秒时间戳 → ISO，越界降级为 null。实现在 lib/time.js —— dsh 元数据里的时间戳
+// 可能「有限但超出日期范围」（如单位写错成纳秒得到 1e300），直接 toISOString 会抛 RangeError
+// 并把整个 projcache 域拖成 degraded（该实例会话在仪表盘上凭空消失）。
 
 // dsh storage files carry a unit envelope: { unit: { name, version }, global, tables }.
 // We validate unit.version per domain, not the whole file shape (§4.3).

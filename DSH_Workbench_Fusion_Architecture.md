@@ -464,7 +464,7 @@ interface QuotaProvider {
 
 ```
 dsh-workbench/
-├── package.json              # type: "module", engines: {node: ">=22"}
+├── package.json              # type: "module", engines: {node: ">=22.5.0"}
 ├── src/
 │   ├── server.js             # HTTP 服务器入口 + 调度器启动
 │   ├── lib/                  # 纯内核（零副作用，可单元测试）

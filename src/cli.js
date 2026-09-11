@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { serviceDir, socketFile, configFile, readConfig, saveConfig, serverArgs } from './lib/service-config.js';
+import { isNodeSupported, nodeRequirementMessage, MIN_NODE } from './lib/node-version.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const help = `hwb — 服务管理（macOS / Linux，Node.js 22.5+）
+const help = `hwb — 服务管理（macOS / Linux，Node.js ${MIN_NODE}+）
   hwb [serve] [服务器选项]       前台运行，兼容原命令
   hwb start | stop | restart    后台启停（不配置开机自启）
   hwb status                   显示运行端口和 PID；停止时退出码 1
@@ -82,6 +83,13 @@ async function main() {
   let [command, ...args] = process.argv.slice(2);
   if (['--help', '-h', 'help'].includes(command)) return console.log(help);
   if (['--version', '-V', 'version'].includes(command)) return console.log(JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version);
+  // 版本门槛集中在此处（与 package.json engines 同源）：索引依赖 node:sqlite，
+  // 版本不足时子进程只会写一行难懂的 ERR_UNKNOWN_BUILTIN_MODULE 到 service.log，
+  // 这里先拦住并给出可照做的提示。--help/--version 仍然可用，便于排查。
+  if (!isNodeSupported()) {
+    console.error(nodeRequirementMessage());
+    process.exit(1);
+  }
   if (!command || command === 'serve' || command.startsWith('-')) {
     const extra = command && command !== 'serve' ? [command, ...args] : args;
     process.argv = [process.execPath, path.join(root, 'src/server.js'), ...serverArgs(readConfig()), ...extra];
@@ -127,8 +135,7 @@ async function main() {
     case 'test': return test(args);
     case 'doctor': {
       readConfig();
-      const [major, minor] = process.versions.node.split('.').map(Number);
-      if (major < 22 || (major === 22 && minor < 5)) throw Error('需要 Node.js 22.5+');
+      if (!isNodeSupported()) throw Error(nodeRequirementMessage());
       const state = await request();
       if (state?.ready) {
         const res = await fetch(`http://127.0.0.1:${state.port}/`, { signal: AbortSignal.timeout(3000) });

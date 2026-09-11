@@ -8,6 +8,21 @@ Semantic Versioning.
 
 ### Added
 
+#### Node 版本门槛集中到单一事实来源（src/lib/node-version.js）
+- 新增 `MIN_NODE = '22.5.0'`、`isNodeSupported()`、`nodeRequirementMessage()`、`enforceNodeVersion()`；
+  `package.json` 的 `engines`、`hwb doctor`、`hwb` 启动预检、CLI `--help` 文案现在同源，不再各写一份。
+- `hwb doctor` 原先把版本判断内联成 `major < 22 || (major === 22 && minor < 5)`，与新模块重复；
+  改为复用同一判断，避免两处漂移。
+
+### Changed
+
+- **`engines.node` 从 `>=22` 收紧到 `>=22.5.0`**：索引依赖内置 `node:sqlite`，该模块自 22.5.0 起才提供。
+  原先声明 `>=22` 会把 Node 22.0–22.4 的用户放进来，然后死在
+  `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`——由于本项目零依赖，
+  这个报错极易被误读成「忘了 npm install」。
+- `src/server.js` 改为动态 `await import('./dshhome/store.js')`：静态 import 会先于模块体求值，
+  让 `node:sqlite` 的加载早于版本预检，预检就永远来不及给提示。其余 import 不受影响。
+
 #### 文件预览侧栏支持拖拽上传（src/web/components/file-preview.js + src/lib/file-preview.js + src/api/routes.js）
 - 浏览目录时侧栏显示上传区：拖拽文件到侧栏即上传到**当前预览目录**，也可点「选择文件上传」；
   多文件串行上传并显示整批进度，完成后自动刷新目录列表。单文件上限 256 MiB（前端先过滤超限文件）。
@@ -27,6 +42,59 @@ Semantic Versioning.
   内存占用与文件大小无关；缺失 `Content-Length` 时直接拒绝，以保证写盘前就能设限。
 
 ### Fixed
+
+#### 存储型 XSS：会话状态的 approval 未转义，可突破 title 属性（src/web/components/recent-sessions.js）
+- **现象**：状态 chip 把 `permissions.approval` 直接拼进 `title="状态: … ${approve} …"`，而同一个表达式
+  里 `label` 是转义的、`approval` 不是。值里带 `">` 就能提前闭合属性并注入任意标签，例如
+  `x"><img src=x onerror=alert(1)>` 会渲染出真实可执行的 `<img>`（已用真实渲染链路复现）。
+- **为什么是「存储型」**：`approval` 来自 dsh home 的元数据——`storages/session_projcache.json` 的
+  `rows.permissions.val.approval`，或实时 RPC 的 `values.permissions.approval`（两条路径都只做
+  null 兜底、不做内容校验）。也就是说**任何被登记过的实例（含 SSH 远程）都能把内容送进工作台页面**，
+  而工作台页面同源可调用全部本地 API（读写工作区文件、登记 SSH 主机等），危害远超「弹个窗」。
+- **修复**：对整段（含 ` · 审批 ` 前缀）做 `esc()`，避免以后改前缀时又漏一次。
+  同时修掉 `app.js` 启动失败分支里 `${e.message}` 的同类问题（`api()` 会把服务端 `{error}` 当消息抛出）。
+- **回归测试**：`tests/web-render-safety.test.js`——用最小 globals 跑真实渲染函数，断言注入内容以
+  `&lt;img` 转义文本出现、且输出中不含任何真实注入标签；另逐字段覆盖 title/project/sessionId/别名/路径。
+
+#### 时间戳越界把整个 projcache 域拖成 degraded，实例会话凭空消失（src/lib/time.js + schema/live-status）
+- **现象**：`msToIso` 只检查 `Number.isFinite(v)`，但 ECMAScript 的日期时间戳上界是 ±8.64e15 毫秒
+  （±275760 年）。`Number.isFinite(1e300)` 为真而 `new Date(1e300).toISOString()` **抛
+  `RangeError: Invalid time value`**。该异常沿调用栈冒到域级校验，于是整个 projcache 域被判 `degraded`、
+  一条会话行都不产出——用户看到的是这个实例的项目/会话在仪表盘上凭空消失，且日志只说了一句
+  「Invalid time value」。触发条件很现实：dsh 侧时间戳单位变化（纳秒/微秒当毫秒）即可产生这种值。
+- **修复**：抽出 `src/lib/time.js` 的 `msToIso`（同时约束上下界），`schema.js` 与
+  `dshhome/live-status.js` 共用一份实现（后者原先也直接 `new Date(…).toISOString()`）。
+  超范围时降级为 `null`，由调用方回落（如 `identity.createdAt`）。
+- **回归测试**：`tests/time.test.js` 覆盖边界值、越界值、非数字，以及「脏时间戳不再拖垮整个域」。
+
+#### 日志面板去重集合无上限增长（src/web/components/log-panel.js）
+- `entries` 截断到 `MAX_VIEW=500`，但去重用的 `seen` 只增不减：长时间打开的页面（尤其 `-v`
+  级别日志）会持续累积字符串键，而视图本身是有界的。截断时同步重建 `seen`，保证 `seen.size ≤ MAX_VIEW`。
+
+#### npm 发布包缺 images/，README 头图在已发布版本里是坏链（package.json）
+- `README.md` 第一行就是 `![hwb](images/hwb.png)`，但 `files` 白名单里没有 `images/`（`docs/` 同样漏了），
+  `npm install -g hwb` 装到的包里没有这张图。补上 `images` 与 `docs`。
+- `package-lock.json` 里 root 包的 `engines` 仍是旧的 `>=22`，与 manifest 不一致；同步为 `>=22.5.0`。
+
+#### 写接口的跨站保护存在缺口：13 个写路由里只有 3 个有来源校验（src/api/routes.js）
+- **现象**：`open-workspace`、`upload` 两条路由各自内联了一份「拒绝跨站」检查，其余写路由
+  （`POST /api/homes`、`POST /api/homes/order`、`POST /api/homes/{id}/{reindex,open,stop,restart,disconnect,switch}`、
+  `POST /api/quota/refresh`、`PUT/DELETE /api/homes/{id}`）**完全没有校验**。
+- **为什么浏览器不会替你拦**：hwb 无鉴权且只监听 127.0.0.1，任意网页都能向本机端口发请求。带 JSON
+  `Content-Type` 的请求会触发 CORS 预检（服务端不答预检，所以被拦），但 `Content-Type: text/plain`
+  的 POST 属于 **CORS 简单请求**——不预检、直接发出，响应虽读不到，**副作用已经发生**：
+  可被注册一个指向攻击者的远程实例、或把用户正在用的 dsh 实例 stop/restart。
+- **修复**：把校验上提到 `route()` 入口，对 `POST`/`PUT`/`PATCH`/`DELETE` 统一生效——
+  `Sec-Fetch-Site: cross-site` 一律拒绝；带 `Origin` 时必须等于 `http://{Host}`；
+  非浏览器客户端（两个头都不带）照常放行。两处内联的重复校验同时删除。
+- **回归测试**：`tests/api-csrf.test.js` 对 10 条写路由逐一断言「跨站 → 403 且不触达 store/launcher」，
+  并断言同源请求与非浏览器请求仍然通过。
+
+#### JSON 请求体上限形同虚设：超限必须读完整包才报错（src/api/routes.js）
+- `readJsonBody` 先把整个请求体累加进字符串，读完之后才判断 `> 64 KiB`；也就是说 64 KiB 的
+  「上限」不提供任何内存保护，一个超大 body 仍会被完整缓冲。
+- 改为**边收边计**：累计字节数一超限就 `req.destroy()` 并抛错，不再继续读；测试用 100 个 1 KiB
+  分片断言实际只读了 ≤66 个分片。
 
 #### 文件预览不再依赖「内嵌页上报会话」这一条链路（src/web/components/file-preview.js）
 - **现象**：侧栏能打开，但一直显示「请先在 dsh 中打开项目会话，预览会自动绑定其工作区」，

@@ -3,7 +3,13 @@ import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { IndexStore } from './dshhome/store.js';
+import { enforceNodeVersion } from './lib/node-version.js';
+
+// 版本预检必须先于 dshhome/store.js 求值：只有它 import 'node:sqlite'，而该模块在
+// Node < 22.5 并不存在，静态引入只会抛一行与根因无关的 ERR_UNKNOWN_BUILTIN_MODULE。
+// 由于静态 import 全部先于模块体求值，store.js 这里只能改成动态引入。
+enforceNodeVersion();
+const { IndexStore } = await import('./dshhome/store.js');
 import { Indexer } from './dshhome/indexer.js';
 import { LiveStatusReader } from './dshhome/live-status.js';
 import { LiveStatusPoller } from './dshhome/live-poller.js';

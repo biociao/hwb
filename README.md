@@ -2,7 +2,7 @@
 
 # hwb — harness workbench
 
-> 版本：**v0.1.1** ｜ Node.js 22+ ｜ 原生 ESM ｜ **零 npm 依赖**（用 `node:sqlite`）
+> 版本：**v0.1.1** ｜ Node.js 22.5+ ｜ 原生 ESM ｜ **零 npm 依赖**（用 `node:sqlite`）
 
 
 [![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
@@ -460,6 +460,11 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
 ## 安全边界
 
 - hwb 仅监听 **127.0.0.1**，无鉴权，不暴露公网。
+- **跨站写保护**：因为无鉴权，浏览器里的任意页面理论上都能向本机端口发请求，所以所有改变状态的
+  方法（`POST`/`PUT`/`PATCH`/`DELETE`）统一要求同站来源——`Sec-Fetch-Site: cross-site` 或
+  `Origin` 与本机 `Host` 不一致的请求一律 403。这不能只依赖 CORS：`Content-Type: text/plain`
+  之类的请求属于 **CORS 简单请求**，不触发预检，浏览器不会替你拦。非浏览器客户端（curl 等）不带
+  这两个头，照常可用。
 - **API key 永不越界**：`.credentials.yaml` 的 key 只用于服务端查余额，浏览器只收到
   `{ provider, remaining, currency }`（单测专门断言 key 不出现在列表里）。
 - **远程读取只读**：SSH 单条命令只提取元数据，不注入密钥、不修改远端文件。

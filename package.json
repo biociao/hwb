@@ -9,6 +9,8 @@
   "files": [
     "src",
     "scripts",
+    "images",
+    "docs",
     "dsh-remote-index",
     "dsh-static-cache",
     "tests",
@@ -27,7 +29,7 @@
     "agent"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "start": "node src/server.js",

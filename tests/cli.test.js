@@ -79,6 +79,7 @@ test('CLI upgrade uses the tracked Git branch and rejects dirty or failing updat
   fs.mkdirSync(path.join(upstream, 'tests'));
   fs.copyFileSync(cli, path.join(upstream, 'src/cli.js'));
   fs.copyFileSync(new URL('../src/lib/service-config.js', import.meta.url), path.join(upstream, 'src/lib/service-config.js'));
+  fs.copyFileSync(new URL('../src/lib/node-version.js', import.meta.url), path.join(upstream, 'src/lib/node-version.js'));
   fs.writeFileSync(path.join(upstream, 'package.json'), '{"type":"module"}');
   fs.writeFileSync(path.join(upstream, 'tests/pass.test.js'), 'import test from "node:test"; test("ok", () => {});');
   await git(upstream, 'add', '.');

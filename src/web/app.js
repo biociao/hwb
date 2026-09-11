@@ -855,5 +855,6 @@ async function boot() {
 }
 
 boot().catch((e) => {
-  dashboardEl.innerHTML = `<div class="empty">failed to load: ${e.message}</div>`;
+  // e.message 可能是服务端回显的自由文本（api() 会把 {error} 当消息抛出），必须转义后再进 innerHTML。
+  dashboardEl.innerHTML = `<div class="empty">failed to load: ${esc(e.message)}</div>`;
 });

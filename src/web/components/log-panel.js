@@ -38,7 +38,14 @@ export function appendLog(entry) {
   if (seen.has(k)) return; // 与首屏快照重叠，去重
   seen.add(k);
   entries.push(entry);
-  if (entries.length > MAX_VIEW) entries = entries.slice(-MAX_VIEW);
+  if (entries.length > MAX_VIEW) {
+    // entries 截断后必须同步重建 seen：否则去重键只增不减（长开页面 / -v 级别日志下
+    // 是无上限的字符串集合），而 entries 本身是有上限的。重建后 seen.size ≤ MAX_VIEW。
+    // 被丢弃的旧键不会「复活」——服务端环缓冲只在尾部追加，不会重发这些历史条目。
+    entries = entries.slice(-MAX_VIEW);
+    seen.clear();
+    for (const e of entries) seen.add(key(e));
+  }
   logRenderEntries();
 }
 

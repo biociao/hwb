@@ -1,4 +1,5 @@
 import { logger } from '../lib/logger.js';
+import { msToIso } from '../lib/time.js';
 
 const log = logger('live-status');
 
@@ -105,6 +106,9 @@ async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS) {
 //   { sessionId, updatedAt(ms), running(bool), blank, cwd, projections: { values: {...} } }
 // values 内含 sessionStats/goal/todos/subagent/plan/permissions/sessionListMetadata/tokenUsage/title。
 // `running` 是权威的实时运行信号；其余经 deriveSessionStatus 推导 completed/idle，保持与缓存一致。
+// ms → ISO：超出 ECMAScript 日期范围（±8.64e15 ms）的时间戳 toISOString 会抛 RangeError，
+// 而 isFinite 仍为 true（例如单位写错成纳秒）。这里降级为 null，绝不因为一个脏字段抛穿整个轮询。
+// 统一实现见 lib/time.js。
 function toLiveRow(item) {
   const sid = item?.sessionId ?? item?.id ?? null;
   if (!sid) return null;
@@ -133,7 +137,7 @@ function toLiveRow(item) {
       subagents,
       approval: values.permissions?.approval ?? null,
     },
-    lastActivity: lastPromptAt ? new Date(lastPromptAt).toISOString() : null,
+    lastActivity: msToIso(lastPromptAt),
     tokenUsage: values.tokenUsage ?? null,
     title: typeof values.title === 'string' ? values.title : null,
   };

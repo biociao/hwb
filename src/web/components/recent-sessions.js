@@ -5,7 +5,11 @@ function statusChip(status) {
   const st = status ?? { kind: 'idle', label: '空闲', subagents: 0 };
   const cls = st.kind === 'running' ? 'run' : st.kind === 'completed' ? 'done' : 'idle';
   const sub = st.subagents > 0 ? ` · ${st.subagents} 子agent` : '';
-  const approve = st.approval ? ` · 审批 ${st.approval}` : '';
+  // approval 直接来自 dsh 元数据（projcache 的 permissions.approval / live RPC），是**未校验的自由文本**。
+  // 它被拼进 title="…" 属性里，不转义就能用 `">` 提前闭合属性、注入任意标签 → 存储型 XSS。
+  // 这里对整段（含前缀）转义，避免以后改前缀时又漏掉一次。
+  const approve = st.approval ? esc(` · 审批 ${st.approval}`) : '';
+  // kind → cls 是白名单映射，st.label / sub 均为转义或数值，属性与文本都安全。
   return `<span class="chip status ${cls}"
       title="状态: ${esc(st.label)}${approve}${sub}">${esc(st.label)}${sub}</span>`;
 }

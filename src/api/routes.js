@@ -14,11 +14,35 @@ function send(res, status, body) {
   res.end(json);
 }
 
+const JSON_BODY_LIMIT = 64 * 1024;
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
 async function readJsonBody(req) {
   let raw = '';
-  for await (const chunk of req) raw += chunk;
-  if (raw.length > 64 * 1024) throw new Error('body too large');
+  let bytes = 0;
+  for await (const chunk of req) {
+    // 边收边限：超限立刻断开，不把整个请求体读进内存（否则 64 KiB 限制形同虚设）。
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > JSON_BODY_LIMIT) {
+      req.destroy?.();
+      throw new Error('body too large');
+    }
+    raw += chunk;
+  }
   return raw ? JSON.parse(raw) : {};
+}
+
+// 跨站写保护。hwb 只监听 127.0.0.1 且无鉴权（架构文档 §11），所以浏览器里的任意页面都能
+// 向本机端口发请求；又因为 Content-Type 为 text/plain / multipart/form-data 的请求属于 CORS
+// **简单请求**（不触发预检、也因此拿不到 CORS 拒绝），不能只靠「浏览器会不会拦住」来兜底。
+// 因此凡改变状态的方法一律要求同站来源：Sec-Fetch-Site 明确 cross-site 时拒绝；带 Origin 时
+// 必须与本机 Host 完全一致。非浏览器客户端（curl / 测试）两个头都没有，照常放行。
+function sameSiteRequest(req) {
+  const headers = req.headers ?? {};
+  if (headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = headers.origin;
+  if (origin && origin !== `http://${headers.host}`) return false;
+  return true;
 }
 
 function dshHomeInfo(homePath) {
@@ -35,12 +59,14 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
   return async function route(req, res, url) {
     const { pathname, searchParams } = url;
 
+    // 所有写操作统一在此拦截，避免每个路由各写一份、漏一个就留一个 CSRF 口子。
+    if (MUTATING_METHODS.has(req.method) && !sameSiteRequest(req)) {
+      send(res, 403, { error: '不允许跨站请求' });
+      return;
+    }
+
     const finder = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/open-workspace$/);
     if (req.method === 'POST' && finder) {
-      if (req.headers['sec-fetch-site'] === 'cross-site' ||
-          (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`)) {
-        send(res, 403, { error: '不允许跨站打开工作区' }); return;
-      }
       try {
         const body = await readJsonBody(req);
         const home = store.getHome(finder[1]);
@@ -86,10 +112,6 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     const upload = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/upload$/);
     if (req.method === 'PUT' && upload) {
       res.setHeader('Cache-Control', 'no-store');
-      if (req.headers['sec-fetch-site'] === 'cross-site'
-          || (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`)) {
-        send(res, 403, { error: '不允许跨站写入文件' }); return;
-      }
       const home = store.getHome(upload[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
       const workspaces = store.listWorkspaces({ homeId: home.homeId });
