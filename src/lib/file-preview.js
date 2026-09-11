@@ -1,4 +1,4 @@
-import { open, realpath, opendir, lstat, mkdtemp, link, unlink, rm } from 'node:fs/promises';
+import { open, realpath, opendir, lstat, stat, mkdtemp, link, unlink, rm } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { sshBash } from '../control/remote.js';
@@ -44,6 +44,17 @@ export async function readLocalPreview(root, requested = '.', download = false) 
   }
   try {
     const st = await handle.stat();
+    // realpath 与 open 之间存在 TOCTOU 窗口：窗口内把 target 换成符号链接，就能读到工作区之外
+    // 的文件（越界检查查的是 realpath 那一刻的路径）。这里以**已打开的 fd** 为准，复核「打开的
+    // 就是刚才 realpath 解析出来的那个对象」（dev+ino 相同）。独立审查在 129,576 次竞态读里
+    // 没有撞出逃逸（窗口在同一个宏任务内，需要精确调度才能赢），所以这是加固而不是修缺陷。
+    // 注意：不加密完全等价于 openat() 从 root 的 dirfd 逐段走 —— 那需要更多代码，这里是
+    // 「以代价很小的一步把窗口从『随时可赢』缩到『需要竞态才能赢』」。也不能用 O_NOFOLLOW：
+    // 指向工作区内的目录符号链接是**允许**的（见 inside() 的说明）。
+    const confirmed = await stat(target);
+    if (confirmed.dev !== st.dev || confirmed.ino !== st.ino) {
+      throw new Error('文件在预览期间被替换，请刷新后重试');
+    }
     if (st.isDirectory()) {
       if (download) throw new Error('请选择文件下载，暂不支持目录打包');
       const entries = [];

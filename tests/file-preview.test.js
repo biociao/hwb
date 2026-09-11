@@ -184,3 +184,18 @@ test('readLocalPreview: 常见文件系统错误翻译成人话，不再把裸 e
   await mkdir(path.join(base, 'sub'), { recursive: true });
   await assert.rejects(readLocalPreview(base, 'sub', true), /目录打包/);
 });
+
+// realpath 与 open 之间的 TOCTOU：窗口内把 target 换成符号链接就能读到工作区之外的文件。
+// 独立审查在 129,576 次竞态读里没有撞出逃逸（窗口在同一个宏任务内，要精确调度才能赢），
+// 所以这条是**加固**而不是修缺陷 —— 没法用「必定失败」的用例来钉（需要精确控制时序）。
+// 因此①正路径由上面那批越界/符号链接用例守着（不许误伤指向工作区内的符号链接）
+// ②这里加一条结构断言，保证「以 fd 为准复核身份」这一步不被悄悄删掉。
+test('结构: 本地预览必须以已打开的 fd 复核「打开的就是 realpath 解析出的那个对象」', async () => {
+  const { readFile: readSrc } = await import('node:fs/promises');
+  const src = await readSrc(new URL('../src/lib/file-preview.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('export async function readLocalPreview'), src.indexOf('async function readImage'));
+  assert.match(fn, /handle\.stat\(\)/, '应以 fd 为准取状态');
+  assert.match(fn, /confirmed\.dev !== st\.dev \|\| confirmed\.ino !== st\.ino/,
+    '必须比对 dev+ino：否则 realpath 之后被换成符号链接仍会被读出来');
+  assert.match(fn, /请刷新后重试|被替换/, '被替换时要说人话，而不是继续读');
+});

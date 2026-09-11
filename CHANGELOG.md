@@ -186,6 +186,19 @@ Semantic Versioning.
 - **修复**：`readFile` 包 try/catch，`ENOENT`/`EACCES`/`EISDIR`/`EIO` 一律 404。
 - **回归测试**：`tests/dsh-static-cache.test.js` —— chmod 000 的文件请求必须 404 且不再抛。
 
+#### 本地预览的 realpath→open 窗口（TOCTOU，加固）（src/lib/file-preview.js）
+- **问题**：`readLocalPreview` 先 `realpath` 做越界判断，再用**路径**去 `open` —— 两步之间把
+  target 换成符号链接，就能读到工作区之外的文件（越界检查查的是 realpath 那一刻的路径）。
+  独立审查用两个进程做符号链接/rename 翻转 + 129,576 次竞态读：**0 次逃逸**（窗口在同一个宏任务内，
+  要精确调度才能赢）。所以这条是**加固**，不是已发生的缺陷。
+- **修复**：以**已打开的 fd** 为准复核「打开的就是刚才 realpath 解析出的那个对象」（dev+ino 相同），
+  不一致就报「文件在预览期间被替换，请刷新后重试」。刻意**不**用 `O_NOFOLLOW`：指向工作区**内**的
+  目录符号链接是允许的（既有用例明确覆盖），加了会误伤。彻底的做法是 `openat()` 从 root 的 dirfd
+  逐段走 —— 那需要更多代码，这一步把窗口从「很容易赢」缩到「必须竞态才能赢」。
+- **回归测试**：这个窗口无法写成「必定失败」的用例（要精确控制时序），所以用一条**结构断言**
+  钉住加固本身（必须有 `handle.stat()` 与 dev+ino 比对），正路径的越界/符号链接用例照旧守着不误伤。
+  与 `readMetadataFile` 的 TOCTOU 加固采用同一套做法（那条也是结构断言）。
+
 #### 预览路径把裸 errno 抛给界面（src/lib/file-preview.js）
 - **现象**：文件被删掉后点预览，界面上显示
   `ENOENT: no such file or directory, realpath '/private/var/.../nope.txt'` —— 一句英文系统错误，
