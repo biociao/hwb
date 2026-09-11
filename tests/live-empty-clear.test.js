@@ -108,3 +108,33 @@ test('文件索引重跑后，实时补插的行被正式收录（liveOnly 归�
   assert.equal(store.recentSessions({ homeId }).length, 2);
   store.close();
 });
+
+// 文件索引的「整表替换」原先把 liveOnly=1 的行也一起删掉，3s 后再由轮询器补插回来 ——
+// 每 60s 一次无谓的删除+重插，而且**中间那几秒工作台会少显示这些会话**。
+// 真实数据上的规模：用户那台机器的 dsh 实时列表有 500 条、projcache 只有 179 条，
+// 也就是每分钟 321 行被删掉再插回来（用真实库副本逐 sessionId 比对确认）。
+// 现在索引只在**文件快照里没有**的范围内替换（`AND liveOnly = 0`），纯实时行的生命周期
+// 完全交给 applyLiveStatus（不在实时列表里就删、被文件索引收录后由 ON CONFLICT 归零）。
+test('文件索引不再删掉纯实时行（纯实时行仍由实时列表管理生命周期）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  store.applyLiveStatus(homeId, [liveSession('from-file', 'running'), liveSession('rpc-only', 'running')]);
+  assert.equal(store.recentSessions({ homeId }).length, 2, '前置条件：文件会话 + 实时补插会话');
+
+  // 再跑一次文件索引（快照里只有 from-file）
+  store.upsertRows(normalize({
+    homeId, homePath: '/mock/home', generatedAt: new Date().toISOString(),
+    wsVersion: 2, pcVersion: 3,
+    workspaces: [{ workspaceId: 'ws-1', title: 'A', path: '/r/a', archived: false, sessionIds: ['from-file'] }],
+    sessions: [{ sessionId: 'from-file', workspaceId: 'ws-1', tokenUsage: null, lastActivity: new Date().toISOString() }],
+    modelTier: null, providers: [], degraded: [],
+  }));
+  const ids = store.recentSessions({ homeId }).map((s) => s.sessionId).sort();
+  assert.deepEqual(ids, ['from-file', 'rpc-only'], '纯实时行不该被文件索引删掉（否则每 60s 掉一次、3s 后再出现）');
+
+  // 但它的生命周期仍然属于实时通道：实时列表变空时它必须消失
+  store.applyLiveStatus(homeId, []);
+  assert.deepEqual(store.recentSessions({ homeId }).map((s) => s.sessionId), ['from-file'],
+    '实时列表变空 → 纯实时行仍要被清掉（这条语义不能被上面那条改坏）');
+  store.close();
+});

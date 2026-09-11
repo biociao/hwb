@@ -610,7 +610,14 @@ export class IndexStore {
         }
         for (const table of CHILD_TABLES) {
           if (protectedTables.has(table)) continue; // 该域降级 → 保留上次成功的行
-          this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(home.homeId);
+          // sessions 的替换**不动 liveOnly=1 的行**：那些行只由实时通道支撑、由 applyLiveStatus 管
+          // 生命周期（不在实时列表里就删、进了文件索引就由下面的 ON CONFLICT 归零）。原先它们会被
+          // 文件索引整表删掉、3s 后再由轮询器补插回来 —— 每 60s 一次无谓的删除+重插，
+          // 而**中间那几秒里工作台会少显示这些会话**。
+          // 真实数据上的规模：用户那台机器的 dsh 实时列表有 500 条、projcache 只有 179 条，
+          // 也就是说每分钟有 321 行被删掉再插回来（用真实库副本逐 sessionId 比对确认过）。
+          const where = table === 'sessions' ? 'WHERE homeId = ? AND liveOnly = 0' : 'WHERE homeId = ?';
+          this.db.prepare(`DELETE FROM ${table} ${where}`).run(home.homeId);
         }
       }
 
