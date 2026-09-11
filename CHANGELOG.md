@@ -370,6 +370,10 @@ Semantic Versioning.
   三条连接路径（含远端重连）在写 `phase:'running'` 之前都必须通过它。
   ②`prober.js` 拆出 `httpProbeStatus()` 并新增 `probeAlive()`（401/403 判为不可用），
   Monitor 的心跳默认改用 `probeAlive` —— httpProbe 的语义保持不变，供端口探测类判断继续使用。
+- **对真实 dsh 的复验**（审查当时标为 UNVERIFIED 的那一条）：本机真实 dsh web（127.0.0.1:3080，
+  只读探测）—— 裸 URL 与错 token 都返回 **401**，`httpProbe` 判 `true` 而 `probeAlive` 判 `false`，
+  `authFetch` 两条也都拿到 401（不是 303）。也就是说这套判据在真实 dsh 上同样成立，
+  而不是只在假栅栏上成立。
 - **回归测试**：`tests/launcher-terminate.test.js` —— 假 dsh 带真 token 栅栏（裸 URL/错 token 401，
   对 token 303 + Set-Cookie 后 200）：错 token 的直连必须失败且不留「已连接」状态、对 token 必须照常连上；
   另断言 `httpProbe(裸 URL) === true` 而 `probeAlive(裸 URL) === false`，以及 Monitor 默认探测就是
