@@ -50,7 +50,12 @@ export class Indexer {
   }
 
   #tick() {
-    this.#run().finally(() => {
+    // 与 monitor 的心跳同理：#runAll 一旦抛错（例如 store 已关闭、homes() 读不到），
+    // .finally() 返回的 promise 就成了未处理拒绝 —— 被 crash handler 记成 fatal 并掩盖真因。
+    // 索引循环必须能扛住单轮失败继续跑。
+    this.#run().catch((e) => {
+      log.warn('索引轮次失败（本轮跳过，下一轮重试）', { error: e?.message ?? String(e) });
+    }).finally(() => {
       if (!this.running) return;
       this.timer = setTimeout(() => this.#tick(), this.baseMs);
       this.timer.unref?.();

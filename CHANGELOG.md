@@ -89,6 +89,15 @@ Semantic Versioning.
 - 上传的 multipart 解析是流式的（`src/lib/multipart.js`）：边解析边把文件字节交给写入端，
   内存占用与文件大小无关；缺失 `Content-Length` 时直接拒绝，以保证写盘前就能设限。
 
+### Fixed
+
+#### 后台索引路径上的两处未处理拒绝（src/dshhome/indexer.js + src/api/routes.js）
+- `Indexer.#tick()` 只用 `.finally()` 收尾（与 Monitor 心跳同款问题）：`#runAll` 一旦抛错就变成
+  每轮一次的 unhandledRejection，被 crash handler 记成 fatal 并掩盖真因。补 `catch` + warn。
+- 4 处 `indexer.reindexNow(...)` 是刻意的 fire-and-forget（远程要等 SSH 超时，不能阻塞响应），
+  但「不 await」不等于「不管」：返回的 promise 一旦拒绝同样产生未处理拒绝。
+  统一走 `reindexInBackground()`，并容忍「同步抛出」与「返回 undefined」两种实现。
+
 ### Changed
 
 - 本机**下载**不再经 base64 中转（`readLocalPreview` 直接交回 `Buffer`）。原先的链路上有三层同尺寸

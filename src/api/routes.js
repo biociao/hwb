@@ -78,6 +78,17 @@ function dshHomeInfo(homePath) {
 
 export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi }) {
   const connecting = new Set();
+  // 定向重索引常常是 fire-and-forget（远程要等 SSH 超时，不能阻塞响应）。
+  // 但「不 await」不等于「不管」：返回的 promise 一旦拒绝就是未处理拒绝，
+  // 会被 crash handler 记成 fatal 并掩盖真正的失败原因。这里统一吞掉——
+  // 索引本身已经把失败写进 homes.status/degraded 并通过 SSE 广播出去了。
+  const reindexInBackground = (homeId) => {
+    try {
+      // Promise.resolve(...) 同时容纳「返回 promise」与「返回 undefined」两种实现；
+      // 同步抛出也一并吞掉 —— 这是后台优化，不该反过来把用户的操作请求打成 5xx。
+      Promise.resolve(indexer.reindexNow(homeId)).catch(() => {});
+    } catch { /* 同上 */ }
+  };
   return async function route(req, res, url) {
     const { pathname, searchParams } = url;
 
@@ -225,7 +236,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         const homeId = store.registerHome({ homePath, alias, serverId, endpoints: body.endpoints, activeEndpointId: body.activeEndpointId, hostType: 'remote', host, remotePort, remoteHome, remoteCmd, remoteLog, token, accessPort });
         // 注册后立即触发一次该实例的索引（不等结果：远程走 SSH，不可达时要等超时，
         // 同步等待会卡住注册响应；索引完成后会广播 index:updated，前端经 SSE 自动刷新）。
-        indexer.reindexNow(homeId);
+        reindexInBackground(homeId);
         send(res, 200, { homeId, warning: null, result: null });
         return;
       }
@@ -459,7 +470,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         if (monitor.get(home.homeId).runtime !== 'running') throw new Error('连接不可达，请断开后重试');
         // 连接成功后立即索引一次（此时 runtime=running，liveStatus 实时通道可用），
         // 新会话/状态马上进入工作台，不用等下一个 60s tick。
-        indexer.reindexNow(home.homeId);
+        reindexInBackground(home.homeId);
         send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });
@@ -487,7 +498,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
           store.updateHomeConfig(home.homeId, patch);
         }
         await monitor.refresh(home.homeId);
-        indexer.reindexNow(home.homeId);
+        reindexInBackground(home.homeId);
         hub.broadcast('instance:status', { homeId: home.homeId });
         send(res, 200, { homeId: home.homeId, activeEndpointId: endpoint.id });
       } catch (error) { send(res, 502, { error: error.message }); }
@@ -547,7 +558,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       try {
         const inst = await launcher.restart(home);
         await monitor.refresh(home.homeId);
-        indexer.reindexNow(home.homeId); // 同 open：重启后立即索引，实时状态即刻入库
+        reindexInBackground(home.homeId); // 同 open：重启后立即索引，实时状态即刻入库
         send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });
