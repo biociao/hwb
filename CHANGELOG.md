@@ -287,6 +287,26 @@ Semantic Versioning.
   实测 15 种形态全部脱敏且保持幂等。
 - **回归测试**：`tests/logger-security.test.js` 的 leaks 列表补上这 10 种形态（含幂等断言）。修复前失败。
 
+### 变更说明（证据，不是猜测）
+#### 实时 `/api/session/list` 的投影形状：用 **dsh 自己的类型声明**定案（此前几轮一直写着「无法确定」）
+- 前几轮的注释与审查都停在「`projections.values.*` 到底是解开值还是 `{ver,seq,val}` 包装，本项目
+  没有可对照的 live dsh，无法确定」。这一轮直接读了本机安装的 dsh（`~/.nvm/.../node_modules/
+  @deepseek-ai/dsh`）的类型声明，逐条落实：
+  · item = `SessionSummary`：`sessionId`（branded string）、`updatedAt`、**`running: boolean`（恒为布尔）**、
+    `blank`、`cwd?`、`projections?: SessionProjectionHints`
+    —— `dsh-api-session-controller/lib/types/types.d.ts:138`。
+  · `SessionProjectionHints = { values: SessionProjectionValues }`（同文件 :40-59）。
+  · `values` 里是**投影值本身**、没有包装：`tokenUsage` = `TokenUsageProjection`（**扁平四键**，
+    `dsh-token-meter/lib/types/projection.d.ts:10`）、`sessionListMetadata = {blank,lastPromptAt}`、
+    `goal`/`plan`/`sessionStats`/`permissions`/`todos`/`title` 各自的原生形状。
+  · 包装 `(sessionId, key, ver, seq, val)` 是**文件侧**的 durable 行：
+    `dsh-session-projection/lib/types/index.d.ts:199`。
+- 结论：hwb 原来的判断是对的（实时=解开、文件=包装）；`tokenUsage` 三形态兼容是兼容余量，
+  不是「不知道形状」。`running` 恒为布尔也证实了 `typeof item.running === 'boolean'` 那条分支足够。
+- 代码动作：把 `live-status.js` 里两处「无法确定」的注释换成带包路径与行号的权威说明；
+  把上一轮加的 `unwrapProjection` **收窄**成「只有确实长得像包装（除 `val` 外只剩 `ver`/`seq`）才解」
+  —— dsh 允许插件贡献任意 JSON 键，一个恰好带 `val` 字段的投影值不该被吃掉一层（有回归测试）。
+
 ### Fixed
 #### 实时投影只接受「解开形态」：包装形态会把「已完成」判成「空闲」（src/dshhome/live-status.js）
 - **风险（审查标记为最值得跟进的 UNVERIFIED）**：文件侧的投影值形状是**带版本包装**的

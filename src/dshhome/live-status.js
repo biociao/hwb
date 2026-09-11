@@ -157,9 +157,10 @@ async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS, maxByte
 // ms → ISO：超出 ECMAScript 日期范围（±8.64e15 ms）的时间戳 toISOString 会抛 RangeError，
 // 而 isFinite 仍为 true（例如单位写错成纳秒）。这里降级为 null，绝不因为一个脏字段抛穿整个轮询。
 // 统一实现见 lib/time.js。
-// dsh 的投影值在**文件**侧是带版本包装的：`{ver, seq, val: {totals: {...}}}`（见 lib/schema.js）。
-// 而 `/api/session/list` 的 `projections.values.tokenUsage` 给的是哪一层，本项目没有可对照的实例
-// 可以确定（`values` 是 dsh 的内存投影表，理论上也可能是解开后的值）。所以三种形态都接受：
+// dsh 的投影值在**文件**侧是带版本包装的：`{ver, seq, val: {totals: {...}}}`（durable 行
+// `(sessionId, key, ver, seq, val)`）。而 `/api/session/list` 的 `values.tokenUsage` 按 dsh 的类型
+// 声明就是 `TokenUsageProjection` —— **扁平四键**（dsh-token-meter/lib/types/projection.d.ts:10）。
+// 三种形态都接受是**向后/向前兼容**的余量（上游换一层不会让用量归零），不是「不知道是什么形状」：
 //   {uncachedInputTokens,…} / {totals:{…}} / {val:{totals:{…}}}
 //
 // 为什么要在这里归一：不归一的话，若 dsh 给的是带包装的那层，我们就会把一个**嵌套结构**存进
@@ -181,17 +182,25 @@ export function normalizeLiveTokenUsage(raw) {
   return Object.keys(out).length ? out : null;
 }
 
-// 投影值可能是**带版本包装**的 `{ver,seq,val}`（文件侧就是这个形状）。
-// tokenUsage 早就按「三种形态都接受」归一，但 goal / todos / plan / subagent / permissions /
-// sessionListMetadata 当时只接受**解开后的**形态 —— 本项目没有可对照的 live dsh，谁也不知道
-// `/api/session/list` 给的是哪一层（见 normalizeLiveTokenUsage 的注释）。若实际是包装形态，
-// 实时通道会把「已完成」系统性降级成「空闲」、丢掉 in_progress todo，而且**每 3s 重写一次**、
-// 在宽限期内赢过文件侧的正确值 —— 与「实时 approval 绕过守卫」同一类「不自愈」的缺陷。
-// 解一层即可：没有 `val` 字段的值原样返回（解开形态的载荷不受影响）。
-// 只对**对象**解（数组、字符串、null 原样返回）。
+// 投影值的两层形状 —— 现在有**权威依据**了（此前几轮注释里一直写着「无法确定」）：
+//   · 实时 RPC：`/api/session/list` 的 item 是 dsh 的 `SessionSummary`
+//     （dsh-api-session-controller/lib/types/types.d.ts:138），带 `projections?: SessionProjectionHints`，
+//     而 `SessionProjectionHints = { values: SessionProjectionValues }`（同文件 :40-59）。
+//     `values` 里是**投影值本身**、不是包装：`goal`、`plan`、`sessionStats`、`permissions`、
+//     `todos`、`title`、`tokenUsage`（= `TokenUsageProjection`，**扁平四键**）、
+//     `sessionListMetadata`（= `{blank, lastPromptAt}`）—— 逐条见各包 lib/types 的
+//     `SessionProjectionMap` 声明式合并。顺带确认 `SessionSummary.running: boolean` 恒为布尔。
+//   · 文件侧（`session_projcache.json`）：durable 行是 `(sessionId, key, ver, seq, val)`
+//     （dsh-session-projection/lib/types/index.d.ts:199），所以**那一侧**才是 `{ver,seq,val}` 包装。
+// 也就是说：解开形态是常态，包装形态理论上不该出现在实时通道里。但这里仍然保留解一层的能力，
+// 作为「上游改成包装形态」的防御（代价是几行代码，而漏判的代价是实时值每 3s 覆盖正确值、不自愈）。
+// 只当它**确实长得像包装**（有 `val`，且其余键只有 ver/seq）才解 —— dsh 允许插件贡献任意 JSON 键，
+// 一个恰好带 `val` 字段的投影值不该被我们吃掉一层。
 function unwrapProjection(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  return 'val' in value ? value.val : value;
+  if (!('val' in value)) return value;
+  const others = Object.keys(value).filter((k) => k !== 'val');
+  return others.every((k) => k === 'ver' || k === 'seq') ? value.val : value;
 }
 
 function toLiveRow(item) {

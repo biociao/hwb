@@ -42,6 +42,13 @@ test('toLiveRow: 实时 approval 与文件侧走同一套守卫（长串截断�
     assert.equal(long[0].status.approval.length, 65, '超长截断到 64 字符 + 省略号');
     const ok = await rowsFor({ permissions: { approval: 'never' } });
     assert.equal(ok[0].status.approval, 'never', '正常字符串照旧');
+
+    // 只当它**确实长得像版本包装**（除 val 外只剩 ver/seq）才解一层：
+    // dsh 允许插件贡献任意 JSON 键（SessionProjectionValues 里有 Record<string, …>），
+    // 一个恰好带 `val` 字段的投影值不该被我们吃掉一层。
+    const notWrapper = await rowsFor({ sessionStats: { val: 1, openStep: 3 } });
+    assert.equal(notWrapper[0].status.kind, 'running',
+      '带 val 字段但不像包装的对象必须原样保留（否则会把 openStep 吃掉、状态错判成空闲）');
   } finally { globalThis.fetch = saved; }
 });
 
