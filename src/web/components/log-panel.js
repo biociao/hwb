@@ -14,7 +14,16 @@ let follow = true;   // 自动滚动到底部
 let loaded = false;  // 是否已拉取过首屏快照
 const seen = new Set(); // 去重键（初始快照与实时事件重叠窗口）
 
-const key = (e) => `${e.ts}|${e.level}|${e.message}`;
+// 去重键必须包含 scope 与 fields：同一毫秒里两条「相同 ts/level/message」但不同上下文的日志
+// 是真实存在的（索引器对多个实例并发失败 → 同一句「索引该 home 失败」+ 不同 homeId），
+// 只用 ts|level|message 会把后一条**丢掉**，用户看到的失败实例少一个。
+// 导出是为了能直接测（这个模块的其余部分是 DOM 渲染）。
+export const logEntryKey = (e) => [
+  e.ts, e.level, e.scope ?? '', e.message,
+  e.fields === undefined ? '' : JSON.stringify(e.fields),
+].join('|');
+
+const key = logEntryKey;
 
 // 过滤语义：filter 视为「最低级别」（error=错误及以上 warn/error/fatal）。
 function passes(e) {

@@ -11,6 +11,7 @@ import { renderUsageCard, usageTrendHtml, USAGE_PERIODS } from './components/usa
 import { renderHomeForm, renderOnboarding, renderSettingsForm, applyHomeMode } from './components/add-home.js';
 import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLogView, logPanelHtml } from './components/log-panel.js';
 import { captureFormDraft, restoreFormDraft } from './components/form-draft.js';
+import { createUsageCache } from './components/usage-cache.js';
 
 const main = document.getElementById('main');
 const dashboardEl = document.getElementById('dashboard');
@@ -27,6 +28,21 @@ let refreshSequence = 0;
 const endpointSwitching = new Set();
 // Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
 let lastUsage = null;
+// 渲染由 SSE 驱动（每 3s 一次），而 /api/usage 是 8 个同步聚合（实测 40k 会话 ~330ms，
+// 期间整个单线程服务都停着）。所以渲染路径上不再「每次都要」：同一个统计周期 15s 内复用。
+const usageCache = createUsageCache(15_000);
+const usageKey = () => `${usagePeriod.days}:${usagePeriod.hours}`;
+function fetchUsage({ force = false } = {}) {
+  const key = usageKey();
+  if (!force) {
+    const cached = usageCache.peek(key);
+    if (cached) return Promise.resolve(cached);
+  } else {
+    usageCache.invalidate();
+  }
+  return api(`/api/usage?days=${usagePeriod.days}&hours=${usagePeriod.hours}`)
+    .then((body) => usageCache.store(key, body));
+}
 let usageDim = 'total';
 // 当前统计周期（过去 24h / 3天 / 7天 / 14天 / 30天）。hours 驱动趋势图，days 驱动汇总/按项目。
 let usagePeriod = USAGE_PERIODS[0];
@@ -172,9 +188,12 @@ async function renderDashboard(sequence = refreshSequence) {
     dashboardEl.dataset.layout = 'onboarding';
     // 首装时这个表单是唯一的出口，而 monitor 每 30s 就会无条件广播一次 → 重建。
     // 不保留草稿的话用户每半分钟就被清空一次输入（与 grid 布局同一个问题）。
-    const onboardingDraft = captureAddFormDraft();
+    // 但**捕获必须紧挨着重建**：detect 是一次网络请求，先捕获再 await 的话，用户在这段时间里
+    // 敲的字会被随后的重建覆盖掉（而「不让输入丢失」正是这个模块存在的理由）。
+    // 所以顺序是：await → 确认这次渲染仍然有效 → 捕获 → 重建 → 恢复。
     const detected = await api('/api/homes/detect');
     if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
+    const onboardingDraft = captureAddFormDraft();
     dashboardEl.innerHTML = renderOnboarding(detected);
     restoreAddFormDraft(onboardingDraft);
     return;
@@ -185,7 +204,7 @@ async function renderDashboard(sequence = refreshSequence) {
   const [projectsRes, sessionsRes, usageRes] = await Promise.allSettled([
     api('/api/projects/recent'),
     api('/api/sessions/recent'),
-    api(`/api/usage?days=${usagePeriod.days}&hours=${usagePeriod.hours}`),
+    fetchUsage(),
   ]);
   if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
   const failed = [['项目列表', projectsRes], ['会话列表', sessionsRes], ['用量统计', usageRes]]
@@ -238,8 +257,16 @@ function renderUsageTrend() {
 
 // —— Token 用量：切换统计周期（过去 24h / 3天 / 7天 / 14天 / 30天）——
 // 按当前周期重新拉取 /api/usage，并就地重绘整个用量卡片（汇总 + 趋势 + 按项目保持一致）。
+// 周期切换的序号守卫：`/api/usage` 的耗时随周期变化（30 天比 24h 重得多），
+// 「先点 30 天、再快速点 24h」会让响应**乱序返回** —— 没有守卫时会把 30 天的数字配着
+// 「24h」的高亮一起画出来，并且污染 lastUsage（后续切换维度时画出与周期不符的趋势）。
+// 与 refresh() / renderDashboard() 的做法一致：只有最后一次请求的结果可以落盘。
+let usageSequence = 0;
 async function refreshUsageCard() {
-  const usage = await api(`/api/usage?days=${usagePeriod.days}&hours=${usagePeriod.hours}`);
+  const seq = ++usageSequence;
+  const key = usageKey();
+  const usage = await fetchUsage({ force: true });
+  if (seq !== usageSequence || key !== usageKey()) return;   // 期间用户又切了周期 → 丢弃
   lastUsage = usage;
   const el = document.getElementById('usage-card');
   if (el) el.innerHTML = renderUsageCard(usage, usageDim, usagePeriod.key);
@@ -476,9 +503,16 @@ async function addHome({ homePath, alias, hostType = 'local', host, remotePort, 
     : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
   if (hostType === 'remote' && accessPort !== undefined) body.accessPort = accessPort;
   const data = await api('/api/homes', { method: 'POST', body });
-  if (form && data.warning && data.warning !== null) formMsg(form, data.warning, false);
+  // warning 必须挂在**持久**的 #note 上：紧接着的 showAddForm = false; refresh() 会重建整个
+  // dashboard 的 innerHTML（表单只在 showAddForm 为真时才重新插入），写进表单的消息会被直接抹掉
+  // —— 服务端明明回了「这个目录看起来不像 dsh home」，用户一个字都看不到。
+  const warning = form && data.warning ? data.warning : null;
   showAddForm = false;
   await refresh();
+  if (warning) {
+    note.textContent = `已添加，但注意：${warning}`;
+    note.hidden = false;
+  }
 }
 
 async function handleAction(e) {
@@ -890,7 +924,12 @@ subscribe(
   (on) => {
     live.textContent = on ? 'live' : 'reconnecting…';
     live.classList.toggle('on', on);
-    if (!on) reportRefreshFailure(new Error('实时通道已断开，正在重连'));
+    if (!on) { reportRefreshFailure(new Error('实时通道已断开，正在重连')); return; }
+    // 恢复时两件事都要做：①把断线提示撤掉（否则顶栏写着 live、下面还挂着「已断开」）；
+    // ②补一次刷新 —— 断线期间错过的 index:updated 不会重发，不补就一直是旧数据（最长等到 30s 心跳）。
+    note.hidden = true;
+    note.textContent = '';
+    scheduleRefresh();
   },
   (entry) => appendLog(entry) // 实时日志推送到「运行日志」面板
 );

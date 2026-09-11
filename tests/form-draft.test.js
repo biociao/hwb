@@ -145,3 +145,22 @@ test('restoreFormDraft 不传钩子时照常工作（向后兼容）', () => {
   assert.equal(restoreFormDraft(fakeForm(controls), { values: { homePath: '/x' }, focused: null }), false);
   assert.equal(controls[0].value, '/x');
 });
+
+// 用量节流：同一周期在窗口内不重复请求（服务端那层是 10s TTL，这里是客户端这层）。
+// 抽成模块就是为了能这样直接测 —— app.js 依赖完整 DOM，在 node:test 里跑不起来。
+test('usage-cache: 窗口内复用、换周期不复用、过期后重新取', async () => {
+  const { createUsageCache } = await import('../src/web/components/usage-cache.js');
+  let t = 1000;
+  const cache = createUsageCache(15_000, () => t);
+  assert.equal(cache.peek('30:24'), null, '第一次必须去请求');
+  cache.store('30:24', { summary: 'A' });
+  assert.deepEqual(cache.peek('30:24'), { summary: 'A' }, '窗口内应复用');
+  assert.equal(cache.peek('7:24'), null, '换周期不该复用别的周期的数据');
+  t += 14_999;
+  assert.deepEqual(cache.peek('30:24'), { summary: 'A' }, '窗口边界内仍复用');
+  t += 2;                                                  // 越过 15s
+  assert.equal(cache.peek('30:24'), null, '过期后应重新请求');
+  cache.store('30:24', { summary: 'B' });
+  cache.invalidate();
+  assert.equal(cache.peek('30:24'), null, '主动切换周期时应丢弃缓存');
+});

@@ -212,3 +212,41 @@ test('log-panel: 日志条目的每个字段都转义（日志内容含远端 st
   assert.doesNotMatch(html, INJECTED_TAG, '日志面板出现了真实注入标签');
   clearLogView();
 });
+
+// 日志去重键原先只看 ts|level|message：同一毫秒里两条同文案、不同上下文的日志（索引器对多个
+// 实例并发失败，message 相同、homeId 不同）会被当成重复 → 后一条直接丢掉，失败实例少一个。
+test('log-panel: 去重键包含 scope 与 fields，不同上下文的同文案日志不会被吞', async () => {
+  const { logEntryKey } = await import('../src/web/components/log-panel.js');
+  const base = { ts: '2026-09-12T04:00:00.000', level: 'error', scope: 'indexer', message: '索引该 home 失败' };
+  const a = logEntryKey({ ...base, fields: { homeId: 'A' } });
+  const b = logEntryKey({ ...base, fields: { homeId: 'B' } });
+  assert.notEqual(a, b, '不同 homeId 的两条日志必须有两个不同的键');
+  assert.equal(logEntryKey({ ...base, fields: { homeId: 'A' } }), a, '同一条日志重复到达时仍要去重');
+  assert.notEqual(a, logEntryKey({ ...base, scope: 'other', fields: { homeId: 'A' } }), 'scope 不同也要区分');
+});
+
+// 趋势图的 x 轴原先按「第几个非空桶」定位：空桶被过滤掉之后，23 小时的空白与相邻两小时
+// 在图上完全一样（实测：数据只在第 1 与第 24 个桶时，两个点画在 0% 与 100%，曲线还平滑连过去，
+// 读者会以为中间是逐步衰减）。修好后：x 按时间插值，跨空桶处断开折线。
+test('usage-card: 趋势图按时间定位 x，且跨空桶处断线', async () => {
+  const { usageTrendHtml } = await import('../src/web/components/usage-card.js');
+  const H = 3_600_000, t0 = Date.parse('2026-09-12T00:00:00.000Z');
+  const mk = (i, total) => ({ ts: new Date(t0 + i * H).toISOString(), groups: total ? { '合计': total } : {}, total });
+  const buckets = Array.from({ length: 24 }, (_, i) => mk(i, 0));
+  // 0 与 1 相邻（同一桶宽），1 与 23 之间隔了 21 个空桶 → 应断成两段
+  buckets[0].total = 1000; buckets[0].groups = { '合计': 1000 };
+  buckets[1].total = 500; buckets[1].groups = { '合计': 500 };
+  buckets[23].total = 300; buckets[23].groups = { '合计': 300 };
+  const usage = { trendBy: { total: { buckets, hours: 24, stepMs: H } } };
+  const html = usageTrendHtml(usage, 'total');
+
+  const lefts = [...html.matchAll(/class="trend-dot" style="left:([\d.]+)%/g)].map((m) => Number(m[1]));
+  assert.equal(lefts.length, 3, `应有 3 个数据点，实际 ${lefts.length}`);
+  // 第 2 个桶（1/23 ≈ 4.3%）不该被画在中间（按序号会是 50%，那样 21 小时空白就被压缩掉了）
+  assert.ok(Math.abs(lefts[0] - 0) < 0.01, `第一个点应在 0%，实际 ${lefts[0]}`);
+  assert.ok(Math.abs(lefts[1] - (1 / 23) * 100) < 1, `第 2 小时的桶应画在约 4.3%，实际 ${lefts[1]}`);
+  assert.ok(Math.abs(lefts[2] - 100) < 0.01, `最后一个点应在 100%，实际 ${lefts[2]}`);
+  // 0→1h 相邻（同一个桶宽内），1h→23h 跨了 21 个空桶 → 必须断成两条路径
+  const paths = (html.match(/<path /g) || []).length;
+  assert.equal(paths, 2, `跨空桶应断开折线（应为 2 条 path），实际 ${paths}`);
+});

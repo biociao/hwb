@@ -86,7 +86,10 @@ export function usageTrendHtml(usage, dim = 'total') {
   const buckets = Array.isArray(source?.buckets) ? source.buckets : [];
   const hours = source?.hours ?? 24;
   const stepMs = source?.stepMs ?? 3_600_000;
-  // 只画有数据（total>0）的桶，避免空桶把坐标拉扁。
+  // 只**画**有数据的桶（空桶会把曲线压扁），但**定位必须按时间**，不能按「第几个非空桶」：
+  // 过滤掉空桶之后，23 小时的空白与相邻的两个小时在图上长得一模一样 —— 独立审查实测：
+  // 数据只在第 1 与第 24 个桶时，两个点被画在 0% 与 100%，曲线还平滑连过去，
+  // 读者会以为中间是逐步衰减。这里保留全量桶用于时间轴（t0..t1），只跳过错点的绘制。
   const data = buckets.filter((b) => b.total > 0);
   if (data.length === 0) {
     return '<div class="empty">暂无 token 趋势数据（需先有被索引的活跃会话）</div>';
@@ -100,7 +103,16 @@ export function usageTrendHtml(usage, dim = 'total') {
 
   // 点图坐标（SVG viewBox 0..100；preserveAspectRatio=none，随容器横向拉伸）。
   // x：0..100 左→右；y：0..100 顶→底。数据点用 HTML 圆形散点（left%/bottom%）定位，不受拉伸变形。
-  const px = (i) => (n <= 1 ? 50 : (i / (n - 1)) * 100);
+  // x 按**时间**插值：整段窗口（含空桶）的首尾桶时间戳为端点。
+  const t0 = buckets.length ? Date.parse(buckets[0].ts) : 0;
+  const t1 = buckets.length ? Date.parse(buckets[buckets.length - 1].ts) : 0;
+  const span = t1 - t0;
+  const pxAt = (ts) => {
+    const t = Date.parse(ts);
+    if (!Number.isFinite(span) || span <= 0 || !Number.isFinite(t)) return n <= 1 ? 50 : 50;
+    return ((t - t0) / span) * 100;
+  };
+  const px = (i) => pxAt(data[i].ts);
   const py = (v) => (max > 0 ? (1 - Math.min(1, v / max)) * 100 : 100);
   const bottomOf = (v) => (max > 0 ? Math.min(1, v / max) * 100 : 0);
 
@@ -124,13 +136,23 @@ export function usageTrendHtml(usage, dim = 'total') {
     return d;
   }
 
+  // 相邻两个非空桶之间若隔了空桶（时间跨度超过 1.5 个桶宽），就**断开**折线：
+  // 跨空白区连一条平滑曲线等于替用户编了一段「逐步衰减」的假数据。
+  const contiguous = (a, b) => Date.parse(b.ts) - Date.parse(a.ts) <= stepMs * 1.5;
   const series = groups.map((g) => {
     const pts = data.map((b, i) => ({ x: px(i), y: py(b.groups[g] || 0) }));
-    return { g, path: smoothPath(pts), pts };
+    const paths = [];
+    let run = [];
+    for (let i = 0; i < pts.length; i++) {
+      if (run.length && !contiguous(data[i - 1], data[i])) { paths.push(smoothPath(run)); run = []; }
+      run.push(pts[i]);
+    }
+    if (run.length) paths.push(smoothPath(run));
+    return { g, paths, pts };
   });
   const lineSvg = `<svg class="trend-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${
-    series.map((s) => `<path d="${s.path}" fill="none" stroke="${colorOf(s.g)}"
-        stroke-width="${s.g === '合计' ? 2 : 1.6}" vector-effect="non-scaling-stroke"/>`).join('')
+    series.flatMap((s) => s.paths.map((d) => `<path d="${d}" fill="none" stroke="${colorOf(s.g)}"
+        stroke-width="${s.g === '合计' ? 2 : 1.6}" vector-effect="non-scaling-stroke"/>`)).join('')
   }</svg>`;
   const dots = series.flatMap((s) => s.pts.map((p, i) => {
     const v = data[i].groups[s.g] || 0;

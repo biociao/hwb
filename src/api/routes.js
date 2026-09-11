@@ -113,6 +113,40 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
   // 但「不 await」不等于「不管」：返回的 promise 一旦拒绝就是未处理拒绝，
   // 会被 crash handler 记成 fatal 并掩盖真正的失败原因。这里统一吞掉——
   // 索引本身已经把失败写进 homes.status/degraded 并通过 SSE 广播出去了。
+  // `/api/usage` 是**八个同步 SQLite 聚合**（node:sqlite 没有异步接口），而整个服务是单线程的：
+  // 这段时间里所有 HTTP 请求、SSE 推送、30s 心跳全部停住。真实规模下实测（40k 会话）合计
+  // **~330ms**；而前端原先**每次渲染都取一次用量**，渲染又由 SSE 驱动（每 3s 一次）——
+  // 于是「开着一个大库的工作台」就是每 3 秒冻一次。索引层已经是覆盖索引
+  // （SEARCH sessions USING COVERING INDEX idx_sessions_activity），慢的是逐行 json_extract。
+  //
+  // 这里加一层很短的 TTL 记忆：同一组参数 10s 内只算一次，多标签页/多客户端共享同一份结果，
+  // 把请求频率直接压到 1/10。用量面板统计的是历史，滞后 10 秒无感；代价是尖峰仍在
+  // （每 10s 一次 ~330ms，不再是每 3s 一次）。要彻底消除尖峰得把 token 总量落成列（去 json_extract），
+  // 那是一次 schema 迁移，留作后续工作 —— 这里先把它从「常态卡顿」降到「偶发尖峰」。
+  const USAGE_TTL_MS = 10_000;
+  const USAGE_MEMO_MAX = 32;
+  const usageMemo = new Map();   // `${days}:${hours}` -> { at, body }
+  const usagePayload = (days, hours) => {
+    const key = `${days}:${hours}`;
+    const hit = usageMemo.get(key);
+    if (hit && Date.now() - hit.at < USAGE_TTL_MS) return hit.body;
+    const body = {
+      summary: store.usageSummary({ days }),
+      trend: store.usageTrend({ hours }),
+      byProject: store.usageByProject({ days }),
+      trendBy: {
+        total: store.usageTrendGrouped({ dimension: 'total', hours }),
+        project: store.usageTrendGrouped({ dimension: 'project', hours }),
+        instance: store.usageTrendGrouped({ dimension: 'instance', hours }),
+        provider: store.usageTrendGrouped({ dimension: 'provider', hours }),
+        model: store.usageTrendGrouped({ dimension: 'model', hours }),
+      },
+    };
+    if (usageMemo.size >= USAGE_MEMO_MAX) usageMemo.clear();   // 键的取值空间很小，防的是异常调用
+    usageMemo.set(key, { at: Date.now(), body });
+    return body;
+  };
+
   const reindexInBackground = (homeId) => {
     try {
       // Promise.resolve(...) 同时容纳「返回 promise」与「返回 undefined」两种实现；
@@ -450,18 +484,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       const days = numParam(searchParams.get('days'), 30, 1, 365);
       // hours 支持到 30 天（24 * 30 = 720），对应「过去 30 天」统计周期。
       const hours = numParam(searchParams.get('hours'), 24, 1, 24 * 30);
-      send(res, 200, {
-        summary: store.usageSummary({ days }),
-        trend: store.usageTrend({ hours }),
-        byProject: store.usageByProject({ days }),
-        trendBy: {
-          total: store.usageTrendGrouped({ dimension: 'total', hours }),
-          project: store.usageTrendGrouped({ dimension: 'project', hours }),
-          instance: store.usageTrendGrouped({ dimension: 'instance', hours }),
-          provider: store.usageTrendGrouped({ dimension: 'provider', hours }),
-          model: store.usageTrendGrouped({ dimension: 'model', hours }),
-        },
-      });
+      send(res, 200, usagePayload(days, hours));
       return;
     }
     if (req.method === 'GET' && pathname === '/api/logs') {
