@@ -160,6 +160,7 @@ function shutdown(reason = 'signal') {
   livePoller.stop();
   indexer.stop();
   monitor.stop();
+  hub.close(); // 清掉 SSE 心跳定时器并断开所有客户端，避免退出时残留句柄
   server.close();
   store.close();
   process.exit(0); // 'exit' 事件里 Launcher 会杀掉所有 dsh web 子进程

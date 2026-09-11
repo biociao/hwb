@@ -51,11 +51,39 @@ async function serveStatic(webRoot, pathname, req, res) {
 }
 
 // Listens on 127.0.0.1 only, no auth (§11).
+// API 只接受回环地址的 Host —— DNS rebinding 防护。
+//
+// 「只监听 127.0.0.1 + 无鉴权」并不足以限定谁能访问：攻击者可以把自己的域名解析到 127.0.0.1，
+// 让受害者的浏览器直接连上本机端口。此时请求里 Host 与 Origin 都是攻击者的域名、
+// Sec-Fetch-Site 甚至是 same-origin，所以 routes.js 里那套同源检查会**全部通过**
+// （它比较的两个值都由攻击者控制）。唯一能区分「本机页面」与「rebinding 页面」的信号就是
+// Host 是否指向回环地址本身。
+//
+// 实测影响面（未加此校验时）：跨站页面可读到 GET /api/homes 返回的 dsh token 与本地路径、
+// 经 preview/download 读取工作区文件、并经 upload 写入文件。
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+export function isLoopbackHost(hostHeader) {
+  const raw = String(hostHeader ?? '').trim();
+  if (!raw) return false;
+  // 去掉端口；IPv6 字面量是 [::1]:4310 这种形式，先剥方括号再取冒号前的部分。
+  const hostname = raw.startsWith('[') && raw.includes(']')
+    ? raw.slice(1, raw.indexOf(']'))
+    : raw.split(':')[0];
+  return LOOPBACK_HOSTNAMES.has(hostname.toLowerCase());
+}
+
 export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot }) {
   const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {
+      if (!isLoopbackHost(req.headers.host)) {
+        log.warn('拒绝非回环 Host 的 API 请求（疑似 DNS rebinding）', { host: req.headers.host, path: url.pathname });
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'API 仅接受来自本机回环地址的请求' }));
+        return;
+      }
       route(req, res, url).catch((e) => {
         // API 处理抛错：记录请求路径 + 错误栈，返回 500；前端能拿到 message，日志能还原根因。
         log.error('API 请求处理失败', e, { method: req.method, path: url.pathname });

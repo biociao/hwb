@@ -108,7 +108,14 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
               if (!match.groups.filename) { state = 'field'; continue; } // 非文件字段（如 dir）：值在 body 里，读完丢弃
               partOpen = true;
               try {
-                if (!onFileStart(decodeURIComponent(match.groups.filename))) return fail('上传请求格式无效');
+                // 浏览器发的 filename 是**原样**的（只对 `"` 做转义），并不做百分号编码。
+                // 因此 decodeURIComponent 只对「我们自己/旧客户端编码过」的名字有意义；
+                // 对含裸 `%` 的合法文件名（`100% done.csv`、`R&D 100% x.csv`）它会抛
+                // URIError: URI malformed，整个上传被拒并报一句令人困惑的「格式无效」。
+                // 这里解码失败就按原样使用——writeUpload 还会再规范化一次文件名。
+                let name = match.groups.filename;
+                try { name = decodeURIComponent(name); } catch { /* 含裸 % 的真实文件名：保持原样 */ }
+                if (!onFileStart(name)) return fail('上传请求格式无效');
               } catch (e) { return fail(e.message || '文件名无效'); }
             }
           }
@@ -119,11 +126,20 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
           //     也天然避免了「最后写出去的恰好是文件内容」这条歧义路径；
           //   · 找不到完整分隔符时就保留末尾 hold 字节（可能只是分隔符的一部分）继续等数据，
           //     其余立刻写盘，因此缓冲区占用与文件大小无关。
+          // 候选位置必须**顺序**找，且不能每个 cursor 都重扫一遍：
+          // 原实现是 `for (cursor = 0; …; cursor++) if (buffer.indexOf(delimiter, cursor) !== cursor) continue;`
+          // ——每前进一步就把剩余缓冲区整段重扫一次，而「缓冲区里没有分隔符」正是文件内容的常态，
+          // 于是退化成 O(n²)：实测每 64 KiB 内容块 46 ms，合法的 256 MiB 上传会把事件循环冻住
+          // 约 3 分钟（工作台的 SSE、监控心跳、所有 API 一起卡住）。
+          // 改为「一次 indexOf 取下一个出现位置，不是完整分隔符就继续往后找」，总代价与缓冲区长度线性相关。
+          // 语义不变：仍然从前往后取**最早出现的完整**分隔符。
           let at = -1;
-          for (let cursor = 0; cursor <= buffer.length - delimiter.length - 2; cursor++) {
-            if (buffer.indexOf(delimiter, cursor) !== cursor) continue;
-            const next = delimiter.length + cursor;
-            if ((buffer[next] === 0x0d && buffer[next + 1] === 0x0a) || (buffer[next] === 0x2d && buffer[next + 1] === 0x2d)) { at = cursor; break; }
+          for (let from = 0; from <= buffer.length - delimiter.length - 2;) {
+            const i = buffer.indexOf(delimiter, from);
+            if (i < 0) break;
+            const next = i + delimiter.length;
+            if ((buffer[next] === 0x0d && buffer[next + 1] === 0x0a) || (buffer[next] === 0x2d && buffer[next + 1] === 0x2d)) { at = i; break; }
+            from = i + 1;
           }
           if (at < 0) {
             if (flush) return fail('\u4e0a\u4f20\u8bf7\u6c42\u4e0d\u5b8c\u6574');

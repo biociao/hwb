@@ -16,20 +16,42 @@ function send(res, status, body) {
 
 const JSON_BODY_LIMIT = 64 * 1024;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+// 带 code 的错误：路由的 catch 需要据此区分「包太大」与「JSON 非法」，否则前者的真实原因
+// 会被统一成无效 JSON，前端只能提示一个误导性的错误。
+const bodyTooLarge = () => Object.assign(new Error('body too large'), { code: 'BODY_TOO_LARGE' });
 
 async function readJsonBody(req) {
+  // Content-Length 先判：能在读第一个字节之前就拒绝（也避免读一个明知会超限的大包）。
+  const declared = Number(req.headers?.['content-length']);
+  if (Number.isFinite(declared) && declared > JSON_BODY_LIMIT) throw bodyTooLarge();
+  // 显式按 UTF-8 解码：异步迭代器给的是 Buffer，`raw += chunk` 会对**每个 TCP 分片**单独
+  // toString('utf8')，一个多字节字符（中文、emoji）若正好被分片切开就会变成 U+FFFD——而且
+  // 结果仍是合法 JSON，所以只会静默存进一个乱码的别名/host 才被发现。setEncoding 让
+  // StringDecoder 跨分片拼接，边界由它负责。
+  req.setEncoding?.('utf8');
   let raw = '';
   let bytes = 0;
   for await (const chunk of req) {
-    // 边收边限：超限立刻断开，不把整个请求体读进内存（否则 64 KiB 限制形同虚设）。
+    // 边收边限：没有 Content-Length（chunked）时也不能把整个包读进内存。
+    // 注意**不要** req.destroy()：那会把 socket 一起销毁，调用方随后的 400 响应写不出去，
+    // 客户端只能看到 EPIPE，反而分不清「包太大」和「服务已死」。这里只是停止读取，
+    // 由 Node 在响应写完后自行关闭这条 keep-alive 连接。
     bytes += Buffer.byteLength(chunk);
-    if (bytes > JSON_BODY_LIMIT) {
-      req.destroy?.();
-      throw new Error('body too large');
-    }
+    if (bytes > JSON_BODY_LIMIT) throw bodyTooLarge();
     raw += chunk;
   }
   return raw ? JSON.parse(raw) : {};
+}
+
+// 统一把 readJsonBody 的失败翻译成 400（包太大 → 原样透出，JSON 非法 → 固定文案）。
+// 返回 null 表示已响应，调用方直接 return 即可。
+async function readJsonBodyOr400(req, res) {
+  try {
+    return await readJsonBody(req);
+  } catch (error) {
+    send(res, 400, { error: error.code === 'BODY_TOO_LARGE' ? error.message : 'invalid JSON body' });
+    return null;
+  }
 }
 
 // 跨站写保护。hwb 只监听 127.0.0.1 且无鉴权（架构文档 §11），所以浏览器里的任意页面都能
@@ -163,13 +185,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
     if (req.method === 'POST' && pathname === '/api/homes') {
-      let body;
-      try {
-        body = await readJsonBody(req);
-      } catch {
-        send(res, 400, { error: 'invalid JSON body' });
-        return;
-      }
+      const body = await readJsonBodyOr400(req, res);
+      if (body === null) return;
       if (body.endpoints !== undefined) {
         try {
           body.endpoints = normalizeEndpoints(body.endpoints, body.hostType || 'local');
@@ -242,13 +259,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 404, { error: `unknown homeId ${delHome[1]}` });
         return;
       }
-      let body;
-      try {
-        body = await readJsonBody(req);
-      } catch {
-        send(res, 400, { error: 'invalid JSON body' });
-        return;
-      }
+      const body = await readJsonBodyOr400(req, res);
+      if (body === null) return;
       if (connecting.has(instanceKey(home))) {
         send(res, 409, { error: '请先断开连接再修改实例配置' });
         return;
@@ -339,13 +351,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
     if (req.method === 'POST' && pathname === '/api/homes/order') {
-      let body;
-      try {
-        body = await readJsonBody(req);
-      } catch {
-        send(res, 400, { error: 'invalid JSON body' });
-        return;
-      }
+      const body = await readJsonBodyOr400(req, res);
+      if (body === null) return;
       const ids = Array.isArray(body.homeIds) ? body.homeIds : null;
       if (!ids || !ids.every((id) => typeof id === 'string' && store.getHome(id))) {
         send(res, 400, { error: 'homeIds must be a non-empty array of known homeIds' });
@@ -462,8 +469,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'POST' && switchHome) {
       const home = store.getHome(switchHome[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
-      let body;
-      try { body = await readJsonBody(req); } catch { send(res, 400, { error: 'invalid JSON body' }); return; }
+      const body = await readJsonBodyOr400(req, res);
+      if (body === null) return;
       const endpoint = home.endpoints?.find((e) => e.id === body.endpointId);
       if (!endpoint) { send(res, 400, { error: '未知连接端点' }); return; }
       const key = instanceKey(home);

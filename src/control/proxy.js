@@ -182,6 +182,13 @@ function forwardRequest(req, res, hostname, port, preview) {
 
 // 转发 WebSocket 升级。
 function forwardUpgrade(req, socket, head, hostname, port) {
+  // 客户端 socket 的 error 监听必须在**任何异步等待之前**挂上。从收到 upgrade 请求到上游回 101
+  // 之间存在一段空窗（经 ssh -L 隧道可达数百毫秒），这期间浏览器关标签页/断网会让 socket 抛
+  // ECONNRESET；没有监听就是 uncaughtException → 整个 hwb 进程退出，并连带杀掉所有托管的
+  // dsh web 子进程。原先 `socket.on('error', noop)` 写在 upstream 'upgrade' 回调内部，
+  // 覆盖不到这段空窗（实测：上游挂起不应答 + 客户端 resetAndDestroy ⇒ ECONNRESET 打穿进程）。
+  const noop = () => {};
+  socket.on('error', noop);
   const headers = { ...req.headers };
   for (const h of ['proxy-connection']) delete headers[h];
   const upstream = http.request({
@@ -191,22 +198,31 @@ function forwardUpgrade(req, socket, head, hostname, port) {
     method: req.method,
     headers,
   });
-  upstream.on('upgrade', (upRes, upSocket, upHead) => {
+  // 空窗内的拆除也必须在这里建立，不能只放在 'upgrade' 回调里：
+  // 若客户端在上游回 101 **之前**就走了，这个挂起中的 upstream 请求没有任何人中止，
+  // 它会连着自己的 socket 一直挂着（代理侧泄漏；实测会让持有它的进程无法干净退出）。
+  // upgraded 标记用于区分「已交出 socket」与「仍在等 101」——升级成功后 socket 归 upSocket，
+  // 此时再 destroy upstream 反而会把刚建立的隧道拆掉。
+  let closed = false;
+  let upgraded = false;
+  let upSocket = null;
+  const teardown = () => {
+    if (closed) return;
+    closed = true;
+    if (!upgraded) upstream.destroy();
+    upSocket?.destroy();
+    socket.destroy();
+  };
+  socket.on('close', teardown);
+  upstream.on('upgrade', (upRes, upSocketIn, upHead) => {
     // 对端（浏览器 / SSH 隧道）可能在升级握手中途断开：此时向已关闭的 socket 写入会抛 EPIPE。
     // 若不挂 error 监听，EPIPE 会以 uncaughtException 打穿整个 hwb 进程——曾在写响应头时
     // （@proxy.js:103）触发并连带杀掉本地 dsh web 子进程（见 hwb.log 14:53:26 uncaughtException）。
     // 连接没了本就不该崩，这里是代理最常见的退化路径：吞掉 error、静默拆除即可。
-    const noop = () => {};
-    let closed = false;
-    const teardown = () => {
-      if (closed) return;
-      closed = true;
-      socket.destroy();
-      upSocket.destroy();
-    };
-    socket.on('close', teardown);
+    upgraded = true;
+    upSocket = upSocketIn;
+    if (closed) { upSocket.destroy(); return; }
     upSocket.on('close', teardown);
-    socket.on('error', noop);
     upSocket.on('error', noop);
     const safeWrite = (sock, chunk) => {
       if (closed) return;
@@ -221,7 +237,7 @@ function forwardUpgrade(req, socket, head, hostname, port) {
     upSocket.pipe(socket);
     socket.pipe(upSocket);
   });
-  upstream.on('response', () => socket.destroy());
-  upstream.on('error', () => socket.destroy());
+  upstream.on('response', () => teardown());
+  upstream.on('error', () => teardown());
   upstream.end();
 }

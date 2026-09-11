@@ -219,6 +219,12 @@ export class Launcher {
     });
     let stderr = '';
     const lastStderr = (n = 8) => stderr.trim().split('\n').slice(-n).join('\n');
+    // spawn 的失败（PATH 里没有 dsh、dsh 不可执行）是**异步**以 'error' 事件上报的，
+    // 而且它会绕过 'exit'；没有监听就变成 uncaughtException → installCrashHandlers 直接
+    // process.exit(1)，连带 SIGTERM 掉所有托管的 dsh web 子进程。挂上监听后 Node 会把
+    // proc.exitCode 置为 -2，下方的 waitForHttp 轮询据此立即失败，走既有的错误分支，
+    // 用户看到的是「dsh web did not come up」，而不是整个 hwb 消失。
+    proc.on('error', (e) => { stderr += `spawn error: ${e.message}\n`; });
     proc.stderr.on('data', (d) => {
       stderr += d;
       if (stderr.length > 32 * 1024) stderr = stderr.slice(-16 * 1024);
@@ -461,10 +467,15 @@ export function localWebUrl(base, tokenFragment) {
 export function captureDshToken(proc, timeoutMs) {
   return new Promise((resolve) => {
     let buf = '';
+    // 提前绑定：spawn 失败（PATH 里没有 dsh）时 'exit' **永远不会触发**，只有 'error' 会。
+    // 只等 'exit' 的话这个 Promise 要挂到 timeoutMs 才 settle，白白拖住 Promise.all，
+    // 而调用方其实已经能从 exitCode(-2) 判断失败并抛出更准确的错误。
+    const onError = () => settle(null);
     const settle = (fragment) => {
       clearTimeout(timer);
       proc.stdout.off('data', onData);
       proc.off('exit', onExit);
+      proc.off('error', onError);
       resolve(fragment);
     };
     const onExit = () => settle(null);
@@ -485,6 +496,7 @@ export function captureDshToken(proc, timeoutMs) {
     const timer = setTimeout(() => settle(null), timeoutMs);
     proc.stdout.on('data', onData);
     proc.on('exit', onExit);
+    proc.on('error', onError);
   });
 }
 

@@ -43,6 +43,66 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 两条「一次失败 = 整个工作台退出」的进程级崩溃路径（src/control/launcher.js + src/control/proxy.js）
+- **本机拉起 dsh 时 spawn 失败**：`spawn('dsh', …)` 的失败（PATH 里没有 dsh、dsh 不可执行）是
+  **异步**通过 `'error'` 事件上报的，而且**不触发 `'exit'`**。原先没有 `'error'` 监听，Node 把它
+  当 uncaughtException 抛出 → `installCrashHandlers` 直接 `process.exit(1)` → Launcher 的
+  `process.on('exit')` 钩子再 SIGTERM 掉**所有**已托管的 dsh web 子进程。
+  也就是说「dsh 不在 PATH 里」（nvm/local-bin 路径不一致时的常见情况）会让整个工作台连同其它实例一起消失，
+  而不是显示一句「连接失败」。挂上 `'error'` 后 Node 会把 `exitCode` 置为 -2，既有的等待逻辑据此
+  立即失败并给出 `dsh web did not come up`；`captureDshToken` 也补了同样的监听（原先只等 `'exit'`，
+  失败时要空等满 20s 超时）。
+- **WebSocket 升级握手空窗内的 ECONNRESET**：从客户端发出 Upgrade 到上游回 101 之间有一段空窗
+  （经 ssh -L 隧道可达数百毫秒）。原先 `socket.on('error', noop)` 写在 upstream 的 `'upgrade'`
+  回调**内部**，覆盖不到这段空窗，空窗里关标签页就在 `TCP.onStreamRead` 抛 ECONNRESET → 同样打穿进程。
+  监听改到 `forwardUpgrade` 开头。**顺带修掉一个泄漏**：空窗内客户端离开时，挂起中的 upstream 请求
+  没有任何人中止，会连着自己的 socket 一直挂着（会让持有它的进程无法干净退出）。
+- **回归测试**：`tests/launcher-spawn-failure.test.js`（把 PATH 指向空目录后真的点一次「连接」）、
+  `tests/proxy-upgrade.test.js`（上游「接受连接但永不回应」以拉长空窗，再在空窗内 `resetAndDestroy`）。
+  两者在还原修复前都复现出 `uncaughtException`（`spawn dsh ENOENT` / `read ECONNRESET`）。
+
+#### multipart 分隔符扫描退化成 O(n²)：合法的大文件上传会冻住整个工作台（src/lib/multipart.js）
+- **现象**：扫描写成 `for (cursor = 0; …; cursor++) if (buffer.indexOf(delimiter, cursor) !== cursor) continue;`
+  ——每前进一步就把剩余缓冲区整段重扫一次，而「缓冲区里没有分隔符」恰好是文件内容的常态。
+  实测每 64 KiB 内容块 36 ms，64 MiB 上传约 41 s；允许上限 256 MiB 时约 3 分钟。
+  hwb 是单进程单线程，这段时间里 SSE、监控心跳、索引、所有 API 全部停止响应。
+- **修复**：改成「一次 `indexOf` 取下一个出现位置，不是完整分隔符就继续往后找」，总代价与缓冲区长度线性。
+  实测同一数据量从 41 s 降到毫秒级；16 KiB/64 KiB/256 KiB 单块扫描从 3.6/35.8/537 ms 降到
+  0.014/0.003/0.009 ms，且结果完全一致。
+- **回归测试**：`tests/multipart-hardening.test.js`——8 MiB 上传必须 < 1500 ms（修复后约 5 ms），
+  并断言「数据翻 4 倍耗时不得接近翻 16 倍」以直接捕捉二次增长特征。
+
+#### 浏览器发来的文件名含裸 `%` 时整个上传被拒（src/lib/multipart.js）
+- 浏览器发的 `filename=` 是**原样**的（只转义 `"`），并不做百分号编码。原先无条件
+  `decodeURIComponent(filename)`，于是 `100% done.csv`、`R&D 100% x.csv`、`a%zz.txt` 这类合法文件名
+  会抛 `URIError: URI malformed`，整个上传被拒并报一句「上传请求格式无效」。
+  （测试夹具里对名字做了 `encodeURIComponent`，所以 CI 一直看不到。）
+- **修复**：解码失败就按原样使用（`writeUpload` 还会再规范化一次文件名）；旧客户端传来的
+  已编码名字仍然照常解码。回归测试同时覆盖这两种输入。
+
+#### 远端 `test -d` 路径未加引号：正常路径被误判不可访问，且可注入远端命令（src/control/prober.js）
+- **现象**：`~` 开头的 `remoteHome` 是裸拼进 `ssh host "<cmd>"` 的。该字符串由**远端登录 shell**
+  解释，于是 `~/my dsh` 会让 `test -d` 收到多个参数、以 exit 2 失败，一个完全正常的路径被判成
+  「远端 dsh home 不可访问」而拒绝连接；`;` / `$()` 更会被远端直接执行
+  （`remoteHome` 只经过 `trim()` 校验，不像 `host` 那样有字符白名单）。
+- **修复**：`~` 与 `~user` 之外一律单引号引用；`~` 需要展开，所以用 `"$HOME"` + 单引号字面量**拼接**
+  （实测 `"$HOME"'/x'` 正确展开）。**不能用双引号**：双引号里 `$(...)` 仍会执行，
+  实测 `"$HOME/a$(echo LEAKED)"` 会真的产生 `LEAKED`。
+- 说明：`~user/x` 现在按字面量处理，与 `remote.js` / `dshhome/remote-reader.js` 的 `expandHome`
+  行为一致（它们同样只把开头的 `~` 换成 `$HOME`）；跨用户路径请写绝对路径。
+- **回归测试**：`tests/prober-ssh-path.test.js`——直接断言生成的远端命令，并在真 bash 下验证
+  `~` 仍展开、`$(echo PWNED)` 原样保留。
+
+#### SSE 没有背压：一个不读数据的标签页就能把进程拖到 OOM（src/api/sse.js + src/server.js）
+- `broadcast` 原先只做 `res.write(payload)` 且忽略返回值。客户端**连着但不再读**（合盖的笔记本、
+  被节流的标签页、NAT 半开、只连不读的 curl）时 socket 不报错也不关闭，每次广播都堆进它的写队列。
+  实测一个卡住的客户端 + 40 次 256 KiB 广播 ⇒ `writableLength` 涨到 10 MiB 且永不回落。
+- **修复**：广播前检查 `writableLength`，超过上限（4 MiB）的客户端直接 `destroy` 并移出；
+  另外加 30s 心跳（写入失败或已销毁也一并清理）。被断开的是浏览器 EventSource，它会自动重连，
+  重连后重新拉全量状态，不丢数据。`hub.close()` 在 shutdown 时清理定时器与客户端。
+- **回归测试**：`tests/sse.test.js`（卡住客户端被移除且写队列被限制在上限附近；正常客户端不受影响；
+  心跳剔除已销毁客户端；写抛错不再二次抛出）。
+
 #### 存储型 XSS：会话状态的 approval 未转义，可突破 title 属性（src/web/components/recent-sessions.js）
 - **现象**：状态 chip 把 `permissions.approval` 直接拼进 `title="状态: … ${approve} …"`，而同一个表达式
   里 `label` 是转义的、`approval` 不是。值里带 `">` 就能提前闭合属性并注入任意标签，例如
@@ -93,8 +153,26 @@ Semantic Versioning.
 #### JSON 请求体上限形同虚设：超限必须读完整包才报错（src/api/routes.js）
 - `readJsonBody` 先把整个请求体累加进字符串，读完之后才判断 `> 64 KiB`；也就是说 64 KiB 的
   「上限」不提供任何内存保护，一个超大 body 仍会被完整缓冲。
-- 改为**边收边计**：累计字节数一超限就 `req.destroy()` 并抛错，不再继续读；测试用 100 个 1 KiB
-  分片断言实际只读了 ≤66 个分片。
+- 改为**边收边计**：先看 `Content-Length`（能不读一个字节就拒），没有时按实际累计字节在超限处停下；
+  测试用 100 个 1 KiB 分片断言实际只读了 ≤66 个分片。
+- **不要 `req.destroy()`**：第一版修复在超限时 destroy 了 socket，结果调用方随后的 400 响应
+  根本写不出去，客户端只能看到 EPIPE —— 反而分不清「包太大」和「服务已死」。现在只停止读取，
+  由 Node 在响应写完后关闭这条 keep-alive 连接；`tests/api-server-hardening.test.js` 用真实
+  socket 断言能收到 `400 {"error":"body too large"}`。
+- 同时修掉一个只在真实分片下才暴露的静默错误：`raw += chunk` 会对**每个 TCP 分片**单独
+  `toString('utf8')`，多字节字符（中文、emoji）正好被切开就变成 U+FFFD，而结果仍是合法 JSON，
+  于是乱码被静默存进别名 / host。改为 `req.setEncoding('utf8')`，由 `StringDecoder` 跨分片拼接。
+
+#### DNS rebinding：跨站写保护看不到的一种攻击（src/api/server.js）
+- 上一节加的同源检查比较的是 `Origin` 与 `Host` —— 这两个值在 DNS rebinding 下**都由攻击者控制**：
+  攻击者把域名解析到 127.0.0.1，浏览器就会带着 `Host: evil.example:4310`、
+  `Origin: http://evil.example:4310`、`Sec-Fetch-Site: same-origin` 直连本机端口，三项检查全部通过。
+  实测（未加校验时）：跨站页面可以读到 `GET /api/homes` 里明文返回的 dsh token 与本地路径、
+  经 `preview`/`download` 读工作区文件、经 `upload` 写入文件。
+- **修复**：`/api/*` 只接受回环地址的 Host（`127.0.0.1` / `localhost` / `::1`，含端口与 IPv6 方括号形式），
+  否则 403 并记一条 warn 日志。这是唯一能区分「本机页面」与「rebinding 页面」的信号。
+- **回归测试**：`tests/api-server-hardening.test.js` 起真实 HTTP 服务，断言伪造 Host 的读写请求都是 403
+  且响应里不含 token，回环 Host 正常。
 
 #### 文件预览不再依赖「内嵌页上报会话」这一条链路（src/web/components/file-preview.js）
 - **现象**：侧栏能打开，但一直显示「请先在 dsh 中打开项目会话，预览会自动绑定其工作区」，
