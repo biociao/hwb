@@ -85,6 +85,13 @@ export const adapters = [
 ];
 
 // provider → { remaining, currency } 或 { error }。永不抛错。
+//
+// 注意 error 会**原样**出现在未经鉴权的 GET /api/quota 响应里，所以绝不能把 `e.message`
+// 直接转发出去：Node 的 fetch 在 header 值非法时会抛
+//   `Headers.append: "Bearer sk-…" is an invalid header value.`
+// —— 消息里带着 key 本身。实测一个含控制字符的 key 就能把明文 key 送进响应，
+// 而那条不变量（§8.1「key NEVER 传给浏览器」）本来就是本文件开头写下的承诺。
+// 技术细节只记服务端日志，客户端只拿到一个分类过的原因。
 export async function queryBalance({ provider, key }, fetchImpl = fetch) {
   const adapter = adapters.find((a) => a.match(provider));
   if (!adapter) return { provider, error: 'no adapter' };
@@ -92,6 +99,28 @@ export async function queryBalance({ provider, key }, fetchImpl = fetch) {
     const r = await adapter.fetchBalance(key, fetchImpl);
     return { provider, ...r };
   } catch (e) {
-    return { provider, error: e.message };
+    logBalanceFailure(provider, e);
+    return { provider, error: classifyBalanceError(e) };
   }
+}
+
+// 适配器**主动**抛出的、本身就是给用户看的原因（如「无公开余额 API」）—— 原样保留。
+// 只有技术性错误才需要被分类，因为技术消息可能带上请求内容（header 值 = key）。
+const INTENTIONAL = new Set(['no public balance API']);
+
+// 只回一个不含任何请求内容的短分类，供 UI 展示。
+function classifyBalanceError(e) {
+  const msg = String(e?.message ?? e);
+  if (INTENTIONAL.has(msg)) return msg;
+  if (/invalid header value/i.test(msg)) return '凭证格式无效（含非法字符）';
+  if (/HTTP 401|HTTP 403/.test(msg)) return '凭证被拒绝（401/403）';
+  if (/HTTP \d+/.test(msg)) return `上游返回错误（${/HTTP \d+/.exec(msg)[0]}）`;
+  if (/timeout|aborted/i.test(msg)) return '查询超时';
+  return '余额查询失败';
+}
+
+function logBalanceFailure(provider, e) {
+  try {
+    process.emitWarning(`[balance] ${provider} 查询失败: ${String(e?.message ?? e).slice(0, 200)}`);
+  } catch { /* 日志失败不影响返回值 */ }
 }

@@ -19,6 +19,13 @@ function makeServer({ allowedHosts = [] } = {}) {
       registerHome: (body) => { registered.push(body); return 'newhome'; },
       listWorkspaces: () => [],
       getSession: () => null,
+      // 这几个查询会被「极端查询参数」用例打到；返回空结构即可，测的是**参数解析**不抛错。
+      recentProjects: () => [],
+      recentSessions: () => [],
+      usageSummary: () => ({ sessionCount: 0 }),
+      usageByProject: () => [],
+      usageTrend: () => [],
+      usageTrendGrouped: () => ({ buckets: [] }),
     },
     indexer: { reindexNow: async () => [] },
     hub: { broadcast() {}, handle() {} },
@@ -164,4 +171,19 @@ test('真实服务：放行的 Host 能访问，未放行的仍然 403', async (
 
   const denied = await rawRequest(port, { path: '/api/homes', host: `evil.example:${port}` });
   assert.equal(statusOf(denied), 403, '未放行的 Host 仍必须拒绝');
+});
+
+// 查询参数里的数值必须带上下界：`Number(x) || fallback` 只挡得住 0/NaN/'abc'，
+// 挡不住 `?days=1e9` —— 那会一路传到 `new Date(Date.now() - days*86400000).toISOString()`，
+// 超出 ECMAScript 日期范围后 toISOString 抛 RangeError，请求变成 500。
+test('极端查询参数不再把接口打成 500', async (t) => {
+  const { port } = await listen(t);
+  const paths = ['/api/projects/recent', '/api/sessions/recent', '/api/usage'];
+  const queries = ['days=1e9', 'days=999999999999', 'days=-5', 'days=abc', 'days=Infinity', 'hours=1e12', 'limit=1e20'];
+  for (const path of paths) {
+    for (const q of queries) {
+      const raw = await rawRequest(port, { path: `${path}?${q}` });
+      assert.equal(statusOf(raw), 200, `${path}?${q} 应为 200，实际 ${statusOf(raw)}`);
+    }
+  }
 });

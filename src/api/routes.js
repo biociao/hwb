@@ -1,5 +1,5 @@
 import { openWorkspaceInFinder } from '../lib/open-workspace.js';
-import { normalizeEndpoints, endpointPatch } from '../lib/endpoints.js';
+import { normalizeEndpoints, endpointPatch, assertSshHost } from '../lib/endpoints.js';
 import { normalizeAccessPort } from '../lib/access-port.js';
 import { instanceKey } from '../web/instance-state.js';
 import { existsSync, statSync } from 'node:fs';
@@ -12,6 +12,20 @@ function send(res, status, body) {
   const json = JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(json);
+}
+
+// 查询参数里的数值必须**带上下界**解析。
+// `Number(x) || fallback` 只挡得住 0/NaN/'abc'，挡不住 `?days=1e9` —— 那会一路传到
+// `new Date(Date.now() - days * 86_400_000).toISOString()`，超出 ECMAScript 日期范围后
+// toISOString 抛 RangeError，请求变成 500（实测 /api/projects/recent?days=1e9）。
+function numParam(raw, fallback, min, max) {
+  // 参数**缺失**时必须走 fallback，不能落进下面的数值分支：
+  // `Number(null)` 是 0（有限数），会被夹到 min —— 于是「不传 days」变成 days=1，
+  // 默认窗口从 7 天缩成 1 天（这是真踩到过的：/api/projects/recent 少了 7 天内的空工作区）。
+  if (raw === null || raw === undefined || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
 const JSON_BODY_LIMIT = 64 * 1024;
@@ -226,6 +240,10 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
           send(res, 400, { error: 'remote instance requires a non-empty host and a numeric remotePort' });
           return;
         }
+        // 必须在 registerHome 之前校验：registerHome 先 INSERT homes，随后 updateHomeConfig
+        // 才做端点校验；校验放在后面会变成「返回 500、但实例已经建好了」——
+        // 用户看到添加失败，实例却出现在列表里且索引永远失败，只能手工删。
+        try { assertSshHost(host); } catch (error) { send(res, 400, { error: error.message }); return; }
         const remoteHome = typeof body.remoteHome === 'string' && body.remoteHome.trim() ? body.remoteHome.trim() : null;
         const remoteCmd = typeof body.remoteCmd === 'string' && body.remoteCmd.trim() ? body.remoteCmd.trim() : null;
         const remoteLog = typeof body.remoteLog === 'string' && body.remoteLog.trim() ? body.remoteLog.trim() : null;
@@ -318,6 +336,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
             send(res, 400, { error: 'host is required for remote instance' });
             return;
           }
+          try { assertSshHost(body.host.trim()); } catch (error) { send(res, 400, { error: error.message }); return; }
           patch.host = body.host.trim();
         }
         if (body.remotePort !== undefined) {
@@ -381,8 +400,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       send(res, 200, {
         projects: store.recentProjects({
           homeIds: store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId),
-          days: Number(searchParams.get('days')) || 7,
-          limit: Number(searchParams.get('limit')) || 20,
+          days: numParam(searchParams.get('days'), 7, 1, 3650),
+          limit: numParam(searchParams.get('limit'), 20, 1, 200),
         }),
       });
       return;
@@ -392,7 +411,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         sessions: store.recentSessions({
           homeIds: store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId),
           homeId: searchParams.get('homeId') || null,
-          limit: Number(searchParams.get('limit')) || 50,
+          limit: numParam(searchParams.get('limit'), 50, 1, 500),
         }),
       });
       return;
@@ -404,9 +423,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
     if (req.method === 'GET' && pathname === '/api/usage') {
-      const days = Math.min(Math.max(Number(searchParams.get('days')) || 30, 1), 365);
+      const days = numParam(searchParams.get('days'), 30, 1, 365);
       // hours 支持到 30 天（24 * 30 = 720），对应「过去 30 天」统计周期。
-      const hours = Math.min(Math.max(Number(searchParams.get('hours')) || 24, 1), 24 * 30);
+      const hours = numParam(searchParams.get('hours'), 24, 1, 24 * 30);
       send(res, 200, {
         summary: store.usageSummary({ days }),
         trend: store.usageTrend({ hours }),
@@ -424,7 +443,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'GET' && pathname === '/api/logs') {
       // 日志区域：返回环缓冲中（可按最低级别过滤）的最近日志。
       const level = searchParams.get('level') || undefined;
-      const limit = Math.min(Math.max(Number(searchParams.get('limit')) || 200, 1), 1000);
+      const limit = numParam(searchParams.get('limit'), 200, 1, 1000);
       send(res, 200, { logs: logApi.getLogs({ level, limit }) });
       return;
     }

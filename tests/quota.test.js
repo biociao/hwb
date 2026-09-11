@@ -30,13 +30,37 @@ test('kimi adapter parses available_balance', async () => {
 
 test('queryBalance degrades errors instead of throwing', async () => {
   const boom = await queryBalance({ provider: 'deepseek', key: 'x' }, async () => { throw new Error('network down'); });
-  assert.equal(boom.error, 'network down');
+  // 错误被**分类**后再返回，不回显上游原始消息（见下一条测试的原因）
+  assert.equal(typeof boom.error, 'string');
+  assert.doesNotMatch(boom.error, /network down/, '不该把上游原始消息透给客户端');
   const httpErr = await queryBalance({ provider: 'kimi', key: 'x' }, async () => jsonRes({}, 401));
-  assert.match(httpErr.error, /HTTP 401/);
+  assert.match(httpErr.error, /401/, '应保留下游可用的状态码信息');
   const unknown = await queryBalance({ provider: 'macstudio_local', key: 'x' }, async () => { throw new Error('should not be called'); });
   assert.equal(unknown.error, 'no adapter');
   const noApi = await queryBalance({ provider: 'zai', key: 'x' });
   assert.equal(noApi.error, 'no public balance API');
+});
+
+// /api/quota 是**未经鉴权**的 GET，任何本地进程都能读。而 Node 的 fetch 在 header 非法时
+// 抛的消息里会带上 header 值本身（`Headers.append: "Bearer sk-…" is an invalid header value.`）——
+// 若把 e.message 直接转发，一个含控制字符的 key 就会把明文 key 送进响应，
+// 破坏本文件本来就承诺的不变量（§8.1「key NEVER 传给浏览器」）。
+test('queryBalance: 上游/技术错误消息里的 key 绝不进入返回值', async () => {
+  const secret = 'sk-live-SUPERSECRET-0001';
+  const leaky = async () => { throw new Error(`Headers.append: "Bearer ${secret}" is an invalid header value.`); };
+  const r = await queryBalance({ provider: 'deepseek', key: secret }, leaky);
+  assert.doesNotMatch(JSON.stringify(r), /SUPERSECRET/, '响应里出现了明文 key');
+  assert.match(r.error, /凭证格式无效/);
+
+  // 其余分类也都不含请求内容
+  for (const [err, re] of [
+    [new Error('HTTP 403 Forbidden'), /403/],
+    [new Error('The operation was aborted due to timeout'), /超时/],
+  ]) {
+    const out = await queryBalance({ provider: 'kimi', key: secret }, async () => { throw err; });
+    assert.doesNotMatch(JSON.stringify(out), /SUPERSECRET/);
+    assert.match(out.error, re);
+  }
 });
 
 test('readCredentials reads refs: block with values', () => {
@@ -94,5 +118,89 @@ test('QuotaService: TTL cache, single-flight, keys never leak', async () => {
   });
   const down = await svcDown.refresh();
   assert.equal(down[0].provider, 'deepseek');
-  assert.match(down[0].error, /offline/);
+  assert.ok(down[0].error, '失败也要给出一个可展示的原因');
+  assert.doesNotMatch(down[0].error, /offline/, '原因应是分类后的短文案，不是上游原始消息');
+});
+
+// 实例被删除后，它的额度条目没有任何人会来清 —— 会一直返回给客户端；
+// 且那条记录的时间戳永远是旧的，于是每次 list() 都会再触发一次全量刷新 + SSE 广播。
+test('QuotaService: 实例被移除后，它的额度条目会被清掉', async () => {
+  let homes = [{ homeId: 'h1', homePath: '/m', providers: [{ ref: 'DEEPSEEK_API_KEY', provider: 'deepseek' }] }];
+  const store = { listHomes: () => homes };
+  const events = [];
+  const svc = new QuotaService({
+    store,
+    broadcast: (e) => events.push(e),
+    fetchImpl: async () => jsonRes({ data: { total_balance: '10.00', currency: 'CNY' } }),
+    ttlMs: 60_000,
+  });
+  await svc.refresh();
+  assert.equal(svc.list().length, 1);
+
+  homes = []; // 实例被删除
+  assert.deepEqual(svc.list(), [], '已移除实例的额度不该继续返回');
+});
+
+// 「缓存为空」原先被当成「永远 stale」：只要实例在但一个 provider 都没有（没配 credentials 很常见），
+// 每次 GET /api/quota 都会再来一轮刷新 + quota:updated 广播。客户端若把它映射回 /api/quota 就是死循环。
+test('QuotaService: 没有 provider 时不会每次 list 都重刷/重播', async () => {
+  const store = { listHomes: () => [{ homeId: 'h1', homePath: '/m', providers: [] }] };
+  const events = [];
+  let refreshes = 0;
+  const svc = new QuotaService({
+    store,
+    broadcast: (e) => events.push(e),
+    fetchImpl: async () => { refreshes++; return jsonRes({}); },
+    ttlMs: 60_000,
+  });
+  for (let i = 0; i < 5; i++) svc.list();
+  await new Promise((r) => setTimeout(r, 50));
+  // 第一次 list 会刷一轮（lastRefreshAt=0 → 视为 stale）；之后 TTL 内不该再刷。
+  assert.ok(refreshes <= 1, `不应反复刷新，实际 ${refreshes} 次`);
+  assert.ok(events.length <= 1, `TTL 内不该重复广播，实际 ${events.length} 次`);
+
+  // 再等一轮确认已经稳定（不会随 list 次数线性增长）
+  const before = events.length;
+  for (let i = 0; i < 5; i++) svc.list();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(events.length, before, '重复调用 list 不应继续产生广播');
+});
+
+// 「有 provider 行、但没有对应凭据」是很常见的状态（key 还没配 / ref 改过名）。
+// 原实现里这一支是 `(key ? queryBalance(...) : {…}).then(...)` —— 右侧是**普通对象**、
+// 没有 .then，于是同步抛 TypeError，而且是在循环里抛：整批 provider（含其它实例）
+// 一个都进不了缓存，quota:updated 也不会广播。整个额度功能表现为「一直没有数据」。
+test('QuotaService: 缺少凭据 key 时仍能完成整批刷新（不再 TypeError）', async () => {
+  const { mkdtemp } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const pathMod = await import('node:path');
+  const homePath = await mkdtemp(pathMod.join(tmpdir(), 'hwb-quota-nokey-'));
+  const events = [];
+  const svc = new QuotaService({
+    store: {
+      listHomes: () => [
+        { homeId: 'no-key', homePath, providers: [{ ref: 'DEEPSEEK_API_KEY', provider: 'deepseek' }] },
+        { homeId: 'has-key', homePath, providers: [{ ref: 'KIMI_CODE_API_KEY', provider: 'kimi' }] },
+      ],
+    },
+    broadcast: (e) => events.push(e),
+    fetchImpl: async () => ({ ok: true, json: async () => ({ data: { total_balance: '5', currency: 'CNY' } }) }),
+    ttlMs: 60_000,
+  });
+  const rows = await svc.refresh();   // 此前这里会直接抛
+  assert.equal(rows.length, 2, '两个 provider 都应产出条目，不能因为一个缺 key 就整批失败');
+  assert.equal(rows.find((r) => r.homeId === 'no-key').error, 'key not found');
+  assert.ok(events.some((e) => e === 'quota:updated'), '整批完成时应广播');
+
+  // 单个 home 的凭据读取失败也要被隔离
+  const svc2 = new QuotaService({
+    store: { listHomes: () => [
+      { homeId: 'bad', homePath: '/nonexistent-dir-for-test', providers: [{ ref: 'X_API_KEY', provider: 'deepseek' }] },
+      { homeId: 'ok', homePath, providers: [{ ref: 'KIMI_CODE_API_KEY', provider: 'kimi' }] },
+    ] },
+    fetchImpl: async () => ({ ok: true, json: async () => ({ data: { total_balance: '1', currency: 'CNY' } }) }),
+    ttlMs: 60_000,
+  });
+  const rows2 = await svc2.refresh();
+  assert.equal(rows2.length, 2, '一个实例的凭据异常不该让其它实例也拿不到额度');
 });

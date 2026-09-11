@@ -68,8 +68,20 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
           // 还没看到起始分隔符。multipart 正文必须以 `--boundary` 开头（允许前面有 CRLF），
           // 所以一旦前几个字节不是这两种开头，就肯定不是 multipart：立即报错，
           // 不要一直等到收完才报“不完整”（那样错误信息会误导排查）。
-          const head = buffer.subarray(0, Math.min(buffer.length, start.length)).toString('latin1');
-          const partial = start.startsWith(head) || start.startsWith(head.slice(1));
+          // 「允许前面有 CRLF」这一条在偏函数里要真的成立：正文可能以 `\r\n--boundary` 开头，
+          // 于是首个分片恰好落在 `\r\n` 或 `\r\n--bo` 这类位置时，head 既不是 start 的前缀、
+          // 也不是去掉首字节后的前缀 —— 同一个正文会因为 TCP 分片不同而被拒（实测首个分片
+          // 2 或 6 字节时必拒、整包一次给就通过）。把 CRLF 变体也算进「可能的前缀」。
+          const head = buffer.subarray(0, Math.min(buffer.length, start.length + 2)).toString('latin1');
+          // 三种「可能还没读全」的情形：
+          //   1) head 就是 start 的前缀（正常开头，分片切在分隔符中间）
+          //   2) 首个分片只给了 1 个字节（head 比 start 短一位，去掉首字节后是其前缀）
+          //   3) 允许前导 CRLF：head 是 `\r\n` + start 的前缀
+          // 注意第 3 条的方向：是「把 CRLF 也算进正文开头」后判断 head 是否为其前缀，
+          // 而不是反过来 —— 写反了就会把 `\r\n--B…` 这种合法正文直接拒掉。
+          const partial = start.startsWith(head)
+            || start.startsWith(head.slice(1))
+            || `\r\n${start}`.startsWith(head);
           if (!partial) return fail('上传请求格式无效');
           if (buffer.length > hold) take(buffer.length - hold);
           return false;

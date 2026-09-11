@@ -22,8 +22,12 @@ export function homeIdOf(homePath) {
 // discarded except for emptiness — we only extract provider names (§4.1).
 export function parseCredentialsYaml(text) {
   const providers = [];
+  const seen = new Set(); // 按 ref 去重（见下）
   let inRefs = false;
-  for (const raw of text.split('\n')) {
+  // 去掉 UTF-8 BOM：`\s` 在 JS 里匹配 U+FEFF，于是带 BOM 的 `\uFEFFrefs:` 会走 else 分支、
+  // inRefs 永远为 false，缩进的所有 key 全被跳过 —— 一个被 BOM-adding 编辑器重存过的
+  // 凭据文件会表现为「这个 home 没有任何 provider」。必须在切行之前剥掉。
+  for (const raw of String(text ?? '').replace(/^\uFEFF/, '').split('\n')) {
     if (!raw.trim() || raw.trim().startsWith('#')) continue;
     if (!/^\s/.test(raw)) {
       inRefs = /^refs\s*:\s*$/.test(raw.trim());
@@ -37,6 +41,16 @@ export function parseCredentialsYaml(text) {
     if (!ref.endsWith('_API_KEY')) continue;
     if (!value || value.startsWith('#')) continue;
     const base = ref.slice(0, -'_API_KEY'.length).toLowerCase();
+    // **按 ref 去重**：providers 表是 UNIQUE(homeId, ref)，而且插入用的是普通 INSERT。
+    // 一个被手工追加/编辑器重排过的凭据文件里出现两行同名 key，就会让整个 upsertRows 事务
+    // 撞 UNIQUE 约束并回滚 —— 该实例的会话/工作区一行都提交不了，状态永久 degraded，
+    // 每 60s 重试一次同样失败。这里取**最后一条**（与 readCredentials 的 Map 语义一致）。
+    if (seen.has(ref)) {
+      const at = providers.findIndex((p) => p.ref === ref);
+      providers[at] = { ref, provider: PROVIDER_ALIASES[base] ?? base };
+      continue;
+    }
+    seen.add(ref);
     providers.push({ ref, provider: PROVIDER_ALIASES[base] ?? base });
   }
   return providers;

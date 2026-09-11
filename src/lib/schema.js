@@ -100,6 +100,10 @@ export function validateProjcacheJson(data) {
       subagent: rows.subagent?.val,
       plan: rows.plan?.val,
       permissions: rows.permissions?.val,
+      // 投影缓存是**快照**：进程被杀/机器休眠/会话被放弃时，里面那些「进行中」的信号会永远
+      // 冻结在那里。不断言新鲜度的话，几周前的会话会一直显示「运行中」（实测真实 home：
+      // 179 个会话里 18 个被判 running，全部空闲 7–28 天，0 个在 10 分钟内）。
+      lastActivity: meta.lastActivity,
     });
     sessions.push(meta);
   }
@@ -123,7 +127,10 @@ export function validateModelTierJson(data) {
   if (!active || active.tiers === null || typeof active.tiers !== 'object') {
     return fail(`model-tier.json: active scheme ${data.activeId} has no tiers`);
   }
-  const tiers = {};
+  // 无原型对象：tierId 直接来自文件，而 `tiers['__proto__'] = …` 会走原型 setter ——
+  // 那个 tier 会从 Object.entries 里凭空消失（normalize 于是不产出 modelTier 行），
+  // 同时返回对象的原型被文件内容控制。
+  const tiers = Object.create(null);
   for (const [tierId, t] of Object.entries(active.tiers)) {
     if (!t || typeof t !== 'object') continue;
     tiers[tierId] = {

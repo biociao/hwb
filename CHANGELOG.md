@@ -492,6 +492,85 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 仪表盘一直在撒谎：18/179 个会话被永久标成「运行中」（src/lib/status.js + dshhome/live-status.js）
+- **实测真实 home**：179 个会话里 18 个被判 `running`，**全部空闲 7–28 天，0 个在 10 分钟内**。
+  原因有两层：
+  ① 判据里的信号（`sessionStats.openStep` / `pendingCalls` / `todos.in_progress` /
+  `goal.phase==='active'` / `plan.running`）全部来自**投影缓存快照** —— 进程被杀、机器休眠、
+  会话被放弃之后，这些「进行中」标记会永久冻结在缓存里，而代码从不断言新鲜度。
+  ② `plan.active` 被当成了活动信号，但它是**持久模式开关**（`plan/mode` 设置、空闲不复位），
+  真正表示在跑的是 `plan.running`（进行中的 /plan 命令）。也就是说任何开过 plan 模式的会话
+  都会永久显示「运行中」。
+- **修复**：`planRunning` 只看 `plan.running`（两处同改）；并加新鲜度门限 —— `running` 之外
+  30 分钟没有任何活动就降级为 `idle`。本机实例另有 3s 的实时通道（`item.running` 布尔是权威信号）
+  会覆盖这个结论；远端/离线实例只能靠文件索引，宁可保守显示「空闲」。
+- **修复后真实 home 的分布**：`{idle: 147, completed: 32}`（不再有任何虚假的 running）。
+
+#### 分时用量图静默丢掉「当前这一小时」（src/dshhome/store.js）
+- SQL 的窗口是 `lastActivity >= now - hours`，但桶只列到 `floor(now/H) - 1` ——
+  当前这一小时的数据被 SQL 选出来了却没有桶可放，直接丢掉。实测真实库 24h 窗口里
+  **丢了 3.5% 的 token，全部落在当前小时**。顺带发现桶数组是**倒序**（与 `usageTrendGrouped` 相反）。
+- **修复**：范围改为 `endHour - hours + 1 .. endHour`（含当前小时），并按从旧到新输出。
+
+#### 缺少任一 token 字段时总用量算成 0（src/dshhome/store.js）
+- `COALESCE(SUM(a + b + c + d), 0)`：COALESCE 只包住 SUM，而 `1000 + NULL + …` 整个相加是 NULL、
+  SUM 又忽略 NULL → **totalTokens 变成 0**。只要 dsh 的 `tokenUsage` 少任何一个键就会中招。
+  改为逐项 `COALESCE(json_extract(...), 0)`（`recentProjects` 本来就是这个写法，另两处漏了）。
+
+#### 缺少凭据 key 时整个额度刷新崩掉（src/dshhome/quota.js）
+- `(key ? queryBalance(...) : { provider, error: 'key not found' }).then(...)` ——
+  右侧是**普通对象**、没有 `.then`，于是同步抛 TypeError；而它在循环里抛，**所有** provider
+  （含其它实例）一个都进不了缓存、`quota:updated` 也不广播。而「有 provider 行但缺对应 key」
+  是很常见的状态（key 还没配、ref 改过名）。改为 `Promise.resolve(...)` 包一层，
+  并给单个 provider / 单个实例的凭据读取各加一层隔离。
+
+#### 额度：缓存为空被当成「永远 stale」+ 已删实例的额度一直返回（src/dshhome/quota.js）
+- `#hasStale()` 里 `cache.size === 0 && 有实例` 恒为真：只要实例在但一个 provider 都没有，
+  **每一次** `GET /api/quota` 都会再触发一轮刷新 + `quota:updated` 广播（客户端把它映射回
+  `/api/quota` 就是死循环）。改为记录独立的 `lastRefreshAt`。
+- 实例被删除后其缓存条目无人清理：会一直返回给客户端，且时间戳永远是旧的 → 每次 `list()`
+  都再刷一轮。现在按 `store.listHomes()` 清掉已消失实例的条目。
+
+#### 凭据里的 API key 会经错误消息泄漏到 /api/quota 响应（src/lib/balance.js）
+- `/api/quota` 是**未经鉴权**的 GET，任何本地进程都能读。而 Node 的 fetch 在 header 值非法时
+  抛的消息里带着值本身（`Headers.append: "Bearer sk-…" is an invalid header value.`）——
+  原实现把 `e.message` 原样转发，于是一个含控制字符的 key 会把明文 key 送进响应，
+  直接破坏本文件开头写下的不变量（§8.1「key NEVER 传给浏览器」）。实测复现过。
+- **修复**：技术性错误改为**分类后的短文案**（凭证格式无效 / 被拒绝 / 上游错误 / 超时），
+  细节只记服务端日志；适配器主动抛出的、本身就是给用户看的原因（如「无公开余额 API」）原样保留。
+
+#### `.credentials.yaml` 的解析问题（src/lib/read-home.js）
+- **UTF-8 BOM**：JS 的 `\s` 匹配 U+FEFF，于是带 BOM 的 `\uFEFFrefs:` 会走错分支、`inRefs`
+  永远为 false，缩进的所有 key 全被跳过 —— 一个被 BOM-adding 编辑器重存过的凭据文件会表现为
+  「这个 home 没有任何 provider」。现在切行之前先剥 BOM。
+- **重复的 `*_API_KEY`**：providers 表是 `UNIQUE(homeId, ref)` 且用普通 INSERT，重复一行就会让
+  整个 `upsertRows` 事务回滚 —— 该实例的会话/工作区一行都提交不了、状态永久 degraded、
+  每 60s 重试一次同样失败。现在解析时按 ref 去重（取最后一条），并把 INSERT 改为
+  `ON CONFLICT(homeId, ref) DO UPDATE` 作为第二道保险。
+
+#### 查询参数越界把接口打成 500（src/api/routes.js + src/dshhome/store.js）
+- `Number(x) || fallback` 只挡得住 0/NaN/'abc'，挡不住 `?days=1e9`：它会一路传到
+  `new Date(Date.now() - days * 86400000).toISOString()`，超出 ECMAScript 日期范围后
+  toISOString 抛 RangeError → **实测 `GET /api/projects/recent?days=1e9` 返回 500**。
+- **修复**：统一的 `numParam()` 带上下界解析（并正确区分「参数缺失」与「参数非法」——
+  第一版把缺失当成 0 再夹到 min，等于把默认 7 天窗口悄悄改成 1 天）；
+  store 侧的「N 天前」也改用带 100 年上限的安全计算。
+
+#### 其它（一轮对抗式纯函数审查）
+- `schema.validateModelTierJson`：tierId 直接来自文件，`tiers['__proto__'] = …` 会走原型 setter ——
+  该 tier 从 `Object.entries` 里凭空消失（normalize 于是不产出 modelTier 行），同时返回对象的
+  原型被文件内容控制。改用 `Object.create(null)`。
+- `multipart`：正文允许前导 CRLF，但偏函数判定只认「`--boundary` 的前缀」——
+  同一个正文会因 TCP 分段不同而被拒（实测首个分片 2 或 6 字节时必拒、整包一次给就通过）。
+  现在把 CRLF 变体也算进合法前缀（方向别写反），并穷举验证了两种正文在所有 2 段切分位置 + 1 字节切分下都能解析。
+- `endpoints.normalizeEndpoints`：端口接受 `Number()` 的强制转换结果 —— `true→1`、`[22]→22`、
+  `'0x50'→80`、`'1e3'→1000` 都会被静默接受并落库；host 也没有长度上限（id/label 本来就有）。
+  改为只接受数字或纯数字字符串，host 上限 255。
+- `normalize`：导出函数，缺字段/类型不对时会抛 TypeError（等于整个 home 的索引失败）。
+  改为逐字段兜底，坏字段降级而不是炸掉整批。
+- `routes`：旧 `host` 字段在**入库之后**才校验 → 恶意/非法 host（如前导 `-`）返回 500
+  却把实例建好了，用户只能手工删。现在在 registerHome 之前校验，返回 400 且不留残行。
+
 #### 源码注释引用了设计文档里不存在的章节（DSH_Workbench_Fusion_Architecture.md）
 - 三个文件（`reader.js` / `remote-reader.js` / `server.js`）都在注释里指向「§4.6」，而设计文档的
   第 4 节只到 §4.5 —— 顺着引用去查的人会一无所获。补上真正的 §4.6「远端只读索引」小节

@@ -6,6 +6,16 @@
 // 但「正在等待用户审批（approval pending）」属于运行时交互态，不落在投影缓存里——
 // 因此这里只输出 running / completed / idle 三态；审批策略（permissions.approval）
 // 作为附带信息给出，UI 可酌情用作次级提示。
+// 「仍在进行中」的最长无活动时间。超过就认为那条快照已经冻结。
+const RUNNING_STALE_MS = 30 * 60_000;
+
+function isStale(lastActivity) {
+  if (!lastActivity) return false; // 没有时间信息时不做判断（例如只从实时通道来的会话）
+  const at = Date.parse(lastActivity);
+  if (!Number.isFinite(at)) return false;
+  return Date.now() - at > RUNNING_STALE_MS;
+}
+
 // 审批策略：只保留字符串，并限制长度（超长直接截断 —— 它只是一个展示用的次级提示）。
 const APPROVAL_MAX = 64;
 
@@ -29,7 +39,10 @@ export function deriveSessionStatus(src = {}) {
   const hasInProgressTodo = todos.some((t) => t && t.status === 'in_progress');
   const todoCount = todos.length;
   const allDone = todoCount > 0 && todos.every((t) => t && t.status === 'completed');
-  const planRunning = !!(src.plan && (src.plan.running != null || src.plan.active));
+  // `plan.active` 是**持久模式开关**（`plan/mode` 设置，空闲时不会复位），
+  // 只有 `plan.running`（进行中的 /plan 命令）才代表「正在跑」。
+  // 把 active 当活动信号的话，任何开过 plan 模式的会话都会永久显示「运行中」。
+  const planRunning = !!(src.plan && src.plan.running != null);
 
   const subagentRaw = src.subagent;
   const subagents =
@@ -45,6 +58,14 @@ export function deriveSessionStatus(src = {}) {
   } else {
     kind = 'idle';
   }
+
+  // 新鲜度门限：以上信号全部来自**投影缓存快照**。进程被杀、机器休眠、会话被放弃之后，
+  // 那些「进行中」的标记会永久冻结在缓存里 —— 不断言新鲜度的话，几周前的会话会一直显示
+  // 「运行中」。实测真实 home：179 个会话里 18 个被判 running，全部空闲 7–28 天，0 个在 10 分钟内。
+  // 极少数「长时间没有新输入」的真跑任务会被误判成空闲，这是刻意选择的取舍：
+  // 本机实例另有 3s 的实时通道（live-status 的 `running` 布尔是权威信号）会覆盖这里的结论，
+  // 而远端/离线实例只能靠文件索引，宁可保守显示「空闲」，也不能把几周前的会话标成在跑。
+  if (kind === 'running' && isStale(src.lastActivity)) kind = 'idle';
 
   const labels = {
     running: '运行中',

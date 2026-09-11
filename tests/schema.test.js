@@ -80,10 +80,16 @@ test('validateProjcacheJson accepts version 3 and extracts rows.val', () => {
 });
 
 test('validateProjcacheJson derives running/completed status from projections', () => {
+  // 「进行中」的判定自带新鲜度门限（投影快照会冻结，见 lib/status.js），所以这个夹具必须用
+  // **当前时间**：写死的历史时间戳会被判成陈旧 → idle，测试会随日期推移假失败。
+  const now = Date.now();
   const r = validateProjcacheJson(pcFile({
     run: {
-      identity: { createdAt: 1786665487928, cwd: '/x/a' },
-      rows: { sessionStats: { ver: 1, seq: 3, val: { openStep: { turn: 1, step: 2 } } } },
+      identity: { createdAt: now, cwd: '/x/a' },
+      rows: {
+        sessionStats: { ver: 1, seq: 3, val: { openStep: { turn: 1, step: 2 } } },
+        sessionListMetadata: { ver: 1, seq: 3, val: { lastPromptAt: now } },
+      },
     },
     done: {
       identity: { createdAt: 1786665487928, cwd: '/x/b' },
@@ -128,4 +134,20 @@ test('validateCredentials requires {ref, provider} entries', () => {
   assert.equal(validateCredentials([{ ref: 'A_API_KEY', provider: 'a' }]).ok, true);
   assert.equal(validateCredentials([{ ref: 'A_API_KEY' }]).ok, false);
   assert.equal(validateCredentials('nope').ok, false);
+});
+
+// tierId 直接来自 model-tier.json：`tiers['__proto__'] = …` 会走原型 setter，
+// 那个 tier 会从 Object.entries 里凭空消失（normalize 于是不产出 modelTier 行），
+// 同时返回对象的原型被文件内容控制。
+test('validateModelTierJson: __proto__ 作为 tierId 不会污染原型、也不会静默丢 tier', () => {
+  // 必须用 JSON.parse 构造：在**对象字面量**里写 `__proto__:` 是设置原型、不会产生自有属性，
+  // 而真实路径正是 JSON.parse（它用 DefineOwnProperty，会真的建出自有的 "__proto__" 键）。
+  const file = JSON.parse('{"schema":2,"activeId":"std","schemes":[{"id":"std","tiers":{"default":{"provider":"p","model":"m"},"__proto__":{"provider":"evil","model":"evil"}}}]}');
+  const r = validateModelTierJson(file);
+  assert.equal(r.ok, true);
+  assert.equal(Object.getPrototypeOf(r.modelTier.tiers), null, '应使用无原型对象');
+  assert.deepEqual(Object.keys(r.modelTier.tiers).sort(), ['__proto__', 'default'], 'tier 不该凭空消失');
+  assert.equal(r.modelTier.tiers.default.provider, 'p');
+  // 普通对象上不应出现被污染的 provider/model
+  assert.equal({}.provider, undefined);
 });

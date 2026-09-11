@@ -102,6 +102,15 @@ CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(lastActivity DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_home ON sessions(homeId);
 `;
 
+// 把「N 天前」算成 ISO 时间戳。上限 100 年：既覆盖任何合理查询，也保证结果一定落在
+// ECMAScript 的日期范围内（|ms| ≤ 8.64e15）。超出范围时 toISOString 会抛 RangeError，
+// 而那会把一次查询变成 500。
+function daysAgoIso(days) {
+  const n = Number(days);
+  const safe = Number.isFinite(n) ? Math.min(Math.max(n, 0), 36_500) : 0;
+  return new Date(Date.now() - safe * 86_400_000).toISOString();
+}
+
 const int = (v, dflt) => {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : dflt;
@@ -401,8 +410,13 @@ export class IndexStore {
         `INSERT INTO workspaces (homeId, workspaceId, title, path, project, archived, sessionCount)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       );
+      // ON CONFLICT 而不是裸 INSERT：providers 有 UNIQUE(homeId, ref)，而 ref 来自凭据/文件内容。
+      // 上游已经按 ref 去重（read-home.parseCredentialsYaml），这里是第二道保险 ——
+      // 一次约束冲突会让整个 upsertRows 事务回滚，该实例的会话/工作区一行都提交不了、
+      // 状态永久 degraded 并每 60s 重试一次同样失败。
       const insProvider = this.db.prepare(
-        `INSERT INTO providers (homeId, ref, provider) VALUES (?, ?, ?)`
+        `INSERT INTO providers (homeId, ref, provider) VALUES (?, ?, ?)
+         ON CONFLICT(homeId, ref) DO UPDATE SET provider = excluded.provider`
       );
       const insTier = this.db.prepare(
         `INSERT INTO model_tiers (homeId, tierId, active, provider, model) VALUES (?, ?, ?, ?, ?)`
@@ -557,7 +571,7 @@ export class IndexStore {
   // Recent projects: cross-instance, active within `days`, ordered by last activity (§7.1).
   // 每个 project 附带"它所属的实例 + 该 project 最新会话"，供点击直接跳转。
   recentProjects({ days = 7, limit = 20, homeIds = null } = {}) {
-    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const since = daysAgoIso(days);
     const scope = homeIds === null ? null : JSON.stringify(homeIds);
     const projects = this.db.prepare(
       `WITH visible_sessions AS (
@@ -623,7 +637,7 @@ export class IndexStore {
 
   // Token 用量汇总（基于会话聚合 tokenUsage）：总 Tokens / 输入 / 输出 / 缓存命中 / 缓存创建 / 缓存命中率。
   usageSummary({ days = 30 } = {}) {
-    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const since = daysAgoIso(days);
     const r = this.db.prepare(
       `SELECT
          COUNT(*) AS sessionCount,
@@ -631,10 +645,10 @@ export class IndexStore {
          COALESCE(SUM(json_extract(tokenUsage, '$.outputTokens')), 0) AS outputTokens,
          COALESCE(SUM(json_extract(tokenUsage, '$.cacheReadTokens')), 0) AS cacheRead,
          COALESCE(SUM(json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS cacheWrite,
-         COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')
-                 + json_extract(tokenUsage, '$.outputTokens')
-                 + json_extract(tokenUsage, '$.cacheReadTokens')
-                 + json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS totalTokens
+         COALESCE(SUM(COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0)
+                 + COALESCE(json_extract(tokenUsage, '$.outputTokens'), 0)
+                 + COALESCE(json_extract(tokenUsage, '$.cacheReadTokens'), 0)
+                 + COALESCE(json_extract(tokenUsage, '$.cacheWriteTokens'), 0)), 0) AS totalTokens
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?`
     ).get(since);
@@ -667,10 +681,14 @@ export class IndexStore {
        GROUP BY h`
     ).all(startIso);
     const byH = new Map(rows.map((r) => [r.h, r]));
-    const startHour = Math.floor(start / 3_600_000);
+    // 桶范围必须**包含当前这一小时**：SQL 的窗口是 `lastActivity >= now - hours`，
+    // 而原实现只列到 `floor(now/H) - 1` —— 当前这一小时的数据被 SQL 选出来了却没有桶可放，
+    // 于是被静默丢掉（实测真实库 24h 窗口里丢了 3.5% 的 token，全部落在当前小时）。
+    // 同时改为从旧到新的顺序（与 usageTrendGrouped 一致，图表不该反着画）。
+    const endHour = Math.floor(now / 3_600_000);
+    const startHour = endHour - hours + 1;
     const buckets = [];
-    for (let i = hours - 1; i >= 0; i--) {
-      const h = startHour + i;
+    for (let h = startHour; h <= endHour; h++) {
       const r = byH.get(h);
       buckets.push({
         ts: new Date(h * 3_600_000).toISOString(),
@@ -685,14 +703,14 @@ export class IndexStore {
 
   // 按项目拆分的 Token 用量（跨实例聚合）。
   usageByProject({ days = 30, limit = 15 } = {}) {
-    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const since = daysAgoIso(days);
     return this.db.prepare(
       `SELECT project,
               COUNT(*) AS sessionCount,
-              COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')
-                      + json_extract(tokenUsage, '$.outputTokens')
-                      + json_extract(tokenUsage, '$.cacheReadTokens')
-                      + json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS tokens
+              COALESCE(SUM(COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0)
+                      + COALESCE(json_extract(tokenUsage, '$.outputTokens'), 0)
+                      + COALESCE(json_extract(tokenUsage, '$.cacheReadTokens'), 0)
+                      + COALESCE(json_extract(tokenUsage, '$.cacheWriteTokens'), 0)), 0) AS tokens
        FROM sessions
        WHERE project IS NOT NULL AND lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY project

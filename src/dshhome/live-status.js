@@ -118,7 +118,10 @@ function toLiveRow(item) {
   const todos = Array.isArray(values.todos) ? values.todos : [];
   const hasInProgressTodo = todos.some((t) => t && t.status === 'in_progress');
   const goalPhase = (typeof goal === 'object' && goal ? goal.goal?.phase ?? goal.phase : null) ?? null;
-  const planRunning = !!(values.plan && (values.plan.running != null || values.plan.active));
+  // 与 lib/status.js 保持一致：`plan.active` 是持久的**模式开关**（plan/mode 设置，空闲不复位），
+  // 只有 `plan.running`（进行中的 /plan 命令）才代表正在跑。把它当活动信号会让任何开过
+  // plan 模式的会话在回退推断时永久显示「运行中」。
+  const planRunning = !!(values.plan && values.plan.running != null);
   const inferredRunning = stats.openStep != null || (stats.pendingCalls && Object.keys(stats.pendingCalls).length > 0) || hasInProgressTodo || goalPhase === 'active' || planRunning;
   const isRunning = typeof item.running === 'boolean' ? item.running : !!inferredRunning;
   const kind = isRunning ? 'running' : (goalPhase === 'complete' || (todos.length > 0 && todos.every((t) => t && t.status === 'completed')) ? 'completed' : 'idle');
