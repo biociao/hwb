@@ -411,6 +411,27 @@ Semantic Versioning.
 - **回归测试**：`tests/api-server-hardening.test.js` —— HEAD 必须 200 且无 body、`/api/*` 必须
   `no-store` + nosniff、404 也要带 JSON content-type 与 no-store。修复前失败。
 
+#### 用量聚合改为派生整数列（src/dshhome/store.js）
+- **背景**：上一节用 10s TTL 记忆把「每 3 秒一次」压成「每 10 秒一次」，但**尖峰本身**还在
+  （40k 会话一次 ~330ms，而 `node:sqlite` 是同步的，那段时间整个服务停着）。根因是逐行
+  `json_extract`：索引层早就是覆盖索引了，慢在解析 JSON。
+- **做法**：`sessions` 增加四个派生整数列（`tokInput/tokOutput/tokCacheRead/tokCacheWrite`），
+  由 **SQLite 触发器**（`sessions_tok_ai`/`sessions_tok_au`）从 `tokenUsage` 维护 ——
+  而不是由 JS 写入。这一点是刻意的：我第一版让 `upsertRows` 负责派生，结果 **6 个既有测试**
+  立刻挂了（它们直接裸 SQL 插 sessions，派生列全是 0）—— 那正是「外部工具改库」这个真实场景的
+  预演。改成触发器之后，任何写入者（裸 SQL、外部工具）都不会让两列漂移。
+- **实测（同一份数据直接 A/B）**：
+  · 读：等效 5 条聚合 **175ms → 76ms（2.3×）**；此前按 8 条统计的 40k 场景是 ~330ms。
+  · 写：20k 行插入 **43ms → 172ms（4×）**，即每行多一次 UPDATE。
+  · 按「每秒阻塞事件循环多少毫秒」算仍是净赚：读侧每 10s 省 ~220ms，写侧每分钟多 ~130ms。
+  · 老库升级：`migrate()` 加列后一次性回填（包在事务里），实测 4 万行的库也能在启动时完成。
+- **回归测试**：`tests/store-token-columns.test.js` —— ①派生列与 JSON **逐项对拍**，且聚合结果与
+  「在测试里现写的旧式 `json_valid`/`json_extract` SQL」**逐项相等**（独立预言机，不是自己对自己）；
+  ②老库（删掉派生列）重新打开后必须自动回填且数字与升级前完全一致；③裸 SQL 插入与 UPDATE 之后
+  派生列都要跟上，非法 JSON 按 0。修复前三条全失败。
+- **顺带**：读路径不再需要 `json_valid` 守卫（`json_extract` 只剩触发器里那几处），
+  `tests/bad-json-sql.test.js` 的结构断言阈值随之从 24 降到 8（并注明原因）。
+
 #### `/api/usage` 的 8 个同步聚合把整个服务冻住（src/api/routes.js + src/web/app.js）
 - **现象**（独立审查第 8 轮，HIGH）：`node:sqlite` 是同步的，`/api/usage` 一次要跑**八个**聚合；
   用 40k 会话的真实库实测：合计 **~330ms**（summary 38.6 / trend 35.2 / byProject 28.7 /

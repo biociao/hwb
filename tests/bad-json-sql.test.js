@@ -131,6 +131,9 @@ test('结构: 源码里每一处 json_extract 都带 json_valid 守卫（避免�
       if (!line.includes('json_valid(')) offenders.push(`${path.relative(srcRoot, file)}:${i + 1}`);
     });
   }
-  assert.ok(checked >= 20, `应扫到足够多的 json_extract 站点，实际 ${checked}`);
+  // 阈值只是「扫描器确实扫到了东西」的护栏，不是业务常量。
+  // 用法聚合改用派生整数列之后，源码里的 json_extract 站点从 24 降到 8（剩下的主要是
+  // sessions_tok_ai/au 两个维护派生列的触发器），所以这里跟着下调。
+  assert.ok(checked >= 6, `应扫到足够多的 json_extract 站点，实际 ${checked}`);
   assert.deepEqual(offenders, [], `这些 json_extract 没有 json_valid 守卫，坏 JSON 会让整条 SQL 报错：${offenders}`);
 });

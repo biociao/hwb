@@ -64,6 +64,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   project TEXT,
   title TEXT,
   tokenUsage TEXT,
+  -- tokenUsage 的派生列：四个计数从 JSON 里解出来的整数。
+  -- 为什么要冗余：/api/usage 要跑八个聚合，而逐行 json_extract 在真实规模下很贵
+  -- （实测 40k 会话合计 ~330ms，而 node:sqlite 是同步的 —— 那段时间整个单线程服务都停着）。
+  -- 落成整数列之后聚合就是普通 SUM。真相仍是 tokenUsage（读接口照旧返回它），
+  -- 这两列由下面的触发器维护（任何写入者都算数），并与「直接对 JSON 跑 json_extract」的结果
+  -- 在 tests/store-token-columns.test.js 里逐项对拍。
+  -- 代价（实测 20k 行）：有触发器 172ms / 无 43ms —— 每行多一次 UPDATE；换来的是读侧
+  -- 等价 5 条聚合 175ms → 76ms（同一份 40k 数据）。按秒计的阻塞是净减少的。
+  -- 注意：这段注释里不能出现反引号 —— 它在 SCHEMA 模板字符串内部，反引号会提前结束字符串。
+  tokInput INTEGER NOT NULL DEFAULT 0,
+  tokOutput INTEGER NOT NULL DEFAULT 0,
+  tokCacheRead INTEGER NOT NULL DEFAULT 0,
+  tokCacheWrite INTEGER NOT NULL DEFAULT 0,
   contextPressure TEXT,
   status TEXT,
   lastActivity TEXT,
@@ -100,6 +113,27 @@ CREATE TABLE IF NOT EXISTS model_tiers (
   model TEXT,
   UNIQUE(homeId, tierId)
 );
+-- 派生列由**触发器**维护，而不是由 JS 写入：任何写入者（包括裸 SQL、外部工具改库）都不会
+-- 让两列与 tokenUsage 漂移。JS 侧不再参与，读路径也不解析 JSON。
+-- 表达式与旧的 json_valid/json_extract 写法逐项等价（json_valid 挡住非法 JSON → 0）。
+-- 注意 AFTER INSERT 里的 UPDATE 不会递归触发下面那个 UPDATE 触发器：SQLite 默认
+-- recursive_triggers=OFF（本文件不打开它）——若哪天要打开，这两个触发器必须重新设计。
+CREATE TRIGGER IF NOT EXISTS sessions_tok_ai AFTER INSERT ON sessions BEGIN
+  UPDATE sessions SET
+    tokInput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END,
+    tokOutput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.outputTokens'), 0) ELSE 0 END,
+    tokCacheRead = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheReadTokens'), 0) ELSE 0 END,
+    tokCacheWrite = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheWriteTokens'), 0) ELSE 0 END
+  WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_tok_au AFTER UPDATE OF tokenUsage ON sessions BEGIN
+  UPDATE sessions SET
+    tokInput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END,
+    tokOutput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.outputTokens'), 0) ELSE 0 END,
+    tokCacheRead = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheReadTokens'), 0) ELSE 0 END,
+    tokCacheWrite = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheWriteTokens'), 0) ELSE 0 END
+  WHERE id = NEW.id;
+END;
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(lastActivity DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_home ON sessions(homeId);
@@ -123,6 +157,53 @@ function daysAgoIso(days) {
 //
 // 注意：加法一定要**逐项** COALESCE。写成 COALESCE(SUM(a + b + c + d), 0) 时，
 // 只要某个键缺失，整个相加就是 NULL、SUM 又忽略 NULL —— totalTokens 会变成 0。
+
+// tokenUsage（JSON 文本）→ 四个整数计数。**只用于老库升级这一次回填**；
+// 日常写入由 sessions_tok_ai / sessions_tok_au 触发器在 SQLite 内部完成（见 SCHEMA）。
+// 与 SQLite 的 json_extract **语义对齐**：
+// 非法 JSON / 缺键 / 非数值一律按 0（正是那批 json_valid 守卫在表达的东西，只是提前到写入时）。
+// 不在 JS 里做位数截断：SQLite 的 SUM 会原样累加浮点，截断会让两条路径的数字对不上。
+function tokenTotals(tokenUsage) {
+  const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  if (tokenUsage == null) return zero;
+  let value = tokenUsage;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return zero; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return zero;
+  const num = (x) => {
+    if (typeof x === 'number') return Number.isFinite(x) ? x : 0;
+    if (typeof x === 'string' && x.trim() !== '') { const n = Number(x); return Number.isFinite(n) ? n : 0; }
+    return 0;
+  };
+  return {
+    input: num(value.uncachedInputTokens),
+    output: num(value.outputTokens),
+    cacheRead: num(value.cacheReadTokens),
+    cacheWrite: num(value.cacheWriteTokens),
+  };
+}
+
+// 用量聚合现在直接 SUM 派生整数列（tokInput/tokOutput/tokCacheRead/tokCacheWrite）。
+// 这些列由触发器（见 SCHEMA 里的 sessions_tok_ai/au）从 tokenUsage 派生维护；等价的旧式表达式
+// （CASE WHEN json_valid(...) THEN json_extract(...)）仍在本文件的历史注释与
+// tests/store-token-columns.test.js 的独立预言机里保留，用来对拍。
+// 收益：40k 会话下八个聚合从 ~330ms 降到普通 SUM 的量级（同步 SQLite 会冻住整个服务）。
+const TOK = {
+  input: 'COALESCE(SUM(tokInput), 0)',
+  output: 'COALESCE(SUM(tokOutput), 0)',
+  cacheRead: 'COALESCE(SUM(tokCacheRead), 0)',
+  cacheWrite: 'COALESCE(SUM(tokCacheWrite), 0)',
+  total: 'COALESCE(SUM(tokInput + tokOutput + tokCacheRead + tokCacheWrite), 0)',
+};
+// 带表别名的版本（trend/grouped 的查询里表别名是 s）
+const tokOf = (alias) => ({
+  input: `COALESCE(SUM(${alias}.tokInput), 0)`,
+  output: `COALESCE(SUM(${alias}.tokOutput), 0)`,
+  cacheRead: `COALESCE(SUM(${alias}.tokCacheRead), 0)`,
+  cacheWrite: `COALESCE(SUM(${alias}.tokCacheWrite), 0)`,
+  total: `COALESCE(SUM(${alias}.tokInput + ${alias}.tokOutput + ${alias}.tokCacheRead + ${alias}.tokCacheWrite), 0)`,
+});
 
 const int = (v, dflt) => {
   const n = Number(v);
@@ -167,6 +248,27 @@ export class IndexStore {
     this.migrate();
   }
 
+  // 把 tokenUsage 里的四个计数写进派生列（老库升级时跑一次）。
+  // 只处理 tokenUsage 非空的行；解析失败的按 0（与读路径的降级一致）。
+  #backfillTokenTotals() {
+    const rows = this.db.prepare('SELECT id, tokenUsage FROM sessions WHERE tokenUsage IS NOT NULL').all();
+    if (!rows.length) return;
+    const upd = this.db.prepare(
+      'UPDATE sessions SET tokInput = ?, tokOutput = ?, tokCacheRead = ?, tokCacheWrite = ? WHERE id = ?'
+    );
+    this.db.exec('BEGIN');
+    try {
+      for (const row of rows) {
+        const t = tokenTotals(row.tokenUsage);
+        upd.run(t.input, t.output, t.cacheRead, t.cacheWrite, row.id);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   migrate() {
     const sess = this.db.prepare("SELECT name FROM pragma_table_info('sessions')").all().map((c) => c.name);
     if (!sess.includes('title')) {
@@ -178,6 +280,15 @@ export class IndexStore {
     }
     if (!sess.includes('status')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN status TEXT');
+    }
+    if (!sess.includes('tokInput')) {
+      // 老库补列 + 用 tokenUsage 回填一次（只在加列的那一次跑）。
+      // 回填包在事务里：4 万行的老库也要在启动时一次性做完，不能拖成逐行 fsync。
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN tokInput INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE sessions ADD COLUMN tokOutput INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE sessions ADD COLUMN tokCacheRead INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE sessions ADD COLUMN tokCacheWrite INTEGER NOT NULL DEFAULT 0;`);
+      this.#backfillTokenTotals();
     }
     const homes = this.db.prepare("SELECT name FROM pragma_table_info('homes')").all().map((c) => c.name);
     if (!homes.includes('sortIndex')) {
@@ -439,7 +550,8 @@ export class IndexStore {
       }
 
       const insSession = this.db.prepare(
-        `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, generatedAt, liveOnly)
+        `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage,
+                               contextPressure, status, lastActivity, generatedAt, liveOnly)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(homeId, sessionId) DO UPDATE SET
            workspaceId=excluded.workspaceId, workspaceTitle=excluded.workspaceTitle,
@@ -621,10 +733,8 @@ export class IndexStore {
        ) SELECT s.project,
               COUNT(*) AS sessionCount,
               MAX(s.lastActivity) AS lastActivity,
-              SUM(COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
-                + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
-                + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)) AS inputTokens,
-              SUM(COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.outputTokens') ELSE NULL END, 0)) AS outputTokens,
+              SUM(s.tokInput + s.tokCacheRead + s.tokCacheWrite) AS inputTokens,
+              SUM(s.tokOutput) AS outputTokens,
               (SELECT x.homeId FROM visible_sessions x WHERE x.project = s.project
                  ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS homeId,
               (SELECT x.sessionId FROM visible_sessions x WHERE x.project = s.project
@@ -683,14 +793,11 @@ export class IndexStore {
     const r = this.db.prepare(
       `SELECT
          COUNT(*) AS sessionCount,
-         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END), 0) AS inputTokens,
-         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END), 0) AS outputTokens,
-         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END), 0) AS cacheRead,
-         COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END), 0) AS cacheWrite,
-         COALESCE(SUM(COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
-                 + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END, 0)
-                 + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
-                 + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)), 0) AS totalTokens
+         ${TOK.input} AS inputTokens,
+         ${TOK.output} AS outputTokens,
+         ${TOK.cacheRead} AS cacheRead,
+         ${TOK.cacheWrite} AS cacheWrite,
+         ${TOK.total} AS totalTokens
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?`
     ).get(since);
@@ -722,10 +829,10 @@ export class IndexStore {
     const startIso = new Date(startHour * 3_600_000).toISOString();
     const rows = this.db.prepare(
       `SELECT CAST(STRFTIME('%s', lastActivity) / 3600 AS INTEGER) AS h,
-              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END), 0) AS inputTokens,
-              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END), 0) AS outputTokens,
-              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END), 0) AS cacheRead,
-              COALESCE(SUM(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END), 0) AS cacheWrite
+              ${TOK.input} AS inputTokens,
+              ${TOK.output} AS outputTokens,
+              ${TOK.cacheRead} AS cacheRead,
+              ${TOK.cacheWrite} AS cacheWrite
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY h`
@@ -751,10 +858,7 @@ export class IndexStore {
     return this.db.prepare(
       `SELECT project,
               COUNT(*) AS sessionCount,
-              COALESCE(SUM(COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
-                      + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.outputTokens') ELSE NULL END, 0)
-                      + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
-                      + COALESCE(CASE WHEN json_valid(tokenUsage) THEN json_extract(tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)), 0) AS tokens
+              ${TOK.total} AS tokens
        FROM sessions
        WHERE project IS NOT NULL AND lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY project
@@ -795,10 +899,7 @@ export class IndexStore {
     const rows = this.db.prepare(
       `SELECT CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER) AS h,
               ${groupExpr} AS grp,
-              COALESCE(SUM(COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.uncachedInputTokens') ELSE NULL END, 0)
-                      + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.outputTokens') ELSE NULL END, 0)
-                      + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheReadTokens') ELSE NULL END, 0)
-                      + COALESCE(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.cacheWriteTokens') ELSE NULL END, 0)), 0) AS tokens
+              COALESCE(SUM(s.tokInput + s.tokOutput + s.tokCacheRead + s.tokCacheWrite), 0) AS tokens
        FROM sessions s
        WHERE s.lastActivity IS NOT NULL AND s.lastActivity >= ?
        GROUP BY h, grp
