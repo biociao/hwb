@@ -546,3 +546,27 @@ test('CLI: 陈旧的 service.port 指向无关程序时，stop 不该报错（�
   const busyOut = await run('stop').then((r) => r.stdout, (e) => `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`);
   assert.match(String(busyOut), /其它程序/, `配置端口被占用时必须说清楚（实际 ${String(busyOut).trim().slice(0, 120)}）`);
 });
+
+// 服务日志（子进程 stdout/stderr 的重定向目标）只增不减，且不在 hwb.log 的轮转预算里。
+// 规模审查实测的失败形态：200 个实例的实时通道都不可达时 ~349 KB/min（21 MiB/h ≈ 490 MB/天）。
+// 现在每次 `hwb start` 之前做一次上限控制（8 MiB → 轮转成 .1/.2）。
+test('CLI: start 之前会把超限的 service.log 轮转掉（否则它可以无界增长到写满磁盘）', async (t) => {
+  const { dir, run } = await fixture(t);
+  const free = await port();
+  await run('config', 'set', 'port', String(free));
+  const log = path.join(dir, 'service.log');
+  // 造一个 9 MiB 的旧日志（超过 8 MiB 上限），并用一个可辨认的头部标记它
+  fs.writeFileSync(log, 'OLD-SERVICE-LOG-MARKER\n');
+  const chunk = Buffer.from('x'.repeat(1023) + '\n');
+  const fd = fs.openSync(log, 'a');
+  for (let i = 0; i < 9 * 1024; i++) fs.writeSync(fd, chunk);
+  fs.closeSync(fd);
+  const before = fs.statSync(log).size;
+  assert.ok(before > 8 * 1024 * 1024, `前置条件：日志超过上限（实际 ${before}）`);
+
+  await run('start');
+  t.after(async () => { await run('stop').catch(() => {}); });
+  assert.ok(fs.existsSync(`${log}.1`), '旧的 service.log 应被轮转成 .1');
+  assert.match(fs.readFileSync(`${log}.1`, 'utf8').slice(0, 40), /OLD-SERVICE-LOG-MARKER/, '轮转的是旧内容');
+  assert.ok(fs.statSync(log).size < 1024 * 1024, `轮转后新日志应当是空的/很小（实际 ${fs.statSync(log).size}）`);
+});

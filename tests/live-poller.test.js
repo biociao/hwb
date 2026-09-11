@@ -182,3 +182,25 @@ test('live poller: 抓取期间 activeEndpointId 变了就不许写（否则会�
   await poller.refresh('h1');
   assert.equal(applied, 0, '端点已变为 B（快照属于 A）时必须丢弃这份快照');
 });
+
+// tick 里已经有 home 列表，原先却还给每个实例传 homeId、让 refresh 再跑一次 `this.homes()`
+// （= store.listHomes()，带两个相关子查询 COUNT + 每实例 #enrichHome）。规模审查实测：
+// 200 个实例时单是这 200 次冗余调用就 3,868.9ms/轮（同步阻塞），并发探针最大停顿 4,936.7ms。
+test('live poller: 一轮 tick 只读一次实例列表（不是每个实例一次）', async () => {
+  let listCalls = 0;
+  const homes = Array.from({ length: 8 }, (_, i) => ({ homeId: `h${i}`, activeEndpointId: null }));
+  const store = { getHome: () => ({ homeId: 'h', activeEndpointId: null }), applyLiveStatus: () => {}, liveStatusAt: () => 0 };
+  const poller = new LiveStatusPoller({
+    store,
+    homes: () => { listCalls++; return homes; },
+    read: async () => [],
+    intervalMs: 60_000,
+  });
+  // 直接 start()：它有 `if (this.running) return`，先手动置 running 就什么都不跑了
+  // （我第一版就是这么写的 —— 断言恒真、变异也照样通过，典型的空洞断言）。
+  poller.start();
+  await new Promise((r) => setTimeout(r, 50));
+  poller.stop();
+  assert.ok(listCalls >= 1, `tick 必须真的跑过（实际读了 ${listCalls} 次实例列表）`);
+  assert.ok(listCalls <= 2, `8 个实例只该读 1-2 次实例列表（实际 ${listCalls} 次）—— 传 home 对象正是为此`);
+});

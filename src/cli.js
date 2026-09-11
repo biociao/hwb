@@ -91,6 +91,7 @@ async function start() {
   fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
   fs.rmSync(socketFile, { force: true });
   const output = path.join(serviceDir, 'service.log');
+  rotateServiceLog(output);
   const fd = fs.openSync(output, 'a', 0o600);
   const child = spawn(process.execPath, [path.join(root, 'src/service.js'), ...serverArgs(cfg)], {
     cwd: root, detached: true, stdio: ['ignore', fd, fd, 'ipc'],
@@ -207,6 +208,23 @@ async function stop() {
   }
   throw Error('停止超时；未强制杀进程，请查看日志');
 }
+// `service.log` 是子进程 stdout/stderr 的重定向目标，**只增不减** —— 它是唯一不进轮转的日志
+// （`hwb.log` 自己有 rotateBytes/KEEP_ROTATED）。规模审查实测的失败形态：200 个实例的实时通道都
+// 不可达时，它以 349 KB/min（≈21 MiB/h ≈ 490 MB/天）增长，可以安静地把磁盘写满。
+// 这里在**每次 start 之前**做一次上限控制。
+// 说明（诚实标注边界）：这不是「运行中按大小实时轮转」—— 那需要由子进程自己管理 stdout
+// （fd 已经交给它了，父进程退出后就不再持有）。所以一个长期运行、且持续大量输出的服务仍会增长；
+// 这条修复保证的是「重启即回收」，以及把无界增长变成有界增长。
+const SERVICE_LOG_MAX_BYTES = 8 * 1024 * 1024;
+function rotateServiceLog(file) {
+  try {
+    if (fs.statSync(file).size < SERVICE_LOG_MAX_BYTES) return;
+    fs.rmSync(`${file}.2`, { force: true });
+    if (fs.existsSync(`${file}.1`)) fs.renameSync(`${file}.1`, `${file}.2`);
+    fs.renameSync(file, `${file}.1`);
+  } catch { /* 文件不存在/不可写：启动流程不因此失败 */ }
+}
+
 function run(command, args, capture = false) {
   const env = { ...process.env };
   // A CLI invoked by a Node test must still run its own test suite.
