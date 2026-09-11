@@ -3,8 +3,8 @@
 一条命令跑完整条链路，把「手动验证」固化成可重复的检查：
 
 ```bash
-node scripts/smoke-e2e.mjs                    # 起在 4397，用 /tmp 下的临时目录
-node scripts/smoke-e2e.mjs --with-chrome      # 额外用真浏览器加载工作台并断言用量卡
+node scripts/smoke-e2e.mjs                    # 起在 4397，用 /tmp 下的临时目录（17 条断言）
+node scripts/smoke-e2e.mjs --with-chrome      # 额外用真浏览器加载工作台并断言用量卡（19 条）
 node scripts/smoke-e2e.mjs --port 4398 --keep # 换端口、保留临时目录便于排查
 ```
 
