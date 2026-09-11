@@ -174,3 +174,26 @@ test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然�
   await assert.rejects(run('stop'), /持有/);
   fs.rmSync(lock, { force: true });
 });
+
+// service.log 是 append-only 的：历次启动失败的提示都留在里面。取「第一个」hwb: 提示
+// 会把**上一次**失败的原因当成这一次的 —— 实测：日志开头是旧的「无法打开数据库（/tmp/OLD-…）」，
+// 而这次其实死于端口占用，终端却让用户去改一个跟当前问题无关的数据库路径。
+test('CLI：启动失败取的是日志里**最后**一条提示，不能把旧故障当成本次原因', async t => {
+  const { dir, run } = await fixture(t);
+  const server = net.createServer(s => s.end());
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => server.close(r)));
+  const n = server.address().port;
+  await run('config', 'set', 'port', String(n));
+  // 写入一条历史提示（比本次启动更早）
+  fs.writeFileSync(path.join(dir, 'service.log'),
+    'hwb: 无法打开数据库（/tmp/OLD-backup/hwb.db）: unable to open database file\n'
+    + '  常见原因：该路径已被一个目录占用、父目录不可写、或文件不是 SQLite 数据库。\n');
+
+  await assert.rejects(run('start'), (err) => {
+    assert.match(err.stderr, /已被占用/, '应报本次的真实原因（端口占用）');
+    assert.doesNotMatch(err.stderr, /OLD-backup/, '不得把上一次失败的提示当成这次的原因');
+    assert.doesNotMatch(err.stderr, /无法打开数据库/, '不得回显历史提示');
+    return true;
+  });
+});

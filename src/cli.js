@@ -38,17 +38,22 @@ function request(command = 'status') {
 // 启动失败时，子进程的 stdout/stderr 都进了 service.log —— 用户只看到一句
 // 「启动失败 (2)，查看 …/service.log」就得自己去翻文件。而「为什么失败」往往是一句
 // 已经写好的、能照做的提示（server.js 打的 `hwb: 无法打开数据库（路径）…` 常见原因……）。
-// 这里把那几行直接带回终端：优先取 `hwb:` 开头的提示块（含其缩进续行），否则退回日志尾部。
-// 完整日志仍然是权威，所以两条路径都会把文件位置一并说出来。
+// 这里把那几行直接带回终端：取**最后**一个 `hwb:` 提示块（含其缩进续行），
+// 没有提示块时退回日志尾部。完整日志仍然是权威，所以两条路径都会把文件位置一并说出来。
+//
+// 「最后」这个限定是必须的：service.log 是 append-only 的，历次启动的提示都留在里面。
+// 取第一个会把**上一次**失败的提示当成这一次的原因 —— 实测：日志开头是旧的
+// `无法打开数据库（/tmp/OLD-backup/hwb.db）`，而这一次其实死于端口占用，
+// 用户却被告知去改一个跟当前问题无关的数据库路径。
 function failureDetail(logFile, maxLines = 8) {
   let text;
   try { text = fs.readFileSync(logFile, 'utf8'); } catch { return ''; }
   const lines = text.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim() !== '');
-  const hint = [];
-  for (let i = 0; i < lines.length; i++) {
+  let hint = [];
+  for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].startsWith('hwb:')) continue;
-    hint.push(lines[i]);
-    // 提示块是「首行 + 若干缩进续行」
+    hint = [lines[i]];
+    // 提示块是「首行 + 若干缩进续行」，续行紧跟在后面
     for (let j = i + 1; j < lines.length && /^\s{2,}\S/.test(lines[j]); j++) hint.push(lines[j]);
     break;
   }
