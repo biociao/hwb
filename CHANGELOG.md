@@ -251,6 +251,10 @@ Semantic Versioning.
   memo 改成两级判据 —— ①版本没变 ⇒ 缓存**永远有效**；②版本变了但还在 TTL 内 ⇒ 仍然复用
   （实例在跑、每 3s 都有实时写入时，聚合频率仍压在 1/10s，节流没有丢）。
   `createApiServer` 新增 `usageTtlMs`（默认 10s）以便测试这个语义。
+- **实测（同一个 4 万会话的库，A/B 跑同一段脚本）**：`GET /api/usage?days=30&hours=24`
+  · 冷缓存真跑 8 个聚合：55ms（新）/ 55ms（旧，本来就一样）
+  · TTL 内命中：1–2ms
+  · **TTL 过后、数据一个字节没变**：旧实现 95ms（又跑了一遍聚合）/ 新实现 **4ms**（直接复用）
 - **回归测试**：`tests/usage-memo.test.js` —— 用 40ms 的 TTL 把语义钉住：数据不变 + 超过 TTL
   仍复用（`usageSummary` 调用次数不增）、数据一变 + 超过 TTL 必须重算、版本变了但在 TTL 内仍节流、
   以及 `upsertRows`/`removeHome` 都会抬高版本。修复前两条用例都失败。
