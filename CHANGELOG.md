@@ -203,6 +203,74 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 用量卡的空状态是个死胡同：周期按钮在早退之后，用户永远放宽不了窗口（src/web/components/usage-card.js）
+- **现象**：默认 24h 窗口内没有数据、更早有数据的用户，卡片只显示一句「暂无 token 用量数据
+  （需先有被索引的活跃会话）」，页面上**一个周期按钮都没有** —— 唯一能放宽窗口的入口点不到。
+  文案本身也是错的：同一个 API 换个窗口就有数据。
+- **实测（独立审查·真浏览器）**：某实例（最新会话 6 天前）`#usage-card` 只有那句空状态，
+  `document.querySelectorAll('#usage-period-toggle button').length === 0`；
+  而 `/api/usage?days=30&hours=720` 返回 `sessionCount: 5`、3 个非空桶。
+- **根因**：`renderUsageCard` 在 `summary.sessionCount === 0` 时直接 `return`，
+  而 `periodToggleHtml` / `dimToggleHtml` 在早退**之后**那一段里。
+- **修复**：空状态也渲染周期切换（与正常状态同一套 DOM 结构），文案改为
+  「这个窗口（最近 N 天）内没有 token 用量数据。若更早用过 dsh，可切换到更长的周期查看。」
+- **回归测试**：`tests/web-render-safety.test.js` —— 空窗口必须出现 24h/3天/7天/14天/30天 五个按钮；
+  `renderUsageCard(null)` 也不能抛。修复前该用例失败。
+
+#### 趋势图 x 轴标签与散点错位：标签等分、散点按时间（src/web/components/usage-card.js + src/web/index.html）
+- **现象**：稀疏窗口下读者会把用量算到错的日子。24h 周期里唯一的数据点画在 15.8%，
+  而它上方的标签写着「09:00」。
+- **实测（独立审查·真浏览器）**：30 天周期、60 桶里 5 个非空 —— 标签中心在
+  9.9 / 29.9 / 50.0 / 70.1 / 90.1%，对应散点却在 72.9 / 86.4 / 96.6 / 98.3 / 100.0%：
+  所有数据都堆在「09-11 20:00」底下，而「09-03 20:00」的标签悬在空白上。
+- **根因**：散点用 `pxAt(ts)`（按时间），标签用 `n` 个 `flex:1` 的等分单元格（按序号）——
+  只有「每个桶都非空」时两者才重合。
+- **修复**：标签改成绝对定位在 `pxAt(ts)%`（与散点同一个函数、同一个坐标系），贴边时改为向内对齐
+  （`.trend-xlabel-left/right`）避免被裁掉；`.trend-xcell` 等分样式删除。
+- **回归测试**：`tests/web-render-safety.test.js` —— 60 桶里只有末尾 5 个非空时，
+  每个标签的 `left` 必须等于某个散点的 `left`，且第一个标签 > 90%（等分的老实现在 0%），
+  同时断言等分单元格不再出现。修复前该用例失败。
+
+#### 按维度拆分时给每个 0 值都画了一个散点（src/web/components/usage-card.js）
+- **现象**：0% 基线上叠着一排 8px 圆点，同一位置有多个不同 tooltip（悬停命中的是 DOM 顺序里最后一个）。
+- **实测（独立审查·真浏览器）**：24h + 按项目，12 个点里 8 个 `data-tok="0"`，
+  如「00:00 · proj-0 tok=0」与「00:00 · proj-1 tok=0」完全重叠。
+- **修复**：`v > 0` 才画散点（曲线与断线逻辑不变；合计维度本来就只有非空桶，行为无变化）。
+- **回归测试**：`tests/web-render-safety.test.js` —— 3 个分组的桶里只有 2 个非零值，
+  断言散点里不出现 `data-tok="0"` 且数量为 2。修复前该用例失败。
+
+#### 运行日志面板：首屏拉取失败一次就永远停在「暂无日志」（src/web/components/log-panel.js）
+- **现象**：页面加载时那一次 `GET /api/logs` 失败（后端正在重启、瞬时 500），日志面板之后
+  永远空着 —— SSE 的 `log:event` 只会追加新行，没有任何机制补上历史快照。
+- **实测（独立审查）**：让 fetch 返回 500 并连调两次 `logInit()`，全程只有 **1** 次请求。
+- **根因**：`loaded = true` 写在 try/catch **之外**，失败也算「已加载」；而 app.js 只调用一次 `logInit()`。
+- **修复**：只在成功时置 `loaded`；并发调用合并成同一个 Promise；失败后设 10s 冷却；
+  `appendLog`（每条 SSE 日志都说明后端是活的）在 `loaded` 仍为 false 时自动补拉一次 ——
+  自动补拉受冷却限流，避免后端持续 5xx 时被日志流打成请求风暴。快照与已有条目**合并**而非覆盖。
+- **回归测试**：`tests/log-panel-retry.test.js`（fetch 桩 + 最小 DOM 桩，驱动真实模块）：
+  失败后必须还能重试、成功后才不再拉、自动补拉在冷却期内被限流。修复前第 1 条失败。
+
+#### 「已添加，但注意：…」这类提示会被下一次刷新抹掉（约 3 秒）（src/web/app.js + src/web/components/note.js）
+- **现象**：添加实例时服务端回的 warning（如「这个目录看起来不像 dsh home」）在页面上存在 ≤3s
+  就消失了，用户根本来不及看 —— 而代码注释当时还写着它挂在一个「持久」的提示条上。
+- **实测（独立审查·真浏览器，走真实的 addHome 路径）**：添加后立即可见（`hidden: false`），
+  下一次 SSE 刷新后 `hidden: true`，文本没变。
+- **根因**：`refresh()` 无条件 `note.hidden = true`（「这一轮成功了」）—— 对失败提示正确，
+  对「需要用户处理的事实」错误；重连分支同样会清空。
+- **修复**：抽出 `components/note.js`（`createNote`），区分**普通提示**（刷新失败/部分加载失败/
+  断线，成功刷新即撤）与**粘性提示**（添加实例的 warning，刷新与重连都不撤，被普通提示覆盖时自动解除）。
+- **回归测试**：`tests/note.test.js`（4 例：粘性不被撤、普通被撤、覆盖后按普通处理、无 DOM 不抛）。
+
+#### 用量卡可能显示「新周期高亮 + 旧周期数字」（src/web/app.js）
+- **现象**：点「30 天」→ 请求失败 → `handleAction` 的 catch 先 `alert` 再 `refresh()`，
+  而渲染用的是用户刚点的 `usagePeriod.key` 配 `lastUsage`（上一个周期的数据）——
+  卡片变成「30 天高亮 + 24 小时的数字」，读者无法察觉自己看的是哪个窗口。
+- **修复**：单独记录 `lastUsageKey`（屏上数据所属周期），渲染时用它高亮；
+  失败时自然回退到旧周期，与屏上的数字一致。
+- **回归测试**：`tests/web-render-safety.test.js` 的源码级一致性断言（app.js 需要整套 DOM 才能 import，
+  与 docs-consistency 的做法一致）：必须存在 `lastUsageKey`，且不得再出现
+  `renderUsageCard(usage, usageDim, usagePeriod.key)`。
+
 #### 「停止实例」只发信号不等待：忽略 SIGTERM 的子进程仍活着，界面却报已停止（src/control/launcher.js）
 - **现象**：点「停止」后 API 回 `{ok:true,stopped:true}`、`/api/homes` 显示 `runtime: "stopped"`、
   pid/url 清空，而那个 dsh web 子进程**仍在监听端口并返回 200**。句柄已经不在 `procs` 里，

@@ -250,3 +250,82 @@ test('usage-card: 趋势图按时间定位 x，且跨空桶处断线', async () 
   const paths = (html.match(/<path /g) || []).length;
   assert.equal(paths, 2, `跨空桶应断开折线（应为 2 条 path），实际 ${paths}`);
 });
+
+// 「空状态」曾经是一个死胡同：renderUsageCard 在 summary.sessionCount === 0 时直接 return 一句
+// 「暂无 token 用量数据」，而统计周期按钮（24h/3天/…/30天）在早退之后的代码里 ——
+// 于是默认 24h 窗口内没有数据、更早有数据的用户：卡片说没数据，页面上一个周期按钮都没有，
+// 唯一能放宽窗口的入口点不到。独立审查用真浏览器复现：`#usage-period-toggle button` 数量为 0，
+// 而同一个 API 用 ?days=30 返回 5 个活跃会话 —— 不是没数据，是这个窗口里没有数据。
+test('renderUsageCard: 空窗口也必须给出周期切换按钮（否则用户永远放宽不了窗口）', async () => {
+  const { renderUsageCard } = await import('../src/web/components/usage-card.js');
+  const empty = { summary: { sessionCount: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: 0, days: 1 },
+    trendBy: { total: { hours: 24, stepMs: 900_000, buckets: [] } } };
+  const html = renderUsageCard(empty, 'total', '24h');
+  for (const key of ['24h', '3d', '7d', '14d', '30d']) {
+    assert.match(html, new RegExp(`data-action="usage-period" data-period="${key}"`), `空状态也要有 ${key} 按钮`);
+  }
+  assert.match(html, /id="usage-period-toggle"/);
+  assert.match(html, /这个窗口/, '文案应说明「这个窗口内没有数据」，而不是「没有数据」');
+  // 完全没有 usage 时也不能抛
+  const bare = renderUsageCard(null, 'total', '7d');
+  assert.match(bare, /data-period="30d"/);
+});
+
+// x 轴标签曾经是 n 个 flex:1 的等分单元格，而散点按时间定位 —— 有空桶时两者必然错位。
+// 独立审查用真浏览器实测（30 天周期、60 桶里 5 个非空）：标签中心 9.9/29.9/50.0/70.1/90.1%，
+// 对应的散点却在 72.9/86.4/96.6/98.3/100.0% —— 所有数据都堆在最后一个标签底下，读者会看错日期。
+test('usage-card: x 轴标签与散点用同一个定位函数（不随空桶错位）', async () => {
+  const { usageTrendHtml } = await import('../src/web/components/usage-card.js');
+  const H = 3_600_000, t0 = Date.parse('2026-09-01T00:00:00.000Z');
+  const mk = (i, total) => ({ ts: new Date(t0 + i * H).toISOString(), groups: total ? { '合计': total } : {}, total });
+  // 稀疏窗口：60 个桶里只有**末尾** 5 个有数据（等价于审查实测的「30 天窗口、最近几小时才有数据」）
+  const buckets = Array.from({ length: 60 }, (_, i) => mk(i, 0));
+  for (const i of [55, 56, 57, 58, 59]) buckets[i] = mk(i, 100 + i);
+  const html = usageTrendHtml({ trendBy: { total: { buckets, hours: 24, stepMs: H } } }, 'total');
+
+  const dotLefts = [...html.matchAll(/class="trend-dot" style="left:([\d.]+)%/g)].map((m) => Number(m[1]));
+  const labelLefts = [...html.matchAll(/class="trend-xlabel[^"]*" style="left:([\d.]+)%"/g)].map((m) => Number(m[1]));
+  assert.equal(dotLefts.length, 5);
+  assert.ok(labelLefts.length >= 2, `应至少渲染 2 个标签，实际 ${labelLefts.length}`);
+  // 每个标签的 left 必须是某个散点的 left（同一个 pxAt），而不是等分位置
+  for (const l of labelLefts) {
+    assert.ok(dotLefts.some((d) => Math.abs(d - l) < 0.01), `标签 ${l}% 必须落在某个数据点上，散点在 ${dotLefts.join('/')}%`);
+  }
+  // 等分位置（i/(n-1)）不该再出现：数据都在末尾，第一个标签就应该在 93% 附近，而不是 0%
+  assert.ok(labelLefts[0] > 90, `稀疏窗口下第一个标签应贴近真实数据位置，实际 ${labelLefts[0]}%`);
+  assert.doesNotMatch(html, /trend-xcell/, '等分单元格已废弃');
+});
+
+// 按维度拆分时，绝大多数「分组 × 桶」都是 0：画出来是一排 8px 圆点全叠在 0% 基线上，
+// 且同一位置有多个不同 tooltip。独立审查实测 24h + 按项目：12 个点里 8 个 data-tok="0"。
+test('usage-card: 拆维度时不再为 0 值画散点（避免基线上一堆重叠圆点）', async () => {
+  const { usageTrendHtml } = await import('../src/web/components/usage-card.js');
+  const H = 3_600_000, t0 = Date.parse('2026-09-12T00:00:00.000Z');
+  const buckets = Array.from({ length: 6 }, (_, i) => ({
+    ts: new Date(t0 + i * H).toISOString(),
+    groups: i < 2 ? { projA: 1000, projB: 0 } : { projA: 0, projB: 0 },
+    total: i < 2 ? 1000 : 0,
+  }));
+  const html = usageTrendHtml({ trendBy: { project: { buckets, hours: 24, stepMs: H } } }, 'project');
+  const toks = [...html.matchAll(/class="trend-dot"[^>]*data-tok="([^"]*)"/g)].map((m) => m[1]);
+  assert.ok(toks.length > 0);
+  assert.ok(!toks.includes('0'), `不该有 0 值的散点，实际 ${toks.join(',')}`);
+  // 非 0 的点仍在
+  assert.equal(toks.length, 2, `只有两个非零点，实际 ${toks.length}`);
+});
+
+// 用量卡高亮哪个周期，必须由**屏上数据所属的周期**决定，而不是用户刚点的那个：
+// 点「30 天」→ 请求失败 → handleAction 的 catch 会 alert 后 refresh()，而 refresh 渲染时若用
+// `usagePeriod.key`（用户刚点的）配 `lastUsage`（上一个周期的数据），卡片就变成
+// 「30 天高亮 + 24 小时的数字」—— 读者无法察觉自己看的是哪个窗口。
+// app.js 需要整套 DOM 才能 import，所以这里做源码级一致性断言（同 docs-consistency 的做法）。
+test('app.js: 用量卡的高亮周期取自屏上数据（lastUsageKey），不是用户刚点的周期', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('../src/web/app.js', import.meta.url), 'utf8');
+  assert.match(src, /let lastUsageKey = null/, '需要单独记录「屏上数据属于哪个周期」');
+  assert.match(src, /lastUsageKey = key;/, '成功拉到某个周期的数据后要更新它');
+  assert.match(src, /renderUsageCard\(usage, usageDim, lastUsageKey\)/);
+  assert.match(src, /renderUsageCard\(usage, usageDim, lastUsageKey \?\? usagePeriod\.key\)/);
+  assert.doesNotMatch(src, /renderUsageCard\(usage, usageDim, usagePeriod\.key\)/,
+    '不得用「用户刚点的周期」去高亮旧数据');
+});

@@ -12,12 +12,15 @@ import { renderHomeForm, renderOnboarding, renderSettingsForm, applyHomeMode } f
 import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLogView, logPanelHtml } from './components/log-panel.js';
 import { captureFormDraft, restoreFormDraft } from './components/form-draft.js';
 import { createUsageCache } from './components/usage-cache.js';
+import { createNote } from './components/note.js';
 
 const main = document.getElementById('main');
 const dashboardEl = document.getElementById('dashboard');
 const tabs = document.getElementById('tabs');
 const live = document.getElementById('live');
-const note = document.getElementById('note'); // 刷新/连接失败提示（挂在 dashboard 之外，避免被每轮重建清掉）
+// 刷新/连接失败提示（挂在 dashboard 之外，避免被每轮重建清掉）。
+// 粘性语义见 components/note.js：普通提示会被成功刷新撤掉，粘性提示（如添加实例时的 warning）不会。
+const note = createNote(document.getElementById('note'));
 const modalEl = document.getElementById('modal');
 const themeBtn = document.getElementById('theme-btn');
 const themeMenu = document.getElementById('theme-menu');
@@ -28,6 +31,11 @@ let refreshSequence = 0;
 const endpointSwitching = new Set();
 // Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
 let lastUsage = null;
+// lastUsage 对应的统计周期 key。渲染时**用数据自己的周期**去高亮按钮，而不是用「用户刚点的那个」：
+// 点「30天」→ 请求失败 → handleAction 的 catch 会 alert 后 refresh()，而 refresh 之前用的是
+// 用户刚点的 key —— 卡片于是变成「新周期高亮 + 旧周期的数字」，读者无法察觉自己看的是哪个窗口。
+// 现在高亮永远与屏上数据一致（失败时自然回退到旧的周期）。
+let lastUsageKey = null;
 // 渲染由 SSE 驱动（每 3s 一次），而 /api/usage 是 8 个同步聚合（实测 40k 会话 ~330ms，
 // 期间整个单线程服务都停着）。所以渲染路径上不再「每次都要」：同一个统计周期 15s 内复用。
 const usageCache = createUsageCache(15_000);
@@ -161,7 +169,8 @@ async function refresh() {
   const sequence = ++refreshSequence;
   const { homes } = await api('/api/homes');
   if (sequence !== refreshSequence) return;
-  note.hidden = true; // 这一轮成功了，撤掉上一次的失败提示
+  // 这一轮成功了，撤掉上一次的失败提示；粘性提示（见 components/note.js）不在此列。
+  note.clearUnlessSticky();
   lastHomes = homes;
   if (view.kind === 'instance' && !tabHomes(homes).some((h) => h.homeId === view.homeId)) {
     view = { kind: 'dashboard' };
@@ -211,13 +220,14 @@ async function renderDashboard(sequence = refreshSequence) {
     .filter(([, r]) => r.status === 'rejected')
     .map(([label, r]) => `${label}(${r.reason?.message ?? r.reason})`);
   if (failed.length) {
-    note.textContent = `部分数据加载失败：${failed.join('；')}`;
-    note.hidden = false;
+    // 「当下失败」属于普通提示：会覆盖掉粘性提示（它更紧急），也会被下一次成功刷新撤掉。
+    note.set(`部分数据加载失败：${failed.join('；')}`);
   }
   const projects = projectsRes.status === 'fulfilled' ? projectsRes.value.projects : [];
   const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value.sessions : [];
   const usage = usageRes.status === 'fulfilled' ? usageRes.value : null;
   lastUsage = usage;
+  if (usage) lastUsageKey = usageKey(); // 与 fetchUsage 的缓存键同源（这里拿到的就是这个周期的数据）
   const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
   const draft = captureAddFormDraft();
@@ -225,7 +235,7 @@ async function renderDashboard(sequence = refreshSequence) {
     projects: connectedIds.size ? renderRecentProjects(projects.filter((p) => connectedIds.has(p.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
     sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId))) : '<div class="empty">连接实例后显示对应会话</div>',
     homes: renderInstanceGrid(lastHomes),
-    usage: renderUsageCard(usage, usageDim, usagePeriod.key),
+    usage: renderUsageCard(usage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
   });
   logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
@@ -268,8 +278,9 @@ async function refreshUsageCard() {
   const usage = await fetchUsage({ force: true });
   if (seq !== usageSequence || key !== usageKey()) return;   // 期间用户又切了周期 → 丢弃
   lastUsage = usage;
+  lastUsageKey = key;
   const el = document.getElementById('usage-card');
-  if (el) el.innerHTML = renderUsageCard(usage, usageDim, usagePeriod.key);
+  if (el) el.innerHTML = renderUsageCard(usage, usageDim, lastUsageKey);
 }
 
 // —— Token 构成线（新增输入/缓存命中/缓存创建/输出）与趋势图数据点的悬停 tooltip ——
@@ -510,8 +521,9 @@ async function addHome({ homePath, alias, hostType = 'local', host, remotePort, 
   showAddForm = false;
   await refresh();
   if (warning) {
-    note.textContent = `已添加，但注意：${warning}`;
-    note.hidden = false;
+    // 粘性：这类提示描述的是「需要你处理的事实」，不是「刚刚那一轮刷新失败了」，
+    // 所以刷新与重连都不该把它撤掉（用户处理完之后再刷新页面即可）。
+    note.set(`已添加，但注意：${warning}`, { sticky: true });
   }
 }
 
@@ -925,8 +937,8 @@ function scheduleRefresh() {
 // 刷新失败时必须让用户看见，而不是把旧内容默默留在屏幕上。
 // 提示挂在 dashboard 之外（它每轮都会被 innerHTML 重建）。
 function reportRefreshFailure(error) {
-  note.textContent = `刷新失败：${error?.message ?? error}`;
-  note.hidden = false;
+  // 普通提示：优先于粘性提示显示，且会在下一次成功刷新时被撤掉。
+  note.set(`刷新失败：${error?.message ?? error}`);
 }
 
 subscribe(
@@ -937,8 +949,8 @@ subscribe(
     if (!on) { reportRefreshFailure(new Error('实时通道已断开，正在重连')); return; }
     // 恢复时两件事都要做：①把断线提示撤掉（否则顶栏写着 live、下面还挂着「已断开」）；
     // ②补一次刷新 —— 断线期间错过的 index:updated 不会重发，不补就一直是旧数据（最长等到 30s 心跳）。
-    note.hidden = true;
-    note.textContent = '';
+    // 粘性提示（如添加实例时的 warning）不在此列：它跟「通道通不通」无关。
+    note.clearUnlessSticky();
     scheduleRefresh();
   },
   (entry) => appendLog(entry) // 实时日志推送到「运行日志」面板

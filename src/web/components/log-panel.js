@@ -11,7 +11,10 @@ const RANK = { trace: 0, debug: 1, info: 2, warn: 3, error: 4, fatal: 5 };
 let entries = [];    // 全量条目（模块态；dashboard 重建后据此重绘，不丢）
 let filter = 'all';  // 'all' | 'debug' | 'info' | 'warn' | 'error'
 let follow = true;   // 自动滚动到底部
-let loaded = false;  // 是否已拉取过首屏快照
+let loaded = false;  // 是否已成功拉取过首屏快照
+let loadPromise = null; // 正在进行中的首屏拉取（合并并发调用）
+let retryAfter = 0;  // 失败后的重试冷却截止时间（避免持续 5xx 时被 SSE 事件打成请求风暴）
+const RETRY_COOLDOWN_MS = 10_000;
 const seen = new Set(); // 去重键（初始快照与实时事件重叠窗口）
 
 // 去重键必须包含 scope 与 fields：同一毫秒里两条「相同 ts/level/message」但不同上下文的日志
@@ -31,15 +34,34 @@ function passes(e) {
   return (RANK[e.level] ?? 2) >= (RANK[filter] ?? 2);
 }
 
-export async function logInit() {
+// 首屏快照拉取。**失败不算「加载过」**：原先无论成败都置 `loaded = true`，而 app.js 只调用
+// 一次 logInit() —— 于是页面加载时那一次请求只要失败（后端正在重启、瞬时 500），日志面板就永远停在
+// 「暂无日志」，之后 SSE 的 log:event 只会往里追加新行，没有任何机制补上历史快照。
+// 独立审查复现：让 fetch 返回 500 并连调两次 logInit()，全程只有 1 次请求。
+// 现在失败不置位（并允许重试），并发调用合并成同一个 Promise。
+// `auto: true` 是「SSE 收到日志后顺手补拉」那一类调用，受 RETRY_COOLDOWN_MS 限流
+// （后端持续 5xx 时不会被日志流打成请求风暴）；显式调用（页面加载、用户操作）不受限。
+export async function logInit({ auto = false } = {}) {
   if (loaded) return;
-  try {
-    const { logs } = await api(`/api/logs?limit=${MAX_VIEW}`);
-    entries = Array.isArray(logs) ? logs : [];
-    for (const e of entries) seen.add(key(e));
-  } catch { /* 后端不可用时日志区留空即可 */ }
-  loaded = true;
-  logRefresh();
+  if (auto && Date.now() < retryAfter) return;
+  if (loadPromise) return loadPromise;
+  loadPromise = (async () => {
+    try {
+      const { logs } = await api(`/api/logs?limit=${MAX_VIEW}`);
+      // 合并而不是覆盖：拉取期间 SSE 可能已经追加了新行，覆盖会把它们丢掉。
+      const incoming = Array.isArray(logs) ? logs : [];
+      const fresh = incoming.filter((e) => !seen.has(key(e)));
+      for (const e of fresh) seen.add(key(e));
+      entries = [...fresh, ...entries].slice(-MAX_VIEW);
+      loaded = true;
+    } catch {
+      // 后端不可用：保持 loaded=false（下次还能重试），并设一个冷却，避免持续 5xx 时
+      // 每个 SSE 日志事件都打一次请求。
+      retryAfter = Date.now() + RETRY_COOLDOWN_MS;
+    }
+    logRefresh();
+  })().finally(() => { loadPromise = null; });
+  return loadPromise;
 }
 
 export function appendLog(entry) {
@@ -55,6 +77,9 @@ export function appendLog(entry) {
     seen.clear();
     for (const e of entries) seen.add(key(e));
   }
+  // 每收到一条实时日志就说明后端是活的：如果首屏快照还没成功拉到，顺手补一次
+  // （logInit 内部有 loaded/冷却/并发合并三重闸门，这里不会被 SSE 的频率放大成请求风暴）。
+  if (!loaded) logInit({ auto: true }).catch(() => {});
   logRenderEntries();
 }
 

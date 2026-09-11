@@ -156,6 +156,10 @@ export function usageTrendHtml(usage, dim = 'total') {
   }</svg>`;
   const dots = series.flatMap((s) => s.pts.map((p, i) => {
     const v = data[i].groups[s.g] || 0;
+    // 0 不画点：按维度拆分时，大部分分组在大部分桶里都是 0，画出来是一排 8px 圆点全叠在 0% 基线上，
+    // 且各自的 tooltip 不同（同一位置悬停只能命中 DOM 里最后那个）。独立审查实测 24h + 按项目：
+    // 12 个点里 8 个 data-tok="0"，两两完全重叠。曲线路径（含断线逻辑）不受影响。
+    if (!(v > 0)) return '';
     const pct = max > 0 ? (v / max) * 100 : 0;
     // 数据点悬停显示详细信息：时间 · 分组 · 用量 · 占峰值百分比（交由前端 tooltip 渲染）。
     return `<i class="trend-dot" style="left:${p.x}%;bottom:${bottomOf(v)}%;background:${colorOf(s.g)}"
@@ -163,10 +167,17 @@ export function usageTrendHtml(usage, dim = 'total') {
   })).join('');
 
   // X 轴标签稀疏显示：每约 8 个点显示一个，末尾必显示。
+  // **必须与散点用同一个 x 函数**（pxAt）：散点按时间定位，而标签原先是 n 个 flex:1 的等分单元格
+  // —— 只要有空桶两者就对不上。独立审查用真浏览器实测（30 天周期、60 桶里只有 5 个非空）：
+  // 标签中心在 9.9/29.9/50.0/70.1/90.1%，对应散点却在 72.9/86.4/96.6/98.3/100.0% ——
+  // 所有数据都堆在「09-11 20:00」底下，而「09-03 20:00」的标签悬在空白上，读者会把用量算到错的日子。
   const step = Math.max(1, Math.ceil(n / 8));
   const xcells = data.map((b, i) => {
-    const show = i % step === 0 || i === n - 1;
-    return `<div class="trend-xcell">${show ? axisLabel(b.ts, stepMs) : ''}</div>`;
+    if (!(i % step === 0 || i === n - 1)) return '';
+    const left = px(i);
+    // 贴边的标签改为向内对齐（右端右对齐、左端左对齐），否则一半会跑到绘图区外被裁掉。
+    const anchor = left > 88 ? 'right' : (left < 12 ? 'left' : 'center');
+    return `<span class="trend-xlabel trend-xlabel-${anchor}" style="left:${left}%">${axisLabel(b.ts, stepMs)}</span>`;
   }).join('');
   // Y 轴刻度（0/25/50/75/100% of max）+ 网格线。
   const ticks = [1, 0.75, 0.5, 0.25, 0];
@@ -212,7 +223,22 @@ function periodToggleHtml(activePeriodKey) {
 
 export function renderUsageCard(usage = {}, activeDim = 'total', activePeriodKey = USAGE_PERIODS[0].key) {
   if (!usage || !usage.summary || usage.summary.sessionCount === 0) {
-    return '<div class="empty">暂无 token 用量数据（需先有被索引的活跃会话）</div>';
+    // 空状态**也必须渲染周期切换按钮**。原先这里直接 return 一句「暂无 token 用量数据」，
+    // 而周期按钮（24h/3天/…/30天）在早退之后的那一段里 —— 于是「默认 24h 窗口里没有数据、但更早
+    // 有数据」的用户：卡片说没有数据、页面上一个周期按钮都没有，唯一的出路（放宽窗口）点不到。
+    // 独立审查用真浏览器复现过：默认窗口 sessionCount=0 且 `#usage-period-toggle button` 数量为 0，
+    // 而同一个 API 用 30 天窗口返回「5 个活跃会话 / 3 个非空桶」—— 不是没数据，是这个窗口里没有。
+    const hours = usage?.trendBy?.total?.hours
+      ?? USAGE_PERIODS.find((p) => p.key === activePeriodKey)?.hours ?? 24;
+    return `
+    <div class="usage-trend-block">
+      <div class="usage-trend-head">
+        <span class="usage-trend-title">用量趋势</span>
+        <span class="trend-range">${rangeLabel(hours)}</span>
+      </div>
+      ${periodToggleHtml(activePeriodKey)}
+      <div class="empty">这个窗口（${rangeLabel(hours)}）内没有 token 用量数据。若更早用过 dsh，可切换到更长的周期查看。</div>
+    </div>`;
   }
   const { summary } = usage;
   const totalTrend = usage?.trendBy?.total || null;
