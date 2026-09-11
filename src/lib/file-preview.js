@@ -423,23 +423,30 @@ export async function writeUpload(home, root, dir, parts, exec = sshBash) {
     let index = 0;
     let pending = [];
     let pendingBytes = 0;
-    for await (const chunk of asChunks(part.chunks)) {
-      for (let at = 0; at < chunk.length; at += REMOTE_CHUNK_BYTES) {
-        const slice = chunk.subarray(at, at + REMOTE_CHUNK_BYTES);
-        total += slice.length;
-        if (total > UPLOAD_BYTES) throw new Error(`上传内容超过 ${Math.floor(UPLOAD_BYTES / (1024 * 1024))} MiB 上限`);
-        pending.push(slice);
-        pendingBytes += slice.length;
-        if (pendingBytes >= REMOTE_CHUNK_BYTES) {
-          await sendRemoteChunk(home, exec, tmp, index++, Buffer.concat(pending));
-          pending = [];
-          pendingBytes = 0;
+    try {
+      for await (const chunk of asChunks(part.chunks)) {
+        for (let at = 0; at < chunk.length; at += REMOTE_CHUNK_BYTES) {
+          const slice = chunk.subarray(at, at + REMOTE_CHUNK_BYTES);
+          total += slice.length;
+          if (total > UPLOAD_BYTES) throw new Error(`上传内容超过 ${Math.floor(UPLOAD_BYTES / (1024 * 1024))} MiB 上限`);
+          pending.push(slice);
+          pendingBytes += slice.length;
+          if (pendingBytes >= REMOTE_CHUNK_BYTES) {
+            await sendRemoteChunk(home, exec, tmp, index++, Buffer.concat(pending));
+            pending = [];
+            pendingBytes = 0;
+          }
         }
       }
+      if (pendingBytes) await sendRemoteChunk(home, exec, tmp, index++, Buffer.concat(pending));
+      const result = await finishRemoteUpload(home, exec, tmp, meta64, total);
+      files.push({ ...result, path: result.path });
+    } catch (e) {
+      // 分片阶段失败时 finishRemoteUpload 还没跑过，没人清理远端临时目录：
+      // 每次重试都会在远端留一份残留（TMPDIR 不可用时甚至在用户家目录里）。
+      await cleanupRemoteTemp(home, exec, tmp);
+      throw e;
     }
-    if (pendingBytes) await sendRemoteChunk(home, exec, tmp, index++, Buffer.concat(pending));
-    const result = await finishRemoteUpload(home, exec, tmp, meta64, total);
-    files.push({ ...result, path: result.path });
   }
   const resolved = await resolveUploadDir(root, dir);
   return { dir: resolved.dir, files };
@@ -452,9 +459,28 @@ function safeRandomSuffix() {
 // 远端临时目录（放在 /tmp 下，避开用户家目录的权限差异）。
 async function remoteTempDir(home, exec) {
   const result = await exec(home.host, REMOTE_TEMP_DIR_SCRIPT, [], 20000);
-  const dir = result.stdout.trim();
-  if (result.code !== 0 || !dir.startsWith('/')) throw new Error('无法在远端创建临时目录，请检查 SSH 连接');
+  // 只取最后一行：远端登录 shell 可能先打印 profile / motd / BASH_ENV 之类的内容，
+  // 整段 trim 会把它们一并当成目录名（本文件其它远端消费点一律用 lastLine）。
+  const dir = lastLine(result.stdout);
+  // 目录名会被拼进后续远端命令（包括 `rm -rf`），必须限制字符集：只允许绝对路径 +
+  // 常见安全字符。mktemp 生成的名字必然满足；出现别的说明远端环境异常，宁可拒绝。
+  if (result.code !== 0 || !/^\/[A-Za-z0-9._/-]+$/.test(dir)) throw new Error('无法在远端创建临时目录，请检查 SSH 连接');
   return dir;
+}
+
+// POSIX 单引号引用（与 control/prober.js 的 shellSingleQuote 同一套规则）：
+// 单引号之外的字符一律按字面量处理。
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+// 失败路径的 best-effort 清理：合并阶段自己会清（见 finishRemoteUpload），但**分片阶段**
+// 失败（SSH 断、超时、超限）时没人清，重试一次就在远端留一份残留 —— 而且 TMPDIR 不可用时
+// mktemp 的兜底会把目录建到用户家目录里。清理失败不掩盖原始错误。
+async function cleanupRemoteTemp(home, exec, tmp) {
+  try {
+    await exec(home.host, `rm -rf ${shellQuote(tmp)}`, [], 20000);
+  } catch { /* 尽力而为 */ }
 }
 
 async function sendRemoteChunk(home, exec, tmp, index, data) {
@@ -470,7 +496,9 @@ function lastLine(text) {
 async function finishRemoteUpload(home, exec, tmp, meta64, total) {
   const command = remotePython(REMOTE_FINISH_PY, [tmp, meta64]);
   // 无论合并成败都清掉远端临时目录（否则失败会在 /tmp 下留一堆分片）。
-  const script = `${command} ; __hwb_rc=$? ; rm -rf '${tmp}' ; exit $__hwb_rc`;
+  // 用 shellQuote 而不是裸 `'${tmp}'`：tmp 来自远端 stdout，其中一个单引号就能闭合引号，
+  // 把后面的内容变成要执行的命令。
+  const script = `${command} ; __hwb_rc=$? ; rm -rf ${shellQuote(tmp)} ; exit $__hwb_rc`;
   const result = await exec(home.host, script, [], Math.max(120000, Math.ceil(total / (1024 * 1024)) * 2000));
   if (result.code !== 0) {
     const reason = lastLine(result.stderr);

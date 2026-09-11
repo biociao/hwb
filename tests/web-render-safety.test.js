@@ -15,6 +15,7 @@ globalThis.window = { matchMedia: () => ({ matches: false }) };
 
 const { renderRecentSessions } = await import('../src/web/components/recent-sessions.js');
 const { renderRecentProjects } = await import('../src/web/components/recent-projects.js');
+const { renderInstanceGrid } = await import('../src/web/components/instance-grid.js');
 
 const PAYLOAD = 'x"><img src=x onerror=alert(1)>';
 // 只有在「真的被解析成标签」时才算注入成功。注意不能拿 `onerror=` 之类的**字面量**当判据：
@@ -76,4 +77,36 @@ test('recent-projects: 无实例信息时不给 chip，避免读 undefined 崩�
   );
   assert.doesNotMatch(html, /home-chip/);
   assert.match(html, /no sessions/);
+});
+
+// 实例网格的降级提示。域降级（如 dsh 升级后 unit.version 不被识别）此前只写进数据库、
+// 界面上任何地方都不显示，用户只能看到「这个实例的会话/项目变少了」而毫无线索。
+test('instance-grid: 域降级时显示可解释的警告 chip', () => {
+  const home = {
+    homeId: 'abcdef1234567890', homePath: '/home/u/.dsh', status: 'degraded',
+    workspaceCount: 1, sessionCount: 2, runtime: { runtime: 'running', latencyMs: 3, checkedAt: null },
+    degraded: [{ domain: 'projcache', error: 'unsupported version 4 (supported: 3)', degraded: true }],
+  };
+  const html = renderInstanceGrid([home]);
+  assert.match(html, /projcache 降级/, '必须出现降级 chip');
+  assert.match(html, /unsupported version 4/, 'chip 的 title 应带上具体原因，便于归因');
+  assert.match(html, /本次成功索引|上一次成功索引/, '应说明数据仍在沿用上一次');
+});
+
+test('instance-grid: 无降级时不显示 chip', () => {
+  const home = {
+    homeId: 'abcdef1234567890', homePath: '/home/u/.dsh', status: 'ok',
+    workspaceCount: 0, sessionCount: 0, runtime: { runtime: 'stopped' }, degraded: [],
+  };
+  assert.doesNotMatch(renderInstanceGrid([home]), /降级/);
+});
+
+test('instance-grid: 降级原因里的 HTML 被转义（错误文本可能含远端路径）', () => {
+  const evil = '"><img src=x onerror=alert(1)>';
+  const html = renderInstanceGrid([{
+    homeId: 'abcdef1234567890', homePath: '/x', status: 'degraded', workspaceCount: 0, sessionCount: 0,
+    runtime: { runtime: 'stopped' }, degraded: [{ domain: evil, error: evil, degraded: true }],
+  }]);
+  assert.doesNotMatch(html, INJECTED_TAG);
+  assert.match(html, /&lt;img/);
 });

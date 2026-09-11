@@ -9,10 +9,13 @@ const pExecFile = promisify(execFile);
 //   · 依赖 `ps` 的命令签名校验在受限环境下不可靠。
 // 作为"自主选择"而非继承法则。
 
-// 主指纹：我们持有 ChildProcess 句柄，且它仍未退出（exitCode===null）。
-// 若已退出（exitCode!==null），pid 可能已被复用 → 不应 kill。
+// 主指纹：我们持有 ChildProcess 句柄，且它仍未退出。
+// 判据必须同时看 exitCode 与 signalCode —— 被信号杀掉的子进程（SIGKILL / OOM killer / SIGTERM）
+// 保持 exitCode === null，只设 signalCode。原实现只判 exitCode，于是「已被信号杀掉」的句柄
+// 仍被判成存活：与 Launcher.status() 的判据（两个字段都看）不一致，
+// 也让 stop() 的返回值对「被信号终止」这种情况说谎。
 export function fingerprint(proc) {
-  return !!proc && proc.exitCode === null;
+  return !!proc && proc.exitCode === null && proc.signalCode == null;
 }
 
 // 可选：从启动参数构造该进程应有的命令签名（供 ps 校验时的补充判断，需 ps 可用）。

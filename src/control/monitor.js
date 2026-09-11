@@ -77,7 +77,12 @@ export class Monitor {
   }
 
   #tick() {
-    this.#checkAll().finally(() => {
+    // #checkAll 里任何一处抛错（store 查询、launcher 状态、broadcast）都会让 .finally() 返回的
+    // promise 变成未处理的拒绝：既污染日志（crash handler 记成 fatal），又掩盖真正的原因。
+    // 心跳本身必须能扛住单次失败继续跑。
+    this.#checkAll().catch((e) => {
+      log.warn('实例心跳检查失败（本轮跳过，下一轮重试）', { error: e?.message ?? String(e) });
+    }).finally(() => {
       if (!this.running) return;
       this.timer = setTimeout(() => this.#tick(), this.intervalMs);
       this.timer.unref?.();
@@ -94,7 +99,8 @@ export class Monitor {
       if (!this.store.getHome(e.homeId)) {
         // 删除路径的兜底清理；显式删除 API 会先 disconnect，避免等待下次心跳。
         // :switch 是 Launcher 尚未提交的端点候选，不属于已删除实例。
-        if (!e.homeId.endsWith(':switch')) await this.launcher.disconnect?.({ homeId: e.homeId });
+        // release=true：实例已从 store 消失，受管子进程必须回收，不能只标记 detached。
+        if (!e.homeId.endsWith(':switch')) await this.launcher.disconnect?.({ homeId: e.homeId }, { release: true });
         this.registry.delete(e.homeId);
         this.checks.delete(e.homeId);
         this.health.delete(e.homeId);

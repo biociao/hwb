@@ -14,13 +14,14 @@ const log = logger('launcher');
 // 进程句柄存 this.procs；控制状态（phase/url/port/pid）写入共享 registry，
 // 由 Monitor 推进状态机。stop 前经 guard 指纹校验，防误杀。
 export class Launcher {
-  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], stopRemoteFn = stopRemote, rememberAccessPort = () => {} } = {}) {
+  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {} } = {}) {
     this.registry = registry;
     this.tunnelFactory = tunnelFactory;
     this.remotePathExists = remotePathExists;
     this.waitHttp = waitHttp;
     this.tunnelReadyDelayMs = tunnelReadyDelayMs;
     this.recoveryDelaysMs = recoveryDelaysMs;
+    this.recoveryCooldownMs = recoveryCooldownMs;
     this.stopRemoteFn = stopRemoteFn;
     this.rememberAccessPort = rememberAccessPort;
     this.procs = new Map(); // homeId -> { pid, port, url, proc, deeplink, kind }
@@ -40,19 +41,29 @@ export class Launcher {
   }
 
   // 仅撤销 hwb 接入；不停止远端 dsh web。
-  async disconnect(home) {
+  //
+  // release=true 表示「这个实例正在被**移除**」，而不是「暂时断开」：此时必须把 hwb 自己
+  // 拉起的本机 dsh web 也收掉。否则 store.removeHome() 之后该条目在任何 API/UI 里都不再可达，
+  // 而进程会一直占着端口与 DSH_HOME，直到 hwb 本身退出（只有 process 'exit' 钩子会兜底杀）。
+  async disconnect(home, { release = false } = {}) {
     const inst = this.procs.get(home.homeId);
     this.#cancelRecovery(inst);
     // 本机受管进程保留所有权，断开只撤销 hwb 接入，之后可以重新连接。
     if (inst?.previewProxy) await inst.previewProxy.close();
     if (inst?.proxy) await inst.proxy.close();
     if (inst?.kind === 'ssh' && fingerprint(inst.proc)) inst.proc.kill();
-    if (inst?.kind === 'dsh-web') {
+    if (inst?.kind === 'dsh-web' && !release) {
       inst.detached = true;
       delete inst.previewProxy;
       delete inst.previewPending;
       delete inst.iframeUrl;
-    } else this.procs.delete(home.homeId);
+    } else {
+      if (release && inst?.proc && fingerprint(inst.proc)) {
+        log.info('移除实例：回收 hwb 拉起的本机 dsh web', { homeId: home.homeId, pid: inst.pid });
+        inst.proc.kill();
+      }
+      this.procs.delete(home.homeId);
+    }
     this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
   }
 
@@ -347,8 +358,20 @@ export class Launcher {
 
   #scheduleRecovery(home, inst) {
     if (this.procs.get(home.homeId) !== inst || inst.cancelled || !inst.recovering || inst.recoveryTimer) return;
-    const delayMs = this.recoveryDelaysMs[inst.recoveryAttempts ?? 0];
-    if (delayMs === undefined) return; // 有界重试；用户仍可点击连接重新尝试。
+    const attempts = inst.recoveryAttempts ?? 0;
+    // 先按快退避把常见抖动救回来；预算用尽后转入**慢速常驻重试**，而不是彻底停下。
+    // 原先预算用尽就直接 return，什么状态都不清：recovering 永远为真，status() 因此跳过
+    // 「进程已死」判断、持续吐出早就失效的 URL，Monitor 走 recovering 分支既不再探测也不安排
+    // 重连 —— 网络恢复后实例永远不会自愈，而且 routes.js 会把「换一条通道连同一实例」判成
+    // 「已被占用」直接 409，用户连绕过去都做不到。
+    const delayMs = attempts < this.recoveryDelaysMs.length
+      ? this.recoveryDelaysMs[attempts]
+      : this.recoveryCooldownMs;
+    if (attempts === this.recoveryDelaysMs.length) {
+      log.warn('SSH 重连快退避已用尽，转为慢速常驻重试', {
+        homeId: home.homeId, attempts, cooldownMs: this.recoveryCooldownMs,
+      });
+    }
     inst.recoveryTimer = setTimeout(() => {
       inst.recoveryTimer = null;
       this.#recoverRemote(home, inst).catch(() => {});

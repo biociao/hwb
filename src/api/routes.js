@@ -343,7 +343,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       connecting.add(key);
       try {
         // 移除前先撤销接入与后台恢复，避免删除后旧连接重新出现。
-        await launcher.disconnect(home);
+        // release=true：实例即将从索引里消失，hwb 自己拉起的本机 dsh web 必须一并回收，
+        // 否则它会一直占着端口与 DSH_HOME，且再也无法从 UI/API 触达。
+        await launcher.disconnect(home, { release: true });
         store.removeHome(homeId);
         hub.broadcast('index:updated', { homeId, removed: true });
         send(res, 200, { ok: true, homeId });

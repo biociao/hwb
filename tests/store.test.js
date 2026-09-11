@@ -72,11 +72,31 @@ test('store re-upsert replaces child rows wholesale', () => {
     homeId, homePath: '/mock/home', generatedAt: new Date().toISOString(),
     wsVersion: 2, pcVersion: 3,
     workspaces: [], sessions: [], modelTier: null,
-    providers: [], degraded: [{ domain: 'workspace', error: 'gone', degraded: true }],
+    providers: [], degraded: [],
   });
   store.upsertRows(rows);
   assert.equal(store.recentSessions({}).length, 0);
   assert.equal(store.listWorkspaces().length, 0);
+  assert.equal(store.listHomes()[0].status, 'ok');
+  store.close();
+});
+
+// 降级域是「整表替换」的例外：它对应的表必须保留上一次成功索引的行。
+// 否则一次 dsh 升级（unit.version 不再被识别）就会把该实例的会话/项目静默删空
+// —— 界面上没有任何地方显示 degraded，用户只会看到实例「变空了」。
+// 完整覆盖见 tests/store-degraded.test.js。
+test('store re-upsert keeps rows of degraded domains only', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  const rows = normalize({
+    homeId, homePath: '/mock/home', generatedAt: new Date().toISOString(),
+    wsVersion: 999, pcVersion: 3,
+    workspaces: [], sessions: [], modelTier: null,
+    providers: [], degraded: [{ domain: 'workspace', error: 'gone', degraded: true }],
+  });
+  store.upsertRows(rows);
+  assert.equal(store.listWorkspaces().length, 2, 'workspace 降级 → 保留旧行（seed 建了 2 个工作区）');
+  assert.equal(store.recentSessions({}).length, 0, 'projcache 未降级 → 照常按快照替换');
   assert.equal(store.listHomes()[0].status, 'degraded');
   store.close();
 });

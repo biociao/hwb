@@ -63,7 +63,7 @@ function fakeProc(pid) {
   return proc;
 }
 
-async function fixture(t, { recoveryDelaysMs = [10, 20, 30], waitHttp = async () => true, tunnelFactoryWait = async () => {} } = {}) {
+async function fixture(t, { recoveryDelaysMs = [10, 20, 30], recoveryCooldownMs, waitHttp = async () => true, tunnelFactoryWait = async () => {} } = {}) {
   const server = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end('<html><head></head><body>session-deeplink local dsh mock</body></html>');
@@ -88,6 +88,7 @@ async function fixture(t, { recoveryDelaysMs = [10, 20, 30], waitHttp = async ()
     waitHttp: (...args) => waitHttp(++readinessCalls, ...args),
     tunnelReadyDelayMs: 0,
     recoveryDelaysMs,
+    ...(recoveryCooldownMs === undefined ? {} : { recoveryCooldownMs }),
   });
   const home = {
     homeId: 'ssh-recovery-local-mock',
@@ -305,4 +306,53 @@ test('open immediately starts a waiting recovery and concurrent opens share its 
   assert.equal(a.iframeUrl, b.iframeUrl);
   assert.equal(a.url, f.launcher.status(f.home.homeId).url);
   assert.equal(f.registry.get(f.home.homeId).phase, 'running');
+});
+
+// 快退避预算用尽后必须还能自愈。
+// 原生实现里 #scheduleRecovery 在预算用尽时**直接 return，什么状态都不清**：recovering 永远为真，
+// 于是 status() 跳过「进程已死」判断继续吐出失效 URL，Monitor 走 recovering 分支既不探测也不安排
+// 重连 —— 网络恢复后实例永远回不来，而且换一条通道连同一实例会被 409 判成「已被占用」。
+// 现在预算用尽后转入慢速常驻重试（recoveryCooldownMs），这里把冷却压到 40ms 验证它真的会重试并恢复。
+test('ssh recovery keeps self-healing after the fast budget is exhausted', async (t) => {
+  let upstreamDown = true;
+  const f = await fixture(t, {
+    recoveryDelaysMs: [10, 20],
+    recoveryCooldownMs: 40,
+    // 第 1 次是初次连接（必须成功），之后的重连在 upstreamDown 期间失败。
+    waitHttp: (attempt) => {
+      if (attempt === 1) return true;
+      if (upstreamDown) throw new Error('mock upstream temporarily unavailable');
+      return true;
+    },
+  });
+  const original = await f.launcher.open(f.home);
+  f.tunnels[0].proc.exit();
+
+  // 快退避两次都用尽（tunnels: 原 1 + 2 次重试）
+  await until(() => f.readinessCalls() === 1 + 2, 'fast backoff budget was not consumed');
+  assert.equal(f.launcher.status(f.home.homeId)?.url, original.url, '预算用尽后仍保留旧入口，页面不白屏');
+
+  // 网络恢复：下一次冷却重试应当成功，实例自愈
+  upstreamDown = false;
+  await until(() => f.readinessCalls() > 1 + 2, 'cooldown retry never happened after the fast budget was exhausted');
+  // 等到重连真正完成：status().recovering 归位为 false（只看 url 不能区分「旧入口仍在」与「已重连」）
+  await until(() => f.launcher.status(f.home.homeId)?.recovering === false, 'cooldown retry did not complete the reconnect');
+  await f.monitor.refresh(f.home.homeId);
+  assert.equal(f.monitor.get(f.home.homeId).runtime, 'running', '网络恢复后实例必须能自愈为 running');
+});
+
+// 反向保证：冷却重试并不是「无脑刷」——真正被取消（disconnect/stop）后不能再安排任何重试。
+test('ssh recovery cooldown stops once the instance is disconnected', async (t) => {
+  const f = await fixture(t, {
+    recoveryDelaysMs: [10, 20],
+    recoveryCooldownMs: 30,
+    waitHttp: (attempt) => { if (attempt === 1) return true; throw new Error('down'); },
+  });
+  await f.launcher.open(f.home);
+  f.tunnels[0].proc.exit();
+  await until(() => f.readinessCalls() === 1 + 2, 'fast backoff budget was not consumed');
+  await f.launcher.disconnect(f.home);
+  const tunnelsAtDisconnect = f.tunnels.length;
+  await sleep(150);
+  assert.equal(f.tunnels.length, tunnelsAtDisconnect, '取消后不得再建隧道');
 });

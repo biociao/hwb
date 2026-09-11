@@ -5,6 +5,28 @@ import path from 'node:path';
 import { homeIdOf } from '../lib/read-home.js';
 import { mergeLiveStatus } from './reader.js';
 
+// 每个 home 的子表（整表替换的粒度）。
+const CHILD_TABLES = ['sessions', 'workspaces', 'providers', 'model_tiers'];
+
+// 降级域 → 它负责填充的子表。见 upsertRows 的注释：降级域对应的表必须保留上次成功的行。
+// 未列出的域（例如 markHomeError 写的 'index'）不保护任何表——那类失败走的是 catch 分支，
+// 不会经过 upsertRows。
+const DOMAIN_TABLES = {
+  projcache: 'sessions',
+  workspace: 'workspaces',
+  credentials: 'providers',
+  modelTier: 'model_tiers',
+};
+
+function degradedTables(degraded) {
+  const tables = new Set();
+  for (const entry of Array.isArray(degraded) ? degraded : []) {
+    const table = DOMAIN_TABLES[entry?.domain];
+    if (table) tables.add(table);
+  }
+  return tables;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS homes (
   homeId TEXT PRIMARY KEY,
@@ -318,15 +340,21 @@ export class IndexStore {
   }
 
   // Full-refresh per home: child rows for a home are replaced wholesale.
+  //
+  // 但「整表替换」遇上降级域会变成一个静默的数据清空：某个元数据文件的 unit.version
+  // 超出支持范围时（dsh 升级后的必然情形），该域被判 degraded 并产出 0 行，
+  // 照删不误就等于把上一次成功索引的内容删光 —— 用户在仪表盘上看到「这个实例的会话和项目全没了」，
+  // 而界面上没有任何地方显示 degraded，完全无法归因。
+  // 因此：某域降级时**跳过它对应的表的 DELETE**，保留上次成功的行；其余域照常刷新。
   upsertRows(rows) {
     const homeRows = rows.filter((r) => r.type === 'home');
-    const homeIds = homeRows.map((r) => r.homeId);
 
     this.db.exec('BEGIN');
     try {
-      for (const homeId of homeIds) {
-        for (const table of ['sessions', 'workspaces', 'providers', 'model_tiers']) {
-          this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(homeId);
+      for (const home of homeRows) {
+        for (const table of CHILD_TABLES) {
+          if (degradedTables(home.degraded).has(table)) continue; // 该域降级 → 保留上次成功的行
+          this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(home.homeId);
         }
       }
 

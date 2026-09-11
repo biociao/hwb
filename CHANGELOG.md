@@ -43,6 +43,55 @@ Semantic Versioning.
 
 ### Fixed
 
+#### dsh 版本升级会静默清空该实例的整个索引（src/dshhome/store.js + src/web/components/instance-grid.js）
+- **现象**：`upsertRows` 是「整表替换」语义 —— 先把该 home 的 `sessions`/`workspaces`/`providers`/
+  `model_tiers` 全删，再按本次快照插入。而某个元数据文件的 `unit.version` 超出 `SUPPORTED_VERSIONS`
+  时（dsh 升级后的必然情形），该域被判 degraded、产出 **0 行**，于是上一次成功索引的内容被删光。
+  实测：projcache 版本 3 → 1 条会话、状态 ok；版本 4 → **0 条会话**、状态 degraded。
+- **更糟的是不可见**：`homes.degraded` 只写进数据库，界面上任何地方都不渲染，
+  用户看到的是「这个实例的会话和项目全没了」，没有任何线索指向「元数据格式不兼容」。
+- **修复**：降级域对应的表**跳过 DELETE**，保留上次成功的行（其余域照常刷新）；恢复后降级标记自动清空。
+  并在实例卡上渲染降级 chip（带具体原因与「已沿用上一次索引的数据」的解释）。
+- **回归测试**：`tests/store-degraded.test.js` 逐域覆盖（projcache / workspace / credentials / modelTier /
+  全降级 / 恢复后清标记），并在 `tests/web-render-safety.test.js` 断言 chip 文案与转义。
+
+#### 移除实例会留下占着端口的孤儿 dsh 进程（src/control/launcher.js + src/api/routes.js）
+- `disconnect()` 对 hwb 自己拉起的本机 `dsh web` 只做 `detached = true`（对「暂时断开后重连」是对的），
+  但删除路径用的是同一个 `disconnect()`：`store.removeHome()` 之后该条目在任何 API/UI 里都不再可达，
+  而进程会一直占着端口和 `DSH_HOME`，直到 hwb 本身退出（只有 `process 'exit'` 钩子兜底回收）。
+- **修复**：`disconnect(home, { release: true })`。删除 API 与 Monitor 的孤儿清理都传 `release: true`，
+  真正回收受管进程；普通「断开」行为完全不变，仍可一键重连。
+
+#### SSH 重连退避用尽后实例永久卡死，无法自愈（src/control/launcher.js）
+- `#scheduleRecovery` 在预算用尽时**直接 return，什么状态都不清**：`recovering` 永远为真，于是
+  `status()` 跳过「进程已死」判断、持续吐出早就失效的 URL；Monitor 走 `recovering` 分支既不探测也
+  不安排重连 —— 网络恢复后实例永远回不来。其次生影响同样实在：`routes.js` 会把「换一条通道连同一
+  实例」判成「已被占用」并返回 409，用户连绕过去都做不到。
+- **修复**：快退避（1/2/4/8/16s）用尽后转入慢速常驻重试（`recoveryCooldownMs`，默认 30s），
+  既保留「预算内快速自救」的设计，又不再永久卡死。`disconnect`/`stop` 仍会彻底取消重试。
+- **回归测试**：`tests/ssh-recovery.test.js` 新增「预算用尽 + 网络恢复 ⇒ 自愈为 running」与
+  「取消后不得再建隧道」两条；原有「保留旧入口不白屏」的断言全部保持通过。
+
+#### fingerprint 把「被信号杀掉的子进程」当成存活（src/control/guard.js）
+- 判据只看了 `exitCode`。被 SIGKILL / OOM killer 收掉的句柄 `exitCode` 仍为 `null`，只设 `signalCode`，
+  于是 guard 认为它还在跑 —— 与 `Launcher.status()` 的判据（两个字段都看）不一致，
+  也让 `stop()` 的返回值对这种情况说谎。改为两个字段都判。
+
+#### 心跳检查抛错会变成每 30s 一次的未处理拒绝（src/control/monitor.js）
+- `#tick()` 只用 `.finally()` 链式收尾，`#checkAll()` 里任何一处抛错（store 查询 / launcher 状态 /
+  broadcast）都会产生 unhandledRejection，被 crash handler 记成 fatal，掩盖真正原因。
+  补上 `catch` 并记 warn；心跳本身照常继续。
+
+#### 远端上传的临时目录：命令注入面 + 失败时不清理（src/lib/file-preview.js）
+- `rm -rf '${tmp}'` 里的 `tmp` 来自**远端 stdout**，单引号未转义：远端 `TMPDIR` 里有一个 `'`
+  就能闭合引号、把后面的内容变成要执行的命令。改为 POSIX 单引号引用，
+  并且 `remoteTempDir` 收紧为「只取 stdout 最后一行 + 只允许 `[A-Za-z0-9._/-]` 的绝对路径」
+  （原先整段 `trim()` 会把远端 profile 噪声当成目录名；本文件其它远端消费点早已用 `lastLine`）。
+- **失败时不清理**：`finishRemoteUpload` 只在合并阶段清临时目录，分片阶段失败（SSH 断、超时、超限）
+  时没人清 —— 每次重试都在远端留一份残留，`TMPDIR` 不可用时 `mktemp` 的兜底还会把它建到用户家目录。
+  失败路径现在补一次 best-effort `rm -rf`。
+- **回归测试**：`tests/remote-upload-tmp.test.js`（profile 噪声、恶意目录名被拒、分片失败后确实发起了清理）。
+
 #### 两条「一次失败 = 整个工作台退出」的进程级崩溃路径（src/control/launcher.js + src/control/proxy.js）
 - **本机拉起 dsh 时 spawn 失败**：`spawn('dsh', …)` 的失败（PATH 里没有 dsh、dsh 不可执行）是
   **异步**通过 `'error'` 事件上报的，而且**不触发 `'exit'`**。原先没有 `'error'` 监听，Node 把它
