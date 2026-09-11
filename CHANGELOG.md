@@ -149,6 +149,33 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 相对的 `HWB_DIR` 下 `status`/`stop` 找不到服务，还在仓库里落下状态目录（src/cli.js）
+- **现象**（独立审查提出，实测复现）：`HWB_DIR=relstate hwb start` 之后，`status` 输出 `stopped`
+  （退出码 1）而服务其实在 4399 上正常返回 200；`stop` **永远停不掉它**，还会误报
+  「很可能是前台运行的 `hwb serve`」。同时仓库根下多出一个 `relstate/` 目录，里面有
+  `service.sock` —— 一台机器上就这么出现了一个谁也管不着的后台服务。
+- **根因**：`serviceDir` 是**各进程自己**用 `path.resolve(process.env.HWB_DIR || …)` 算的，
+  而后台服务由 `spawn(..., { cwd: root })` 拉起：CLI 解析成 `<当前目录>/relstate`，
+  子进程解析成 `<仓库根>/relstate`。两个目录各有各的 socket，于是 CLI 与服务的「世界」分开了。
+- **修复**：`start()` 把**解析后的绝对路径**作为 `HWB_DIR` 传给子进程，两边永远指向同一个目录，
+  与 cwd 无关。
+- **回归测试**：`tests/cli.test.js` —— `cwd` 设在临时目录、`HWB_DIR=relstate` 时，
+  `start` 后 `status` 必须报 running、`stop` 必须真的停掉，并且仓库根下**不得**出现 `relstate`。
+
+#### 间隔与端口没有上界，可以被悄悄退化成 1ms 空转（src/lib/service-config.js + src/server.js）
+- **现象**：`hwb config set intervalMs 9999999999999999` 原样通过校验（它确实是个整数值）。
+  而 `setTimeout` 的延时上限是 `2^31-1`：**超过它不报错**，只打印一行 `TimeoutOverflowWarning`
+  然后按 **1ms** 处理 —— 于是「把间隔调大」变成「每毫秒跑一轮索引与心跳」，CPU 打满。
+  命令行那条门更松：`hwb serve --interval-ms abc` 根本不校验，`Number('abc')` → NaN → 同样 1ms；
+  `--port abc` → `listen(NaN)` 在部分平台会绑到随机端口，用户看到的端口号就成了假的。
+- **修复**：新增 `src/lib/timers.js` 导出 `MAX_TIMER_MS = 2^31-1`；配置校验与 `parseArgs`
+  都用它设上界（`--port` 上界 65535），越界时明确报出「收到什么」并以退出码 2 结束。
+- **回归测试**：`tests/cli.test.js` —— 超大的 `intervalMs` 必须被拒绝**且不写进配置**，
+  `serve --interval-ms abc` / `--interval-ms 1e16` / `--port abc` 都必须以非零码退出并说明原因。
+- **顺带**：`tests/cli.test.js` 的 upgrade 夹具改为整个 `src/lib` 目录一起复制 —— 它原先逐个列
+  文件名（`service-config.js` + `node-version.js`），这次新增 `timers.js` 又把它打破了一次
+  （`ERR_MODULE_NOT_FOUND`）。复制目录后新增依赖不会再来一次。
+
 #### 启动失败会报「上一次」的原因（src/cli.js）
 - **现象**：上一条修复引入的 `failureDetail()` 从日志**开头**往后找第一条 `hwb:` 提示就收工，
   而 `service.log` 是 append-only 的、历次启动的提示都留在里面 —— 于是本次死于端口占用时，

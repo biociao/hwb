@@ -76,7 +76,13 @@ async function start() {
   const fd = fs.openSync(output, 'a', 0o600);
   const child = spawn(process.execPath, [path.join(root, 'src/service.js'), ...serverArgs(cfg)], {
     cwd: root, detached: true, stdio: ['ignore', fd, fd, 'ipc'],
-    env: { ...process.env, HWB_SERVICE_PORT: String(cfg.port) },
+    // HWB_DIR **必须传解析后的绝对路径**：子进程的 cwd 是仓库根（cwd: root），
+    // 而 serviceDir 是各进程自己用 path.resolve 算的 —— 若用户给的是相对路径（HWB_DIR=state），
+    // CLI 会指向 <当前目录>/state，子进程却指向 <仓库根>/state。实测后果：
+    //   · 控制 socket 落在仓库里，`status` 报 stopped（退出码 1）而服务其实在 4399 正常服务
+    //   · `stop` 永远停不掉它，还会误报「很可能是前台运行的 hwb serve」
+    // 传绝对路径让两边指向同一个目录，与 cwd 无关。
+    env: { ...process.env, HWB_DIR: serviceDir, HWB_SERVICE_PORT: String(cfg.port) },
   });
   fs.closeSync(fd);
   // 日志可能因失败而新增内容，所以细节要在失败发生的**那一刻**再读

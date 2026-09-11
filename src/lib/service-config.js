@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { MAX_TIMER_MS } from './timers.js';
 
 export const serviceDir = path.resolve(process.env.HWB_DIR || path.join(os.homedir(), '.hwb'));
 export const configFile = path.join(serviceDir, 'config.json');
@@ -15,6 +16,9 @@ export function validate(value) {
   for (const key of Object.keys(value)) if (!Object.hasOwn(defaults(), key)) throw Error(`未知配置项: ${key}`);
   if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) throw Error('port 必须为 1–65535');
   if (!Number.isInteger(cfg.intervalMs) || cfg.intervalMs < 1) throw Error('intervalMs 必须为正整数');
+  // 上限 = setTimeout 延时上限。别以为「设得越大越好」：超过 2^31-1 时 Node 会把它当 1ms，
+  // 服务反而开始每毫秒跑一轮（实测 1e16 曾原样通过校验）。
+  if (cfg.intervalMs > MAX_TIMER_MS) throw Error(`intervalMs 过大（上限 ${MAX_TIMER_MS} ms ≈ 24.8 天；再大 setTimeout 会退化成 1ms 空转）`);
   for (const key of ['verbose', 'silent']) if (typeof cfg[key] !== 'boolean') throw Error(`${key} 必须为 boolean`);
   for (const key of ['db', 'log']) {
     if (key === 'log' && cfg[key] === false) continue;

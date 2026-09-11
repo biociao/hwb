@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { enforceNodeVersion } from './lib/node-version.js';
+import { MAX_TIMER_MS } from './lib/timers.js';
 
 // 版本预检必须先于 dshhome/store.js 求值：只有它 import 'node:sqlite'，而该模块在
 // Node < 22.5 并不存在，静态引入只会抛一行与根因无关的 ERR_UNKNOWN_BUILTIN_MODULE。
@@ -26,19 +27,34 @@ const defaultDb = path.join(homedir(), '.hwb', 'hwb.db');
 
 function parseArgs(argv) {
   const opts = { homes: [], port: 4310, db: defaultDb, intervalMs: 60_000, logFile: defaultLogFile(), level: 'info', silent: false };
+  // 这两项直接喂给 listen()/setTimeout()，非法值不会得到报错，只会得到**奇怪的行为**：
+  //   · `--interval-ms abc` → NaN → setTimeout 当 0 处理 → 每 1ms 跑一轮（CPU 打满）
+  //   · `--interval-ms 1e16` → 超过 setTimeout 的 2^31-1 上限，Node 警告后同样退化成 1ms
+  //   · `--port abc` → listen(NaN) 在部分平台会绑到随机端口，用户看到的端口号就成了假的
+  // 所以在这里明确拒绝，而不是让它悄悄变成别的东西。
+  const positiveInt = (name, raw, max) => {
+    const n = Number(raw);
+    const bad = !Number.isInteger(n) || n < 1 || (max !== undefined && n > max);
+    if (bad) {
+      logger('server').error(`${name} 需要 1 到 ${max ?? '无穷'} 之间的整数，收到 ${JSON.stringify(raw)}`);
+      process.exit(2);
+    }
+    return n;
+  };
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
       case '--home':
         opts.homes.push(path.resolve(argv[++i]));
         break;
       case '--port':
-        opts.port = Number(argv[++i]);
+        opts.port = positiveInt('--port', argv[++i], 65535);
         break;
       case '--db':
         opts.db = argv[++i];
         break;
       case '--interval-ms':
-        opts.intervalMs = Number(argv[++i]);
+        // 上限 = setTimeout 的最大延时（2^31-1）。超过它 Node 会把延时当成 1ms。
+        opts.intervalMs = positiveInt('--interval-ms', argv[++i], MAX_TIMER_MS);
         break;
       case '-v':
       case '--verbose':

@@ -100,11 +100,13 @@ test('CLI upgrade uses the tracked Git branch and rejects dirty or failing updat
   fs.mkdirSync(upstream);
   const git = (cwd, ...args) => exec('git', args, { cwd, env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
   await git(upstream, 'init', '-b', 'main');
-  fs.mkdirSync(path.join(upstream, 'src/lib'), { recursive: true });
+  fs.mkdirSync(path.join(upstream, 'src', 'lib'), { recursive: true });
   fs.mkdirSync(path.join(upstream, 'tests'));
   fs.copyFileSync(cli, path.join(upstream, 'src/cli.js'));
-  fs.copyFileSync(new URL('../src/lib/service-config.js', import.meta.url), path.join(upstream, 'src/lib/service-config.js'));
-  fs.copyFileSync(new URL('../src/lib/node-version.js', import.meta.url), path.join(upstream, 'src/lib/node-version.js'));
+  // 整个 src/lib 一起复制，**不要**逐个列文件名：cli.js 的 import 会变（加过 node-version.js、
+  // 又加过 timers.js），每加一个文件都要回来改这份清单，忘了就是一次「升级测试莫名其妙失败」。
+  // 复制目录后新增依赖自动被覆盖。
+  fs.cpSync(new URL('../src/lib', import.meta.url), path.join(upstream, 'src/lib'), { recursive: true });
   fs.writeFileSync(path.join(upstream, 'package.json'), '{"type":"module"}');
   fs.writeFileSync(path.join(upstream, 'tests/pass.test.js'), 'import test from "node:test"; test("ok", () => {});');
   await git(upstream, 'add', '.');
@@ -196,4 +198,54 @@ test('CLI：启动失败取的是日志里**最后**一条提示，不能把旧�
     assert.doesNotMatch(err.stderr, /无法打开数据库/, '不得回显历史提示');
     return true;
   });
+});
+
+// HWB_DIR 允许是相对路径，但 serviceDir 是**各进程自己**用 path.resolve 算的，而后台服务是被
+// `spawn(..., { cwd: root })` 拉起来的 —— 于是 CLI 指向 <当前目录>/state、子进程指向 <仓库根>/state。
+// 实测后果（修前）：控制 socket 落在仓库里，`status` 报 stopped（退出码 1）而服务在 4399 正常服务，
+// `stop` 永远停不掉它，还会误报「很可能是前台运行的 hwb serve」。
+test('CLI：相对的 HWB_DIR 下 status/stop 依然能找到服务，且不往仓库里落文件', async t => {
+  const repoRoot = path.dirname(path.dirname(cli));
+  const stray = path.join(repoRoot, 'relstate');           // 修前子进程会创建它
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-rel-'));
+  const run = (...args) => exec(process.execPath, [cli, ...args], { cwd: dir, env: { ...process.env, HWB_DIR: 'relstate' }, timeout: 25000 });
+  t.after(async () => {
+    await run('stop').catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(stray, { recursive: true, force: true });
+  });
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+  await run('start');
+  const state = JSON.parse((await run('status')).stdout);
+  assert.equal(state.ready, true, 'status 必须能找到刚启动的服务（两边要指向同一个 HWB_DIR）');
+  assert.equal(state.port, n);
+  assert.equal(fs.existsSync(stray), false, '相对 HWB_DIR 不该解析到仓库根下（子进程的 cwd）');
+  await run('stop');
+  await assert.rejects(run('status'), /./, 'stop 之后 status 应当报停止');
+});
+
+// setTimeout/setInterval 的延时上限是 2^31-1，**超过不会报错**，而是打印一行
+// TimeoutOverflowWarning 后按 1ms 处理 —— 于是「把间隔调大」变成「每毫秒跑一轮索引与心跳」。
+// 实测 1e16 曾原样通过 config 校验；命令行那条门（`serve --interval-ms`）连类型都不校验。
+test('CLI：间隔与端口必须是有界的正整数，不能悄悄退化成 1ms 空转', async t => {
+  const { dir, run } = await fixture(t);
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+  const baseline = fs.readFileSync(path.join(dir, 'config.json'), 'utf8');
+
+  // ① 配置这条门
+  await assert.rejects(run('config', 'set', 'intervalMs', '9999999999999999'), /intervalMs 过大/);
+  await assert.rejects(run('config', 'set', 'intervalMs', '0'), /正整数/);
+  assert.equal(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'), baseline, '非法值不该写进配置');
+
+  // ② 命令行这条门（绕过配置校验）。修前 `--interval-ms abc` 会照常启动服务并 1ms 空转。
+  const serve = (args) => exec(process.execPath, [cli, 'serve', ...args, '--db', path.join(dir, 'hwb.db'),
+    '--log', path.join(dir, 'serve.log')], { env: { ...process.env, HWB_DIR: dir }, timeout: 8000 });
+  await assert.rejects(serve(['--interval-ms', 'abc', '--port', String(n)]), (err) => {
+    assert.match(String(err.stderr || err.message), /--interval-ms 需要 1 到/);
+    return true;
+  });
+  await assert.rejects(serve(['--interval-ms', '1e16', '--port', String(n)]), /--interval-ms 需要 1 到/);
+  await assert.rejects(serve(['--port', 'abc']), /--port 需要 1 到/);
 });
