@@ -516,3 +516,33 @@ test('CLI: upgrade 全程持有启停锁（并发 stop 必须被明确拒绝）'
   assert.equal(code, 0, `upgrade 应正常结束，实际 ${code}；输出：${upgradeOut.slice(-300)}`);
   assert.match(upgradeOut, /升级及测试完成/);
 });
+
+// 记录端口只是**线索**，不能让它制造与 hwb 无关的错误：前台 serve 退出后留下的陈旧
+// `service.port`，配上之后某个无关程序恰好占用那个端口，原先会让 `hwb stop` 报
+// 「端口 X 被其它程序占用（不是 hwb）」—— 而 X 跟用户当前的服务毫无关系。
+// 「被其它程序占用」只对**配置端口**报（那才是用户打算给 hwb 用的端口）。
+test('CLI: 陈旧的 service.port 指向无关程序时，stop 不该报错（只对配置端口报占用）', async (t) => {
+  const { dir, run } = await fixture(t);
+  const cfgPort = await port();
+  await run('config', 'set', 'port', String(cfgPort));
+  // 一个与 hwb 无关的监听者，占用「记录端口」
+  const strangerPort = await port();
+  const stranger = net.createServer((s) => s.destroy());
+  await new Promise((r) => stranger.listen(strangerPort, '127.0.0.1', r));
+  t.after(() => new Promise((r) => stranger.close(r)));
+  fs.writeFileSync(path.join(dir, 'service.port'), String(strangerPort));
+
+  const stopOut = await run('stop').then((r) => r.stdout, (e) => `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`);
+  assert.match(String(stopOut), /已停止/, `没有 hwb 在跑时 stop 应正常报已停止（实际 ${String(stopOut).trim()}）`);
+  assert.doesNotMatch(String(stopOut), /其它程序/, '无关程序占用的是记录端口，不该拿它报错');
+  assert.ok(!fs.existsSync(path.join(dir, 'service.port')), 'stop 之后应清掉端口记录');
+
+  // 对照：**配置端口**被无关程序占用时仍然要明确报错（用户该处理的就是这个）
+  const blocker = net.createServer((s) => s.destroy());
+  const busy = await port();
+  await new Promise((r) => blocker.listen(busy, '127.0.0.1', r));
+  t.after(() => new Promise((r) => blocker.close(r)));
+  await run('config', 'set', 'port', String(busy));
+  const busyOut = await run('stop').then((r) => r.stdout, (e) => `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`);
+  assert.match(String(busyOut), /其它程序/, `配置端口被占用时必须说清楚（实际 ${String(busyOut).trim().slice(0, 120)}）`);
+});

@@ -128,6 +128,8 @@ async function start() {
 // 所以进程被 kill -9 后留下的陈旧文件不会造成误报。
 const servicePortFile = path.join(serviceDir, 'service.port');
 
+const dropPortFile = () => { try { fs.rmSync(servicePortFile, { force: true }); } catch { /* 尽力而为 */ } };
+
 // 从 argv 里取生效端口（`--port a --port b` 取最后一个，与 server.js 的解析顺序一致）。
 function effectivePort(argv) {
   let port = readConfig().port;
@@ -139,16 +141,17 @@ function effectivePort(argv) {
   return port;
 }
 
-// 候选端口：记录下来的生效端口优先，其次是配置端口（两者相同就只留一个）。
+// 候选端口：`[前台 serve 记录下来的生效端口, 配置端口]`（缺失/重复时退化为同一个）。
+// 两个位置语义不同，调用方要分开用：记录端口只用来找「hwb 自己」（陈旧文件 + 无关程序占用
+// 不该让 stop 报一个与 hwb 无关的错误），配置端口才是「用户打算给 hwb 用的那个」。
 function candidatePorts() {
-  const ports = [];
+  let recorded = null;
   try {
-    const recorded = Number(fs.readFileSync(servicePortFile, 'utf8').trim());
-    if (Number.isInteger(recorded) && recorded > 0 && recorded < 65536) ports.push(recorded);
-  } catch { /* 没有记录（后台服务或从没起过前台 serve） */ }
-  const cfg = readConfig().port;
-  if (!ports.includes(cfg)) ports.push(cfg);
-  return ports;
+    const n = Number(fs.readFileSync(servicePortFile, 'utf8').trim());
+    if (Number.isInteger(n) && n > 0 && n < 65536) recorded = n;
+  } catch { /* 没有记录（后台服务、或从没起过前台 serve） */ }
+  const configured = readConfig().port;
+  return [recorded ?? configured, configured];
 }
 
 // 端口上是不是**hwb 自己**在服务（不依赖控制 socket）。
@@ -181,23 +184,26 @@ async function stop() {
     // 没有控制 socket ≠ 服务没在跑：前台 `hwb serve` 不创建 socket，但它占着端口。
     // 原先直接打印「已停止」并返回 0，用户以为停掉了，下一次 `hwb start` 却只报一句
     // 难懂的「启动失败 (1)」（其实是 EADDRINUSE）。这里说清楚实际情况。
-    for (const port of candidatePorts()) {
+    const [recorded, configured] = candidatePorts();
+    for (const port of new Set([recorded, configured].filter(Boolean))) {
       if (await hwbOnPort(port)) {
         throw Error(`没有控制 socket，但 http://127.0.0.1:${port} 上有 hwb 在服务 —— `
           + '多半是前台运行的 `hwb serve`。请到那个终端按 Ctrl-C 停止它。');
       }
-      if (await portInUse(port)) {
-        // 端口被占但不是 hwb：不要说成「前台 hwb serve」，那会把用户引到错误的方向
-        // （去某个终端找 Ctrl-C），而实际该处理的是另一个程序。
-        throw Error(`没有控制 socket，端口 ${port} 被**其它程序**占用（不是 hwb）。`
-          + `可换端口：\`hwb config set port <新端口>\`；或查占用者：\`lsof -i :${port}\`。`);
-      }
     }
+    // 「被其它程序占用」只对**配置端口**报错：它才是用户打算给 hwb 用的端口
+    // （提示里也会建议改配置）。记录下来的那个端口只是线索 —— 前台 serve 退出后留下的陈旧
+    // 记录文件 + 之后某个无关程序恰好占用该端口，就会让 `hwb stop` 报一个与 hwb 毫无关系的错误。
+    if (configured !== undefined && await portInUse(configured)) {
+      throw Error(`没有控制 socket，端口 ${configured} 被**其它程序**占用（不是 hwb）。`
+        + `可换端口：\`hwb config set port <新端口>\`；或查占用者：\`lsof -i :${configured}\`。`);
+    }
+    dropPortFile();
     console.log('已停止'); return;
   }
   for (let i = 0; i < 100; i++) {
     await delay(100);
-    if (!await request()) { console.log('已停止'); return; }
+    if (!await request()) { dropPortFile(); console.log('已停止'); return; }
   }
   throw Error('停止超时；未强制杀进程，请查看日志');
 }
