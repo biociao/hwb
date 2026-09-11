@@ -191,3 +191,20 @@ test('proxy: static cache headers survive preview chaining without sharing authe
   // The proxy supplies browser policy; it never stores or reuses response bodies.
   assert.equal(requests, 3);
 });
+
+// 目标协议/URL 两条守卫在套件里从没被走到过（审查指出：把协议检查删掉，整套仍然全绿）。
+// 它们守的是「代理只转发 http 目标」这个前提：`retarget` 只在同一个 registry 数据上被调用，
+// 所以危害有限，但**前提本身**没人守 —— 一旦上游传进 https/ftp（或将来支持 https 的 dsh），
+// 代理会静默地去连一个它不支持的目标。
+test('createProxy: 非 http 目标与非法 URL 必须被拒绝', async () => {
+  const { createProxy } = await import('../src/control/proxy.js');
+  await assert.rejects(() => createProxy({ target: 'https://example.invalid:3080' }), /only http target supported/);
+  await assert.rejects(() => createProxy({ target: 'not a url' }), /invalid target/);
+  // 对照：http 目标可以正常建起来，且 retarget 同样只接受 http
+  const proxy = await createProxy({ target: 'http://127.0.0.1:9' });
+  try {
+    assert.throws(() => proxy.retarget('https://example.invalid'), /only http target supported/);
+  } finally {
+    await proxy.close();
+  }
+});
