@@ -435,6 +435,50 @@ Semantic Versioning.
 - **顺带**修掉测试夹具的一个缺陷：假的 `res` 没有 `end()`，于是「拒绝时回一句话」这种代码
   会被 try/catch 吞掉，测出来是假象。
 
+#### 降级 + 实时合并会把文件索引撑起来的会话「洗白」甚至删掉（src/dshhome/store.js，CRITICAL）
+- **现象**（独立审查第 9 轮，实测复现）：projcache 域降级时（dsh 升级到不认识的 `unit.version`，
+  正是降级路径存在的原因），`normalize()` 产出 0 条会话行，于是 `mergeLiveStatus` 把**每一条**
+  实时会话都当成「文件里还没有的新会话」（`liveOnly=1`、title/workspaceId/tokenUsage 全 null），
+  与库里**被刻意保留**的那行相撞时把文件值覆盖成空，并把 `liveOnly` 从 0 翻成 1。
+  实测：用量统计 1520550 → 620550（**丢 59% 的历史**），会话丢掉标题与工作区归属；
+  更要命的是翻成 1 之后，下一次「实时列表为空」的轮询会**把它删掉**（那一分支专门删 liveOnly=1），
+  workspace 的 sessionCount 也归零。
+- **修复**：`ON CONFLICT` 里做「文件行不被纯实时行覆盖」的条件更新（title/workspaceId/project/
+  tokenUsage/contextPressure 保留旧值，`liveOnly` 保持 0），只让 status/lastActivity 照旧取实时值。
+- **回归测试**：`tests/store-degraded.test.js` 两条 —— 降级 + 实时合并后标题/工作区/token 历史仍在、
+  `liveOnly` 仍是 0、用量统计一分不少；随后「空实时列表」也不得删掉这行。
+
+#### 幽灵会话：实时列表非空时，消失的纯实时行永远不清（src/dshhome/store.js，HIGH）
+- **现象**：`liveOnly=1` 的行只由实时列表支撑，但清理只写在「列表**完全为空**」那一分支。
+  只要还有任意一条会话活着，先前消失的会话就会一直留着：永远显示「运行中」、占着计数、
+  还造出一个幻影项目 —— 实测 70 秒（直到下一轮文件索引），在 projcache 降级时是**永久**的。
+- **修复**：非空分支里先把不在本次实时列表中的 `liveOnly=1` 行删掉（逐行删，避免 SQL 变量数上限）。
+- **回归测试**：`tests/store-degraded.test.js` —— 两条实时会话 → 移除其中一条 → 库里只剩活着的那条，
+  计数同步下降。修复前失败。
+
+#### 索引器用陈旧快照盖掉轮询器刚写的实时状态（src/dshhome/store.js + src/dshhome/indexer.js，MEDIUM）
+- **现象**：索引器在读文件之后 `await liveStatus()`（一次 RPC），期间轮询器可能已写入更新鲜的状态。
+  实测：dsh 报 running、轮询器刚写「运行中」，索引器随后把它打回「空闲」；整表替换还会删掉窗口内
+  新出现的会话（直到下一次轮询才回来）。
+- **修复（两处，第一版是错的，值得记下来）**：
+  · 先加一层守卫：抓实时状态前记下时间，抓完若发现这期间有实时写入，就丢弃自己这份。
+  · 但真正把徽标打回去的是**文件快照**（projcache 的冻结状态，非 null 的陈旧值）——
+    而且它走的是「先 DELETE 整表再 INSERT」，`ON CONFLICT` 分支**根本不会执行**，
+    我第一版把保留逻辑加在 `ON CONFLICT` 里是**死代码**（实测确认，已删）。正确做法是
+    替换前捕获 `status/lastActivity`、替换后写回，且只在「该 home 最近有实时写入」的窗口内这么做
+    （通道停了就恢复文件权威，避免退化成「会话永远挂着旧徽标」那个已修缺陷）。
+- **回归测试**：`tests/indexer.test.js` —— 索引器的实时抓取挂住 → 期间轮询器写「运行中」 →
+  放行索引器那份过期快照 → 状态必须仍是「运行中」。修复前失败。
+
+#### 实时 tokenUsage 的形态没有归一（src/dshhome/live-status.js）
+- **问题**：文件侧是带版本包装的 `{ver,seq,val:{totals:{…}}}`，而实时侧把 `values.tokenUsage`
+  **原样**透传。若 dsh 给的是同一层包装，我们就会把嵌套结构存进 `sessions.tokenUsage`：
+  用量聚合按 `$.uncachedInputTokens` 取值只会得到 0，而且这次实时写入会**覆盖掉文件索引里正确的值**
+  —— 正在跑的会话历史用量突然归零。审查把它标为 UNVERIFIED（没有可对照的实例），两种形态都防才是对的。
+- **修复**：新增 `normalizeLiveTokenUsage`，三种形态（扁平 / `{totals}` / `{val:{totals}}`）都归一，
+  认不出来就返回 null（宁可没有，也不要存一个自己解析不出来的结构）。
+- **回归测试**：`tests/live-status.test.js`（新文件）—— 三种形态 + 字符串数字 + 六种垃圾输入。
+
 #### 两处「原因存在但用户看不到」的静默（src/lib/logger.js + src/lib/balance.js）
 - **日志轮转失败完全静默**：`rotate()` 里三处 `rename` 各自 `catch {}` —— 轮转失败意味着日志文件
   **无上限增长**，而没有任何人知道。修复：失败时用 `console.error` 提示一次（这里在日志写入通道

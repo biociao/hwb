@@ -205,6 +205,11 @@ const tokOf = (alias) => ({
   total: `COALESCE(SUM(${alias}.tokInput + ${alias}.tokOutput + ${alias}.tokCacheRead + ${alias}.tokCacheWrite), 0)`,
 });
 
+// 「实时写入活跃」的宽限期：只要这个 home 在这个窗口内有过实时状态写入，就认为实时通道在主导
+// status/lastActivity（见 upsertRows 里的 preserveLive）。比轮询间隔（3s）宽裕得多，
+// 又足够短：通道一停，宽限期结束，文件索引重新拿到权威。
+const LIVE_GRACE_MS = 10_000;
+
 const int = (v, dflt) => {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : dflt;
@@ -242,8 +247,11 @@ function safeJsonParse(raw, fallback, label) {
 }
 
 export class IndexStore {
+  // homeId -> 最近一次实时状态写入时间（见 liveStatusAt/applyLiveStatus）
+  #liveWrittenAt;
   constructor(dbPath = ':memory:') {
     this.db = new DatabaseSync(dbPath);
+    this.#liveWrittenAt = new Map();
     this.db.exec(SCHEMA);
     this.migrate();
   }
@@ -530,6 +538,7 @@ export class IndexStore {
   upsertRows(rows) {
     const homeRows = rows.filter((r) => r.type === 'home');
     const preservedSessions = new Map(); // homeId -> Map(sessionId -> 上一版的 workspace 归属)
+    const preservedLiveStatus = new Map(); // homeId -> [{sessionId,status,lastActivity}]（见下）
 
     this.db.exec('BEGIN');
     try {
@@ -543,22 +552,49 @@ export class IndexStore {
         // 这里把上一版的归属回填到新行上（workspace 域恢复后会被新数据自然覆盖）。
         // 注意必须在下面的 DELETE **之前**读：workspace 降级时 sessions 本身仍会被替换掉。
         if (protectedTables.has('workspaces')) preservedSessions.set(home.homeId, this.#sessionWorkspaceLinks(home.homeId));
+        // 实时状态保护：索引器写的是文件快照（projcache 的**冻结**值，可能是几分钟前的），
+        // 而轮询器每 3s 写实时值。整表替换会把实时状态一起删掉再用文件值重建 ——
+        // 于是「索引器刚跑完，徽标就退回陈旧状态」（实测：dsh 报 running、轮询器刚写「运行中」，
+        // 索引器把它打回「空闲」）。只要这个 home 最近有实时写入，就在替换前记下这两列、替换后写回。
+        // 只在实时通道**确实在写**的时间窗内让步：通道停了（实例停止、RPC 连续失败）就没有实时写入，
+        // 宽限期一过文件索引重新拿到权威 —— 否则会退化成「会话永远挂着旧徽标」那个已修的缺陷。
+        if (Date.now() - this.liveStatusAt(home.homeId) < LIVE_GRACE_MS) {
+          const live = this.db.prepare('SELECT sessionId, status, lastActivity FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(home.homeId);
+          if (live.length) preservedLiveStatus.set(home.homeId, live);
+        }
         for (const table of CHILD_TABLES) {
           if (protectedTables.has(table)) continue; // 该域降级 → 保留上次成功的行
           this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(home.homeId);
         }
       }
 
+      // 注意：不能用 `ON CONFLICT ... CASE` 来保护实时状态 —— 这条路径在插入之前就把该 home 的
+      // sessions **整表删掉**了（见上面的 DELETE 循环），新行是**插入**而不是冲突更新，
+      // ON CONFLICT 分支根本不会执行。实测确认过：加在 ON CONFLICT 里的保留逻辑是死代码。
+      // 真正有效的做法是在替换前记下实时状态、替换后写回（见 preservedLiveStatus）。
       const insSession = this.db.prepare(
         `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage,
                                contextPressure, status, lastActivity, generatedAt, liveOnly)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(homeId, sessionId) DO UPDATE SET
-           workspaceId=excluded.workspaceId, workspaceTitle=excluded.workspaceTitle,
-           project=excluded.project, title=excluded.title, tokenUsage=excluded.tokenUsage,
-           contextPressure=excluded.contextPressure, status=excluded.status,
+           -- 「文件索引撑起来的行」不能被「只有实时 RPC 支撑的新行」抹掉。
+           -- 触发条件：库里这行是 liveOnly=0（有文件索引依据），而这次写入的是 liveOnly=1
+           -- （说明本次文件快照里没有这条会话 —— projcache 域降级、文件还没更新、或刚升级到
+           -- 不认识的 unit.version，正是降级路径存在的原因）。
+           -- 原先这种冲突会用 live 行的空值覆盖 title/workspaceId/project/tokenUsage，并把
+           -- liveOnly 从 0 翻成 1：于是用量面板整段历史归零（实测 1520550 → 620550，
+           -- 丢了 59%），会话丢掉标题与工作区归属；更要命的是翻成 1 之后，下一次「实时列表为空」
+           -- 的轮询会把它**删掉**（那一分支专门删 liveOnly=1）。文件快照坏掉不该等于历史被删。
+           -- 实时能提供的仍然是状态与活跃时间（这才是徽标要的），所以只保留这两列照旧覆盖。
+           workspaceId=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.workspaceId ELSE excluded.workspaceId END,
+           workspaceTitle=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.workspaceTitle ELSE excluded.workspaceTitle END,
+           project=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.project ELSE excluded.project END,
+           title=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.title ELSE excluded.title END,
+           tokenUsage=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.tokenUsage ELSE excluded.tokenUsage END,
+           contextPressure=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.contextPressure ELSE excluded.contextPressure END,
+           status=excluded.status,
            lastActivity=excluded.lastActivity, generatedAt=excluded.generatedAt,
-           liveOnly=excluded.liveOnly`
+           liveOnly=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN 0 ELSE excluded.liveOnly END`
       );
       const insWorkspace = this.db.prepare(
         `INSERT INTO workspaces (homeId, workspaceId, title, path, project, archived, sessionCount)
@@ -623,9 +659,17 @@ export class IndexStore {
             break;
         }
       }
+      // 把实时状态写回（替换期间被 DELETE 带走了）。新行里没有这条会话（文件快照里没有）也不用管：
+      // 它要么是 liveOnly 行、由下一次轮询重建，要么本来就不该有。
+      for (const [hid, list] of preservedLiveStatus) {
+        const upd = this.db.prepare('UPDATE sessions SET status = ?, lastActivity = ? WHERE homeId = ? AND sessionId = ?');
+        for (const r of list) upd.run(r.status, r.lastActivity, hid, r.sessionId);
+      }
       this.db.exec('COMMIT');
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      // 回滚本身失败时不要把真正的错误吞掉：磁盘满等情况下 SQLite 已经自动回滚，
+      // 此时 ROLLBACK 会抛「cannot rollback - no transaction is active」，覆盖掉真实原因。
+      try { this.db.exec('ROLLBACK'); } catch { /* 已经回滚过了 */ }
       throw e;
     }
   }
@@ -637,6 +681,13 @@ export class IndexStore {
   // 会一直留着：用户在 dsh 里关掉全部会话后，工作台仍显示上一个会话的「运行中」徽标，
   // 直到 60s 后的文件索引才纠正。现在按标记精确清掉这些行；有文件索引支撑的会话不受影响，
   // 它们的权威来源是文件索引，不该被实时列表的缺失误删。
+  // 最近一次「实时状态写入」的时间戳（按 home）。索引器在抓实时状态前会记下时间，
+  // 抓完如果发现这期间轮询器已经写过更新的数据，就丢弃自己这份（多半已经过期）。
+  // 见 src/dshhome/indexer.js 里的守卫。
+  liveStatusAt(homeId) {
+    return this.#liveWrittenAt.get(homeId) ?? 0;
+  }
+
   applyLiveStatus(homeId, live) {
     if (!this.getHome(homeId) || !Array.isArray(live)) return;
     if (!live.length) {
@@ -651,9 +702,22 @@ export class IndexStore {
       }
       return;
     }
+    // 幽灵行清理：liveOnly=1 的行**只由实时列表支撑**，所以一旦它不在这次列表里，就该消失。
+    // 原先只在「列表完全为空」那一分支清理，于是只要有任意一条会话还活着，先前消失的会话就会
+    // 一直留在库里：永远显示「运行中」、占着 sessionCount、还会造出一个幻影项目 ——
+    // 实测在实时列表里移除一条会话后，它整整 70 秒（直到下一轮文件索引）都还在，
+    // 而在 projcache 降级时是**永久**的（文件索引永远覆盖不了它）。
+    // 逐行删而不是 `sessionId NOT IN (...)`：实时列表可能有几千条，SQL 变量数有上限。
+    const liveIds = new Set(live.map((l) => l?.sessionId).filter(Boolean));
+    const ghosts = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND liveOnly = 1').all(homeId);
+    if (ghosts.length) {
+      const del = this.db.prepare('DELETE FROM sessions WHERE id = ?');
+      for (const g of ghosts) if (!liveIds.has(g.sessionId)) del.run(g.id);
+    }
     const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
       .map((row) => ({ ...row, type: 'session' }));
     this.upsertRows(mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() }));
+    this.#liveWrittenAt.set(homeId, Date.now());
   }
 
   // 每个 home 的「当前项目/当前会话」——取最近活跃（lastActivity 最大）的 session 及其所属 workspace。

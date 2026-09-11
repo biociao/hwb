@@ -272,3 +272,66 @@ test('upsertRows：16 种降级组合下，保留/清空的表都与降级域一
   }
   assert.deepEqual(mismatches, [], `降级组合行为不符：\n${mismatches.join('\n')}`);
 });
+
+// ── 降级 + 实时合并不能吃掉文件索引撑起来的行（审查 F1，CRITICAL）──
+// projcache 域降级时 normalize() 产出 0 条会话行，于是 mergeLiveStatus 把**每一条**实时会话都
+// 当成「文件里还没有的新会话」（liveOnly=1、title/workspaceId/tokenUsage 全 null）。
+// 而库里那行是被刻意保留下来的（降级时跳过 DELETE）。两者相撞时，原先的 ON CONFLICT 会用 live 的
+// 空值覆盖文件值，并把 liveOnly 从 0 翻成 1 —— 用量面板整段历史归零（实测 1520550 → 620550，
+// 丢 59%），会话丢掉标题与工作区归属；更要命的是翻成 1 之后，下一次「实时列表为空」的轮询会
+// 把它删掉。文件快照坏掉不该等于历史被删。
+test('降级 + 实时合并：不得用 live 的空值覆盖文件值，也不得把它翻成 liveOnly=1', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  // ① 先有一次成功的文件索引
+  store.upsertRows([
+    { type: 'session', homeId, sessionId: 'sess-003', workspaceId: 'ws-beta', workspaceTitle: 'beta',
+      project: 'quota-axi', title: '额度适配器框架',
+      tokenUsage: JSON.stringify({ uncachedInputTokens: 230000, outputTokens: 41200, cacheReadTokens: 610000, cacheWriteTokens: 18800 }),
+      contextPressure: null, status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 },
+  ]);
+  const before = store.usageSummary({ days: 30 });
+
+  // ② projcache 降级 + 实时列表里有同一条会话（reader.js 在降级时就是这个形状）
+  store.upsertRows([
+    { type: 'home', homeId, homePath: '/m', degraded: [{ domain: 'projcache', error: 'unsupported version' }],
+      generatedAt: now },
+    { type: 'session', homeId, sessionId: 'sess-003', workspaceId: null, workspaceTitle: null,
+      project: 'sess-003', title: null, tokenUsage: null, contextPressure: null,
+      status: JSON.stringify({ kind: 'running' }), lastActivity: now, generatedAt: now, liveOnly: 1 },
+  ]);
+  const row = store.db.prepare("SELECT * FROM sessions WHERE sessionId = 'sess-003'").get();
+  assert.equal(row.liveOnly, 0, '文件索引撑起来的行不该被翻成 liveOnly=1（否则下一轮空列表会删掉它）');
+  assert.equal(row.title, '额度适配器框架', '标题不该被 live 的空值覆盖');
+  assert.equal(row.workspaceId, 'ws-beta', '工作区归属不该被清掉');
+  assert.ok(row.tokenUsage && row.tokenUsage.includes('230000'), 'token 历史不该被清成 null');
+  assert.equal(JSON.parse(row.status).kind, 'running', '实时状态仍要生效（这才是 live 该提供的）');
+  assert.deepEqual(store.usageSummary({ days: 30 }), before, '用量统计不该因为一次降级而缩水');
+
+  // ③ 降级期间实时列表变成空：那行**不能**被删（它还有文件索引依据）
+  store.applyLiveStatus(homeId, []);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE sessionId = 'sess-003'").get().n, 1,
+    '文件索引撑起来的行不该被「空实时列表」删掉');
+  store.close();
+});
+
+// ── 幽灵会话：只要有任意一条会话还活着，消失的「纯实时行」也必须清掉（审查 F2，HIGH）──
+// liveOnly=1 的行只由实时列表支撑。原先只在「列表完全为空」时清理，于是先前消失的会话会一直留着：
+// 永远显示「运行中」、占着 sessionCount、还造出一个幻影项目（实测 70 秒直到下一轮文件索引；
+// projcache 降级时是永久的）。
+test('实时列表非空时也要清掉消失的 liveOnly 行（幽灵会话）', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/m', hostType: 'local' });
+  const live = (ids) => ids.map((sessionId) => ({ sessionId, cwd: '/r/proj',
+    status: { kind: 'running', label: '运行中', subagents: 0, approval: null }, lastActivity: new Date().toISOString() }));
+  store.applyLiveStatus(homeId, live(['sess-alive', 'sess-gone']));
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n, 2);
+  const usageBefore = store.usageSummary({ days: 30 }).sessionCount;
+
+  store.applyLiveStatus(homeId, live(['sess-alive']));
+  const ids = store.db.prepare('SELECT sessionId FROM sessions').all().map((r) => r.sessionId);
+  assert.deepEqual(ids, ['sess-alive'], `消失的纯实时行必须被清掉，实际剩下 ${JSON.stringify(ids)}`);
+  assert.equal(store.usageSummary({ days: 30 }).sessionCount, usageBefore - 1, '计数也要跟着降下来');
+  store.close();
+});

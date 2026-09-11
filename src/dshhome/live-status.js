@@ -109,6 +109,27 @@ async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS) {
 // ms → ISO：超出 ECMAScript 日期范围（±8.64e15 ms）的时间戳 toISOString 会抛 RangeError，
 // 而 isFinite 仍为 true（例如单位写错成纳秒）。这里降级为 null，绝不因为一个脏字段抛穿整个轮询。
 // 统一实现见 lib/time.js。
+// dsh 的投影值在**文件**侧是带版本包装的：`{ver, seq, val: {totals: {...}}}`（见 lib/schema.js）。
+// 而 `/api/session/list` 的 `projections.values.tokenUsage` 给的是哪一层，本项目没有可对照的实例
+// 可以确定（`values` 是 dsh 的内存投影表，理论上也可能是解开后的值）。所以三种形态都接受：
+//   {uncachedInputTokens,…} / {totals:{…}} / {val:{totals:{…}}}
+//
+// 为什么要在这里归一：不归一的话，若 dsh 给的是带包装的那层，我们就会把一个**嵌套结构**存进
+// sessions.tokenUsage —— 用量聚合按 `$.uncachedInputTokens` 取值只会得到 0，而且这次实时写入会
+// **覆盖掉文件索引里正确的扁平值**。宁可返回 null（保持文件索引的值），也不存一个自己解析不出来的结构。
+// 只有确实取到至少一个有限数字才返回对象。
+export function normalizeLiveTokenUsage(raw) {
+  const candidate = raw?.val?.totals ?? raw?.totals ?? raw;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  const out = {};
+  for (const k of ['uncachedInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
+    const v = candidate[k];
+    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    else if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) out[k] = Number(v);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function toLiveRow(item) {
   const sid = item?.sessionId ?? item?.id ?? null;
   if (!sid) return null;
@@ -141,7 +162,7 @@ function toLiveRow(item) {
       approval: values.permissions?.approval ?? null,
     },
     lastActivity: msToIso(lastPromptAt),
-    tokenUsage: values.tokenUsage ?? null,
+    tokenUsage: normalizeLiveTokenUsage(values.tokenUsage),
     title: typeof values.title === 'string' ? values.title : null,
   };
 }

@@ -139,7 +139,14 @@ export class Indexer {
       }
       const snapshot = readHomeSnapshot(home.homePath);
       if (this.liveStatus) {
+        // 抓实时状态要等一次 RPC（本机也可能几百毫秒），而 live-poller 每 3s 就在写同一批行。
+        // 我们把「开始抓」的时间记下来：如果这期间轮询器已经写入更新的数据，就丢弃自己这份 ——
+        // 否则索引器会拿一份**更旧**的快照把刚写进去的新状态覆盖回去（实测：dsh 报 running、
+        // 轮询器刚写成「运行中」，随后索引器把它改回「空闲」；那份快照里还缺了窗口内新出现的会话，
+        // 整表替换会把它们删掉，直到下一次轮询才回来）。
+        const liveCaptureStartedAt = Date.now();
         try { live = await this.liveStatus(home); } catch { live = null; }
+        if (this.store.liveStatusAt?.(homeId) > liveCaptureStartedAt) live = null;
       }
       const rows = indexSnapshot(this.store, home.homePath, snapshot, live);
       return this.#finish(home, homeId, snapshot, rows, results);

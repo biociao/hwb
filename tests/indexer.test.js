@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { IndexStore } from '../src/dshhome/store.js';
 import { Indexer } from '../src/dshhome/indexer.js';
 import { initLogger } from '../src/lib/logger.js';
 
@@ -125,4 +128,52 @@ test('Indexer: 实例被移除后，per-home 退避状态会被清掉', async ()
   await indexer.reindexNow();
   assert.equal(indexer.backoffMs.size, 0, '实例删除后不该继续留着它的退避状态');
   assert.equal(indexer.nextDue.size, 0);
+});
+
+// 索引器 vs 3s 轮询器的竞态：索引器在读文件之后 `await liveStatus()`（一次 RPC，本机也可能几百毫秒），
+// 期间轮询器可能已经写入了更新鲜的实时状态。若索引器随后照写自己那份更旧的快照，就会把新状态覆盖回去
+// （实测：dsh 报 running、轮询器刚写成「运行中」，索引器把它改回「空闲」），而且整表替换还会删掉
+// 窗口内新出现的会话，直到下一次轮询才回来。
+test('indexer: 抓实时状态期间轮询器写过新数据时，索引器不得用更旧的快照覆盖', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-race-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await mkdir(path.join(dir, 'storages'), { recursive: true });
+  await writeFile(path.join(dir, 'storages', 'workspace.json'), JSON.stringify({
+    unit: { name: 'workspace', version: 2 }, global: { initialized: true, workspaceIds: ['w1'] },
+    tables: { workspaces: { w1: { title: 'A', path: '/r/a', sessionIds: ['s1'] } } },
+  }));
+  await writeFile(path.join(dir, 'storages', 'session_projcache.json'), JSON.stringify({
+    unit: { name: 'session_projcache', version: 3 }, global: null,
+    tables: { sessions: { s1: { identity: { createdAt: Date.now(), cwd: '/r/a' }, rows: {} } } },
+  }));
+
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: dir });
+  let releaseLive;
+  const gate = new Promise((r) => { releaseLive = r; });
+  const indexer = new Indexer({
+    store,
+    homes: () => [{ homeId, hostType: 'local', homePath: dir }],
+    // 索引器的实时抓取会挂住，模拟一次慢 RPC；返回的是「更旧」的空闲状态
+    liveStatus: async () => {
+      await gate;
+      return [{ sessionId: 's1', cwd: '/r/a', status: { kind: 'idle', label: '空闲', subagents: 0, approval: null },
+        lastActivity: new Date().toISOString() }];
+    },
+  });
+
+  // 先让索引器跑起来（它会卡在那次 RPC 上），不能先 await —— 那样就把自己锁死了
+  const pending = indexer.reindexNow();
+  await new Promise((r) => setTimeout(r, 30));
+  // 索引器正在等 RPC —— 此刻轮询器写入更新鲜的「运行中」
+  store.applyLiveStatus(homeId, [{ sessionId: 's1', cwd: '/r/a',
+    status: { kind: 'running', label: '运行中', subagents: 0, approval: null }, lastActivity: new Date().toISOString() }]);
+  releaseLive();                       // 放行索引器那份过期的快照
+  const results = await pending;
+  assert.equal(results.length, 1);
+
+  const row = store.recentSessions({ homeId })[0];
+  const kind = (typeof row.status === 'string' ? JSON.parse(row.status) : row.status)?.kind;
+  assert.equal(kind, 'running', `轮询器写的新状态不该被索引器的旧快照覆盖（实际 ${kind}）`);
+  store.close();
 });
