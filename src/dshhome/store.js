@@ -1,6 +1,9 @@
+import { normalizeEndpoints, endpointPatch, legacyEndpoint } from '../lib/endpoints.js';
+import { normalizeAccessPort } from '../lib/access-port.js';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { homeIdOf } from '../lib/read-home.js';
+import { mergeLiveStatus } from './reader.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS homes (
@@ -110,6 +113,9 @@ export class IndexStore {
     if (!homes.includes('localPort')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN localPort INTEGER');
     }
+    if (!homes.includes('accessPort')) this.db.exec('ALTER TABLE homes ADD COLUMN accessPort INTEGER');
+    this.db.exec("UPDATE homes SET accessPort = NULL WHERE hostType != 'remote' AND accessPort IS NOT NULL");
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS homes_access_port ON homes(accessPort) WHERE accessPort IS NOT NULL');
     if (!homes.includes('remoteHome')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteHome TEXT');
     }
@@ -119,17 +125,63 @@ export class IndexStore {
     if (!homes.includes('remoteLog')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteLog TEXT');
     }
+    if (!homes.includes('serverId')) {
+      this.db.exec('ALTER TABLE homes ADD COLUMN serverId TEXT');
+      // 用户确认的同机双通道；仅迁移这两个明确的 SSH 别名。
+      const channels = this.db.prepare("SELECT homeId, host FROM homes WHERE hostType = 'remote'").all();
+      const assign = this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?');
+      for (const h of channels) {
+        if (['cms.lo', 'cms.tun'].includes(h.host?.split('@').pop())) assign.run('cms', h.homeId);
+      }
+    }
     if (!homes.includes('token')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN token TEXT');
     }
+    if (!homes.includes('endpoints')) this.#migrateEndpoints();
+  }
+
+  #migrateEndpoints() {
+    this.db.exec('BEGIN');
+    try {
+      this.db.exec("ALTER TABLE homes ADD COLUMN endpoints TEXT NOT NULL DEFAULT '[]'");
+      this.db.exec('ALTER TABLE homes ADD COLUMN activeEndpointId TEXT');
+      const homes = this.db.prepare('SELECT * FROM homes ORDER BY (sortIndex IS NULL), sortIndex, homeId').all();
+      const groups = new Map();
+      for (const home of homes) {
+        const endpoint = legacyEndpoint(home);
+        const remoteHome = (home.remoteHome || '~/.dsh').replace(/\/+$/, '');
+        const user = remoteHome.startsWith('/') ? '' : (home.host?.includes('@') ? home.host.slice(0, home.host.lastIndexOf('@')) : '');
+        const key = home.hostType === 'remote' && home.serverId
+          ? JSON.stringify([home.serverId, user, remoteHome]) : home.homeId;
+        const group = groups.get(key);
+        if (!group) { groups.set(key, { home, endpoints: endpoint ? [endpoint] : [] }); continue; }
+        if (endpoint && !group.endpoints.some((e) => e.host === endpoint.host && e.port === endpoint.port)) group.endpoints.push(endpoint);
+        // 同一逻辑实例的索引归入保留的 homeId；重复 session/workspace 只保留一份。
+        for (const table of ['sessions', 'workspaces', 'providers', 'model_tiers']) {
+          this.db.prepare(`UPDATE OR IGNORE ${table} SET homeId = ? WHERE homeId = ?`).run(group.home.homeId, home.homeId);
+          this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(home.homeId);
+        }
+        this.db.prepare('DELETE FROM homes WHERE homeId = ?').run(home.homeId);
+      }
+      const update = this.db.prepare('UPDATE homes SET endpoints = ?, activeEndpointId = ? WHERE homeId = ?');
+      for (const { home, endpoints } of groups.values()) update.run(JSON.stringify(endpoints), endpoints[0]?.id || null, home.homeId);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   close() {
     this.db.close();
   }
 
-  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null }) {
+  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null, serverId = null, endpoints, activeEndpointId, accessPort }) {
     const homeId = homeIdOf(homePath);
+    if (hostType !== 'remote' && normalizeAccessPort(accessPort) !== null) throw new Error('本机实例直接使用 dsh 服务端口，无需本地接入端口');
+    if (accessPort !== undefined) accessPort = this.#checkAccessPort(homeId, accessPort);
+    const previous = this.getHome(homeId);
+    const supplied = endpoints !== undefined;
+    const normalized = supplied ? normalizeEndpoints(endpoints, hostType) : null;
+    if (supplied && activeEndpointId && !normalized.some((e) => e.id === activeEndpointId)) throw new Error('未知连接端点');
+
     // 新 home 排在末尾；已存在（冲突）只更新路径/别名/远程配置，保留原 sortIndex。
     const { n } = this.db.prepare('SELECT COALESCE(MAX(sortIndex), -1) + 1 AS n FROM homes').get();
     this.db.prepare(
@@ -142,6 +194,10 @@ export class IndexStore {
          remoteCmd = excluded.remoteCmd, remoteLog = excluded.remoteLog,
          token = excluded.token, localPort = excluded.localPort`
     ).run(homeId, homePath, alias, hostType, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
+    const choices = normalized ?? (previous?.endpoints?.length ? previous.endpoints.map((e) => e.id === previous.activeEndpointId ? { ...e, host, port: hostType === 'remote' ? remotePort : localPort, token } : e) : [legacyEndpoint({ homeId, hostType, host, remotePort, localPort, token })].filter(Boolean));
+    if (choices.length || hostType === 'local') this.updateHomeConfig(homeId, { endpoints: choices, activeEndpointId: activeEndpointId || previous?.activeEndpointId || choices[0]?.id || null });
+    if (serverId) this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?').run(serverId, homeId);
+    if (accessPort !== undefined) this.db.prepare('UPDATE homes SET accessPort = ? WHERE homeId = ?').run(accessPort, homeId);
     return homeId;
   }
 
@@ -189,6 +245,21 @@ export class IndexStore {
   updateHomeConfig(homeId, patch = {}) {
     const cur = this.getHome(homeId);
     if (!cur) return null;
+    if (cur.hostType !== 'remote' && normalizeAccessPort(patch.accessPort) !== null) throw new Error('本机实例直接使用 dsh 服务端口，无需本地接入端口');
+    if (patch.accessPort !== undefined) patch = { ...patch, accessPort: this.#checkAccessPort(homeId, patch.accessPort) };
+    const choices = patch.endpoints !== undefined ? normalizeEndpoints(patch.endpoints, cur.hostType) : cur.endpoints;
+    let selected = patch.activeEndpointId !== undefined ? patch.activeEndpointId : cur.activeEndpointId;
+    if (patch.endpoints !== undefined && !choices.some((e) => e.id === selected)) selected = choices[0]?.id || null;
+    if (selected && !choices.some((e) => e.id === selected)) throw new Error('未知连接端点');
+    if (patch.endpoints !== undefined || patch.activeEndpointId !== undefined) {
+      const endpoint = choices.find((e) => e.id === selected);
+      patch = { ...patch, ...(endpoint ? endpointPatch(cur, endpoint) : { localPort: null }), endpoints: choices, activeEndpointId: selected };
+    } else if (choices.length && ['host', 'remotePort', 'localPort', 'token'].some((key) => patch[key] !== undefined)) {
+      const merged = { ...cur, ...patch };
+      patch = { ...patch, endpoints: choices.map((e) => e.id === selected ? { ...e, host: merged.hostType === 'remote' ? merged.host : null, port: merged.hostType === 'remote' ? merged.remotePort : merged.localPort, token: merged.token } : e) };
+      if (cur.hostType === 'local' && !merged.localPort) patch = { ...patch, endpoints: [], activeEndpointId: null };
+      else patch.endpoints = normalizeEndpoints(patch.endpoints, cur.hostType);
+    }
 
     if (cur.hostType === 'local' && typeof patch.homePath === 'string' && patch.homePath.trim()) {
       const newPath = path.resolve(patch.homePath.trim());
@@ -212,7 +283,11 @@ export class IndexStore {
       }
     }
 
+    if (patch.endpoints !== undefined) this.db.prepare('UPDATE homes SET endpoints = ? WHERE homeId = ?').run(JSON.stringify(patch.endpoints), homeId);
+    if (patch.activeEndpointId !== undefined) this.db.prepare('UPDATE homes SET activeEndpointId = ? WHERE homeId = ?').run(patch.activeEndpointId, homeId);
     const cur2 = this.getHome(homeId);
+    if (patch.serverId !== undefined) this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?').run(patch.serverId, homeId);
+    if (patch.accessPort !== undefined) this.db.prepare('UPDATE homes SET accessPort = ? WHERE homeId = ?').run(patch.accessPort, homeId);
     const alias = patch.alias !== undefined ? patch.alias : cur2.alias;
     const host = patch.host !== undefined ? patch.host : cur2.host;
     const remotePort = patch.remotePort !== undefined ? patch.remotePort : cur2.remotePort;
@@ -224,6 +299,14 @@ export class IndexStore {
     this.db.prepare('UPDATE homes SET alias = ?, host = ?, remotePort = ?, localPort = ?, remoteHome = ?, remoteCmd = ?, remoteLog = ?, token = ? WHERE homeId = ?')
       .run(alias, host, remotePort, localPort, remoteHome, remoteCmd, remoteLog, token, homeId);
     return this.getHome(homeId);
+  }
+
+  #checkAccessPort(homeId, value) {
+    const port = normalizeAccessPort(value);
+    if (port && this.db.prepare('SELECT homeId FROM homes WHERE accessPort = ? AND homeId != ?').get(port, homeId)) {
+      throw new Error(`本地端口 ${port} 已被另一个实例保留`);
+    }
+    return port;
   }
 
   markHomeError(homeId, error) {
@@ -249,7 +332,12 @@ export class IndexStore {
 
       const insSession = this.db.prepare(
         `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, generatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(homeId, sessionId) DO UPDATE SET
+           workspaceId=excluded.workspaceId, workspaceTitle=excluded.workspaceTitle,
+           project=excluded.project, title=excluded.title, tokenUsage=excluded.tokenUsage,
+           contextPressure=excluded.contextPressure, status=excluded.status,
+           lastActivity=excluded.lastActivity, generatedAt=excluded.generatedAt`
       );
       const insWorkspace = this.db.prepare(
         `INSERT INTO workspaces (homeId, workspaceId, title, path, project, archived, sessionCount)
@@ -309,6 +397,14 @@ export class IndexStore {
     }
   }
 
+  // 实时刷新只写会话，保留 workspace/provider 等文件索引数据。
+  applyLiveStatus(homeId, live) {
+    if (!this.getHome(homeId) || !Array.isArray(live) || !live.length) return;
+    const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
+      .map((row) => ({ ...row, type: 'session' }));
+    this.upsertRows(mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() }));
+  }
+
   // 每个 home 的「当前项目/当前会话」——取最近活跃（lastActivity 最大）的 session 及其所属 workspace。
   // 这是 hwb 的「当前」语义：与 recentProjects/recentSessions（时间窗内聚合）不同，它是每个实例的单一当前项。
   #currentSession(homeId) {
@@ -334,7 +430,7 @@ export class IndexStore {
   listHomes() {
     const homes = this.db.prepare(
       `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
-              h.host, h.remotePort, h.localPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
+              h.endpoints, h.activeEndpointId, h.serverId, h.host, h.remotePort, h.localPort, h.accessPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
               (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
               (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
        FROM homes h ORDER BY (h.sortIndex IS NULL), h.sortIndex, h.homeId`
@@ -343,6 +439,7 @@ export class IndexStore {
     const tiers = this.db.prepare("SELECT homeId, tierId, provider, model FROM model_tiers WHERE homeId = ? AND active = 1 ORDER BY CASE WHEN tierId = 'default' THEN 0 ELSE 1 END");
     return homes.map((h) => ({
       ...h,
+      endpoints: JSON.parse(h.endpoints || '[]'),
       degraded: JSON.parse(h.degraded || '[]'),
       providers: providers.all(h.homeId),
       activeTier: tiers.get(h.homeId) ?? null,
@@ -352,28 +449,31 @@ export class IndexStore {
 
   // Recent projects: cross-instance, active within `days`, ordered by last activity (§7.1).
   // 每个 project 附带"它所属的实例 + 该 project 最新会话"，供点击直接跳转。
-  recentProjects({ days = 7, limit = 20 } = {}) {
+  recentProjects({ days = 7, limit = 20, homeIds = null } = {}) {
     const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const scope = homeIds === null ? null : JSON.stringify(homeIds);
     const projects = this.db.prepare(
-      `SELECT s.project,
+      `WITH visible_sessions AS (
+         SELECT * FROM sessions WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?)))
+       ) SELECT s.project,
               COUNT(*) AS sessionCount,
               MAX(s.lastActivity) AS lastActivity,
               SUM(COALESCE(json_extract(s.tokenUsage, '$.uncachedInputTokens'), 0)
                 + COALESCE(json_extract(s.tokenUsage, '$.cacheReadTokens'), 0)
                 + COALESCE(json_extract(s.tokenUsage, '$.cacheWriteTokens'), 0)) AS inputTokens,
               SUM(COALESCE(json_extract(s.tokenUsage, '$.outputTokens'), 0)) AS outputTokens,
-              (SELECT x.homeId FROM sessions x WHERE x.project = s.project
-                 ORDER BY x.lastActivity DESC, x.rowid DESC LIMIT 1) AS homeId,
-              (SELECT x.sessionId FROM sessions x WHERE x.project = s.project
-                 ORDER BY x.lastActivity DESC, x.rowid DESC LIMIT 1) AS sessionId,
-              (SELECT x.workspaceId FROM sessions x WHERE x.project = s.project
-                 ORDER BY x.lastActivity DESC, x.rowid DESC LIMIT 1) AS workspaceId
-       FROM sessions s
+              (SELECT x.homeId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS homeId,
+              (SELECT x.sessionId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS sessionId,
+              (SELECT x.workspaceId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS workspaceId
+       FROM visible_sessions s
        WHERE s.project IS NOT NULL AND s.lastActivity IS NOT NULL AND s.lastActivity >= ?
        GROUP BY s.project
        ORDER BY s.lastActivity DESC
        LIMIT ${int(limit, 20)}`
-    ).all(since);
+    ).all(scope, scope, since);
 
     // Workspaces with no sessions still show up as projects (§4.5) — 跳到其所属实例，
     // 无最新会话，sessionId 为 null。
@@ -382,10 +482,10 @@ export class IndexStore {
               0 AS inputTokens, 0 AS outputTokens,
               w.homeId AS homeId, NULL AS sessionId, w.workspaceId AS workspaceId
        FROM workspaces w
-       WHERE w.archived = 0 AND NOT EXISTS (
+       WHERE (? IS NULL OR w.homeId IN (SELECT value FROM json_each(?))) AND w.archived = 0 AND NOT EXISTS (
          SELECT 1 FROM sessions s WHERE s.homeId = w.homeId AND s.workspaceId = w.workspaceId
        )`
-    ).all();
+    ).all(scope, scope);
     const seen = new Set(projects.map((p) => p.project));
     for (const w of orphanWs) {
       if (!seen.has(w.project)) projects.push(w);
@@ -393,9 +493,14 @@ export class IndexStore {
     return projects.slice(0, int(limit, 20));
   }
 
-  recentSessions({ homeId = null, limit = 50 } = {}) {
-    const where = homeId ? 'WHERE homeId = ?' : '';
-    const args = homeId ? [homeId] : [];
+  getSession(homeId, sessionId) {
+    return this.db.prepare('SELECT sessionId, workspaceId, project FROM sessions WHERE homeId = ? AND sessionId = ?').get(homeId, sessionId) || null;
+  }
+
+  recentSessions({ homeId = null, limit = 50, homeIds = null } = {}) {
+    const scope = homeIds === null ? null : JSON.stringify(homeIds);
+    const where = 'WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?))) AND (? IS NULL OR homeId = ?)';
+    const args = [scope, scope, homeId, homeId];
     return this.db.prepare(
       `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
        FROM sessions ${where}

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { openTunnel } from './tunnel.js';
-import { sshPathExists } from './prober.js';
+import { httpProbe, sshPathExists } from './prober.js';
 import { fingerprint } from './guard.js';
 import { InstanceRegistry } from './registry.js';
 import { ensureRemoteToken, restartRemoteToken, stopRemote, normalizeWebToken, selfServiceHint } from './remote.js';
@@ -14,11 +14,19 @@ const log = logger('launcher');
 // 进程句柄存 this.procs；控制状态（phase/url/port/pid）写入共享 registry，
 // 由 Monitor 推进状态机。stop 前经 guard 指纹校验，防误杀。
 export class Launcher {
-  constructor({ registry = new InstanceRegistry() } = {}) {
+  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], stopRemoteFn = stopRemote, rememberAccessPort = () => {} } = {}) {
     this.registry = registry;
+    this.tunnelFactory = tunnelFactory;
+    this.remotePathExists = remotePathExists;
+    this.waitHttp = waitHttp;
+    this.tunnelReadyDelayMs = tunnelReadyDelayMs;
+    this.recoveryDelaysMs = recoveryDelaysMs;
+    this.stopRemoteFn = stopRemoteFn;
+    this.rememberAccessPort = rememberAccessPort;
     this.procs = new Map(); // homeId -> { pid, port, url, proc, deeplink, kind }
     process.on('exit', () => {
       for (const inst of this.procs.values()) {
+        this.#cancelRecovery(inst);
         if (inst.proc) inst.proc.kill();
       }
     });
@@ -27,22 +35,40 @@ export class Launcher {
   status(homeId) {
     const inst = this.procs.get(homeId);
     // 直连已有实例（adopted-local）无子进程：只判「是否处于运行态」，不能靠 exitCode。
-    if (!inst || (inst.proc && inst.proc.exitCode !== null)) return null;
-    return { url: inst.url, port: inst.port, pid: inst.pid, deeplink: inst.deeplink, kind: inst.kind };
+    if (!inst || inst.detached || inst.cancelled || (!inst.recovering && inst.proc && (inst.proc.exitCode !== null || inst.proc.signalCode != null))) return null;
+    return { url: inst.url, iframeUrl: inst.iframeUrl, port: inst.port, pid: inst.pid, deeplink: inst.deeplink, kind: inst.kind, recovering: !!inst.recovering };
+  }
+
+  // 仅撤销 hwb 接入；不停止远端 dsh web。
+  async disconnect(home) {
+    const inst = this.procs.get(home.homeId);
+    this.#cancelRecovery(inst);
+    // 本机受管进程保留所有权，断开只撤销 hwb 接入，之后可以重新连接。
+    if (inst?.previewProxy) await inst.previewProxy.close();
+    if (inst?.proxy) await inst.proxy.close();
+    if (inst?.kind === 'ssh' && fingerprint(inst.proc)) inst.proc.kill();
+    if (inst?.kind === 'dsh-web') {
+      inst.detached = true;
+      delete inst.previewProxy;
+      delete inst.previewPending;
+      delete inst.iframeUrl;
+    } else this.procs.delete(home.homeId);
+    this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
   }
 
   async stop(home) {
     const inst = this.procs.get(home.homeId);
+    this.#cancelRecovery(inst);
     // 远程:同时把远端 dsh web 停掉,而不是只拆隧道。
     if (home.hostType === 'remote') {
       try {
-        await stopRemote(home);
+        await this.stopRemoteFn(home);
       } catch (e) {
         log.warn('停止远端 dsh web 失败', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, err: e });
       }
     }
     if (!inst) {
-      this.registry.set(home.homeId, { phase: 'stopped' });
+      this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
       log.info('stop: 实例未在运行', { homeId: home.homeId });
       return false;
     }
@@ -59,9 +85,10 @@ export class Launcher {
       log.debug('stop: 直连实例无子进程，跳过 kill', { homeId: home.homeId, kind: inst.kind });
     }
     // 拆掉反代（若已建），再更新状态。
+    if (inst.previewProxy) await inst.previewProxy.close().catch(() => {});
     if (inst.proxy) await inst.proxy.close().catch(() => {});
     this.procs.delete(home.homeId);
-    this.registry.set(home.homeId, { phase: 'stopped' });
+    this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
     return inst.proc ? fingerprint(inst.proc) : false;
   }
 
@@ -71,11 +98,97 @@ export class Launcher {
   //     仅当远端确实没有实例在跑时才把它拉起；
   //   · 本地：连接即「确保本地 dsh web 在跑并连入」（hwb 需持有子进程以抓 token）。
   async open(home) {
+    const previous = this.procs.get(home.homeId);
+    if (previous?.recovering && !previous.cancelled) {
+      if (!previous.recoveryPromise) previous.recoveryAttempts = 0;
+      return this.#recoverRemote(home, previous);
+    }
+    if (previous?.detached) {
+      if (home.localPort && Number(home.localPort) !== previous.port) throw new Error('请先在设置中停止原本机进程，再连接其他端口');
+      previous.detached = false;
+      previous.cancelled = false;
+    }
     const running = this.status(home.homeId);
-    if (running) return running;
+    if (running) {
+      try { return await this.#withPreview(home, running); }
+      catch (error) { await this.disconnect(home); throw error; }
+    }
     this.registry.set(home.homeId, { phase: 'probing' });
-    if (home.hostType === 'remote') return this.#openRemote(home);
-    return this.#openLocal(home);
+    const result = home.hostType === 'remote' ? await this.#openRemote(home) : await this.#openLocal(home);
+    try { return await this.#withPreview(home, result); }
+    catch (error) { await this.disconnect(home); throw error; }
+  }
+
+  // 先验证新端点，再释放旧连接；失败时当前连接和实例身份不变。
+  async switchEndpoint(home, target) {
+    if (this.procs.get(home.homeId)?.kind === 'dsh-web') throw new Error('请先停止 hwb 启动的本机进程，再切换直连端点');
+    const stagingId = `${home.homeId}:switch`;
+    const staged = { ...target, homeId: stagingId, connectOnly: true, accessPort: null, transient: true };
+    try {
+      let result = await this.open(staged);
+      const response = await authFetch(result.url);
+      await response.body?.cancel();
+      if (!response.ok) throw new Error(`新端点鉴权或响应失败（HTTP ${response.status}）`);
+      const next = this.procs.get(stagingId);
+      if (!next || !this.status(stagingId)) throw new Error('新端点连接已失效');
+      const previous = this.procs.get(home.homeId);
+      if (home.hostType === 'remote' && previous?.previewProxy) {
+        const temporary = next.previewProxy;
+        this.#transferPreview(next, previous);
+        await temporary.close();
+      } else if (home.hostType === 'remote') {
+        await next.previewProxy.close();
+        delete next.previewProxy;
+        await this.#withPreview(home, result, next);
+      }
+      result = { ...result, iframeUrl: next.iframeUrl };
+      await this.disconnect(home);
+      this.procs.delete(stagingId);
+      staged.homeId = home.homeId; // SSH exit 回调随连接归入稳定的实例 ID。
+      staged.transient = false;
+      staged.accessPort = next.previewProxy?.port ?? null;
+      this.procs.set(home.homeId, next);
+      this.registry.set(home.homeId, { ...result, homeId: home.homeId, phase: 'running', lastError: null, attempts: 0 });
+      return result;
+    } catch (error) {
+      await this.disconnect({ homeId: stagingId }).catch(() => {});
+      throw error;
+    } finally { this.registry.delete(stagingId); }
+  }
+
+  async #withPreview(home, result, inst = this.procs.get(home.homeId)) {
+    if (!inst) return result;
+    const remote = home.hostType === 'remote';
+    if (!inst.previewProxy) {
+      // Separate iframe entry preserves the original external dsh URL.
+      inst.previewPending ||= createProxy({ target: new URL(inst.url).origin, preview: true, port: remote ? home.accessPort || 0 : 0 });
+      try { inst.previewProxy = await inst.previewPending; }
+      catch (error) {
+        if (error.code === 'EADDRINUSE') throw new Error(`本地端口 ${home.accessPort} 已被占用，请释放该端口或在实例设置中更换`);
+        throw error;
+      }
+      finally { inst.previewPending = null; }
+      if (remote && !home.transient) {
+        try {
+          this.rememberAccessPort(home.homeId, inst.previewProxy.port);
+          home.accessPort = inst.previewProxy.port;
+        } catch (error) {
+          await inst.previewProxy.close();
+          delete inst.previewProxy;
+          throw error;
+        }
+      }
+      inst.iframeUrl = inst.previewProxy.url + '/' + new URL(inst.url).search;
+      if (this.procs.get(home.homeId) === inst) this.registry.set(home.homeId, { iframeUrl: inst.iframeUrl });
+    }
+    return { ...result, iframeUrl: inst.iframeUrl };
+  }
+
+  #transferPreview(inst, previous) {
+    inst.previewProxy = previous.previewProxy;
+    delete previous.previewProxy;
+    inst.previewProxy.retarget(new URL(inst.url).origin);
+    inst.iframeUrl = inst.previewProxy.url + '/' + new URL(inst.url).search;
   }
 
   // 重启：先撤当前实例（远程=停远端 dsh + 拆隧道；本地=杀进程），再拉起。
@@ -83,9 +196,9 @@ export class Launcher {
     const running = this.status(home.homeId);
     if (running) await this.stop(home);
     this.registry.set(home.homeId, { phase: 'probing' });
-    if (home.hostType !== 'remote') return this.#openLocal(home); // 本地重启 = 停 + 重开
+    if (home.hostType !== 'remote') return this.#withPreview(home, await this.#openLocal(home)); // 本地重启 = 停 + 重开
     const token = await restartRemoteToken(home);
-    return this.#connectRemote(home, token);
+    return this.#withPreview(home, await this.#connectRemote(home, token));
   }
 
   // 「连接」本地实例：hwb 需持有子进程才能从 stdout 抓 token，故“连接”即“确保本地 dsh web
@@ -117,7 +230,8 @@ export class Launcher {
     this.procs.set(home.homeId, inst);
     // 子进程生命周期记录：非 0 退出视为崩溃，带上退出码与 stderr 尾部，便于排查。
     proc.on('exit', (code, signal) => {
-      this.procs.delete(home.homeId);
+      inst.previewProxy?.close().catch(() => {});
+      if (this.procs.get(home.homeId) === inst) this.procs.delete(home.homeId);
       if (signal !== null) {
         log.debug('dsh web 子进程退出（被信号终止）', { homeId: home.homeId, pid: inst.pid, signal });
       } else if (code === 0) {
@@ -204,64 +318,126 @@ export class Launcher {
     return this.#connectRemote(home, token);
   }
 
-  async #connectRemote(home, tokenFragment) {
-    const tunnel = await openTunnel({ host: home.host, remotePort: home.remotePort });
-    const base = tunnel.url; // http://127.0.0.1:<local>
-    // 新版 dsh web 需要 `?token=` 鉴权；旧版（无 token）回退到普通 URL。
+  #cancelRecovery(inst) {
+    if (!inst) return;
+    inst.cancelled = true;
+    inst.recovering = false;
+    if (inst.recoveryTimer) clearTimeout(inst.recoveryTimer);
+    inst.recoveryTimer = null;
+    const pending = inst.recoveryPending;
+    if (pending) {
+      pending.cancelled = true;
+      if (fingerprint(pending.proc)) pending.proc.kill();
+      pending.previewProxy?.close().catch(() => {});
+      pending.proxy?.close().catch(() => {});
+    }
+  }
+
+  async #releaseRemote(inst) {
+    this.#cancelRecovery(inst);
+    if (fingerprint(inst.proc)) inst.proc.kill();
+    await Promise.allSettled([inst.previewProxy?.close(), inst.proxy?.close()]);
+  }
+
+  #scheduleRecovery(home, inst) {
+    if (this.procs.get(home.homeId) !== inst || inst.cancelled || !inst.recovering || inst.recoveryTimer) return;
+    const delayMs = this.recoveryDelaysMs[inst.recoveryAttempts ?? 0];
+    if (delayMs === undefined) return; // 有界重试；用户仍可点击连接重新尝试。
+    inst.recoveryTimer = setTimeout(() => {
+      inst.recoveryTimer = null;
+      this.#recoverRemote(home, inst).catch(() => {});
+    }, delayMs);
+    inst.recoveryTimer.unref?.();
+  }
+
+  #recoverRemote(home, previous) {
+    if (previous.recoveryPromise) return previous.recoveryPromise;
+    if (this.procs.get(home.homeId) !== previous || previous.cancelled) return Promise.reject(new Error('连接已取消'));
+    if (previous.recoveryTimer) clearTimeout(previous.recoveryTimer);
+    previous.recoveryTimer = null;
+    previous.recoveryAttempts = (previous.recoveryAttempts ?? 0) + 1;
+    // 只沿用已连接实例的 token 重建隧道，绝不走 ensureRemoteToken 的启动路径。
+    previous.recoveryPromise = this.#connectRemote(home, previous.tokenFragment, previous).catch((error) => {
+      if (this.procs.get(home.homeId) === previous && !previous.cancelled) {
+        this.registry.set(home.homeId, { phase: 'degraded', lastError: error.message });
+        this.#scheduleRecovery(home, previous);
+      }
+      throw error;
+    }).finally(() => { previous.recoveryPromise = null; });
+    return previous.recoveryPromise;
+  }
+
+  async #connectRemote(home, tokenFragment, replacing = null) {
+    const tunnel = await this.tunnelFactory({ host: home.host, remotePort: home.remotePort });
+    const base = tunnel.url;
     const hasToken = isTokenFragment(tokenFragment);
     const url = hasToken ? `${base}/${tokenFragment}` : base;
-    const inst = { pid: tunnel.proc.pid, port: tunnel.localPort, url, proc: tunnel.proc, deeplink: false, kind: 'ssh' };
-    this.procs.set(home.homeId, inst);
+    const inst = { pid: tunnel.proc.pid, port: tunnel.localPort, url, proc: tunnel.proc, deeplink: false, kind: 'ssh', tokenFragment };
+    // 新隧道在完全就绪前不替换旧实例。断开/端点切换可取消正在准备的候选连接。
+    if (replacing) {
+      if (this.procs.get(home.homeId) !== replacing || replacing.cancelled) {
+        await this.#releaseRemote(inst);
+        throw new Error('连接已取消');
+      }
+      replacing.recoveryPending = inst;
+    } else this.procs.set(home.homeId, inst);
+    const isCurrent = () => !inst.cancelled && (replacing
+      ? this.procs.get(home.homeId) === replacing && !replacing.cancelled && replacing.recoveryPending === inst
+      : this.procs.get(home.homeId) === inst);
+    const assertCurrent = () => {
+      if (!isCurrent()) throw new Error('连接已取消');
+      if (tunnel.proc.exitCode !== null || tunnel.proc.signalCode != null) throw new Error(tunnel.stderr().trim().split('\n').pop() || 'ssh exited early');
+    };
     tunnel.proc.on('exit', (code, signal) => {
-      this.procs.delete(home.homeId);
       if (signal !== null) log.debug('ssh 隧道子进程退出（被信号终止）', { homeId: home.homeId, signal });
       else if (code === 0) log.info('ssh 隧道子进程退出', { homeId: home.homeId });
       else log.warn('ssh 隧道子进程异常退出', { homeId: home.homeId, exitCode: code, stderr: tunnel.stderr().trim().split('\n').slice(-12).join('\n') });
+      if (this.procs.get(home.homeId) !== inst || inst.cancelled || !inst.connected) return;
+      inst.recovering = true;
+      inst.recoveryAttempts = 0;
+      this.registry.set(home.homeId, { phase: 'degraded', lastError: 'SSH 连接已断开，正在重新连接' });
+      this.#scheduleRecovery(home, inst);
     });
 
-    // 给 ssh 一点时间建立连接；若立即退出（host 不可达/认证失败）则报错。
-    await new Promise((r) => setTimeout(r, 800));
-    if (tunnel.proc.exitCode !== null) {
-      const msg = tunnel.stderr().trim().split('\n').pop() || 'ssh exited early';
-      this.procs.delete(home.homeId);
-      this.registry.set(home.homeId, { phase: 'stopped', lastError: msg });
-      log.error('ssh 隧道建立失败', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, stderr: tunnel.stderr().trim() });
-      throw new Error(`ssh 隧道建立失败: ${msg}（检查 ssh 别名/key 与远端可达性）`);
-    }
-    // 等远端 dsh web 可响应。
     try {
-      await waitForHttp(url, 10_000, () => tunnel.proc.exitCode !== null);
-    } catch (e) {
-      this.procs.delete(home.homeId);
-      tunnel.proc.kill();
-      this.registry.set(home.homeId, { phase: 'stopped', lastError: e.message });
-      // 把 SSH 隧道 stderr 一并带进上下文，便于区分「隧道没建通」vs「远端 web 没起来」。
-      const tunnelErr = tunnel.stderr().trim();
-      log.error('远程 dsh web 不可达', e, {
-        homeId: home.homeId, host: home.host, remotePort: home.remotePort, url,
-        remoteCmd: home.remoteCmd, remoteLog: home.remoteLog,
-        tunnelStderr: tunnelErr ? tunnelErr.split('\n').slice(-6).join('\n') : undefined,
-      });
-      throw new Error(`远程 dsh web 不可达: ${home.host}:${home.remotePort} — 请检查远端是否已装 dsh、端口是否正确、实例配置里的 remoteCmd/remoteLog 是否匹配${tunnelErr ? `（ssh: ${tunnelErr.split('\n').pop()}）` : ''}${selfServiceHint(home)}`);
+      await new Promise((resolve) => setTimeout(resolve, this.tunnelReadyDelayMs));
+      assertCurrent();
+      await this.waitHttp(url, 30_000, () => !isCurrent() || tunnel.proc.exitCode !== null || tunnel.proc.signalCode != null);
+      assertCurrent();
+      const remoteHome = home.remoteHome || '~/.dsh';
+      if (!(await this.remotePathExists(home.host, remoteHome))) throw new Error(`远端 dsh home 不可访问: ${home.host}:${remoteHome}${selfServiceHint(home)}`);
+      assertCurrent();
+      inst.proxy = await createProxy({ target: base });
+      assertCurrent();
+      inst.url = hasToken ? `${inst.proxy.url}/${tokenFragment}` : inst.proxy.url;
+      inst.port = inst.proxy.port;
+      inst.deeplink = await probeDeeplink(inst.url);
+      assertCurrent();
+      let result = { url: inst.url, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
+      if (replacing) {
+        if (!replacing.previewProxy) result = await this.#withPreview(home, result, inst);
+        assertCurrent();
+        if (replacing.previewProxy) {
+          this.#transferPreview(inst, replacing);
+          result = { ...result, iframeUrl: inst.iframeUrl };
+        }
+        replacing.recoveryPending = null;
+        this.procs.set(home.homeId, inst);
+      }
+      inst.connected = true;
+      this.registry.set(home.homeId, { ...result, phase: 'running', lastError: null, attempts: 0 });
+      if (replacing) await this.#releaseRemote(replacing);
+      log.info(replacing ? '远程 SSH 连接已恢复' : '远程 dsh web 已接入', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, port: inst.port, hasToken });
+      return result;
+    } catch (error) {
+      await this.#releaseRemote(inst);
+      if (replacing?.recoveryPending === inst) replacing.recoveryPending = null;
+      if (!replacing && this.procs.get(home.homeId) === inst) {
+        this.procs.delete(home.homeId);
+        this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null, lastError: error.message });
+      }
+      throw error;
     }
-    // 隧道连通后，核验远端上的 dsh home 目录可访问（homePath 的真实性检查，不能省略）。
-    const remoteHome = home.remoteHome || '~/.dsh';
-    if (!(await sshPathExists(home.host, remoteHome))) {
-      this.procs.delete(home.homeId);
-      tunnel.proc.kill();
-      this.registry.set(home.homeId, { phase: 'stopped', lastError: 'remote home missing' });
-      log.error('远端 dsh home 不可访问', { homeId: home.homeId, host: home.host, remoteHome });
-      throw new Error(`远端 dsh home 不可访问: ${home.host}:${remoteHome} — 请检查该路径是否存在于远端（或在实例配置里指定 remoteHome）${selfServiceHint(home)}`);
-    }
-    // 反代入口: 浏览器只与 hwb 的代理端口通信; 代理根路径 1:1 转发到隧道(ssh -L)端口。
-    const proxy = await createProxy({ target: base });
-    inst.proxy = proxy;
-    const proxyUrl = hasToken ? `${proxy.url}/${tokenFragment}` : proxy.url;
-    inst.url = proxyUrl;
-    inst.deeplink = await probeDeeplink(proxyUrl);
-    this.registry.set(home.homeId, { phase: 'running', url: proxyUrl, port: proxy.port, pid: inst.pid, deeplink: inst.deeplink });
-    log.info('远程 dsh web 已接入', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, port: proxy.port, hasToken });
-    return { url: proxyUrl, port: proxy.port, pid: inst.pid, deeplink: inst.deeplink };
   }
 }
 
@@ -367,10 +543,10 @@ async function waitForHttp(url, timeoutMs, isDead) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (isDead()) throw new Error('process exited early');
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(1000) });
-      if (res.status < 500) return;
-    } catch { /* not up yet */ }
+    // A remote response can exceed one second while bundles share the tunnel.
+    // Probe headers only, without following the token redirect or retaining a body.
+    const remaining = Math.max(1, deadline - Date.now());
+    if (await httpProbe(url, Math.min(5000, remaining))) return;
     if (Date.now() > deadline) throw new Error('timeout');
     await new Promise((r) => setTimeout(r, 300));
   }

@@ -1,6 +1,12 @@
+import { openWorkspaceInFinder } from '../lib/open-workspace.js';
+import { normalizeEndpoints, endpointPatch } from '../lib/endpoints.js';
+import { normalizeAccessPort } from '../lib/access-port.js';
+import { instanceKey } from '../web/instance-state.js';
 import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { parseMultipart } from '../lib/multipart.js';
+import { readFilePreview, resolveUploadDir, writeUpload, UPLOAD_BYTES, sessionWorkspace } from '../lib/file-preview.js';
 
 function send(res, status, body) {
   const json = JSON.stringify(body);
@@ -25,13 +31,106 @@ function dshHomeInfo(homePath) {
 }
 
 export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi }) {
+  const connecting = new Set();
   return async function route(req, res, url) {
     const { pathname, searchParams } = url;
+
+    const finder = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/open-workspace$/);
+    if (req.method === 'POST' && finder) {
+      if (req.headers['sec-fetch-site'] === 'cross-site' ||
+          (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`)) {
+        send(res, 403, { error: '不允许跨站打开工作区' }); return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        const home = store.getHome(finder[1]);
+        const workspace = home && store.listWorkspaces({ homeId: home.homeId }).find((w) => w.workspaceId === body.workspaceId);
+        await openWorkspaceInFinder(home, workspace);
+        send(res, 200, { ok: true });
+      } catch (e) { send(res, 400, { error: e.message }); }
+      return;
+    }
+
+    const preview = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(preview|download)$/);
+    if (req.method === 'GET' && preview) {
+      res.setHeader('Cache-Control', 'no-store');
+      if (req.headers['sec-fetch-site'] === 'cross-site') {
+        send(res, 403, { error: '不允许跨站读取文件' }); return;
+      }
+      const home = store.getHome(preview[1]);
+      if (!home) { send(res, 404, { error: '实例不存在' }); return; }
+      const workspaces = store.listWorkspaces({ homeId: home.homeId });
+      const sessionId = searchParams.get('sessionId');
+      const workspace = sessionId
+        ? sessionWorkspace(workspaces, store.getSession(home.homeId, sessionId))
+        : workspaces.find((w) => w.workspaceId === searchParams.get('workspaceId'));
+      if (!workspace?.path) { send(res, 400, { error: '当前会话尚未关联可用的 project 工作区，请先在 dsh 中打开项目会话' }); return; }
+      try {
+        if (preview[2] === 'download') {
+          const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { download: true });
+          const name = encodeURIComponent(path.basename(result.path)).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16));
+          const bytes = Buffer.from(result.data, 'base64');
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
+            'Content-Disposition': `attachment; filename="download"; filename*=UTF-8''${name}`, 'X-Content-Type-Options': 'nosniff' });
+          res.end(bytes);
+          return;
+        }
+        send(res, 200, { ...await readFilePreview(home, workspace.path, searchParams.get('path') || '.'),
+          workspace: { workspaceId: workspace.workspaceId, title: workspace.title, path: workspace.path } });
+      } catch (e) { send(res, 400, { error: e.message }); }
+      return;
+    }
+
+    // 上传：把本地文件写进「当前预览目录」。只接受 multipart 单文件字段，落盘位置完全由服务端
+    // 依 workspace + 已校验目录决定（前端只给文件名），同名文件一律改名，不覆盖已有文件。
+    const upload = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/upload$/);
+    if (req.method === 'PUT' && upload) {
+      res.setHeader('Cache-Control', 'no-store');
+      if (req.headers['sec-fetch-site'] === 'cross-site'
+          || (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`)) {
+        send(res, 403, { error: '不允许跨站写入文件' }); return;
+      }
+      const home = store.getHome(upload[1]);
+      if (!home) { send(res, 404, { error: '实例不存在' }); return; }
+      const workspaces = store.listWorkspaces({ homeId: home.homeId });
+      const sessionId = searchParams.get('sessionId');
+      const workspace = sessionId
+        ? sessionWorkspace(workspaces, store.getSession(home.homeId, sessionId))
+        : workspaces.find((w) => w.workspaceId === searchParams.get('workspaceId'));
+      if (!workspace?.path) { send(res, 400, { error: '当前会话尚未关联可用的 project 工作区，请先在 dsh 中打开项目会话' }); return; }
+      const type = String(req.headers['content-type'] || '');
+      const boundary = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(type)?.slice(1).find(Boolean);
+      if (!/^multipart\/form-data/i.test(type) || !boundary) { send(res, 400, { error: '上传请求须为 multipart/form-data' }); return; }
+      const dir = searchParams.get('dir') || searchParams.get('path') || '.';
+      if (dir.includes('\0') || dir.length > 4096) { send(res, 400, { error: '文件路径无效' }); return; }
+      const parts = [];
+      let current = null;
+      try {
+        // 目录先解析一次：目标不存在/越界时立刻回错，不必先把整包读完再失败。
+        await resolveUploadDir(workspace.path, dir);
+        await parseMultipart(req, {
+          boundary,
+          maxBytes: UPLOAD_BYTES,
+          // 解析出的文件名（浏览器可能带上目录前缀）交给 writeUpload 再规范化一次。
+          onFileStart(name) { current = { name, chunks: [] }; parts.push(current); return true; },
+          write(chunk) {
+            if (!current) throw new Error('上传请求格式无效');
+            current.chunks.push(chunk);
+          },
+        });
+        const result = await writeUpload(home, workspace.path, dir, parts);
+        const listing = await readFilePreview(home, workspace.path, dir);
+        send(res, 200, { ok: true, dir: result.dir, files: result.files,
+          listing: listing.kind === 'directory' ? listing : null });
+      } catch (e) { send(res, 400, { error: e.message }); }
+      return;
+    }
 
     if (req.method === 'GET' && pathname === '/api/events') {
       hub.handle(req, res);
       return;
     }
+
     if (req.method === 'GET' && pathname === '/api/homes') {
       const homes = store.listHomes().map((h) => ({ ...h, runtime: monitor.get(h.homeId) }));
       send(res, 200, { homes });
@@ -49,7 +148,23 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 400, { error: 'invalid JSON body' });
         return;
       }
+      if (body.endpoints !== undefined) {
+        try {
+          body.endpoints = normalizeEndpoints(body.endpoints, body.hostType || 'local');
+          const first = body.endpoints[0];
+          if (first) Object.assign(body, endpointPatch({ hostType: body.hostType || 'local' }, first));
+        } catch (error) { send(res, 400, { error: error.message }); return; }
+      }
       const alias = typeof body.alias === 'string' && body.alias.trim() ? body.alias.trim() : null;
+      let accessPort;
+      try { if (body.accessPort !== undefined) accessPort = normalizeAccessPort(body.accessPort); }
+      catch (error) { send(res, 400, { error: error.message }); return; }
+      if (accessPort && !(body.hostType === 'remote' || (body.host && body.remotePort))) {
+        send(res, 400, { error: '本机实例直接使用 dsh 服务端口，无需本地接入端口' }); return;
+      }
+      if (accessPort && store.listHomes().some(h => h.accessPort === accessPort)) {
+        send(res, 409, { error: `本地端口 ${accessPort} 已被另一个实例保留` }); return;
+      }
 
       // SSH 远程实例：host + remotePort（远端 dsh web 监听端口）。
       if (body.hostType === 'remote' || (body.host && body.remotePort)) {
@@ -65,7 +180,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         // 手填 token（自服务直连）：用户已更新远端 dsh 后把 token 填进配置，hwb 直接连接。
         const token = typeof body.token === 'string' && body.token.trim() ? body.token.trim() : null;
         const homePath = `ssh://${host}:${remotePort}`;
-        const homeId = store.registerHome({ homePath, alias, hostType: 'remote', host, remotePort, remoteHome, remoteCmd, remoteLog, token });
+        const serverId = typeof body.serverId === 'string' ? body.serverId.trim() || null : null;
+        const homeId = store.registerHome({ homePath, alias, serverId, endpoints: body.endpoints, activeEndpointId: body.activeEndpointId, hostType: 'remote', host, remotePort, remoteHome, remoteCmd, remoteLog, token, accessPort });
         // 注册后立即触发一次该实例的索引（不等结果：远程走 SSH，不可达时要等超时，
         // 同步等待会卡住注册响应；索引完成后会广播 index:updated，前端经 SSE 自动刷新）。
         indexer.reindexNow(homeId);
@@ -88,7 +204,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       const lp = body.localPort;
       const localPort = (lp === '' || lp == null) ? null : (Number.isInteger(Number(lp)) && Number(lp) > 0 ? Number(lp) : null);
       const token = typeof body.token === 'string' && body.token.trim() ? body.token.trim() : null;
-      const homeId = store.registerHome({ homePath, alias, hostType: 'local', localPort, token });
+      const homeId = store.registerHome({ homePath, alias, hostType: 'local', localPort, token, endpoints: body.endpoints, activeEndpointId: body.activeEndpointId, accessPort });
       const results = await indexer.reindexNow(homeId);
       send(res, info.looksLikeDshHome ? 200 : 202, {
         homeId,
@@ -111,7 +227,26 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 400, { error: 'invalid JSON body' });
         return;
       }
+      if (connecting.has(instanceKey(home))) {
+        send(res, 409, { error: '请先断开连接再修改实例配置' });
+        return;
+      }
       const patch = {};
+      if (body.accessPort !== undefined) {
+        try { patch.accessPort = normalizeAccessPort(body.accessPort); }
+        catch (error) { send(res, 400, { error: error.message }); return; }
+        if (home.hostType !== 'remote' && patch.accessPort) {
+          send(res, 400, { error: '本机实例直接使用 dsh 服务端口，无需本地接入端口' }); return;
+        }
+        if (patch.accessPort && store.listHomes().some(h => h.homeId !== home.homeId && h.accessPort === patch.accessPort)) {
+          send(res, 409, { error: `本地端口 ${patch.accessPort} 已被另一个实例保留` }); return;
+        }
+      }
+      if (body.endpoints !== undefined) {
+        try { patch.endpoints = normalizeEndpoints(body.endpoints, home.hostType); }
+        catch (error) { send(res, 400, { error: error.message }); return; }
+      }
+      if (typeof body.serverId === 'string') patch.serverId = body.serverId.trim() || null;
       if (typeof body.alias === 'string') patch.alias = body.alias.trim() || null;
       if (home.hostType === 'local') {
         // 本地实例：允许改 homePath（须存在）。
@@ -152,19 +287,33 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         // 手填 token：允许清空（''→null）以回到「远端抓取 / 自动启动」的流程。
         if (body.token !== undefined) patch.token = typeof body.token === 'string' ? body.token.trim() || null : null;
       }
+      if (launcher.status(home.homeId)) {
+        const current = home.endpoints?.find((e) => e.id === home.activeEndpointId);
+        const changedEndpoint = patch.endpoints && ((!current && patch.endpoints.length > 0) || JSON.stringify(patch.endpoints.find((e) => e.id === home.activeEndpointId)) !== JSON.stringify(current));
+        const changesConnection = ['host', 'remotePort', 'localPort', 'accessPort', 'homePath', 'remoteHome', 'remoteCmd', 'remoteLog', 'token'].some((key) => patch[key] !== undefined && patch[key] !== home[key]);
+        if (changedEndpoint || changesConnection) { send(res, 409, { error: '当前连接端点正在使用；可添加其他端点并切换后再修改它' }); return; }
+      }
       const updated = store.updateHomeConfig(home.homeId, patch);
       send(res, 200, { home: { ...updated, runtime: monitor.get(home.homeId) } });
       return;
     }
     if (req.method === 'DELETE' && delHome) {
       const homeId = delHome[1];
-      if (!store.getHome(homeId)) {
+      const home = store.getHome(homeId);
+      if (!home) {
         send(res, 404, { error: `unknown homeId ${homeId}` });
         return;
       }
-      store.removeHome(homeId);
-      hub.broadcast('index:updated', { homeId, removed: true });
-      send(res, 200, { ok: true, homeId });
+      const key = instanceKey(home);
+      if (connecting.has(key)) { send(res, 409, { error: '该实例正在连接或切换' }); return; }
+      connecting.add(key);
+      try {
+        // 移除前先撤销接入与后台恢复，避免删除后旧连接重新出现。
+        await launcher.disconnect(home);
+        store.removeHome(homeId);
+        hub.broadcast('index:updated', { homeId, removed: true });
+        send(res, 200, { ok: true, homeId });
+      } finally { connecting.delete(key); }
       return;
     }
     if (req.method === 'POST' && pathname === '/api/homes/order') {
@@ -187,6 +336,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'GET' && pathname === '/api/projects/recent') {
       send(res, 200, {
         projects: store.recentProjects({
+          homeIds: store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId),
           days: Number(searchParams.get('days')) || 7,
           limit: Number(searchParams.get('limit')) || 20,
         }),
@@ -196,6 +346,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'GET' && pathname === '/api/sessions/recent') {
       send(res, 200, {
         sessions: store.recentSessions({
+          homeIds: store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId),
           homeId: searchParams.get('homeId') || null,
           limit: Number(searchParams.get('limit')) || 50,
         }),
@@ -262,16 +413,67 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 404, { error: `unknown homeId ${openHome[1]}` });
         return;
       }
+      const key = instanceKey(home);
+      const sibling = store.listHomes().find((h) => h.homeId !== home.homeId && instanceKey(h) === key && launcher.status(h.homeId));
+      if (sibling || connecting.has(key)) {
+        send(res, 409, { error: sibling ? `同一实例已通过 ${sibling.host} 连接，请先断开该通道再切换` : '该实例正在连接，请稍候' });
+        return;
+      }
+      connecting.add(key);
       try {
         const inst = await launcher.open(home);
         await monitor.refresh(home.homeId);
+        if (monitor.get(home.homeId).runtime !== 'running') throw new Error('连接不可达，请断开后重试');
         // 连接成功后立即索引一次（此时 runtime=running，liveStatus 实时通道可用），
         // 新会话/状态马上进入工作台，不用等下一个 60s tick。
         indexer.reindexNow(home.homeId);
         send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });
+      } finally {
+        connecting.delete(key);
       }
+      return;
+    }
+
+    const switchHome = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/switch$/);
+    if (req.method === 'POST' && switchHome) {
+      const home = store.getHome(switchHome[1]);
+      if (!home) { send(res, 404, { error: '实例不存在' }); return; }
+      let body;
+      try { body = await readJsonBody(req); } catch { send(res, 400, { error: 'invalid JSON body' }); return; }
+      const endpoint = home.endpoints?.find((e) => e.id === body.endpointId);
+      if (!endpoint) { send(res, 400, { error: '未知连接端点' }); return; }
+      const key = instanceKey(home);
+      if (connecting.has(key)) { send(res, 409, { error: '该实例正在连接或切换，请稍候' }); return; }
+      connecting.add(key);
+      try {
+        const patch = endpointPatch(home, endpoint);
+        if (endpoint.id !== home.activeEndpointId || !launcher.status(home.homeId)) {
+          await launcher.switchEndpoint(home, { ...home, ...patch });
+          store.updateHomeConfig(home.homeId, patch);
+        }
+        await monitor.refresh(home.homeId);
+        indexer.reindexNow(home.homeId);
+        hub.broadcast('instance:status', { homeId: home.homeId });
+        send(res, 200, { homeId: home.homeId, activeEndpointId: endpoint.id });
+      } catch (error) { send(res, 502, { error: error.message }); }
+      finally { connecting.delete(key); }
+      return;
+    }
+
+    const disconnectHome = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/disconnect$/);
+    if (req.method === 'POST' && disconnectHome) {
+      const home = store.getHome(disconnectHome[1]);
+      if (!home) { send(res, 404, { error: '实例不存在' }); return; }
+      if (connecting.has(instanceKey(home))) { send(res, 409, { error: '该实例正在连接，请稍候' }); return; }
+      const key = instanceKey(home);
+      connecting.add(key);
+      try {
+        await launcher.disconnect(home);
+        await monitor.refresh(home.homeId);
+        send(res, 200, { ok: true });
+      } finally { connecting.delete(key); }
       return;
     }
 
@@ -282,9 +484,16 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 404, { error: `unknown homeId ${stopHome[1]}` });
         return;
       }
-      const stopped = await launcher.stop(home);
-      await monitor.refresh(home.homeId);
-      send(res, 200, { ok: true, stopped });
+      if (connecting.has(instanceKey(home)) || store.listHomes().some((h) => h.homeId !== home.homeId && instanceKey(h) === instanceKey(home) && launcher.status(h.homeId))) {
+        send(res, 409, { error: '请使用当前已连接通道操作该实例' }); return;
+      }
+      const key = instanceKey(home);
+      connecting.add(key);
+      try {
+        const stopped = await launcher.stop(home);
+        await monitor.refresh(home.homeId);
+        send(res, 200, { ok: true, stopped });
+      } finally { connecting.delete(key); }
       return;
     }
 
@@ -295,6 +504,13 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 404, { error: `unknown homeId ${restartHome[1]}` });
         return;
       }
+      const key = instanceKey(home);
+      const sibling = store.listHomes().find((h) => h.homeId !== home.homeId && instanceKey(h) === key && launcher.status(h.homeId));
+      if (sibling || connecting.has(key)) {
+        send(res, 409, { error: '同一实例已有其他通道连接或正在连接' });
+        return;
+      }
+      connecting.add(key);
       try {
         const inst = await launcher.restart(home);
         await monitor.refresh(home.homeId);
@@ -302,6 +518,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });
+      } finally {
+        connecting.delete(key);
       }
       return;
     }

@@ -76,7 +76,10 @@ const hub = new SSEHub();
 // 每条通过阈值的新日志（含报错时的上下文/堆栈）实时推送到「日志区域」。
 onLog((entry) => hub.broadcast('log:event', entry));
 const registry = new InstanceRegistry(); // 控制平面唯一权威状态（M6）
-const launcher = new Launcher({ registry });
+const launcher = new Launcher({ registry, rememberAccessPort: (homeId, accessPort) => {
+  if (!store.getHome(homeId)) throw new Error('实例已移除');
+  store.updateHomeConfig(homeId, { accessPort });
+} });
 const monitor = new Monitor({
   store,
   launcher,
