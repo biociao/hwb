@@ -176,3 +176,33 @@ test('buildSnapshot degrades a required file that readText reports missing', () 
   assert.equal(snap.workspaces.length, 0);
   assert.equal(snap.sessions.length, 0);
 });
+
+// ── readMetadataFile 的 TOCTOU 加固（O_NOFOLLOW + 以 fd 为准复核） ──
+// lstat 查的是**路径**、open 拿到的是**另一个瞬间的对象**，两者之间有一个窗口：
+// 窗口内被换成符号链接就能把 home 之外的文件读进来（持久化进 hwb.db 并展示给浏览器），
+// 被换成 FIFO 就能把进程永久卡住。这个窗口无法在测试里稳定撞上（要精确控制时序），
+// 所以这里分两条守：① 合法场景不被误伤（硬链接仍是普通文件）② 加固代码本身不被悄悄删掉。
+test('readMetadataFile: 硬的普通文件（硬链接）仍可正常读取，不被 O_NOFOLLOW 误伤', async () => {
+  const { linkSync } = await import('node:fs');
+  const { readMetadataFile } = await import('../src/lib/read-home.js');
+  const dir = mkdtempSync(path.join(tmpdir(), 'hwb-hardlink-'));
+  try {
+    const real = path.join(dir, 'real.json');
+    writeFileSync(real, '{"ok":true}');
+    linkSync(real, path.join(dir, 'alias.json')); // 硬链接：同一个 inode，不是符号链接
+    assert.equal(readMetadataFile(dir, 'alias.json'), '{"ok":true}');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('结构: readMetadataFile 必须用 O_NOFOLLOW 打开，并在读之前以 fd 复核身份', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('../src/lib/read-home.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('export function readMetadataFile'));
+  assert.match(fn, /openSync\([^)]*O_NOFOLLOW/, 'open 必须带 O_NOFOLLOW（否则窗口内换成符号链接会被跟随）');
+  assert.match(fn, /fstatSync\(fd\)/, '必须对已打开的 fd 复核身份 —— 只有这一步没有竞态');
+  const fstatAt = fn.indexOf('fstatSync(fd)');
+  const readAt = fn.indexOf('readFileSync(fd');
+  assert.ok(fstatAt > 0 && readAt > fstatAt, 'fstat 复核必须发生在读取之前');
+});

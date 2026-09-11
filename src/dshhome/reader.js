@@ -54,8 +54,8 @@ export function indexHome(store, homePath, live = null) {
 }
 
 // 把「读文件」与「按快照落库」拆开，供调用方在两者之间插入别的异步步骤
-// （indexer 要在读完文件**之后**才抓实时状态，这样抓到的快照与落库之间没有窗口；
-//   参见 dshhome/indexer.js 的注释）。
+// （indexer 要在读完文件**之后**才抓实时状态，这样「抓快照 → 落库」这段本该最短的间隔里
+//   不再夹着一次完整的文件读取；参见 dshhome/indexer.js 的注释）。
 export function readHomeSnapshot(homePath) {
   return readHome(homePath);
 }

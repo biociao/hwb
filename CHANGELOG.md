@@ -116,8 +116,6 @@ Semantic Versioning.
   这个报错极易被误读成「忘了 npm install」。
 - `src/server.js` 改为动态 `await import('./dshhome/store.js')`：静态 import 会先于模块体求值，
   让 `node:sqlite` 的加载早于版本预检，预检就永远来不及给提示。其余 import 不受影响。
-
-
 - 本机**下载**不再经 base64 中转（`readLocalPreview` 直接交回 `Buffer`）。原先的链路上有三层同尺寸
   副本：原 buffer → base64 字符串（1.33×）→ `JSON.stringify` 的结果（又一份）→ 调用方再解一遍，
   实测 64 MiB 文件额外堆占用约 170 MiB（合计约 235 MB 峰值）。远端仍用 base64（ssh 传输需要），
@@ -151,6 +149,69 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 实时轮询里**第二次**读实例列表抛错会直接弄崩进程（src/dshhome/live-poller.js）
+- **现象**：`listHomes()` 一旦抛错（例如数据库里某行 JSON 列坏了），整个工作台消失 ——
+  crash handler 走 `process.exit(1)`。
+- **根因**：`tick()` 只给**第一次** `this.homes()` 套了 try/catch，而 `refresh(homeId)` 内部
+  **还会再读一次**（取 `activeEndpointId`）。那次同步抛错落在同一个 `setInterval` 回调的
+  同步段里，绕过了唯一的保护。实测：让 `homes()` 第二次调用抛错，`start()` 直接抛出。
+- **修复**：逐个 `refresh` 也兜住（失败只跳过该实例，并记录 homeId）；`refresh` 内部自己
+  兜住 `homes()`，保持「返回 promise」的契约；顺带拒绝非数组返回值
+  （原实现 `for (const home of null)` 会抛 TypeError，同样是致命路径）。
+- **回归测试**：`tests/live-poller.test.js` 两条 —— `homes()` 第二次调用抛错、`homes()`
+  返回 `null`。修复前两条都失败（`start()` 抛出）。
+
+#### 元数据读取的 lstat→open 窗口（TOCTOU）（src/lib/read-home.js）
+- **问题**：`readMetadataFile` 先 `lstatSync` 判身份、再 `openSync` 打开 —— 查的是**路径**，
+  打开的却是**另一个瞬间的对象**。窗口内被换成符号链接就能把 home 之外的文件读进来
+  （持久化进 hwb.db 并展示给浏览器），被换成 FIFO 就能把进程永久卡住。
+  现实中这个窗口没有复现出来（272,889 次尝试 0 泄漏），但它是真实存在的。
+- **修复**：三道防线叠加 —— `O_NOFOLLOW`（换成符号链接直接 ELOOP）、`O_NONBLOCK`
+  （换成 FIFO 也不会挂住）、以及**以 fd 为准**的 `fstatSync(fd)` 复核身份与大小。
+  最后一步没有竞态，是唯一能真正关掉窗口的检查。
+- **回归测试**：`tests/read-home.test.js`。**说实话**：这个窗口没法在测试里稳定撞上（要精确
+  控制时序），所以测的是①不被误伤（硬链接仍是普通文件、照常读）②**加固代码本身不被悄悄
+  删掉** —— 一条源码级不变量断言：`openSync` 必须带 `O_NOFOLLOW`，且 `fstatSync(fd)`
+  必须发生在 `readFileSync(fd)` 之前。删掉加固该用例立即失败。
+
+#### README 路由双向校验漏掉「非 homes 族」的参数化路由（tests/docs-consistency.test.js）
+- **问题**：解析器写死了 `pathname.match(/^\/api\/homes\/([0-9a-f]{16})` 这一族。
+  今天确实所有参数化路由都在这一族里，但只要以后新增别的族（如
+  `/api/sessions/([0-9a-f]{16})/xxx`），它会被**静默漏掉双向检查**：README 不写它不报错，
+  写了也不校验。
+- **修复**：改成通用解析所有 `pathname.match(/^...$/)`：`([0-9a-f]{16})` → 占位符
+  （homes 族叫 `{homeId}`，其它族叫 `{id}`，免得逼着 README 把会话 id 写成 homeId）、
+  `(a|b)` 展开成多条、其它捕获组显式标成 `{...}`（宁可让 README 对不上而报错，也不静默跳过）。
+  并新增一条**反向校验**：源码里每个 `/api` 匹配器都必须能被某条解析结果的具体化实例匹配上 ——
+  新增一族而解析器漏掉时立即失败。
+- **顺带修掉一个自造的假测试**：第一版通用解析把 `api/` 判断写在了反转义**之前**，
+  转义后的文本里只有 `api\/`，于是永远匹配不上、提取出 0 条，测试恒过。已在注释里写明。
+- **回归测试**：临时往 `routes.js` 插一个 `/api/sessions/([0-9a-f]{16})/close`，
+  该用例确实报「README 缺少已实现的路由」；而旧的解析器对这条路由完全无感。
+
+#### 两处「看起来在测、其实测不到」的测试（tests/hostile-env.test.js）
+- **并发上限**：原测试只断言 `new Indexer({concurrency: 99}).concurrency === 8`（构造函数里的
+  clamp），完全没碰线程池 —— 把 `#runAll` 的 `Math.min(this.concurrency, due.length)` 改成
+  `due.length` 照样通过。现改为用可注入的 `remoteExec` 真正量一次同时在飞的实例数
+  （峰值必须恰好为 3；去掉上限则实测峰值 9）。
+- **索引顺序**：原测试断言「实时状态生效」，但状态字段上实时值**总会**赢，两种顺序都能通过。
+  现改为让 `liveStatus` 被调用时把 projcache 里的**标题**改掉，再用只有文件能提供的 `title`
+  作判据：正确顺序入库 `FILE-OLD`，反序入库 `FILE-NEW`。把顺序改回去该用例确实失败。
+- 同时修正 CHANGELOG 与两处源码注释里「窗口收敛到 0」的过度声称：改进是确定的（那段本该最短的
+  间隔里不再夹着一次完整的文件读取），但**不是**严格的 0 —— 实时抓取本身要等一次 RPC，
+  若另一个更早发起的抓取恰好在这期间返回并写库仍可能被覆盖，根治需要版本号/时间戳。
+
+#### CHANGELOG 的结构完整性（tests/docs-consistency.test.js）
+- 一次替换把 `#### 预览代理的建立竞态…` 的**标题行**连同空行一起删掉了，于是那条修复的正文
+  变成挂在上一篇末尾的孤儿 —— 读起来像「上一条的附带说明」，而且没有任何测试会红。
+  新增结构测试：`[Unreleased]` 段内**连续两个空行之后直接跟列表项**即失败
+  （正常排版不会这样，而「标题被删」恰好留下这个形状）。写出来立刻又抓到第二处同类断裂。
+  重新制造该损坏可复现失败。
+
+#### 死代码：multipart.js 里两个没人用的常量（src/lib/multipart.js）
+- `close`（= delimiter）与 `end`（= `${delimiter}--`）自重构后就没有任何引用，注释还写着
+  「field 状态用它找 part 尾巴」（已经不成立）。删除，免得下一个人照着不存在的用法改。
+
 #### 一行坏 JSON 就让整个用量面板 500（src/dshhome/store.js）
 - **现象**：`sessions.tokenUsage` 只要有一行不是合法 JSON（外部工具改过库、或写入中途断电），
   `GET /api/usage` 与 `GET /api/projects/recent` 直接 500，前端整块用量面板与项目列表一起空掉；
@@ -212,7 +273,7 @@ Semantic Versioning.
 - **回归测试**：`tests/hostile-env.test.js` —— 同一份内容带/不带 BOM 各解析一次，
   断言两条路径给出的 ref 列表完全相同。
 
-
+#### 预览代理的建立竞态会留下孤儿监听端口（src/control/launcher.js）
 - `#withPreview` 会 `await createProxy(...)`，而 `disconnect` 只能关掉「当时已经存在」的
   `inst.previewProxy`；`previewPending` 只是作废了一个引用，管不到那个已经跑起来的 Promise。
   于是「代理还没就绪时实例被断开/移除」会让刚 bind 成功的端口没人持有，一直留到进程退出。
@@ -632,10 +693,19 @@ Semantic Versioning.
   per-home 退避与错误隔离都保持不变。
 
 #### 实时状态可能被更旧的快照覆盖（src/dshhome/indexer.js + dshhome/reader.js）
-- indexer 原先**先**抓实时状态、**再**读文件，于是「抓快照」与「落库」之间留出了几秒的窗口：
-  live-poller 写进更新的状态后，被这边更旧的快照覆盖，界面上的状态徽标倒退一拍。
-  改为读完文件（同步、不会让出事件循环）**之后**再抓实时状态，窗口收敛到 0。
+- indexer 原先**先**抓实时状态、**再**读文件，于是「抓快照」与「落库」之间夹着整个文件读取
+  （远程实例是 SSH，几秒到几十秒）：期间 live-poller 写进更新的状态后，会被这边更旧的快照覆盖，
+  界面上的状态徽标倒退一拍。改为读完文件**之后**再抓实时状态。
+- 改完后的窗口是「实时快照被取到 → 落库」这一步。本机实例中间不再有事件循环轮次
+  （读文件是同步的，落库也是同步的），所以定时器驱动的写入无法插进来；**不是**严格意义的
+  「窗口 0」—— 实时抓取本身要等一次 RPC，若同一时刻还有另一个在飞的抓取更早返回并写库，
+  仍可能被覆盖（这是两个读-写者共有的问题，靠排序消不掉，需要版本号/时间戳才能根治）。
+  相对原来的改进是确定的：那段本该「最短」的间隔不再包含一次完整的文件读取。
   顺带把 `reader.js` 的「读文件」与「按快照落库」拆成两个导出，供这里组合。
+- **回归测试**：`tests/hostile-env.test.js`。注意**只看「实时状态生效了没有」是测不出顺序的**
+  （状态字段上实时值总会赢）—— 所以测试改为让 `liveStatus` 被调用时把 projcache 里的**标题**
+  改掉，再用只有文件能提供的 `title` 作判据：正确顺序入库 `FILE-OLD`，反序入库 `FILE-NEW`。
+  把顺序改回去（先抓实时、再读文件）该用例确实失败。
 
 #### 数据库路径不可用、日志文件被删时的可诊断性（src/server.js + src/lib/logger.js）
 - `new IndexStore()` 失败时只抛一句 `unable to open database file`，并冒成

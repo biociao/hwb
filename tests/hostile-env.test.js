@@ -138,6 +138,34 @@ test('indexer: 结果顺序与实例列表一致，且并发数有上限', async
   assert.equal(new Indexer({ store: {}, homes: () => [], concurrency: 99 }).concurrency, 8, '并发数应有上限');
 });
 
+// 上面那条只断言了**构造函数里的 clamp**（concurrency=8），完全没碰线程池本身：
+// 把 #runAll 里的 `Math.min(this.concurrency, due.length)` 换成 `due.length`，
+// 那条断言照样通过。这里用可注入的 remoteExec 真正量一次同时在飞的实例数。
+test('indexer: 池子真的限制同时在飞的实例数（不是只把 concurrency 抄进字段）', async () => {
+  const homes = Array.from({ length: 9 }, (_, i) => ({
+    homeId: `r${i}`, hostType: 'remote', host: 'bot@x', homePath: `ssh://bot@x/${i}`,
+  }));
+  let inFlight = 0, peak = 0;
+  const indexer = new Indexer({
+    store: { upsertRows() {}, markHomeError() {} },
+    homes: () => homes,
+    concurrency: 3,
+    remoteExec: async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 20));   // 假装一次 ssh 往返
+      inFlight--;
+      return {
+        code: 0, stderr: '',
+        stdout: ['storages/workspace.json', 'storages/session_projcache.json', 'model-tier.json']
+          .map((p) => `__DSH_FILE_BEGIN__:${p}\n__MISSING__\n__DSH_FILE_END__\n`).join(''),
+      };
+    },
+  });
+  await indexer.reindexNow();
+  assert.equal(peak, 3, `同时在飞应为 3，实测峰值 ${peak}`);
+  assert.ok(inFlight === 0, '全部 worker 都应已收尾');
+});
+
 // ── 实时状态：抓快照必须在读文件之后，否则会被更旧的快照覆盖 ──
 test('indexer: 实时状态在文件读取之后才抓，不被整表 upsert 覆盖', async (t) => {
   const dir = await mkdtemp(path.join(tmpdir(), 'hwb-order-'));
@@ -148,26 +176,38 @@ test('indexer: 实时状态在文件读取之后才抓，不被整表 upsert 覆
     global: { initialized: true, workspaceIds: ['w1'] },
     tables: { workspaces: { w1: { title: 'A', path: '/r/a', sessionIds: ['s1'] } } },
   }));
-  await writeFile(path.join(dir, 'storages', 'session_projcache.json'), JSON.stringify({
+  const projcache = (title) => JSON.stringify({
     unit: { name: 'session_projcache', version: 3 }, global: null,
-    tables: { sessions: { s1: { identity: { createdAt: Date.now(), cwd: '/r/a' }, rows: {} } } },
-  }));
+    tables: { sessions: { s1: { identity: { createdAt: Date.now(), cwd: '/r/a' }, rows: { title: { val: title } } } } },
+  });
+  const cacheFile = path.join(dir, 'storages', 'session_projcache.json');
+  await writeFile(cacheFile, projcache('FILE-OLD'));
 
   const store = new IndexStore(':memory:');
   const homeId = store.registerHome({ homePath: dir });
   const indexer = new Indexer({
     store,
     homes: () => [{ homeId, hostType: 'local', homePath: dir }],
-    liveStatus: async () => [{
-      sessionId: 's1', cwd: '/r/a',
-      status: { kind: 'completed', label: '已完成', subagents: 0, approval: null },
-      lastActivity: new Date().toISOString(),
-    }],
+    liveStatus: async () => {
+      // 关键：在被调用时把文件里的标题改掉，于是「文件到底是何时读的」变得可观察。
+      //   · 正确顺序（先读文件、再抓实时）→ 入库标题是读取那一刻的 'FILE-OLD'
+      //   · 原实现（先抓实时、再读文件）→ 入库的是改过之后的 'FILE-NEW'
+      // 只看「实时状态有没有生效」是**区分不出顺序**的（那个字段实时值总会赢），
+      // 所以必须用一个**只有文件能提供**的字段来做判据 —— 这就是这条测试以前不成立的原因。
+      await writeFile(cacheFile, projcache('FILE-NEW'));
+      return [{
+        sessionId: 's1', cwd: '/r/a',
+        status: { kind: 'completed', label: '已完成', subagents: 0, approval: null },
+        lastActivity: new Date().toISOString(),
+      }];
+    },
   });
   await indexer.reindexNow();
   const row = store.recentSessions({ homeId })[0];
   const kind = (typeof row.status === 'string' ? JSON.parse(row.status) : row.status)?.kind;
   assert.equal(kind, 'completed', '实时状态应生效，不该被文件索引的旧状态覆盖');
+  assert.equal(row.title, 'FILE-OLD',
+    '文件必须在抓实时状态**之前**读完：读到 FILE-NEW 说明顺序反了，正是那条「旧快照覆盖新状态」的窗口');
   store.close();
 });
 

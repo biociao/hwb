@@ -15,8 +15,6 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
   const delimiter = `\r\n--${boundary}`;
   const open = `--${boundary}`;       // 首个分隔符没有前导 CRLF（body 直接从它开始）
   const start = `${open}\r\n`;      // 第一个 part 之前的那一个
-  const close = delimiter;           // part 体的收尾
-  const end = `${delimiter}--`;      // 结束分隔符（field 状态用它找 part 尾巴）
   const hold = delimiter.length + 4; // 留足「分隔符可能还没读完」的尾巴
   const headLimit = 64 * 1024;   // 头部（Content-Disposition 等）上限
 

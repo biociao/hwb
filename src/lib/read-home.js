@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, lstatSync, openSync, closeSync, constants as fsConstants } from 'node:fs';
+import { readFileSync, existsSync, lstatSync, fstatSync, openSync, closeSync, constants as fsConstants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import {
@@ -175,7 +175,19 @@ export function readMetadataFile(homePath, rel) {
   }
   let fd;
   try {
-    fd = openSync(target, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    // 三道防线叠加，因为 lstat 与 open 之间**存在时间窗**（查的是路径，拿到的可能是另一个
+    // 瞬间的对象 —— 经典的 TOCTOU）：
+    //  · O_NOFOLLOW：即使此刻被换成符号链接，open 直接失败（ELOOP），不跟随到 home 之外；
+    //  · O_NONBLOCK：即使此刻被换成 FIFO，也不会挂住（上面 lstat 那关只是「当时」不是 FIFO）；
+    //  · fstatSync(fd)：对**已经打开的那个对象**再核一次身份与大小 —— 这一步没有竞态，
+    //    是唯一能真正关掉窗口的检查。注意要 fstat 而不是再 stat 一次路径。
+    fd = openSync(target,
+      fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new Error(`${rel} 不是普通文件`);
+    if (opened.size > MAX_METADATA_BYTES) {
+      throw new Error(`${rel} 超过 ${MAX_METADATA_BYTES / 1024 / 1024} MiB 读取上限`);
+    }
     return readFileSync(fd, 'utf8');
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch { /* 已关闭 */ } }

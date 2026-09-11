@@ -9,27 +9,42 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 // 文档里写死的数字与清单会悄悄过期。README 原先写着「当前 62 个用例」，后来涨到 359、又到 419，
 // 三次都没人发现；REST API 表也漏过 4 条已实现的路由。这里把**能自校验的部分**变成会失败的测试。
 
-/** 从 routes.js 里抽出 `/api/homes/{homeId}/xxx` 形式的参数化路由（解析真实字面量，不手写清单）。 */
+/**
+ * 从 routes.js 里抽出**所有**参数化路由（`pathname.match(/^...$/)`），解析真实字面量、不手写清单。
+ *
+ * 旧版只认 `pathname.match(/^\/api\/homes\/([0-9a-f]{16})` 这一族：今天确实所有参数化路由都在
+ * 这一族里，但只要以后新增一个别的族（比如 `/api/sessions/([0-9a-f]{16})/xxx`），它就会**悄悄**
+ * 漏掉双向检查 —— README 不写它不报错，写了也不校验。所以这里改成通用解析：
+ *   · `([0-9a-f]{16})` → `{homeId}`
+ *   · `(a|b)` 顶层分支 → 展开成多条（README 里 preview / download 是两行）
+ *   · 其它捕获组 → `{组内容}`（宁可让 README 对不上而报错，也不要静默跳过）
+ * 同时返回 `literals`（扫到的正则字面量个数）供调用方做「解析器没漏」的反向校验。
+ */
 export function parameterizedRoutes(source) {
-  const marker = 'pathname.match(/^\\/api\\/homes\\/([0-9a-f]{16})';
   const found = new Set();
-  let index = source.indexOf(marker);
-  while (index !== -1) {
-    const rest = source.slice(index + marker.length);
-    const end = rest.search(/\$/); // 正则字面量的结尾锚点
-    if (end !== -1) {
-      // 形如 `/upload$/`、`/(preview|download)$/`、`$/`（无后缀，即 {homeId} 本身）
-      // 源码里的正则字面量把 `/` 写成 `\/`，先还原再拆段。
-      const literal = rest.slice(0, end).replace(/\\\//g, '/');
-      // 空后缀 = 正则到 `{16})` 就结束，即 `/api/homes/{homeId}` 本身（PUT/DELETE 用）。
-      if (literal === '') { found.add('/api/homes/{homeId}'); }
-      for (const seg of literal.replace(/^\//, '').replace(/[()]/g, '').split('|')) {
-        if (seg) found.add(`/api/homes/{homeId}/${seg}`);
-      }
+  let literals = 0;
+  for (const m of source.matchAll(/pathname\.match\(\/\^(.+?)\$\/\)/g)) {
+    const raw = m[1];
+    // 源码里正则把 `/` 写成 `\/`，**先还原**再判断。曾把这个判断写在还原之前
+    // （`raw.includes('api/')`）：转义后的文本里只有 `api\/`，于是永远匹配不上、提取出 0 条。
+    const literal = raw.replace(/\\\//g, '/');
+    if (!literal.startsWith('/api/')) continue;   // 只关心 /api 路由；静态资源匹配器不算
+    literals++;
+    // 先把 `([0-9a-f]{16})` 占位掉，剩下的 `(a|b)` 才是需要展开的分支
+    const marked = literal.replace(/\(\[0-9a-f\]\{16\}\)/g, '\u0000');
+    const branch = /^(.*?)\(([^()]+)\)(.*)$/.exec(marked);
+    const expanded = branch ? branch[2].split('|').map((alt) => `${branch[1]}${alt}${branch[3]}`) : [marked];
+    for (const e of expanded) {
+      // 16 位十六进制在 homes 族里就是 homeId；别的族（以后可能出现的 /api/sessions/...）
+      // 用中性占位符，否则会逼着 README 把一个会话 id 写成 {homeId}。
+      const placeholder = e.startsWith('/api/homes/') ? '{homeId}' : '{id}';
+      const p = e.replace(/\u0000/g, placeholder)
+        // 残留的捕获组（未预期的写法）显式标出来，宁可让 README 对不上而报错，也不静默漏掉
+        .replace(/\(([^()]*)\)/g, '{$1}');
+      if (p.startsWith('/api/')) found.add(p);
     }
-    index = source.indexOf(marker, index + marker.length);
   }
-  return found;
+  return Object.assign(found, { literals });
 }
 
 /** 从 routes.js 里抽出字面量路径（`pathname === '/api/...'`）。 */
@@ -53,6 +68,21 @@ test('README 的 REST API 表双向覆盖 src/api/routes.js 的路由', async ()
   assert.ok(literal.size >= 8, `应解析出若干字面量路由，实际 ${literal.size}：${[...literal]}`);
   assert.ok(parameterized.size >= 8, `应解析出若干参数化路由，实际 ${parameterized.size}：${[...parameterized]}`);
   assert.ok(parameterized.has('/api/homes/{homeId}/upload'), `解析器应认出 upload，实际 ${[...parameterized]}`);
+  // 反向校验「解析器没漏」：routes.js 里每一个 /api 的正则匹配器都要被解析到。
+  // 旧版解析器写死了 homes 这一族，新增别的族（如 /api/sessions/{id}/xxx）会被静默漏掉 ——
+  // 既不要求 README 写它，也不校验 README 里写的它对不对。
+  const allMatchers = [...routes.matchAll(/pathname\.match\(\/\^(.+?)\$\/\)/g)]
+    .map((m) => m[1].replace(/\\\//g, '/'))
+    .filter((s) => s.startsWith('/api/'));
+  assert.equal(parameterized.literals, allMatchers.length,
+    `routes.js 里有 ${allMatchers.length} 个 /api 正则匹配器，解析器只处理了 ${parameterized.literals} 个`);
+  for (const matcher of allMatchers) {
+    // 用「具体化」的方式精确校验：把解析出来的路由里的占位符换成具体值，
+    // 看源码里这个匹配器是否真的能匹配上它。匹配不上 = 解析器漏了这一族。
+    const sample = (p) => p.replace('{homeId}', 'a'.repeat(16));
+    const hit = [...parameterized].some((p) => new RegExp(matcher).test(sample(p)));
+    assert.ok(hit, `解析器漏掉了这个路由匹配器：${matcher}（解析结果：${[...parameterized]}）`);
+  }
 
   // 方向一：代码里有 → 文档里必须有
   for (const p of literal) assert.ok(readme.includes(p), `README 的 REST API 表缺少已实现的路由：${p}`);
@@ -194,4 +224,31 @@ test('src/web 下没有「谁都不引用」的孤儿文件', async () => {
   const orphans = all.filter((f) => !referenced.has(f) && !intentionallyUnwired.has(f));
   assert.deepEqual(orphans, [], `src/web 下存在谁都不引用的文件（死资源）：\n${orphans.join('\n')}`);
   assert.ok(referenced.size >= 15, `可达文件数异常偏少（${referenced.size}），可达性分析可能失效`);
+});
+
+// ── CHANGELOG 的结构完整性（防「编辑时把下一个标题吃掉」） ──
+// 真事：一次替换把 `#### 预览代理的建立竞态…` 这一行which 连同空行一起删掉了，
+// 于是那条修复的正文变成挂在上一篇末尾的孤儿 —— 渲染出来是「上一条的附带说明」，
+// 读者根本不知道它在讲什么，而且没有任何测试会红。这里把结构钉住。
+test('CHANGELOG 的每条修复都有标题，不存在挂在别人末尾的孤儿正文', async () => {
+  const changelog = await readFile(path.join(root, 'CHANGELOG.md'), 'utf8');
+  const lines = changelog.split('\n');
+
+  // 取 [Unreleased] 段（到下一个 ## [ 版本标题为止）
+  const start = lines.findIndex((l) => l.startsWith('## [Unreleased]'));
+  assert.ok(start >= 0, '找不到 [Unreleased] 段');
+  const end = lines.findIndex((l, i) => i > start && l.startsWith('## ['));
+  const body = lines.slice(start, end === -1 ? lines.length : end);
+
+  // 判据只用一条：**连续两个空行之后直接跟列表项**。正常排版不会这样，
+  // 而「标题行被删掉、正文留在原处」恰好会留下这个形状（实测就是这么被发现的）。
+  // 不要求「小节第一条必须是 ####」—— ### Changed 之类本来就是直接列条目。
+  let headingCount = 0;
+  for (let i = 0; i < body.length; i++) {
+    if (/^#### /.test(body[i])) headingCount++;
+    if (body[i].trim() === '' && body[i + 1]?.trim() === '' && /^- /.test(body[i + 2] ?? '')) {
+      assert.fail(`第 ${start + i + 3} 行附近：连续空行后直接跟列表项，疑似标题被删（孤儿正文）`);
+    }
+  }
+  assert.ok(headingCount >= 10, `[Unreleased] 里应有多条 #### 修复条目，实际 ${headingCount}`);
 });

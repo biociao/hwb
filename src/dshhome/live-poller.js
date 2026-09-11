@@ -25,7 +25,23 @@ export class LiveStatusPoller {
         log.warn('实时轮询读取实例列表失败（本轮跳过）', { error: error?.message ?? String(error) });
         return;
       }
-      for (const home of homes) this.refresh(home.homeId);
+      if (!Array.isArray(homes)) {
+        log.warn('实时轮询读到非数组的实例列表（本轮跳过）', { type: typeof homes });
+        return;
+      }
+      // 注意：refresh() 内部**还会再读一次** homes()（用来取端点信息），那一次抛错同样落在
+      // 这个同步段里 —— 上面只兜住了第一次调用。实测：让 homes() 第二次调用抛错，
+      // start() 会直接抛出，进而被 crash handler 变成 process.exit(1)。
+      // 所以逐个 refresh 也要兜住，失败只跳过该实例。
+      for (const home of homes) {
+        try {
+          this.refresh(home?.homeId);
+        } catch (error) {
+          log.warn('实时轮询刷新单个实例失败（跳过该实例）', {
+            homeId: home?.homeId, error: error?.message ?? String(error),
+          });
+        }
+      }
     };
     tick();
     this.timer = setInterval(tick, this.intervalMs);
@@ -40,7 +56,16 @@ export class LiveStatusPoller {
 
   refresh(homeId) {
     if (this.pending.has(homeId)) return this.pending.get(homeId);
-    const home = this.homes().find((h) => h.homeId === homeId);
+    // 同上：这次 homes() 在 refresh 里是同步调用，抛错会直接冒到调用方（API 路由或 tick 的
+    // 同步段）。这里自己兜住，返回一个已完成的 promise，保持 refresh 的返回契约。
+    let home;
+    try {
+      const list = this.homes();
+      home = Array.isArray(list) ? list.find((h) => h.homeId === homeId) : null;
+    } catch (error) {
+      log.warn('实时轮询读取实例列表失败（本次刷新跳过）', { homeId, error: error?.message ?? String(error) });
+      return Promise.resolve();
+    }
     if (!home) return Promise.resolve();
     const work = Promise.resolve().then(() => this.read(home)).then((live) => {
       if (!this.running || !Array.isArray(live) || !this.store.getHome(homeId)) return;

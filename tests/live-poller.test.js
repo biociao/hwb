@@ -95,3 +95,36 @@ test('live reader reports failures once, distinguishes malformed and empty lists
   assert.ok(!logs.includes('DO_NOT_LOG'));
   assert.ok(!logs.includes('PRIVATE'));
 });
+
+// ── 轮询里**第二次**读实例列表抛错曾直接冒成 uncaughtException ──
+// tick() 只给第一次 this.homes() 套了 try/catch，但 refresh() 内部还会再读一次
+// （用来取 activeEndpointId）。那次抛错落在同一个 setInterval 同步段里，
+// 于是走 crash handler → process.exit(1)：工作台消失、没有任何界面提示。
+test('live poller: homes() 第二次调用抛错时只跳过该实例，不再弄崩进程', () => {
+  let calls = 0;
+  const poller = new LiveStatusPoller({
+    homes: () => {
+      calls++;
+      if (calls === 1) return [{ homeId: 'a', activeEndpointId: 'e1' }]; // 第一次正常
+      throw new Error('数据库里的坏 JSON');                                // 之后都坏掉
+    },
+    store: { getHome: () => ({ activeEndpointId: 'e1' }), applyLiveStatus() {} },
+    read: async () => [],
+    intervalMs: 10,
+  });
+  // 原实现：tick() 里 refresh('a') 同步抛出 → start() 直接抛
+  assert.doesNotThrow(() => poller.start());
+  poller.stop();
+});
+
+test('live poller: homes() 返回非数组时也只跳过本轮（不因 .find/for-of 抛 TypeError）', () => {
+  const poller = new LiveStatusPoller({
+    homes: () => null,
+    store: { getHome: () => true, applyLiveStatus() {} },
+    read: async () => [],
+    intervalMs: 10,
+  });
+  assert.doesNotThrow(() => poller.start());
+  assert.doesNotThrow(() => poller.refresh('a'));
+  poller.stop();
+});
