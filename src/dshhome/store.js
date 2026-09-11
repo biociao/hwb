@@ -610,13 +610,18 @@ export class IndexStore {
         }
         for (const table of CHILD_TABLES) {
           if (protectedTables.has(table)) continue; // 该域降级 → 保留上次成功的行
-          // sessions 的替换**不动 liveOnly=1 的行**：那些行只由实时通道支撑、由 applyLiveStatus 管
-          // 生命周期（不在实时列表里就删、进了文件索引就由下面的 ON CONFLICT 归零）。原先它们会被
-          // 文件索引整表删掉、3s 后再由轮询器补插回来 —— 每 60s 一次无谓的删除+重插，
-          // 而**中间那几秒里工作台会少显示这些会话**。
-          // 真实数据上的规模：用户那台机器的 dsh 实时列表有 500 条、projcache 只有 179 条，
-          // 也就是说每分钟有 321 行被删掉再插回来（用真实库副本逐 sessionId 比对确认过）。
-          const where = table === 'sessions' ? 'WHERE homeId = ? AND liveOnly = 0' : 'WHERE homeId = ?';
+          // sessions 的替换在**实时通道正在写**时不动 liveOnly=1 的行：那些行只由实时通道支撑、
+          // 由 applyLiveStatus 管生命周期（不在实时列表里就删、进了文件索引就由下面的 ON CONFLICT 归零）。
+          // 原先它们会被文件索引整表删掉、3s 后再由轮询器补插回来 —— 每 60s 一次无谓的删除+重插，
+          // 而**中间那几秒里工作台会少显示这些会话**。真实数据上的规模：用户那台机器的 dsh 实时列表有
+          // 500 条、projcache 只有 179 条，也就是每分钟 321 行被删掉再插回来（用真实库副本比对确认过）。
+          //
+          // 但**只在通道还活着时**才保护它们：否则一次「曾经连上、后来再没连上」的实例会把那些行
+          // 永远留着（它们带着最后一次实时写入的状态，可能一直显示「运行中」—— 正是本项目修过的那类
+          // 幽灵徽标）。判据复用 LIVE_GRACE_MS：通道停了超过宽限期，下一次文件索引就把它们收回去
+          // （它们不在文件快照里，本来就不该由文件索引负责保留）。
+          const liveActive = Date.now() - this.liveStatusAt(home.homeId) < LIVE_GRACE_MS;
+          const where = table === 'sessions' && liveActive ? 'WHERE homeId = ? AND liveOnly = 0' : 'WHERE homeId = ?';
           this.db.prepare(`DELETE FROM ${table} ${where}`).run(home.homeId);
         }
       }
