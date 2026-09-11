@@ -411,6 +411,28 @@ Semantic Versioning.
 - **回归测试**：`tests/api-server-hardening.test.js` —— HEAD 必须 200 且无 body、`/api/*` 必须
   `no-store` + nosniff、404 也要带 JSON content-type 与 no-store。修复前失败。
 
+#### 额度失败的原因永远进不了日志（src/dshhome/quota.js + src/lib/balance.js）
+- **现象**（我自己复查 `quota.js` 时发现，实测复现）：`logger(scope)` 返回的是**对象**
+  （`.warn`/`.error`/…），而 `quota.js` 里两处写成了 `log('...', {...})` 当函数调用 ——
+  那会抛 `TypeError: log is not a function`：一处会**打断整批额度的异常处理**（正是那段注释声称
+  要隔离的东西），另一处在 per-provider 的 rejection 里，被 `Promise.allSettled` 吞掉。
+  实测结果：provider 查询失败时，UI 只看到「余额查询失败」，日志里**一条都没有**。
+  更深一层：`balance.js` 的 `logBalanceFailure` 用的是 `process.emitWarning` ——
+  它**绕过脱敏管线**（logger 只在自己的写入通道上脱敏），也不进环缓冲/SSE，
+  所以界面上的「日志区域」看不到任何原因，用户只能去翻 `service.log`。
+- **修复**：两处改成 `log.warn(...)`；`logBalanceFailure` 改走结构化日志（脱敏 + 进 UI），
+  并且**只记分类结果**而不是原始消息 —— 分类函数存在的理由就是「技术消息可能带上请求内容」
+  （我自己把带 key 的错误消息喂进去，它确实原样进了日志）；`quota.js` 另外记一条带
+  `homeId/ref/provider` 上下文的失败日志，并对「没公开余额 API」「还没配 key」两种预期内空状态
+  不记（否则每轮刷新都刷屏）。
+- **顺带加固**：脱敏原先只认「键名 + 值」两种形态，裸的凭据**形状**（没有 `token=` 前缀）
+  认不出来 —— 新增按形状的规则（`sk-` / `sk-ant-` / `ghp_` / `xox*-` / `AKIA` / `dcs_pat_`），
+  并断言幂等与不误伤普通文本（`sk- 后面什么都没有` 不动）。
+- **回归测试**：`tests/quota.test.js`（失败进结构化日志、带上下文、**不含 key 原文**、
+  「还没配 key」不刷屏）、`tests/logger-security.test.js`（裸凭据形状脱敏 + 一条**结构断言**：
+  任何从 `logger()` 取到的日志对象都不得被当成函数调用 —— 防的是整类错误；扫描时跳过注释行，
+  否则说明这个坏写法的注释本身会被当成违规）。
+
 #### 用量聚合改为派生整数列（src/dshhome/store.js）
 - **背景**：上一节用 10s TTL 记忆把「每 3 秒一次」压成「每 10 秒一次」，但**尖峰本身**还在
   （40k 会话一次 ~330ms，而 `node:sqlite` 是同步的，那段时间整个服务停着）。根因是逐行

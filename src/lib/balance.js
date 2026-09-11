@@ -1,4 +1,7 @@
 import { readMetadataFile } from './read-home.js';
+import { logger } from './logger.js';
+
+const log = logger('balance');
 
 // §8.1: API key 只存在于服务端内存 —— readCredentials 的返回值 NEVER 传给浏览器。
 // /api/quota 只输出 { provider, remaining, currency, ... }。
@@ -127,8 +130,17 @@ function classifyBalanceError(e) {
   return '余额查询失败';
 }
 
+// 走结构化日志，而不是 `process.emitWarning`：
+//   · emitWarning 的输出**绕过脱敏管线**（logger.js 只在自己的写入通道上脱敏）——适配器的错误
+//     消息里一旦带上请求内容就会原样落到 service.log；而调用方一直强调「技术消息可能带 key，
+//     所以只给 UI 一个分类」。日志这一路同样不该是例外。
+//   · 它也不进环缓冲/SSE，所以界面上的「日志区域」看不到任何余额失败的原因，用户只能去翻
+//     service.log 才知道发生了什么。
+// 结构化日志同时解决这两点：脱敏 + 进 UI。（UI 展示的仍是 classifyBalanceError 的分类结果。）
 function logBalanceFailure(provider, e) {
   try {
-    process.emitWarning(`[balance] ${provider} 查询失败: ${String(e?.message ?? e).slice(0, 200)}`);
+    // 只记**分类结果**，不记原始消息：分类函数存在的理由就是「技术消息可能带上请求内容」，
+    // 而日志这一路同样不该是例外（我自己验证时把带 key 的错误消息喂进来，它确实原样进了日志）。
+    log.warn('余额查询失败', { provider, error: classifyBalanceError(e) });
   } catch { /* 日志失败不影响返回值 */ }
 }

@@ -158,3 +158,61 @@ test('logger: getLogs({limit:0}) 返回空，而不是把整个环缓冲倒出�
   assert.equal(getLogs({ limit: -5 }).length, 0, '负数同样为空');
   assert.equal(getLogs({ limit: Number.NaN }).length, 0, 'NaN 也要安全');
 });
+
+// 裸的凭据**形状**：没有 `token=` 前缀，就一个 sk-… / dcs_pat_… 混在错误消息里。
+// 上游 SDK 的报错经常带请求内容（header 值就是 key）—— 我自己验证额度失败日志时，
+// 「网络炸了 sk-fake-for-test」这样的消息确实原样进了日志。按形状兜一层。
+test('logger: 不带键名的裸凭据（sk-/sk-ant-/ghp_/dcs_pat_）也会被脱敏', async () => {
+  const { redactSecrets } = await import('../src/lib/logger.js');
+  const cases = [
+    ['fetch failed: header sk-fake-for-test rejected', 'sk-fake-for-test'],
+    ['key sk-ant-api03-abcdefghijklmnop is invalid', 'sk-ant-api03-abcdefghijklmnop'],
+    ['DCS PAT dcs_pat_abcdef123456 expired', 'dcs_pat_abcdef123456'],
+    ['token ghp_abcdefghijklmnopqrstuvwxyz0123456789', 'ghp_abcdefghijklmnopqrstuvwxyz0123456789'],
+  ];
+  for (const [text, secret] of cases) {
+    const out = redactSecrets(text);
+    assert.doesNotMatch(out, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `仍能看到 ${secret}：${out}`);
+    assert.match(out, /已脱敏/);
+    assert.equal(redactSecrets(out), out, '必须幂等');
+  }
+  // 不误伤：只有前缀、后面没东西的普通文本
+  assert.equal(redactSecrets('普通文本不该动：sk- 后面什么都没有'), '普通文本不该动：sk- 后面什么都没有');
+});
+
+// `logger(scope)` 返回**对象**（.warn/.error/…），不是可调用函数。quota.js 里有两处写成了
+// `log('...', {...})`：一处会打断整批额度的异常处理，另一处被 Promise.allSettled 吞掉 ——
+// 结果是失败原因永远不进日志。这条结构断言防的是整类错误。
+test('结构: 任何从 logger() 取到的日志对象都不得被当成函数调用', async () => {
+  const { readFile, readdir } = await import('node:fs/promises');
+  const path = await import('node:path');
+  const root = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+  const files = [];
+  const walk = async (dir) => {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) await walk(full);
+      else if (e.name.endsWith('.js')) files.push(full);
+    }
+  };
+  await walk(path.join(root, 'src'));
+  const offenders = [];
+  for (const file of files) {
+    const src = await readFile(file, 'utf8');
+    // 找出 `const X = logger('scope')` 这类绑定，再看 X 有没有被当作函数调用
+    for (const m of src.matchAll(/(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*logger\(/g)) {
+      const name = m[1];
+      const call = new RegExp(`(^|[^.\\w$])${name}\\s*\\(`, 'm');
+      // 允许 `logger(...)` 本身的调用；只找该绑定的裸调用
+      const hit = src.split('\n').findIndex((line) => {
+        const text = line.trim();
+        // 注释行要跳过：quota.js 里正好有一段注释在**说明**这个坏写法（`log('...')`），
+        // 不排除掉就会把文档当成违规。
+        if (text.startsWith('//') || text.startsWith('*') || text.startsWith('/*')) return false;
+        return call.test(line) && !line.includes('= logger(');
+      });
+      if (hit !== -1) offenders.push(`${path.relative(root, file)}:${hit + 1} 把 ${name} 当函数调用`);
+    }
+  }
+  assert.deepEqual(offenders, [], `logger 返回的是对象，不能直接调用：\n${offenders.join('\n')}`);
+});

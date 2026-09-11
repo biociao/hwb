@@ -204,3 +204,40 @@ test('QuotaService: 缺少凭据 key 时仍能完成整批刷新（不再 TypeEr
   const rows2 = await svc2.refresh();
   assert.equal(rows2.length, 2, '一个实例的凭据异常不该让其它实例也拿不到额度');
 });
+
+// 额度失败原来只走 process.emitWarning：绕过脱敏管线、也不进环缓冲/SSE，
+// 界面上的「日志区域」看不到任何原因，只能去翻 service.log。
+// 现在两处都走结构化日志：balance 记分类原因（不记原始消息，因为它可能带请求内容），
+// quota 记带 home/ref 上下文的一条；而「没公开余额 API」「还没配 key」这两种预期内空状态不刷屏。
+test('quota: provider 失败会进结构化日志（带上下文、不含 key 原文、不刷屏）', async (t) => {
+  const { initLogger, getLogs, clearLogs } = await import('../src/lib/logger.js');
+  const { QuotaService } = await import('../src/dshhome/quota.js');
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-quota-log-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(path.join(dir, '.credentials.yaml'), 'version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-naked-secret-1234567890\n');
+
+  initLogger({ level: 'debug', file: false, silent: true });
+  clearLogs();
+  const svc = new QuotaService({
+    store: { listHomes: () => [{ homeId: 'h1', homePath: dir, providers: [
+      { ref: 'DEEPSEEK_API_KEY', provider: 'deepseek' },
+      { ref: 'NOT_CONFIGURED', provider: 'missing' },
+    ] }] },
+    fetchImpl: async () => { throw new Error(`网络炸了 sk-naked-secret-1234567890`); },
+  });
+  const rows = await svc.refresh();
+  assert.equal(rows.find((r) => r.ref === 'DEEPSEEK_API_KEY').error, '余额查询失败', 'UI 仍拿到分类结果');
+
+  const logs = getLogs({ limit: 50 });
+  const failed = logs.filter((l) => l.message === 'provider 额度刷新失败');
+  assert.equal(failed.length, 1, `应恰好一条额度失败日志，实际 ${failed.length}`);
+  assert.equal(failed[0].fields.homeId, 'h1');
+  assert.equal(failed[0].fields.ref, 'DEEPSEEK_API_KEY');
+  assert.equal(failed[0].fields.error, '余额查询失败', '只记分类结果');
+  assert.ok(logs.some((l) => l.message === '余额查询失败'), 'balance 侧也要有一条');
+  assert.doesNotMatch(JSON.stringify(logs), /sk-naked-secret/, '日志里不得出现 key');
+  assert.equal(failed.some((l) => l.fields.ref === 'NOT_CONFIGURED'), false, '「还没配 key」不该记成失败');
+});

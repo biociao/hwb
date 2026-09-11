@@ -219,13 +219,22 @@ const BEARER_BARE = new RegExp(`((?:\\bbearer\\s+))((?=[\\w.~+/=-]{16,})${VALUE}
 // 形如 `--token <v>` / `--api-key <v>`
 const SPACED_FLAG = new RegExp(`((?:--(?:${SECRET_KEY})\\s+))(${VALUE})`, 'gi');
 
+// 裸的凭据**形状**：没有 `token=` 这类前缀，就一个 sk-… / dcs_pat_… 混在错误消息里。
+// 上游 SDK 的报错经常带请求内容（header 值就是 key），而这正是 balance.js 里
+// classifyBalanceError 存在的原因 —— 那条路径已经不记原始消息了，但别的路径仍可能把
+// 「不带键名的 key」写进日志，所以这里按形状兜一层。前缀取自本项目会用到的服务：
+// DeepSeek/OpenAI 的 sk-、Anthropic 的 sk-ant-、GitHub 的 ghp_/gho_、Slack 的 xox*-、
+// AWS 的 AKIA、以及 DCS 的 dcs_pat_。
+const BARE_SECRET = /\b(?:sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|sk_live_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,}|dcs_pat_[A-Za-z0-9_-]{8,})/g;
+
 export function redactSecrets(value) {
   return String(value ?? '')
     .replace(KEY_VALUE, (m, prefix) => `${prefix}[已脱敏]`)
     .replace(AUTH_SCHEME, (m, prefix) => `${prefix}[已脱敏]`)
     .replace(AUTH_BARE, (m, prefix) => `${prefix}[已脱敏]`)
     .replace(BEARER_BARE, (m, prefix) => `${prefix}[已脱敏]`)
-    .replace(SPACED_FLAG, (m, prefix) => `${prefix}[已脱敏]`);
+    .replace(SPACED_FLAG, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(BARE_SECRET, '[已脱敏]');
 }
 
 function redactFields(fields) {
