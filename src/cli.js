@@ -256,7 +256,16 @@ async function main() {
     case 'upgrade': {
       if (!fs.existsSync(path.join(root, '.git'))) throw Error('upgrade 仅支持 Git 安装；npm 安装请使用 npm install -g hwb@latest 后 hwb restart');
       if (run('git', ['status', '--porcelain', '--untracked-files=all'], true)) throw Error('工作区有未提交修改；请先提交或自行保存后升级');
-      run('git', ['rev-parse', '--abbrev-ref', '@{upstream}'], true);
+      // 没有上游分支时 `git rev-parse @{upstream}` 只会给一句
+      // 「fatal: no upstream configured for branch 'x'」，用户得自己知道 upstream 是什么、
+      // 该怎么建。这里换成能照做的说法（并把分支名带上）。
+      const branch = run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], true);
+      try {
+        run('git', ['rev-parse', '--abbrev-ref', '@{upstream}'], true);
+      } catch {
+        throw Error(`当前分支 ${branch} 没有上游分支，无法快进更新。`
+          + `先建立上游（git push -u origin ${branch}）后重试，或切到已有上游的分支（如 main）。`);
+      }
       const wasRunning = await request();
       run('git', ['pull', '--ff-only']);
       test();

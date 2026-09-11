@@ -411,6 +411,18 @@ Semantic Versioning.
 - **回归测试**：`tests/api-server-hardening.test.js` —— HEAD 必须 200 且无 body、`/api/*` 必须
   `no-store` + nosniff、404 也要带 JSON content-type 与 no-store。修复前失败。
 
+#### `hwb upgrade` 在没有上游分支时只抛 git 的英文报错（src/cli.js）
+- **现象**：在一条没有 upstream 的分支上跑 `hwb upgrade`（本仓库的 `tmp-reorder2` 就是），
+  终端只有一句 `hwb: git 失败 (128): fatal: no upstream configured for branch 'tmp-reorder2'` ——
+  用户得自己知道 upstream 是什么、该怎么建。而 `upgrade` 是 README 里明确提供的命令。
+- **修复**：显式接住这个失败，给出可照做的说明（带上分支名）：
+  「当前分支 X 没有上游分支，无法快进更新。先建立上游（`git push -u origin X`）后重试，
+  或切到已有上游的分支（如 main）。」检查顺序不变（仍然在 `git pull` 之前中止，不会动工作区）。
+- **回归测试**：`tests/cli.test.js` —— 把 `cli.js` + `src/lib` 复制进一个独立临时仓库（`upgrade`
+  作用在**它自己所在的仓库**上，必须在隔离仓库里测，否则测的是 hwb 自己的工作区），
+  init 一个没有上游的分支后断言提示含分支名与 `git push -u`、且不再出现 `git 失败 (128)`。
+  修复前失败。
+
 #### SSE 连接数没有上限（src/api/sse.js）
 - **问题**（独立审查第 8 轮的 LOW）：背压上限（4 MiB）管的是「一个卡住的客户端」，
   但没管「有多少个客户端」——一个跑飞的脚本或狂刷页面可以开成百上千条 `EventSource`，

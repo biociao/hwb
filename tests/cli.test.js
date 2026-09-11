@@ -373,3 +373,34 @@ test('CLI 启停锁：持有者正卡在阻塞调用里（心跳暂停）时不�
   await run('stop');
   fs.rmSync(lock, { force: true });
 });
+
+// `git rev-parse @{upstream}` 在没有上游分支时只会给一句
+// 「fatal: no upstream configured for branch 'x'」——用户得自己知道 upstream 是什么、该怎么建。
+// upgrade 是文档里明确提供的命令，这条错误消息应该能照做（并带上分支名）。
+// 注意：upgrade 作用在**它自己所在的仓库**上（run() 的 cwd 是 root），所以必须像上面那条
+// 用例一样，把 cli.js + src/lib 复制到一个独立的临时仓库里跑 —— 否则测的是 hwb 自己的工作区。
+test('CLI: upgrade 在没有上游分支时给出可照做的提示', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-noupstream-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  fs.copyFileSync(cli, path.join(repo, 'src/cli.js'));
+  fs.cpSync(new URL('../src/lib', import.meta.url), path.join(repo, 'src/lib'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'package.json'), '{"type":"module"}');
+  const git = (...args) => exec('git', args, { cwd: repo, env: { ...process.env,
+    GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.invalid' } });
+  await git('init', '-b', 'lonely');
+  await git('add', '.');
+  await git('commit', '-m', 'init');
+
+  await assert.rejects(
+    exec(process.execPath, [path.join(repo, 'src/cli.js'), 'upgrade'],
+      { env: { ...process.env, HWB_DIR: path.join(dir, 'state') }, timeout: 15000 }),
+    (err) => {
+      assert.match(err.stderr, /没有上游分支/, `应说明缺上游，实际：${err.stderr}`);
+      assert.match(err.stderr, /lonely/, '应带上分支名');
+      assert.match(err.stderr, /git push -u/, '应给出可照做的命令');
+      assert.doesNotMatch(err.stderr, /git 失败 \(128\)/, '不该只把 git 的英文报错抛出来');
+      return true;
+    });
+});
