@@ -108,3 +108,18 @@ test('readFile 失败（权限/被删/IO）返回 404，而不是让处理器拒
   assert.equal(res.status, 404, `不该以异常结束（实际 ${res.status}）`);
   assert.equal(res.ended, true);
 });
+
+// `/assets//a.js`：rel 变成 '/a.js'（绝对路径），resolve 后落在 assetRoot 之外 → 被判 403，
+// 而文件其实存在。这是**误拒**（不是逃逸）：正常浏览器不会这么请求，但手工拼出来的地址会出现。
+test('多余前导斜杠的资产路径照常 200，不再被误判成越界', async (t) => {
+  const root = await fixture(t);
+  const { handler } = mount(root);
+  const res = fakeRes();
+  await handler({ method: 'GET', url: '/assets//app-1234abcd.js', headers: {} }, res);
+  assert.equal(res.status, 200, `应照常返回文件，实际 ${res.status}`);
+  // 越界防护本身不能因此放松
+  const escape = fakeRes();
+  await handler({ method: 'GET', url: '/assets/%2e%2e/%2e%2e/etc/hosts', headers: {} }, escape);
+  assert.ok(escape.status === 400 || escape.status === 403 || escape.status === 404,
+    `越界必须被拒，实际 ${escape.status}`);
+});

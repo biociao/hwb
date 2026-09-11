@@ -199,6 +199,13 @@ Semantic Versioning.
   钉住加固本身（必须有 `handle.stat()` 与 dev+ino 比对），正路径的越界/符号链接用例照旧守着不误伤。
   与 `readMetadataFile` 的 TOCTOU 加固采用同一套做法（那条也是结构断言）。
 
+#### 静态缓存：`/assets//a.js` 被误判成越界（dsh-static-cache/lib/index.js）
+- **现象**：`GET /assets//a.js`（多一个斜杠）拿到 **403**，而那个文件确实存在。
+- **根因**：rel 取到 `/a.js`，`resolve(assetRoot, '/a.js')` 把它当成**绝对路径**，于是越界检查拒绝。
+  这是**误拒**而非逃逸（正常的浏览器不会发这种 URL，但手工拼接出来的地址会出现）。
+- **修复**：先收掉多余的前导斜杠再解析；越界防护本身不变。
+- **回归测试**：`tests/dsh-static-cache.test.js` —— 双斜杠必须 200，同时 `%2e%2e/` 的越界尝试照旧被拒。
+
 #### 预览路径把裸 errno 抛给界面（src/lib/file-preview.js）
 - **现象**：文件被删掉后点预览，界面上显示
   `ENOENT: no such file or directory, realpath '/private/var/.../nope.txt'` —— 一句英文系统错误，

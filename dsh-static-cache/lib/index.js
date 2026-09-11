@@ -133,6 +133,10 @@ async function serveAsset(req, res, distRoot) {
   }
   let rel = pathname
   if (rel.startsWith('/assets/')) rel = rel.slice('/assets/'.length)
+  // 收掉多余的前导斜杠：`/assets//a.js` 会得到 rel = '/a.js'，被 resolve 当成**绝对路径**，
+  // 于是越界检查把它判成 403 —— 文件明明存在却拒绝。这是**误拒**（不是逃逸），
+  // 正常的浏览器不会发这种 URL，但手工编辑/拼接出来的地址会出现。
+  rel = rel.replace(/^\/+/, '')
   if (rel === '' || rel.includes('..') || rel.includes('\0')) {
     res.writeHead(400); res.end(); return
   }
