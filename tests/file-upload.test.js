@@ -253,8 +253,8 @@ test('writeUpload accepts plain array chunks (no self-referential generator)', a
 });
 
 // —— API 路由 ——
-function makeRoute(root, home = local) {
-  return createRouter({ store: {
+function makeRoute(root, home = local, remoteExec) {
+  return createRouter({ remoteExec, store: {
     getHome: (id) => id === HOME_ID ? { homeId: id, ...home } : null,
     listWorkspaces: () => [{ workspaceId: 'w', project: 'project', path: root }],
     getSession: (_home, id) => id === 's' ? { workspaceId: 'w' } : null,
@@ -308,4 +308,88 @@ test('upload API: blocks cross-site writes, bad targets and unknown instances', 
   assert.equal((await request(makeRoute(root), { body, headers: { 'content-type': 'text/plain' } })).status, 400);
   const unknown = createRouter({ store: { getHome: () => null, listWorkspaces: () => [], getSession: () => null } });
   assert.equal((await request(unknown, { body })).status, 404);
+});
+
+// 远端实例的上传曾经**整条通道不可达**：路由在读完请求体之前先无条件调用
+// `resolveUploadDir(workspace.path, dir)`，而它走的是**本地** fs realpath —— 远端实例的
+// workspace.path 是远端主机上的路径（由 ssh 读回来），拿它本地 realpath 必然 ENOENT。
+// 于是「远端上传」100% 返回 400，而 file-preview.js 里那套加固过的远端分片上传
+// （REMOTE_CHUNK_PY / REMOTE_FINISH_PY）谁都走不到。
+// 实测（修前）：本机实例 200；远端实例 400 `ENOENT: realpath '/home/bot/projects/remote-project'`。
+test('upload API: 远端实例的上传必须走远端通道，不能被本地 fs 预检挡死', async (t) => {
+  const { root } = await fixture(t);
+  const body = multipartBody('B', [{ name: 'remote.txt', data: 'hello-remote' }]);
+
+  // 远端实例：workspace.path 会原样交给远端执行器。这里用真实 bash 充当「远端」
+  // （execRemote 在本地跑远端 python 脚本），所以文件最终落在同一个 root 下，可直接断言。
+  const response = await request(makeRoute(root, remote, execRemote), { body, query: 'sessionId=s&dir=dir' });
+  assert.equal(response.status, 200, `远端上传应成功，实际 ${response.status}: ${JSON.stringify(response.body)}`);
+  assert.equal(response.body.files[0].name, 'remote.txt');
+  assert.equal(await readFile(path.join(root, 'dir', 'remote.txt'), 'utf8'), 'hello-remote');
+});
+
+// 上面那条用的是「远端路径恰好也在本地存在」的夹具，所以它证明不了**预检本身**是问题所在。
+// 这条用审查给出的原始场景：远端路径在本地**根本不存在**，配一个按协议应答的假执行器。
+// 修前：HTTP 400 `ENOENT: no such file or directory, realpath '/home/bot/projects/remote-project'`
+// —— 路由拿本地 fs 去校验一个远端路径，整条远端上传通道因此永远不可达。
+test('upload API: 远端路径在本地不存在时也必须走到远端通道（预检只该管本地实例）', async (t) => {
+  const remoteRoot = '/home/bot/projects/remote-project';   // 远端路径，本机不存在
+  const calls = [];
+  // 按协议应答的假执行器：shim 掉 ssh，只回答四种脚本。
+  const fakeExec = async (_host, script) => {
+    calls.push(script);
+    if (script.includes('mktemp')) return { code: 0, stdout: '/tmp/hwb-upload-fake1\n', stderr: '' };
+    if (script.includes("x['kind']")) return { code: 0, stdout: '{"kind":"directory","entries":[]}\n', stderr: '' };  // 预览协议
+    if (script.includes('rm -rf')) return { code: 0, stdout: '{"name":"r.txt","path":"/home/bot/projects/remote-project/dir/r.txt","size":3,"renamed":false}\n', stderr: '' };
+    return { code: 0, stdout: '', stderr: '' };   // 分片写入
+  };
+  const body = multipartBody('B', [{ name: 'r.txt', data: 'abc' }]);
+  const response = await request(makeRoute(remoteRoot, remote, fakeExec), { body, query: 'sessionId=s&dir=dir' });
+  assert.equal(response.status, 200, `远端上传应成功，实际 ${response.status}: ${JSON.stringify(response.body)}`);
+  assert.equal(response.body.files[0].name, 'r.txt');
+  assert.equal(response.body.dir, '/home/bot/projects/remote-project/dir', '返回的目标目录应来自远端解析结果');
+  assert.ok(calls.some((c) => c.includes('mktemp')), '应当真的调用远端执行器建临时目录');
+  t.after(() => {});
+});
+
+// 本地实例的越界/不存在预检不能被上面那次放宽弄丢
+test('upload API: 本地实例仍然做越界与不存在的预检', async (t) => {
+  const { root } = await fixture(t);
+  const body = multipartBody('B', [{ name: 'x.txt', data: 'x' }]);
+  const escape = await request(makeRoute(root, local), { body, query: 'sessionId=s&dir=../..' });
+  assert.equal(escape.status, 400);
+  assert.match(escape.body.error, /项目目录内/);
+  const missing = await request(makeRoute(root, local), { body, query: 'sessionId=s&dir=nope' });
+  assert.equal(missing.status, 400);
+  assert.match(missing.body.error, /不存在/);
+});
+
+// 0 字节文件：本机能传（.gitkeep、空 csv），远端永远 400「没有收到上传数据」——
+// 因为 multipart 解析器对一个空文件**不会产出任何 chunk**，远端只看到 merged 目录是空的。
+// 现在把期望字节数一并传给远端，0 字节时创建空文件；非 0 却收不到分片才照旧报错。
+test('writeUpload: 0 字节文件在远端也能上传（与本机行为一致）', async (t) => {
+  const { root } = await fixture(t);
+  const local0 = await writeUpload(local, root, 'dir', [{ name: 'empty-local.txt', chunks: [] }]);
+  assert.equal(local0.files[0].size, 0);
+  assert.equal(await readFile(path.join(root, 'dir', 'empty-local.txt'), 'utf8'), '');
+
+  const remote0 = await writeUpload(remote, root, 'dir', [{ name: 'empty-remote.txt', chunks: [] }], execRemote);
+  assert.equal(remote0.files[0].name, 'empty-remote.txt');
+  assert.equal(remote0.files[0].size, 0, '远端空文件应当成功落盘');
+  assert.equal(await readFile(path.join(root, 'dir', 'empty-remote.txt'), 'utf8'), '');
+
+  // 「分片丢了」本身仍必须是错误，不能被上面这次放宽吞掉：让分片写入「假成功」——
+  // JS 认为发了 5 字节（total=5），而远端的 merged 目录其实是空的 → 合并必须报错。
+  const fakeTmp = await mkdtemp(path.join(tmpdir(), 'hwb-merged-empty-'));
+  t.after(() => rm(fakeTmp, { recursive: true, force: true }));
+  const swallowingExec = async (_h, script, args = []) => {
+    if (script.includes('mktemp')) return { code: 0, stdout: `${fakeTmp}\n`, stderr: '' };
+    if (script.includes('rm -rf')) return execRemote(_h, script, args);   // 真正的合并脚本照跑
+    return { code: 0, stdout: '', stderr: '' };                          // 分片写入被吞掉
+  };
+  await assert.rejects(
+    writeUpload(remote, root, 'dir', [{ name: 'lost.bin', chunks: [Buffer.from('hello')] }], swallowingExec),
+    /没有收到上传数据/,
+    '整体期望 5 字节却一个分片都没有时，必须仍然报错'
+  );
 });

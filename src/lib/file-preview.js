@@ -352,7 +352,9 @@ if not os.path.isdir(target):
     raise Exception('上传目标目录不存在')
 name = meta['name']
 parts = [p for p in sorted(glob.glob(os.path.join(tmp, 'merged', '*'))) if os.path.isfile(p) and not os.path.islink(p)]
-if not parts:
+expected = int(sys.argv[4]) if len(sys.argv) > 4 else -1
+if not parts and expected != 0:
+    # 没有分片，但调用方说这个文件本来就不是 0 字节 → 分片真的丢了，照旧报错
     raise Exception('没有收到上传数据')
 temp = os.path.join(target, '.hwb-upload-%d' % os.getpid())
 out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -453,8 +455,13 @@ export async function writeUpload(home, root, dir, parts, exec = sshBash) {
       throw e;
     }
   }
-  const resolved = await resolveUploadDir(root, dir);
-  return { dir: resolved.dir, files };
+  // 远端分支**不能**用 resolveUploadDir：它做的是本地 fs 的 realpath，而这里的 root 是远端主机上的
+  // 路径（本机通常不存在）→ ENOENT。原先分片全都传完了、最后一步才失败，整条远端上传依旧走不通。
+  // 越界与「目录是否存在」已由 REMOTE_FINISH_PY 在**远端**用 realpath+commonpath 校验过，
+  // 且它返回的 path 是远端上的绝对路径 —— 目录直接取它的父目录。
+  // （本机实例仍走 uploader.dir，那是本地 realpath 的结果。）
+  const remoteDir = path.posix.dirname(files[0].path);
+  return { dir: remoteDir, files };
 }
 
 function safeRandomSuffix() {
@@ -499,7 +506,10 @@ function lastLine(text) {
 }
 
 async function finishRemoteUpload(home, exec, tmp, meta64, total) {
-  const command = remotePython(REMOTE_FINISH_PY, [tmp, meta64]);
+  // total 一并传给远端：0 字节文件**不会产生任何分片**，而远端原先只会看到「merged 目录是空的」
+  // 就报「没有收到上传数据」——于是本机能传空文件（.gitkeep、空 csv），远端永远 400。
+  // 有了期望字节数，远端才能区分「协议坏了/分片丢了」与「这就是个空文件」。
+  const command = remotePython(REMOTE_FINISH_PY, [tmp, meta64, String(total)]);
   // 无论合并成败都清掉远端临时目录（否则失败会在 /tmp 下留一堆分片）。
   // 用 shellQuote 而不是裸 `'${tmp}'`：tmp 来自远端 stdout，其中一个单引号就能闭合引号，
   // 把后面的内容变成要执行的命令。

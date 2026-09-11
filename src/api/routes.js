@@ -90,7 +90,10 @@ function dshHomeInfo(homePath) {
   };
 }
 
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi }) {
+// remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
+// 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
+// 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec }) {
   const connecting = new Set();
   // 定向重索引常常是 fire-and-forget（远程要等 SSH 超时，不能阻塞响应）。
   // 但「不 await」不等于「不管」：返回的 promise 一旦拒绝就是未处理拒绝，
@@ -178,7 +181,14 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       let current = null;
       try {
         // 目录先解析一次：目标不存在/越界时立刻回错，不必先把整包读完再失败。
-        await resolveUploadDir(workspace.path, dir);
+        // **但只对本地实例做。** resolveUploadDir 走的是本地 fs，而远端实例的 workspace.path 是
+        // **远端主机上**的路径（由 indexRemoteHome 通过 ssh 读回来的），拿它去本地 realpath
+        // 必然 ENOENT —— 于是「远端上传」100% 返回 400（实测：本机实例 200 / 远端实例
+        // `400 ENOENT: realpath '/home/bot/projects/remote-project'`），file-preview.js 里那套
+        // 加固过的远端分片上传（REMOTE_CHUNK_PY / REMOTE_FINISH_PY）成了谁都走不到的死代码。
+        // 远端的目标目录校验由 REMOTE_FINISH_PY 在**远端主机上**用 realpath+commonpath 完成，
+        // 那才是有效校验；这里只负责本地实例。
+        if (home.hostType !== 'remote') await resolveUploadDir(workspace.path, dir);
         await parseMultipart(req, {
           boundary,
           maxBytes: UPLOAD_BYTES,
@@ -189,8 +199,8 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
             current.chunks.push(chunk);
           },
         });
-        const result = await writeUpload(home, workspace.path, dir, parts);
-        const listing = await readFilePreview(home, workspace.path, dir);
+        const result = await writeUpload(home, workspace.path, dir, parts, remoteExec);
+        const listing = await readFilePreview(home, workspace.path, dir, remoteExec);
         send(res, 200, { ok: true, dir: result.dir, files: result.files,
           listing: listing.kind === 'directory' ? listing : null });
       } catch (e) { send(res, 400, { error: e.message }); }

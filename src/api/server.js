@@ -96,8 +96,8 @@ export function allowedHostsFromEnv(env = process.env) {
     .filter(Boolean);
 }
 
-export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [] }) {
-  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi });
+export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec }) {
+  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {

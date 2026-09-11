@@ -149,6 +149,36 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### 远端实例的上传整条通道不可达（src/api/routes.js + src/lib/file-preview.js）
+- **现象**：远端实例上传**永远 400**，而本机实例正常。实测：本机 `200` / 远端
+  `400 {"error":"ENOENT: no such file or directory, realpath '/home/bot/projects/remote-project'"}`。
+  也就是说 v0.1.1 里那套花了大力气加固的远端上传（512 KiB 分片、远端 mktemp、
+  `realpath+commonpath` 校验、失败清理）**没有任何一条路径能走到** —— 前端传多少文件都进不来。
+- **根因**（两处，都要修才算真的通）：
+  ① 路由在读完请求体之前无条件调用 `resolveUploadDir(workspace.path, dir)`，而它做的是**本地**
+     `fs.realpath`；远端实例的 `workspace.path` 是**远端主机上**的路径（由 `indexRemoteHome`
+     通过 ssh 读回来），拿它本地 realpath 必然 ENOENT。
+  ② 远端分支最后还有一句 `await resolveUploadDir(root, dir)`：即使预检过了，分片全部传完之后
+     仍会在这一步失败 —— 失败点推到最后，用户看到的是「传完了但报错」。
+- **修复**：预检只对本地实例做（`if (home.hostType !== 'remote')`）；远端的目标目录校验完全交给
+  `REMOTE_FINISH_PY` 在**远端主机上**用 `realpath+commonpath` 完成（那才是有效校验），
+  返回的 `dir` 由远端返回的绝对路径取父目录得到。同时把 ssh 执行器抽成 `createRouter`/`createApiServer`
+  的 `remoteExec` 依赖 —— 让这条链路第一次能在路由级测试里被真正走一遍。
+- **回归测试**：`tests/file-upload.test.js` 两条：①远端路径**在本机不存在**时（审查给出的原始场景）
+  配按协议应答的假执行器，必须 200 且调用过远端 `mktemp`；②用真实 bash 充当远端，断言文件真的
+  落盘、返回的 `dir` 来自远端解析。只回退「预检」这一行，用例①立刻复现审查给出的那条 ENOENT。
+
+#### 0 字节文件在远端永远传不上去（src/lib/file-preview.js）
+- **现象**：本机能传空文件（`.gitkeep`、空 csv），远端固定 400「没有收到上传数据」。
+  批量上传时更糟：前面几个文件已经落到远端目录里了，这个空文件把整批打断。
+- **根因**：multipart 解析器对一个空文件**不会产出任何 chunk**，于是分片阶段一个字节都不发，
+  远端 `merged` 目录为空 → `REMOTE_FINISH_PY` 的 `if not parts: raise` 判定为「没收到数据」。
+  而 `if not parts` 这条检查本身是必要的（分片真的丢了必须报错），所以不能直接删。
+- **修复**：把期望字节数一并传给远端（`total`），0 字节时创建空文件；
+  期望非 0 却仍无分片时才报错。区分了「这就是个空文件」与「分片丢了」。
+- **回归测试**：`tests/file-upload.test.js` —— 空文件在远端与本机行为一致（size 0、落盘为空），
+  同时用「吞掉分片」的假执行器确认「期望 5 字节却零分片」仍然报错。回退该修复后用例失败。
+
 #### 相对的 `HWB_DIR` 下 `status`/`stop` 找不到服务，还在仓库里落下状态目录（src/cli.js）
 - **现象**（独立审查提出，实测复现）：`HWB_DIR=relstate hwb start` 之后，`status` 输出 `stopped`
   （退出码 1）而服务其实在 4399 上正常返回 200；`stop` **永远停不掉它**，还会误报
