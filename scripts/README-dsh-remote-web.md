@@ -44,7 +44,7 @@ scripts/dsh-remote-web.sh --kill-tunnel
 | `--open` | 打印后调用默认浏览器打开(macOS) | 关 |
 | `--no-restart` | 不重启,只抓当前实例已写入日志的 token | 关 |
 | `--token-only` | 只抓 token,不打隧道(隐含 `--no-restart`) | 关 |
-| `--kill-tunnel` | 结束已建隧道(读 `/tmp/.dsh-remote-web.tunnel`) | 关 |
+| `--kill-tunnel` | 结束已建隧道(读 `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/tunnel.pid`) | 关 |
 | `--dry-run` | 只打印将执行的远端命令,不实际执行 | 关 |
 | `--verbose` | 打印调试信息 | 关 |
 | `-h/--help` | 帮助 | — |
@@ -57,7 +57,7 @@ scripts/dsh-remote-web.sh --kill-tunnel
    - `--no-restart` / `--token-only`:直接 grep 整个日志里最新一条 `?token=...`。
    - 40s 内抓不到就报错并回显日志尾部。
 2. **建 SSH 隧道**：`ssh -N -L <local>:<host>:<remote>` 后台运行,PID 存到
-   `/tmp/.dsh-remote-web.tunnel`。本地绑定 `127.0.0.1`,避免跨机再触发 `/api` 信任围栏。
+   `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/tunnel.pid`。本地绑定 `127.0.0.1`,避免跨机再触发 `/api` 信任围栏。
 3. **拼 URL**：`http://127.0.0.1:<local>/?token=<token>`,打印(可选 `--open` 打开)。
 
 > token 只在远端进程里,所以"本地注入启动命令→远端抓 token→本地建隧道访问"是**唯一可靠**的
@@ -121,7 +121,7 @@ scripts/dsh-remote-web.sh --kill-tunnel
 
 ## 状态文件位置（已从 `/tmp` 迁到用户私有目录）
 
-隧道 PID 与 ssh 的输出不再放 `/tmp/.dsh-remote-web.*`。那是一组**全局可写的固定路径**：
+隧道 PID 与 ssh 的输出原先放在 `/tmp/.dsh-remote-web.*`。那是一组**全局可写的固定路径**：
 
 - 任何本地用户都能在文件不存在时抢先创建它（`/tmp` 的 sticky 位只保护已存在的条目）；
 - 旧实现把文件内容当 PID 直接 `kill` —— 内容写成 `0` 就等于让调用者 `kill 0`（SIGTERM 掉整个

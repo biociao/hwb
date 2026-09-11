@@ -339,6 +339,33 @@ Semantic Versioning.
   并对实现做一条结构断言：取头部的函数里**不许出现 `readFile(`**、必须用 `createReadStream`。
   回退修复后该用例失败。（内存数字本身不写成断言：GC/平台差异会抖。）
 
+#### `dsh-remote-web.sh`：文档承诺的选项不存在、拒绝 kill 时还删记录、共享目录被改权限（scripts/dsh-remote-web.sh）
+- **现象**（独立审查第 7 轮，四条都实测复现）：
+  · **`--kill-pattern` 从来不存在**：文档（`README-dsh-remote-web.md:55,:78`）一直写着它，
+    但解析器里只有环境变量 `KILL_PATTERN` —— 「远端没有 fuser」时的兜底完全用不了，
+    `--kill-pattern …` 直接 `Unknown option` + rc=2。
+  · **`--kill-tunnel` 在「拒绝 kill」时把 PID 记录删掉还返回 0**：那条隧道仍在跑，却从此再也
+    管不到（记录没了），而命令说成功。删除发生在校验之前是无条件的。
+  · **PID 记录写失败会让隧道变孤儿**：`set -e` 下写文件失败直接退出，而 ssh 已经在后台跑起来了 ——
+    没有记录、没有 URL、只剩一条占着端口的隧道。
+  · **运行目录被无条件 `chmod 700`**：`DSH_REMOTE_WEB_DIR` 允许指向任意路径（文档还鼓励覆盖），
+    指向一个共享目录就会把它锁死成 0700（实测 0755 → 0700）。
+- **修复**：补上 `--kill-pattern`（与 `KILL_PATTERN` 同源）；`stop_tunnel` 只在**确实 kill 成功**
+  后删记录，其余分支返回 1；`--kill-tunnel` 据此以非零码退出；PID 记录写不进去时立刻回收刚起的
+  隧道并退出 1；运行目录只在自己**新建**时收 0700（预存在的目录一律不动）。
+- **回归测试**：新增 `tests/dsh-remote-web.test.js`（跑真脚本的提前退出路径，不碰 ssh）——
+  `--kill-pattern` 不得被当成未知选项；PID 记录为 `0`/`abc`/空时必须非零退出**且记录保留**；
+  预存在的 0755 目录跑完仍是 0755，而自己新建的目录是 0700。修复前三条全失败。
+
+#### 反代配置：入口 URL 是 `/`，但只有 `/index.html` 发了 no-cache（scripts/dsh-http-cache.nginx.conf + Caddyfile）
+- **现象**：`README-http-cache.md` 说入口文档不缓存以避免「旧注入残留」，而 nginx 只给
+  `/index.html`、`/favicon.svg`、`/manifest.webmanifest` 发了 `Cache-Control: no-cache`；
+  用户实际打开的是 `http://<host>:3081/`，它落到通用 location，一条 Cache-Control 都没有 ——
+  声称的防护对真正被加载的地址不生效。
+- **修复**：nginx 加 `location = /`、Caddy 加 `header /`，都发 `no-cache`。
+- **顺带修文档**：`README-dsh-remote-web.md` 里两处仍写着隧道状态文件在 `/tmp/.dsh-remote-web.*`，
+  而代码早已迁到 `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/`（同一文档后面自己还写着「已从 /tmp 迁出」）。
+
 #### 日志脱敏的「值」只吃前缀；`getLogs({limit:0})` 会倒出整个环缓冲（src/lib/logger.js）
 - **现象**（独立审查第 7 轮）：
   · 值字符集写的是 `[A-Za-z0-9_-]`，于是 `token=abc+DEF/ghi==` 只被脱敏成

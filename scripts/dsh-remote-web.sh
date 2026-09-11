@@ -42,7 +42,12 @@ VERBOSE=0
 #     ~/.ssh/authorized_keys 的符号链接，重定向就会把那个文件截成 0 字节。
 # 统一放进 0700 的私有运行目录，并且 kill 之前校验「这个 PID 确实是我们的 ssh 隧道」。
 RUNTIME_DIR="${DSH_REMOTE_WEB_DIR:-${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web}"
-mkdir -p "$RUNTIME_DIR" && chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+# 只对**我们自己新建的**目录收 0700：DSH_REMOTE_WEB_DIR 允许指向任意路径，
+# 无条件 chmod 会把共享目录（例如 /tmp 下的公共目录）重新授权，影响的远不只是这条隧道。
+if [ ! -d "$RUNTIME_DIR" ]; then
+  mkdir -p "$RUNTIME_DIR" 2>/dev/null || true
+  [ -d "$RUNTIME_DIR" ] && chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+fi
 TUNNEL_PID_FILE="${TUNNEL_PID_FILE:-$RUNTIME_DIR/tunnel.pid}"
 TUNNEL_OUT="${TUNNEL_OUT:-$RUNTIME_DIR/tunnel.out}"
 TUNNEL_ERR="${TUNNEL_ERR:-$RUNTIME_DIR/tunnel.err}"
@@ -80,6 +85,9 @@ while [ $# -gt 0 ]; do
     --no-restart)   NO_RESTART=1; shift ;;
     --token-only)   TOKEN_ONLY=1; NO_RESTART=1; shift ;;
     --kill-tunnel)  KILL_TUNNEL=1; shift ;;
+    # 文档（README-dsh-remote-web.md）一直写着这个选项，但解析器里从来没有它 ——
+    # 「远端没有 fuser 时」的兜底于是完全用不了，只能改用环境变量 KILL_PATTERN。
+    --kill-pattern) KILL_PATTERN="${2:?--kill-pattern 需要一个值}"; shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --verbose)      VERBOSE=1; shift ;;
     -h|--help)      usage; exit 0 ;;
@@ -168,30 +176,35 @@ stop_tunnel() {
   [ -f "$TUNNEL_PID_FILE" ] || return 0
   local pid cmd
   pid="$(cat "$TUNNEL_PID_FILE" 2>/dev/null || true)"
-  rm -f "$TUNNEL_PID_FILE"
+  # 注意：**不能**在这里就删记录。原先无条件 rm，于是「拒绝 kill」的分支（PID 非法/ps 不可用/
+  # 命令行不匹配）会把记录删掉却留下仍在跑的隧道 —— 那条隧道从此再也无法用 --kill-tunnel 管到，
+  # 而命令还返回 0 说成功。删除只发生在「确实杀掉」或「确认已不存在」之后。
   case "$pid" in
-    ''|*[!0-9]*) echo "忽略无效的隧道 PID 记录: '${pid}'（拒绝 kill）" >&2; return 0 ;;
-    0) echo "忽略 PID 0（kill 0 会杀掉整个进程组）" >&2; return 0 ;;
+    ''|*[!0-9]*) echo "忽略无效的隧道 PID 记录: '${pid}'（拒绝 kill）" >&2; return 1 ;;
+    0) echo "忽略 PID 0（kill 0 会杀掉整个进程组）" >&2; return 1 ;;
   esac
   # 没有 ps 就无从验证身份。宁可留着一条隧道，也不误杀一个不相干的进程 ——
   # 明确告诉用户手工确认，而不是假装回收成功。
   if ! command -v ps >/dev/null 2>&1; then
     echo "系统没有 ps，无法验证 PID $pid 的身份；为避免误杀，请手动确认后再 kill $pid" >&2
-    return 0
+    return 1
   fi
   cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
   case "$cmd" in
-    *ssh*-N*-L*) kill "$pid" 2>/dev/null || true; echo "killed tunnel pid $pid" ;;
-    # ps 读不到既可能是进程已退出，也可能是 ps 被限制（受限沙箱）。
-    # 两种情况都不 kill，但措辞不能断言「不存在」。
-    '') echo "ps 读不到 PID ${pid}（可能已退出，或 ps 被限制）——为安全起见不做 kill" >&2 ;;
-    *) echo "PID $pid 现在跑的不是 ssh 隧道，拒绝 kill: $cmd" >&2 ;;
+    # 只有这一条：确实是我们那条隧道 → kill 之后删掉记录
+    *ssh*-N*-L*) kill "$pid" 2>/dev/null || true; rm -f "$TUNNEL_PID_FILE"; echo "killed tunnel pid $pid" ;;
+    # ps 读不到既可能是进程已退出，也可能是 ps 被限制（受限沙箱）。分不开：
+    # 不 kill（宁可留一条隧道，也不误杀），记录也留着，并让调用方知道没做成。
+    '') echo "ps 读不到 PID ${pid}（可能已退出，或 ps 被限制）——为安全起见不做 kill，记录保留" >&2; return 1 ;;
+    *) echo "PID $pid 现在跑的不是 ssh 隧道，拒绝 kill: $cmd" >&2; return 1 ;;
   esac
+  return 0
 }
 
 # ---- kill-tunnel ------------------------------------------------------------
 if [ "$KILL_TUNNEL" = 1 ]; then
-  stop_tunnel
+  # 停止失败（拒绝 kill / 记录无效）必须让调用方看见，而不是一律 exit 0。
+  stop_tunnel || exit 1
   exit 0
 fi
 
@@ -247,7 +260,13 @@ rm -f "$TUNNEL_OUT" "$TUNNEL_ERR"
 ssh -N -L "${LOCAL_PORT}:${REMOTE_TARGET_HOST}:${REMOTE_PORT}" "$REMOTE" \
   >"$TUNNEL_OUT" 2>"$TUNNEL_ERR" &
 TUNNEL_PID=$!
-echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+# 写不进 PID 记录时必须立刻回收这条隧道：否则 ssh 已在后台跑着、却没有任何记录能管到它
+# （--kill-tunnel 找不到、URL 也不会打印），只剩一个孤儿隧道占着端口。
+if ! echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE" 2>/dev/null; then
+  echo "无法写入隧道 PID 记录 ${TUNNEL_PID_FILE}（目录不可写？）——已回收刚启动的隧道" >&2
+  kill "$TUNNEL_PID" 2>/dev/null || true
+  exit 1
+fi
 vlog "tunnel pid $TUNNEL_PID -> $REMOTE:$REMOTE_PORT"
 tunnel_up=0
 for i in $(seq 1 20); do port_ready "$LOCAL_PORT" && { tunnel_up=1; break; }; sleep 0.5; done

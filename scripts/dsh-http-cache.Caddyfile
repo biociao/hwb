@@ -34,7 +34,9 @@
 	@assets path /assets/*
 	header @assets Cache-Control "public, max-age=31536000, immutable"
 
-	# 入口文档/图标/清单: 不能强缓存(无 hash, 且 index 每次要注入), 只做校验
+	# 入口文档/图标/清单: 不能强缓存(无 hash, 且 index 每次要注入), 只做校验。
+	# `header /` 对应的是用户真正打开的地址(见 nginx 配置里同一处的说明)。
+	header /            Cache-Control "no-cache"
 	header /index.html  Cache-Control "no-cache"
 	header /favicon.svg Cache-Control "no-cache"
 	header /manifest.webmanifest Cache-Control "no-cache"
