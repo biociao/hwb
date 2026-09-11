@@ -51,6 +51,10 @@ test('菜单项只在有 workspaceId 的行上出现（未分组行不该显示�
 
 test('注入后的模块仍是合法 JS', async () => {
   const out = addWorkspaceFinderMenu(FIXTURE);
+  // `exec` 会在非零退出时抛错，所以语法检查本身是有效断言；但「输出为空」也能通过 --check，
+  // 那样这条用例就变成空跑 —— 显式断言注入确实发生了。
+  assert.ok(out.length > FIXTURE.length, '注入后应当变长');
+  assert.match(out, /在 Finder 中打开工作区/, '应含注入的菜单项文字');
   const file = `${process.env.TMPDIR ?? '/tmp'}/hwb-ws-menu-check-${process.pid}.mjs`;
   await (await import('node:fs/promises')).writeFile(file, out);
   await exec(process.execPath, ['--check', file]);
