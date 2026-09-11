@@ -143,3 +143,40 @@ test('parseMultipart: 非 multipart 内容仍然被立刻拒绝（不被当成�
     assert.match(await parseWithChunks(junk, 'B', [7]), /格式无效/);
   }
 });
+
+// 非文件字段在前、文件在后时，解析器原先把**文件整个吞掉**：field 状态找的是收尾分隔符
+// （`\r\n--boundary--`），于是在字段处直接跳到 done。结果是解析成功、零文件，
+// 调用方只报一句令人费解的「没有收到文件内容」。
+test('parseMultipart: 非文件字段在前时，后面的文件仍被正确解析', async () => {
+  const CRLF = '\r\n';
+  const B = 'B';
+  const part = (headers, body) => `--${B}${CRLF}${headers}${CRLF}${CRLF}${body}${CRLF}`;
+  const field = part('Content-Disposition: form-data; name="dir"', 'sub/dir');
+  const file = part('Content-Disposition: form-data; name="file"; filename="a.txt"', 'hello world');
+  const build = (order) => Buffer.from(order.map((k) => (k === 'file' ? file : field)).join('') + `--${B}--${CRLF}`);
+
+  async function parseWith(buf, chunk) {
+    const req = new Readable({ read() {} });
+    req.on('error', () => {});
+    req.headers = { 'content-length': String(buf.length) };
+    const files = [];
+    let current = null;
+    const p = parseMultipart(req, {
+      boundary: B, maxBytes: 1024 * 1024,
+      onFileStart: (name) => { current = { name, bytes: 0 }; files.push(current); return true; },
+      write: (c) => { if (current) current.bytes += c.length; },
+    });
+    p.catch(() => {});
+    for (let i = 0; i < buf.length; i += chunk) req.push(buf.subarray(i, i + chunk));
+    req.push(null);
+    await p;
+    return files.map((f) => `${f.name}:${f.bytes}`);
+  }
+
+  for (const [order, label] of [[['field', 'file'], '字段在前'], [['file', 'field'], '文件在前'], [['file'], '只要文件']]) {
+    assert.deepEqual(await parseWith(build(order), 7), ['a.txt:11'], label);
+    assert.deepEqual(await parseWith(build(order), 1), ['a.txt:11'], `${label}（1 字节切分）`);
+  }
+  // 只有字段时不该伪造出文件
+  assert.deepEqual(await parseWith(build(['field']), 7), []);
+});

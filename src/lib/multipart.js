@@ -44,6 +44,19 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
     // 只读缓冲的前 n 字节：读到的数据不立刻丢弃，缓冲区就必须一直留着（见 push 里的说明），
     // 这样无论分隔符被拆成几个 TCP 分片，都不会漏匹配。
     const take = (n) => { const out = buffer.subarray(0, n); buffer = buffer.subarray(n); return out; };
+    // 找**最早出现的完整**分隔符（后面跟 CRLF 或 `--`）：只匹配前缀会把分隔符前的内容误判成边界。
+    // 候选位置必须顺序找，不能每个 cursor 都重扫一遍 —— 后者在「缓冲区里没有分隔符」
+    // （正是文件内容的常态）时退化成 O(n²)。
+    const findBoundary = () => {
+      for (let from = 0; from <= buffer.length - delimiter.length - 2;) {
+        const i = buffer.indexOf(delimiter, from);
+        if (i < 0) return -1;
+        const next = i + delimiter.length;
+        if ((buffer[next] === 0x0d && buffer[next + 1] === 0x0a) || (buffer[next] === 0x2d && buffer[next + 1] === 0x2d)) return i;
+        from = i + 1;
+      }
+      return -1;
+    };
     const indexOf = (needle, from = 0) => buffer.indexOf(needle, from);
     // Read one header line; take() returns a view on the shared buffer, so copy the text out.
     const readLine = () => {
@@ -145,14 +158,7 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
           // 约 3 分钟（工作台的 SSE、监控心跳、所有 API 一起卡住）。
           // 改为「一次 indexOf 取下一个出现位置，不是完整分隔符就继续往后找」，总代价与缓冲区长度线性相关。
           // 语义不变：仍然从前往后取**最早出现的完整**分隔符。
-          let at = -1;
-          for (let from = 0; from <= buffer.length - delimiter.length - 2;) {
-            const i = buffer.indexOf(delimiter, from);
-            if (i < 0) break;
-            const next = i + delimiter.length;
-            if ((buffer[next] === 0x0d && buffer[next + 1] === 0x0a) || (buffer[next] === 0x2d && buffer[next + 1] === 0x2d)) { at = i; break; }
-            from = i + 1;
-          }
+          const at = findBoundary();
           if (at < 0) {
             if (flush) return fail('\u4e0a\u4f20\u8bf7\u6c42\u4e0d\u5b8c\u6574');
             keepTail();
@@ -162,10 +168,19 @@ export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, on
           take(delimiter.length);
           state = 'afterBoundary';
         } else if (state === 'field') {
-          const at = indexOf(end);
-          if (at < 0) { if (buffer.length > headLimit * 8) return fail('上传请求格式无效'); return false; }
-          take(at + end.length);
-          state = 'done';
+          // 非文件字段：内容全部丢弃，但必须停在**普通 part 分隔符**上（`\r\n--boundary`），
+          // 而不是收尾分隔符 `\r\n--boundary--`。原实现找的是收尾符，于是
+          // 「字段在前、文件在后」的请求会在字段处直接跳到 done，把后面的**文件整个吞掉**：
+          // 解析成功、零文件，调用方只报一句令人费解的「没有收到文件内容」。
+          const at = findBoundary();
+          if (at < 0) {
+            if (buffer.length > headLimit * 8) return fail('上传请求格式无效');
+            // 与 body 一样保持恒定内存：确认不可能再是分隔符前缀的部分直接丢掉。
+            if (buffer.length > hold) take(buffer.length - hold);
+            return false;
+          }
+          take(at + delimiter.length);
+          state = 'afterBoundary';
         } else if (state === 'done') {
           return true;
         }
