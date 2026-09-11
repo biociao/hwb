@@ -563,6 +563,16 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   `scripts/render-check-dim-switch.js` 用真浏览器量两条路径（修复前「切维度后」失败）。
 
 ### Fixed
+#### `stop()` 的返回值自相矛盾：一次成功的停止反而回 false（src/control/launcher.js）
+- 返回值原先算的是 `fingerprint(inst.proc)`，即「子进程**是否还活着**」—— 而它在 kill 之后**永远**是
+  false：于是「成功停掉」与「本来没有可停的」两种情况都回 false，谁读这个字段都会被误导
+  （`/api/homes/{id}/stop` 响应里的 `stopped` 就是它；前端目前不读，但字段不该自相矛盾）。
+- 修复：改成「这次确实停掉了一个受管子进程」⇒ true；直连已有实例（adopted-local，没有子进程）或
+  它早就退出了 ⇒ false。README 的 API 表同步写明这个字段的含义。
+- **回归测试**：`tests/launcher-terminate.test.js` —— 受管进程停掉后必须 true、adopted-local 必须 false。
+  修复前后者为 false、前者也是 false（断言会红）。
+
+### Fixed
 #### 实时轮询每轮每实例多读一次实例（src/dshhome/live-poller.js）
 - 相邻两行各调一次 `store.getHome(homeId)`：`if (!… || !this.store.getHome(homeId)) return;` 紧接着
   `if (this.store.getHome(homeId).activeEndpointId !== …) return;`。两行之间**没有 await**（getHome 是

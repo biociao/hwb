@@ -227,3 +227,26 @@ test('open() 失败时不留僵尸：刚拉起的本机子进程必须被收掉'
   assert.ok(pid > 0, '前置条件：确实拉起过一个子进程');
   assert.equal(isAlive(pid), false, '失败的连接不能留下仍占着端口的僵尸进程');
 });
+
+// stop() 的返回值语义：**true = 这次确实停掉了一个受管子进程**，false = 本来就没有可停的。
+// 原先返回的是「子进程是否还活着」，而它在 kill 之后永远为 false —— 一次**成功**的停止反而回 false
+// （前端不读它，但 API 的字段不该自相矛盾）。
+test('stop(): 真的停掉受管进程时返回 true，没有受管进程时返回 false', async (t) => {
+  const dir = await fakeDshOnPath(t, STUBBORN_DSH);
+  const cleanup = trackExitListeners();
+  t.after(cleanup);
+  const home = await mkdtemp(path.join(tmpdir(), 'hwb-home-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  // ① 直连已有实例（无子进程）：没有可停的 → false
+  const adopted = new Launcher({ registry: { set() {} }, ...FAST });
+  adopted.procs.set('adopted', { kind: 'adopted-local', pid: null, port: 1, url: 'http://127.0.0.1:1', proc: null });
+  assert.equal(await adopted.stop({ homeId: 'adopted', hostType: 'local' }), false, '没有受管子进程时应返回 false');
+
+  // ② 受管的本机 dsh web：杀掉之后返回 true
+  const launcher = new Launcher({ registry: { set() {} }, ...FAST, stopTermMs: 200, stopKillMs: 3000 });
+  const homeSpec = { homeId: 'managed-stop', hostType: 'local', homePath: home };
+  const opened = await withPath(dir, () => launcher.open(homeSpec));
+  t.after(() => { try { process.kill(opened.pid, 'SIGKILL'); } catch { /* 已退出 */ } });
+  assert.equal(await launcher.stop(homeSpec), true, '确认停掉受管进程时应返回 true');
+});

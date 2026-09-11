@@ -179,7 +179,11 @@ export class Launcher {
     this.procs.delete(home.homeId);
     this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
     if (remoteStopError) throw new Error(`本地连接已断开，但远端 dsh web 未能停止：${remoteStopError.message ?? remoteStopError}`);
-    return inst.proc ? fingerprint(inst.proc) : false;
+    // 返回值的语义：**true = 这次确实停掉了一个受管子进程**，false = 本来就没有受管子进程可停
+    // （直连已有实例 adopted-local，或它早就退出了）。
+    // 原先返回的是「子进程是否还活着」—— 而它在 kill 之后永远是 false，也就是**一次成功的停止
+    // 反而回 false**，谁读这个字段都会被误导（前端目前不读它；API 的字段不该自相矛盾）。
+    return !!(inst.proc && !fingerprint(inst.proc));
   }
 
   // 「连接」语义（默认）：连接到已有的 dsh 实例，而不是习惯性启动一个新的。
