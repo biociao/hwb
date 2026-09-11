@@ -262,9 +262,18 @@ function goDashboard() {
 }
 
 // —— Token 用量趋势：切换堆叠维度（不整页刷新，只就地重绘图表 + 高亮按钮）——
+// 把趋势图渲染进容器，并按**实测**宽度收边/去重叠（见 usage-card.fitTrendLabels）。
+// 收敛成一个函数是因为「漏掉拟合」已经真实发生过一次：切维度（合计/按项目/…）走的是这条纯本地
+// 重渲染路径，它原先只写了 innerHTML —— 实测切到「按项目」后两个标签重叠（09-04 20:00|09-05 20:00），
+// 而周期切换那条路径（refreshUsageCard）是拟合过的，于是同一个图表两种表现。
+function renderTrendInto(el) {
+  if (!el || !lastUsage) return;
+  el.innerHTML = usageTrendHtml(lastUsage, usageDim);
+  fitTrendLabels(el);
+}
+
 function renderUsageTrend() {
-  const el = document.getElementById('usage-trend');
-  if (el && lastUsage) el.innerHTML = usageTrendHtml(lastUsage, usageDim);
+  renderTrendInto(document.getElementById('usage-trend'));
   document.querySelectorAll('#usage-dim-toggle .usage-dim-btn')
     .forEach((b) => b.classList.toggle('active', b.dataset.dim === usageDim));
 }

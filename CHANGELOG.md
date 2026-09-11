@@ -243,6 +243,18 @@ Semantic Versioning.
   同一组数据在 242px 与 1142px 的绘图区里能放下的标签数差 3 倍。
 
 ### Fixed
+#### 切维度后趋势图标签又互相压字（src/web/app.js）
+- **现象（真浏览器实测）**：点「30 天」标签是好的；再点「按项目」，两个标签叠在一起
+  （`09-04 20:00|09-05 20:00` 重叠）。同一个图表、两条渲染路径两种表现。
+- **根因**：趋势图有两条渲染路径 —— 周期切换（`refreshUsageCard`，整卡重绘）与切维度
+  （`renderUsageTrend`，纯本地重绘）。上一轮把 `fitTrendLabels` 挂在了前者与 dashboard 渲染上，
+  漏了后者。
+- **修复**：收敛成 `renderTrendInto(el)`（写 innerHTML + 拟合），两条路径都走它；
+  源码级测试同时禁止再出现绕过它的 `innerHTML = usageTrendHtml(...)`。
+- **回归测试**：`tests/web-render-safety.test.js` 新增一致性断言；
+  `scripts/render-check-dim-switch.js` 用真浏览器量两条路径（修复前「切维度后」失败）。
+
+### Fixed
 #### 前台 `hwb serve --port` 用了非配置端口时，`stop`/`status`/`doctor` 全部谎报（src/cli.js）
 - **现象（审查端到端复现）**：配置端口 4378、`hwb serve --port 4399` 时 ——
   `hwb status` 打印 `stopped` 并以退出码 1 结束，`hwb stop` 打印「已停止」退出 0，

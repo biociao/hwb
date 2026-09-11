@@ -397,3 +397,21 @@ test('app.js: 用量卡的高亮周期取自屏上数据（lastUsageKey），不
   assert.doesNotMatch(src, /renderUsageCard\(usage, usageDim, usagePeriod\.key\)/,
     '不得用「用户刚点的周期」去高亮旧数据');
 });
+
+// 趋势图有两条渲染路径：周期切换（拉数据后整卡重绘）与切维度（纯本地重绘）。
+// 拟合函数（fitTrendLabels）原先只挂在第一条上 —— 实测：切到「按项目」后标签互相压字
+// （浏览器里量到 09-04 20:00 与 09-05 20:00 重叠），而周期切换后是好的，同一图表两种表现。
+// app.js 需要整套 DOM 才能 import，所以这里做源码级一致性断言（同本文件里另外两条的做法）。
+test('app.js: 趋势图的每条渲染路径都会按实测宽度拟合标签', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('../src/web/app.js', import.meta.url), 'utf8');
+  const fn = src.match(/function renderTrendInto\(el\) \{([\s\S]*?)\n\}/);
+  assert.ok(fn, '趋势图渲染应收敛成一个函数');
+  assert.match(fn[1], /innerHTML = usageTrendHtml\(lastUsage, usageDim\);/);
+  assert.match(fn[1], /fitTrendLabels\(el\)/, 'renderTrendInto 必须在写 innerHTML 之后拟合');
+  assert.match(src, /renderTrendInto\(document\.getElementById\('usage-trend'\)\)/, '切维度路径必须走它');
+  // 所有「写 usageTrendHtml 结果」的地方都必须在这一个函数里（否则就是又漏了一条路径）
+  const all = [...src.matchAll(/innerHTML = usageTrendHtml\(/g)].length;
+  const inside = [...fn[1].matchAll(/innerHTML = usageTrendHtml\(/g)].length;
+  assert.equal(all, inside, `还有 ${all - inside} 处趋势图渲染绕过了 renderTrendInto`);
+});

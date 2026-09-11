@@ -29,6 +29,17 @@ node scripts/render-check.mjs --serve --url /scripts/render-harness.html \
 
 表达式在页面里以 async 函数体执行，`return` 的值会被 JSON 序列化后打印。
 
+### 切维度路径（scripts/render-check-dim-switch.js）
+
+趋势图有两条渲染路径：**周期切换**（拉数据后整卡重绘）与**切维度**（纯本地重绘）。
+后者曾经漏掉 `fitTrendLabels`，实测切到「按项目」后两个标签互相压字，而周期切换后是好的
+（同一图表两种表现）。这条检查同时量两条路径，并顺带断言没有 0 值散点：
+
+```bash
+node scripts/render-check.mjs --url http://127.0.0.1:4397/ --wait-ms 3500 \
+     --expr-file scripts/render-check-dim-switch.js   # 需要一个有「更早数据」的隔离实例
+```
+
 ### 宽度扫描（scripts/render-check-widths.js）
 
 把 6 种卡片宽度 × 3 种数据形态（满窗口 / 稀疏 / 末尾聚集）跑一遍，逐条量
@@ -76,6 +87,7 @@ return { checks, ok: checks.every((c) => c.pass) };
 | 运行日志面板 | `#log-entries .log-row` > 0 | 首屏快照失败一次就永远空着 |
 | 添加实例的 warning | 提交后与 **SSE 刷新之后**提示条都可见 | 普通提示会被成功刷新撤掉，粘性提示不该 |
 | 6 种宽度 × 3 种数据形态 | 18/18：标签对齐 0.0px、不重叠、不越界 | 标签宽度取决于字体与卡片宽度，静态常量算不出来 |
+| 切维度（本地重绘） | 标签同样对齐、不重叠 | 这条路径曾漏掉拟合，与周期切换表现不一致 |
 
 ## 准备数据（隔离实例，别碰用户的服务）
 
