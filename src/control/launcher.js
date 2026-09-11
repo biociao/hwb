@@ -279,7 +279,15 @@ export class Launcher {
     // 子进程生命周期记录：非 0 退出视为崩溃，带上退出码与 stderr 尾部，便于排查。
     proc.on('exit', (code, signal) => {
       inst.previewProxy?.close().catch(() => {});
-      if (this.procs.get(home.homeId) === inst) this.procs.delete(home.homeId);
+      const wasCurrent = this.procs.get(home.homeId) === inst;
+      if (wasCurrent) this.procs.delete(home.homeId);
+      // 子进程没了，就必须让**共享注册表**知道 —— `monitor.get()`（API/界面都读它）在下一轮
+      // 心跳（最多 30s）之前会一直报 running + 旧 pid/url：卡片显示「已连接」、标签页圆点是绿的、
+      // iframe 指向一个已经没人监听的端口，服务端「已连接实例」的过滤也照样把它算进去。
+      // 对照：ssh 隧道退出那条路径早就会把 phase 置为 degraded 并调度恢复，本机子进程这条漏了。
+      if (wasCurrent && !inst.detached) {
+        this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
+      }
       if (signal !== null) {
         log.debug('dsh web 子进程退出（被信号终止）', { homeId: home.homeId, pid: inst.pid, signal });
       } else if (code === 0) {

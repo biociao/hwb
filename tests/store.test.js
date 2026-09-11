@@ -413,3 +413,41 @@ test('getHome and listHomes agree on the enriched shape', () => {
     '两条路径必须返回完全一致的实例视图');
   store.close();
 });
+
+// 实例维度按 `basename(homePath)` 打标签，而 dsh 的默认 home 目录就叫 `.dsh` ——
+// 两个实例（不同用户/项目下的 .dsh）会得到同一个标签，图例上被**合并成一条**（实测 1000+7000
+// 画成一条 `.dsh: 8000`）。撞名时必须补一段标识，而不是让数字悄悄合到一起。
+test('usageTrendGrouped: instance 维度不会把同名实例合并成一条', () => {
+  const store = new IndexStore(':memory:');
+  const now = new Date().toISOString();
+  const a = store.registerHome({ homePath: '/Users/alice/.dsh', hostType: 'local' });
+  const b = store.registerHome({ homePath: '/Users/bob/proj/.dsh', hostType: 'local' });
+  const row = (homeId, sessionId, tok) => ({ type: 'session', homeId, sessionId, project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: tok }), contextPressure: null,
+    status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 });
+  store.upsertRows([row(a, 's1', 1000), row(b, 's2', 7000)]);
+  const g = store.usageTrendGrouped({ dimension: 'instance', hours: 24 });
+  const labels = [...new Set(g.buckets.flatMap((x) => Object.keys(x.groups)))];
+  assert.equal(labels.length, 2, `两个实例应是两条序列，实际 ${JSON.stringify(labels)}`);
+  const total = g.buckets.reduce((acc, x) => acc + x.total, 0);
+  assert.equal(total, 8000, '总量不变（只是拆成两条）');
+  store.close();
+});
+
+// lastActivity 在**未来**（远端实例时钟偏、或 dsh 写了将来时间戳）时，桶号会超出
+// [startHour, endHour]：用量汇总把它算进去了、趋势图却整条丢掉（实测 summary 6000 / trend 0）。
+test('usageTrend/usageTrendGrouped: 未来时间戳不再被趋势图丢掉（与 summary 口径一致）', () => {
+  const store = new IndexStore(':memory:');
+  const h = store.registerHome({ homePath: '/x', hostType: 'local' });
+  const future = new Date(Date.now() + 6 * 3_600_000).toISOString();   // 时钟偏 6 小时
+  store.upsertRows([{ type: 'session', homeId: h, sessionId: 'fut', project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: 6000 }), contextPressure: null,
+    status: JSON.stringify({ kind: 'idle' }), lastActivity: future, generatedAt: future, liveOnly: 0 }]);
+  const sum = store.usageSummary({ days: 30 }).totalTokens;
+  const trend = store.usageTrend({ hours: 24 }).reduce((a, r) => a + r.input + r.output + r.cacheRead + r.cacheWrite, 0);
+  const grouped = store.usageTrendGrouped({ dimension: 'total', hours: 24 }).buckets.reduce((a, x) => a + x.total, 0);
+  assert.equal(sum, 6000);
+  assert.equal(trend, sum, `趋势应与汇总一致，实际 trend=${trend} summary=${sum}`);
+  assert.equal(grouped, sum, `分组趋势应与汇总一致，实际 grouped=${grouped}`);
+  store.close();
+});

@@ -46,7 +46,8 @@ test('usageTrend: SQL 窗口起点与首个桶重合（不留「查出来却无�
   store.db.prepare = (sql) => {
     const st = orig(sql);
     if (!sql.includes('GROUP BY h')) return st;
-    return { ...st, all: (...args) => { seen.push(args[0]); return st.all(...args); } };
+    // 参数里现在不止一个（endHour 用来把未来时间戳夹到最后一只桶），所以取其中的 ISO 时间戳
+    return { ...st, all: (...args) => { seen.push(args.find((a) => typeof a === 'string')); return st.all(...args); } };
   };
   const trend = store.usageTrend({ hours: 24 });
   store.db.prepare = orig;

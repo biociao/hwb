@@ -881,7 +881,10 @@ export class IndexStore {
     // 而且两条趋势口径在同一条边界上悄悄不一致。改成对齐后，取出的每一行都必定有桶。
     const startIso = new Date(startHour * 3_600_000).toISOString();
     const rows = this.db.prepare(
-      `SELECT CAST(STRFTIME('%s', lastActivity) / 3600 AS INTEGER) AS h,
+      // 与 usageTrendGrouped 同样的夹取：lastActivity 在未来（远端时钟偏）时，原先它的桶号超出
+      // [startHour, endHour]，于是汇总算了、趋势图整条丢掉（实测 summary 6000 / trend 0）。
+      // STRFTIME 解析不出来（脏时间戳）同样兜到最后一只桶。
+      `SELECT COALESCE(MIN(CAST(STRFTIME('%s', lastActivity) / 3600 AS INTEGER), ?), ?) AS h,
               ${TOK.input} AS inputTokens,
               ${TOK.output} AS outputTokens,
               ${TOK.cacheRead} AS cacheRead,
@@ -889,7 +892,7 @@ export class IndexStore {
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY h`
-    ).all(startIso);
+    ).all(endHour, endHour, startIso);
     const byH = new Map(rows.map((r) => [r.h, r]));
     const buckets = [];
     for (let h = startHour; h <= endHour; h++) {
@@ -950,14 +953,19 @@ export class IndexStore {
             ? "'合计'"
             : `COALESCE(s.project, '(未分类)')`;
     const rows = this.db.prepare(
-      `SELECT CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER) AS h,
+      // MIN(..., endBucket)：lastActivity 在**未来**（远端时钟偏、或 dsh 写了将来时间）时，
+      // 原先它的桶号超出 [startBucket, endBucket]，于是用量汇总把它算进去了、趋势图却整条丢掉
+      // （实测：summary 6000 / trend 1000）。夹到最后一只桶之后两边口径一致。
+      // STRFTIME 解析不出来时返回 NULL，同样落进最后一只桶（MIN 忽略 NULL 的语义在这里不合适，
+      // 所以用 COALESCE 兜到 endBucket）。
+      `SELECT COALESCE(MIN(CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER), ?), ?) AS h,
               ${groupExpr} AS grp,
               COALESCE(SUM(s.tokInput + s.tokOutput + s.tokCacheRead + s.tokCacheWrite), 0) AS tokens
        FROM sessions s
        WHERE s.lastActivity IS NOT NULL AND s.lastActivity >= ?
        GROUP BY h, grp
        ORDER BY h, tokens DESC`
-    ).all(stepSec, startIso);
+    ).all(stepSec, endBucket, endBucket, startIso);
 
     // instance 维度 group 是 homeId，在这里映射为可读标签（alias || 目录名 || homeId）。
     const homeLabel = this.#homeLabelMap();
@@ -982,9 +990,19 @@ export class IndexStore {
   #homeLabelMap() {
     const homes = this.db.prepare('SELECT homeId, homePath, alias FROM homes').all();
     const m = new Map();
+    // 标签必须**唯一**：图上每个分组是一张图例，同名的两条会被合并成一条。
+    // `basename(homePath)` 撞名很常见 —— dsh 默认 home 目录就叫 `.dsh`，两个实例
+    // （各自用户目录下）会都叫 `.dsh`：实测 1000 + 7000 被画成一条 `.dsh: 8000`。
+    // 撞名时补一段 homeId 前缀，让用户能区分（而不是让数字悄悄合到一起）。
+    const used = new Set();
     for (const h of homes) {
-      const base = h.homePath ? path.basename(h.homePath) : h.homeId;
-      m.set(h.homeId, (h.alias && String(h.alias).trim()) || base);
+      const base = (h.alias && String(h.alias).trim()) || (h.homePath ? path.basename(h.homePath) : h.homeId);
+      let label = base;
+      if (used.has(label)) label = `${base} (${h.homeId.slice(0, 6)})`;
+      let n = 2;
+      while (used.has(label)) label = `${base} (${h.homeId.slice(0, 6)}-${n++})`;
+      used.add(label);
+      m.set(h.homeId, label);
     }
     return m;
   }

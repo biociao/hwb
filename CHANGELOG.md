@@ -435,6 +435,26 @@ Semantic Versioning.
 - **顺带**修掉测试夹具的一个缺陷：假的 `res` 没有 `end()`，于是「拒绝时回一句话」这种代码
   会被 try/catch 吞掉，测出来是假象。
 
+#### 子进程死后 API 仍报「已连接」；同名实例在图上被合并；未来时间戳只算进汇总（第 10 轮审查）
+- **hwb 自己拉起的 `dsh web` 子进程死掉时，共享注册表不更新**（MEDIUM）：卡片显示「已连接」、
+  标签页圆点是绿的、iframe 指向一个已经没人监听的端口，服务端「已连接实例」的过滤也照样把它算进去 ——
+  直到下一轮心跳（最多 30s）。对照：ssh 隧道退出那条路径早就会把 phase 置为 degraded 并调度恢复。
+  修复：子进程 `exit` 时（且仍是当前实例、未 detached）把注册表置为 `stopped` 并清空 pid/url。
+  **回归测试**：`tests/launcher-spawn-failure.test.js` —— 起一个长期运行的假 dsh，`SIGKILL` 它之后
+  注册表必须立刻是 `stopped`。修复前仍是 `running`。
+  （夹具要用「活着等被杀」的假 dsh：让子进程自己退出会触发恢复定时器，测试进程永远等事件循环 ——
+  第一版就是这么卡住的。）
+- **`usageTrendGrouped('instance')` 会把同名实例合并成一条**（MEDIUM）：标签取
+  `basename(homePath)`，而 dsh 的默认 home 目录就叫 `.dsh`，两个实例于是同名 —— 实测
+  1000 + 7000 被画成一条 `.dsh: 8000`。修复：标签撞名时补 `homeId` 前缀（`".dsh (6d6d7a)"`）。
+- **未来的 `lastActivity` 只算进汇总、被趋势图整条丢掉**（MEDIUM）：桶号会超出
+  `[startHour, endHour]`。远端实例时钟偏一点就会触发。实测 `summary=6000 / trend=0`。
+  修复：两条趋势查询都用 `MIN(桶号, 末桶)` 夹取（`STRFTIME` 解析不出来时也兜到末桶）。
+  实测修复后 summary/trend/grouped 三口径一致。
+- **回归测试**：`tests/store.test.js` 各一条；`tests/audit-fixes.test.js` 里那条「SQL 窗口起点」
+  不变量断言也要跟着改 —— 它原先取 `args[0]`，而现在查询多了两个参数（夹取用的末桶号），
+  改成取参数里的 ISO 时间戳（它拦的是「趋势查询的窗口起点」，不是「第一个参数」）。
+
 #### 迁移失败会让历史用量永久显示 0（src/dshhome/store.js，HIGH）
 - **现象**（独立审查第 10 轮，用**真实的 SQLITE_FULL** 复现，不是注入）：旧的迁移闸门是
   「看 `tokInput` 列在不在」，而四个 `ALTER` 各自自动提交（DDL 不在事务里）、回填另起一个事务。

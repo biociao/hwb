@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { InstanceRegistry } from '../src/control/registry.js';
+import { IndexStore } from '../src/dshhome/store.js';
 import { Launcher } from '../src/control/launcher.js';
 
 // spawn('dsh', …) 的失败（PATH 里没有 dsh、dsh 不可执行）是**异步**通过 'error' 事件上报的，
@@ -64,4 +66,35 @@ test('captureDshToken：spawn 失败时立刻 settle，不必等满超时', asyn
     process.env.PATH = saved;
     proc?.kill?.();
   }
+});
+
+// hwb 自己拉起的 dsh web 子进程死掉时，共享注册表必须立刻知道 —— 否则 monitor.get()
+// （API 与界面都读它）在下一轮心跳（最多 30s）之前一直报 running + 旧 pid/url：
+// 卡片显示「已连接」、标签页圆点是绿的、iframe 指向一个已经没人监听的端口，
+// 服务端「已连接实例」的过滤也照样把它算进去。对照：ssh 隧道退出那条路径早就会置 degraded。
+//
+// 注意夹具要用「活着等被杀」的假 dsh：让子进程自己退出会触发 monitor/recovery 的定时器，
+// 测试进程会一直等事件循环（第一版就是这么卡住的）。
+test('launcher: 子进程被杀后注册表立刻变成 stopped（不再谎报已连接）', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hwb-launch-exit-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'dsh');
+  await writeFile(bin, '#!/bin/bash\nsleep 30\n');
+  await chmod(bin, 0o755);
+  const registry = new InstanceRegistry();
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: path.join(dir, 'home'), hostType: 'local' });
+  const launcher = new Launcher({ store, registry,
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    waitHttp: async () => true });   // 跳过真实 HTTP 探测（端口上没人监听）
+  t.after(async () => { try { await launcher.disconnect?.(store.getHome(homeId) ?? { homeId, homePath: dir }, { release: true }); } catch { /* 尽力 */ } store.close(); });
+
+  const inst = await launcher.open(store.getHome(homeId));
+  assert.equal(registry.get(homeId).phase, 'running', '刚起来时应是 running');
+  assert.ok(inst.pid > 0);
+  process.kill(inst.pid, 'SIGKILL');                 // 模拟子进程被杀/崩溃
+  await new Promise((r) => setTimeout(r, 400));
+  const after = registry.get(homeId);
+  assert.equal(after.phase, 'stopped', `子进程死后应立刻是 stopped，实际 ${after.phase}`);
+  assert.equal(after.pid, null, '不该再留着旧 pid');
 });
