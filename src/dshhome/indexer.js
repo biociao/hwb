@@ -58,7 +58,10 @@ export class Indexer {
   }
 
   #run(onlyHomeId = null) {
-    if (this.current) return this.current;
+    if (this.current) {
+      // 连接时的定向刷新必须在当前批次之后执行，不能被旧批次吞掉。
+      return onlyHomeId ? this.current.then(() => this.#run(onlyHomeId)) : this.current;
+    }
     this.current = this.#runAll(onlyHomeId).finally(() => {
       this.current = null;
     });
@@ -88,7 +91,7 @@ export class Indexer {
     try {
       // 实时状态覆盖：仅对运行中且可达的实例抓取；失败必回退（loadLive 内部已容错）。
       let live = null;
-      if (this.liveStatus) {
+      if (this.liveStatus && home.hostType !== 'remote') {
         try {
           live = await this.liveStatus(home);
         } catch {
@@ -97,7 +100,7 @@ export class Indexer {
       }
       // 按 hostType 分流：远程经 SSH 只读索引，本地走 fs。live 非空时覆盖/补插会话状态。
       const { snapshot, rows } = home.hostType === 'remote'
-        ? await indexRemoteHome(this.store, home, this.remoteExec, live)
+        ? await indexRemoteHome(this.store, home, this.remoteExec, this.liveStatus ? () => this.liveStatus(home) : null)
         : indexHome(this.store, home.homePath, live);
       const failed = DOMAINS.every((d) => snapshot.degraded.some((x) => x.domain === d));
       const payload = {

@@ -54,6 +54,10 @@ export function indexHome(store, homePath, live = null) {
 // 远程实例只读索引（§4.6）：经 SSH cat 元数据 → buildSnapshot → normalize → 入库。
 export async function indexRemoteHome(store, home, exec, live = null) {
   const snapshot = await readHomeRemote(home, exec);
+  // SSH 可能很慢；完成后再取实时状态，避免旧响应覆盖期间的新状态。
+  if (typeof live === 'function') {
+    try { live = await live(); } catch { live = null; }
+  }
   const rows = mergeLiveStatus(normalize(snapshot), live, snapshot);
   store.upsertRows(rows);
   return { snapshot, rows };

@@ -1,3 +1,7 @@
+import { logger } from '../lib/logger.js';
+
+const log = logger('live-status');
+
 // 实时状态读取器 —— 让 hwb 的「会话状态」不再只依赖可能冻结的投影缓存，
 // 而是直接读「运行中的 dsh 实例」的实时状态。
 //
@@ -37,8 +41,8 @@ async function acquireCookie(origin, token, timeoutMs) {
   let first;
   try {
     first = await fetch(authUrl, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
-  } catch {
-    return { __error: 'auth fetch failed' }; // 实例不可达：显式失败标记，调用方回退
+  } catch (error) {
+    return { __error: error.name === 'TimeoutError' ? 'auth timeout' : 'auth fetch failed' }; // 实例不可达：显式失败标记，调用方回退
   }
   // 无 token 栅栏（旧版 dsh / 直接放行）→ 无需 cookie。
   if (first.status === 303) {
@@ -47,10 +51,10 @@ async function acquireCookie(origin, token, timeoutMs) {
   if (first.status === 401 || first.status === 403) {
     // launch token 无效/过期：实例被外部重启后 hwb 持有的旧 token 会落到这里。
     // 明确返回 null 哨兵，让调用方回退，并把问题留到日志层提示。
-    return { __auth: false };
+    return { __error: `auth http ${first.status}` };
   }
-  // 200（无鉴权）/ 其它：直接用（多数情况无需 cookie）。
-  return '';
+  if (!first.ok) return { __error: `auth http ${first.status}` };
+  return first.headers.get('set-cookie')?.split(';')[0] ?? '';
 }
 
 // POST 一次 RPC 到 `/api/<endpoint>`，返回 result（或 null）。
@@ -79,13 +83,17 @@ async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS) {
       body,
       signal: AbortSignal.timeout(timeoutMs),
     });
-  } catch {
-    return { __error: 'rpc fetch failed' };
+  } catch (error) {
+    return { __error: error.name === 'TimeoutError' ? 'rpc timeout' : 'rpc fetch failed' };
   }
   if (!res.ok) return { __error: `rpc http ${res.status}` };
   try {
     const msg = await res.json();
     if (msg?.type !== 'server-response') return { __error: 'bad rpc envelope' };
+    if (msg.result?.ok === false) {
+      const code = msg.result.error?.code;
+      return { __error: `rpc rejected (${typeof code === 'string' && /^[a-zA-Z0-9_/-]{1,80}$/.test(code) ? code : 'unknown'})` };
+    }
     return msg.result;
   } catch {
     return { __error: 'rpc response not json' };
@@ -107,7 +115,8 @@ function toLiveRow(item) {
   const hasInProgressTodo = todos.some((t) => t && t.status === 'in_progress');
   const goalPhase = (typeof goal === 'object' && goal ? goal.goal?.phase ?? goal.phase : null) ?? null;
   const planRunning = !!(values.plan && (values.plan.running != null || values.plan.active));
-  const isRunning = item?.running === true || stats.openStep != null || (stats.pendingCalls && Object.keys(stats.pendingCalls).length > 0) || hasInProgressTodo || goalPhase === 'active' || planRunning;
+  const inferredRunning = stats.openStep != null || (stats.pendingCalls && Object.keys(stats.pendingCalls).length > 0) || hasInProgressTodo || goalPhase === 'active' || planRunning;
+  const isRunning = typeof item.running === 'boolean' ? item.running : !!inferredRunning;
   const kind = isRunning ? 'running' : (goalPhase === 'complete' || (todos.length > 0 && todos.every((t) => t && t.status === 'completed')) ? 'completed' : 'idle');
   const labels = { running: '运行中', completed: '已完成', idle: '空闲' };
   const subagentRaw = values.subagent;
@@ -135,30 +144,49 @@ function extractLiveRows(result) {
   if (!result || typeof result !== 'object') return null;
   const list = Array.isArray(result)
     ? result
-    : (result?.value?.items ?? result?.items ?? result?.sessions ?? []);
+    : (result?.value?.items ?? result?.items ?? result?.sessions);
   if (!Array.isArray(list)) return null;
   const rows = list.map(toLiveRow).filter(Boolean);
-  return rows.length ? rows : null;
+  return rows;
 }
 
 export class LiveStatusReader {
   constructor({ timeoutMs = RPC_TIMEOUT_MS } = {}) {
     this.timeoutMs = timeoutMs;
+    this.states = new Map();
   }
 
   // 对一个「运行中的 dsh 实例」（url 形如 http://127.0.0.1:<port>/?token=<x>）
   // 读取实时会话状态。返回 [{sessionId,cwd,status,lastActivity,tokenUsage,title}] 或 null。
   // 用 dsh `/api/session/list`（真实端点，payload 为 { args: { _request: {} } }）。
-  async read(url) {
+  async read(url, { homeId, host } = {}) {
     if (!url) return null;
+    const { origin } = splitAuthUrl(url);
+    const key = homeId ?? origin;
+    const report = (error, count = 0) => {
+      const state = error ?? 'ok';
+      if (this.states.get(key) === state) return;
+      this.states.set(key, state);
+      // 不记录 URL/token/cookie、RPC 正文或远端错误详情。
+      const context = { homeId, host, endpoint: 'session/list', timeoutMs: this.timeoutMs };
+      if (error) log.warn('实时会话同步失败，工作台仍使用文件索引', { ...context, reason: error });
+      else log.info('实时会话同步成功', { ...context, sessionCount: count });
+    };
     try {
       const result = await rpc(url, 'session/list', { _request: {} }, this.timeoutMs);
-      if (result && typeof result === 'object' && 'value' in result && !('__error' in result) && !('__auth' in result)) {
-        const rows = extractLiveRows(result);
-        if (rows) return rows;
+      if (result?.__error) {
+        report(result.__error);
+        return null;
       }
-      return null;
+      const rows = extractLiveRows(result);
+      if (rows === null) {
+        report('invalid session list response');
+        return null;
+      }
+      report(null, rows.length);
+      return rows;
     } catch {
+      report('invalid session data');
       return null;
     }
   }

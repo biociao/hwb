@@ -79,3 +79,27 @@ test('indexer: liveStatus 里 projcache 之外的新会话随索引入库', asyn
   //  projcache 已有会话也应在（mock-home 自带 sess-001..）
   assert.ok(captured.rows.some((r) => r.type === 'session' && r.sessionId === 'sess-001'));
 });
+
+test('indexer: connection refresh arriving during indexing runs again after the active batch', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let calls = 0;
+  const { indexer, local } = fixture({ liveStatus: async () => {
+    calls++;
+    if (calls === 1) await gate;
+    return null;
+  } });
+  const first = indexer.reindexNow(local.homeId);
+  const connected = indexer.reindexNow(local.homeId);
+  release();
+  await Promise.all([first, connected]);
+  assert.equal(calls, 2);
+});
+
+test('indexer: remote live state is read after the SSH snapshot completes', async () => {
+  const order = [];
+  const { indexer, remote } = fixture({ liveStatus: async () => { order.push('live'); return null; } });
+  indexer.remoteExec = async () => { order.push('ssh'); return { code: 0, stdout: ['storages/workspace.json', 'storages/session_projcache.json', 'model-tier.json', '.credentials.yaml'].map((p) => `__DSH_FILE_BEGIN__:${p}\n__MISSING__\n__DSH_FILE_END__\n`).join(''), stderr: '' }; };
+  await indexer.reindexNow(remote.homeId);
+  assert.deepEqual(order, ['ssh', 'live']);
+});
