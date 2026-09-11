@@ -27,6 +27,13 @@ function degradedTables(degraded) {
   return tables;
 }
 
+// listHomes 与 getHome 共用的实例基础查询：单实例点查只需在末尾拼一个 WHERE。
+const HOME_SELECT = `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
+              h.endpoints, h.activeEndpointId, h.serverId, h.host, h.remotePort, h.localPort, h.accessPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
+              (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
+              (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
+       FROM homes h`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS homes (
   homeId TEXT PRIMARY KEY,
@@ -161,6 +168,10 @@ export class IndexStore {
     }
     if (!homes.includes('endpoints')) this.#migrateEndpoints();
   }
+
+  // 预编译语句的缓存位（见 #enrichHome：listHomes 与 getHome 共用同一组语句）。
+  #providersStmt = null;
+  #tiersStmt = null;
 
   #migrateEndpoints() {
     this.db.exec('BEGIN');
@@ -456,23 +467,36 @@ export class IndexStore {
   }
 
   listHomes() {
-    const homes = this.db.prepare(
-      `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
-              h.endpoints, h.activeEndpointId, h.serverId, h.host, h.remotePort, h.localPort, h.accessPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
-              (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
-              (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
-       FROM homes h ORDER BY (h.sortIndex IS NULL), h.sortIndex, h.homeId`
-    ).all();
-    const providers = this.db.prepare('SELECT homeId, ref, provider FROM providers WHERE homeId = ? ORDER BY provider');
-    const tiers = this.db.prepare("SELECT homeId, tierId, provider, model FROM model_tiers WHERE homeId = ? AND active = 1 ORDER BY CASE WHEN tierId = 'default' THEN 0 ELSE 1 END");
-    return homes.map((h) => ({
+    return this.db.prepare(`${HOME_SELECT} ORDER BY (h.sortIndex IS NULL), h.sortIndex, h.homeId`)
+      .all()
+      .map((h) => this.#enrichHome(h));
+  }
+
+  // 按 id 取单个实例。**不能**再用 listHomes().find(...)：listHomes 对每个实例都要跑
+  // providers / activeTier / currentSession 三条语句加两次 JSON.parse，而实时轮询每约 3s 就会
+  // 对每个实例多次调用 getHome —— 一个实例时无感，十几个实例时就是每轮十几毫秒的同步阻塞
+  // （node:sqlite 是同步 API，直接卡住事件循环：SSE、HTTP、监控心跳一起等）。
+  getHome(homeId) {
+    if (!homeId) return null;
+    const row = this.db.prepare(`${HOME_SELECT} WHERE h.homeId = ?`).get(homeId);
+    return row ? this.#enrichHome(row) : null;
+  }
+
+  #enrichHome(h) {
+    // 预编译语句懒初始化并复用：原先它们被提到 listHomes 的 map 之外，
+    // 现在 getHome 也要用，所以挂到实例上（每个 store 实例生命周期内只 prepare 一次）。
+    this.#providersStmt ??= this.db.prepare('SELECT homeId, ref, provider FROM providers WHERE homeId = ? ORDER BY provider');
+    this.#tiersStmt ??= this.db.prepare(
+      "SELECT homeId, tierId, provider, model FROM model_tiers WHERE homeId = ? AND active = 1 ORDER BY CASE WHEN tierId = 'default' THEN 0 ELSE 1 END"
+    );
+    return {
       ...h,
       endpoints: JSON.parse(h.endpoints || '[]'),
       degraded: JSON.parse(h.degraded || '[]'),
-      providers: providers.all(h.homeId),
-      activeTier: tiers.get(h.homeId) ?? null,
+      providers: this.#providersStmt.all(h.homeId),
+      activeTier: this.#tiersStmt.get(h.homeId) ?? null,
       current: this.#currentSession(h.homeId),
-    }));
+    };
   }
 
   // Recent projects: cross-instance, active within `days`, ordered by last activity (§7.1).

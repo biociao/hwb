@@ -378,3 +378,38 @@ test('store localPort: 本机直连端口 round-trip（register/list/update/clea
   assert.equal(store.getHome(homeId).localPort, null);
   store.close();
 });
+
+// getHome 必须是**点查**，不能实现成 listHomes().find(...)。
+// listHomes 对每个实例都要跑 providers / activeTier / currentSession 三条语句加两次 JSON.parse，
+// 而 live-poller 每约 3s 就会对每个实例多次调用 getHome：十几个实例时就是每轮十几毫秒的同步阻塞
+// （node:sqlite 是同步 API，直接卡住事件循环 —— SSE、HTTP、监控心跳一起等）。
+// 这里用「把 listHomes 换成一调用就抛」来结构性地钉住这一点，不依赖计时（避免慢机器误报）。
+test('getHome is a point query and never goes through listHomes', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  const original = store.listHomes;
+  store.listHomes = () => { throw new Error('getHome must not call listHomes'); };
+  try {
+    const home = store.getHome(homeId);
+    assert.equal(home.homeId, homeId);
+    assert.equal(home.sessionCount, 2, '点查也必须带上同一套派生字段');
+    // node:sqlite 返回 null-prototype 行，先摊平成普通对象再比较
+    assert.deepEqual(home.providers.map((p) => ({ ...p })), [{ homeId, ref: 'DEEPSEEK_API_KEY', provider: 'deepseek' }]);
+    assert.equal(home.activeTier.tierId, 'std');
+    assert.equal(store.getHome('does-not-exist'), null);
+    assert.equal(store.getHome(''), null, '空 id 直接返回 null，不查库');
+  } finally {
+    store.listHomes = original;
+  }
+  store.close();
+});
+
+test('getHome and listHomes agree on the enriched shape', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  const fromList = store.listHomes().find((h) => h.homeId === homeId);
+  const fromPoint = store.getHome(homeId);
+  assert.deepEqual(JSON.parse(JSON.stringify(fromPoint)), JSON.parse(JSON.stringify(fromList)),
+    '两条路径必须返回完全一致的实例视图');
+  store.close();
+});

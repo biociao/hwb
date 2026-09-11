@@ -133,6 +133,12 @@
     .pressure { height: 4px; border-radius: 2px; background: var(--panel-2); margin-top: 6px; overflow: hidden; }
     .pressure > i { display: block; height: 100%; background: var(--accent); }
     .empty { color: var(--dim); padding: 14px; font-size: 13px; }
+    /* 刷新/连接失败提示：醒目但不阻塞（dashboard 仍展示上一次成功的内容） */
+    .note { margin: 0 0 10px; padding: 7px 12px; border-radius: 6px; font-size: 13px;
+            background: color-mix(in srgb, var(--warn, #d08a2a) 18%, transparent);
+            border: 1px solid color-mix(in srgb, var(--warn, #d08a2a) 45%, transparent);
+            color: var(--fg); }
+    .note[hidden] { display: none; }
     button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 5px; cursor: pointer;
              background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); }
     button:hover { border-color: var(--accent); }
@@ -342,6 +348,8 @@
     </div>
   </header>
   <main id="main">
+    <!-- 刷新/连接失败提示：挂在 dashboard 之外，dashboard 每轮 SSE 刷新都会重建 innerHTML -->
+    <div id="note" class="note" role="status" aria-live="polite" hidden></div>
     <div id="dashboard" class="view" data-layout="grid"><div class="empty">loading…</div></div>
   </main>
   <div id="modal" class="modal" hidden></div>

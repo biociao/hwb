@@ -10,11 +10,13 @@ import { renderInstanceGrid } from './components/instance-grid.js';
 import { renderUsageCard, usageTrendHtml, USAGE_PERIODS } from './components/usage-card.js';
 import { renderHomeForm, renderOnboarding, renderSettingsForm } from './components/add-home.js';
 import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLogView, logPanelHtml } from './components/log-panel.js';
+import { captureFormDraft, restoreFormDraft } from './components/form-draft.js';
 
 const main = document.getElementById('main');
 const dashboardEl = document.getElementById('dashboard');
 const tabs = document.getElementById('tabs');
 const live = document.getElementById('live');
+const note = document.getElementById('note'); // 刷新/连接失败提示（挂在 dashboard 之外，避免被每轮重建清掉）
 const modalEl = document.getElementById('modal');
 const themeBtn = document.getElementById('theme-btn');
 const themeMenu = document.getElementById('theme-menu');
@@ -143,6 +145,7 @@ async function refresh() {
   const sequence = ++refreshSequence;
   const { homes } = await api('/api/homes');
   if (sequence !== refreshSequence) return;
+  note.hidden = true; // 这一轮成功了，撤掉上一次的失败提示
   lastHomes = homes;
   if (view.kind === 'instance' && !tabHomes(homes).some((h) => h.homeId === view.homeId)) {
     view = { kind: 'dashboard' };
@@ -172,14 +175,29 @@ async function renderDashboard(sequence = refreshSequence) {
     return;
   }
   dashboardEl.dataset.layout = 'grid';
-  const [{ projects }, { sessions }, usage] = await Promise.all([
+  // allSettled 而不是 all：任何一个端点失败（后端重启、单个查询 500）都不该把另外三栏一起清空。
+  // 失败的栏目退化为空态渲染，并在顶部提示具体是哪个接口挂了。
+  const [projectsRes, sessionsRes, usageRes] = await Promise.allSettled([
     api('/api/projects/recent'),
     api('/api/sessions/recent'),
     api(`/api/usage?days=${usagePeriod.days}&hours=${usagePeriod.hours}`),
   ]);
   if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
+  const failed = [['项目列表', projectsRes], ['会话列表', sessionsRes], ['用量统计', usageRes]]
+    .filter(([, r]) => r.status === 'rejected')
+    .map(([label, r]) => `${label}(${r.reason?.message ?? r.reason})`);
+  if (failed.length) {
+    note.textContent = `部分数据加载失败：${failed.join('；')}`;
+    note.hidden = false;
+  }
+  const projects = projectsRes.status === 'fulfilled' ? projectsRes.value.projects : [];
+  const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value.sessions : [];
+  const usage = usageRes.status === 'fulfilled' ? usageRes.value : null;
   lastUsage = usage;
   const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
+  // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
+  const addForm = dashboardEl.querySelector('#add-home');
+  const draft = showAddForm ? captureFormDraft(addForm, document.activeElement) : null;
   dashboardEl.innerHTML = renderWorkbench({
     projects: connectedIds.size ? renderRecentProjects(projects.filter((p) => connectedIds.has(p.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
     sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId))) : '<div class="empty">连接实例后显示对应会话</div>',
@@ -190,7 +208,9 @@ async function renderDashboard(sequence = refreshSequence) {
   logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
   if (showAddForm) {
     dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm());
-    dashboardEl.querySelector('#add-home input[name=homePath]').focus();
+    if (!restoreFormDraft(dashboardEl.querySelector('#add-home'), draft)) {
+      dashboardEl.querySelector('#add-home input[name=homePath]')?.focus();
+    }
   }
   hlProject = null; hlRow = null; hlKind = null; // 刷新后清除残留高亮状态
 }
@@ -200,7 +220,7 @@ function goDashboard() {
   saveView();
   renderTabs();
   showView();
-  refresh();
+  refresh().catch(reportRefreshFailure);
 }
 
 // —— Token 用量趋势：切换堆叠维度（不整页刷新，只就地重绘图表 + 高亮按钮）——
@@ -383,7 +403,7 @@ async function enterInstance(homeId, extra = {}) {
   } finally {
     if (pane._opening === token) pane._opening = null;
   }
-  refresh(); // runtime 状态已变，更新 tab 圆点
+  refresh().catch(reportRefreshFailure); // runtime 状态已变，更新 tab 圆点
 }
 
 function formMsg(form, text, isError) {
@@ -822,11 +842,30 @@ dashboardEl.addEventListener('mouseout', (e) => {
   clearHighlight();
 });
 
+// SSE 刷新合并：一次索引更新会连着广播 index:updated / instance:status / monitor:updated，
+// 逐个直接 refresh() 就是连续几次全量重建（有实例在跑时叠加 live-poller 的 3s 节奏）。
+// 合并到一个短窗口里只刷一次，既省重绘，也避免刚恢复的表单草稿又被下一次重建打断。
+const REFRESH_COALESCE_MS = 120;
+let refreshQueued = false;
+function scheduleRefresh() {
+  if (refreshQueued) return;
+  refreshQueued = true;
+  setTimeout(() => { refreshQueued = false; refresh().catch(reportRefreshFailure); }, REFRESH_COALESCE_MS);
+}
+
+// 刷新失败时必须让用户看见，而不是把旧内容默默留在屏幕上。
+// 提示挂在 dashboard 之外（它每轮都会被 innerHTML 重建）。
+function reportRefreshFailure(error) {
+  note.textContent = `刷新失败：${error?.message ?? error}`;
+  note.hidden = false;
+}
+
 subscribe(
-  () => refresh(),
+  () => scheduleRefresh(),
   (on) => {
     live.textContent = on ? 'live' : 'reconnecting…';
     live.classList.toggle('on', on);
+    if (!on) reportRefreshFailure(new Error('实时通道已断开，正在重连'));
   },
   (entry) => appendLog(entry) // 实时日志推送到「运行日志」面板
 );

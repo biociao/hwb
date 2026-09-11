@@ -43,6 +43,36 @@ Semantic Versioning.
 
 ### Fixed
 
+#### SSE 刷新会清空「添加实例」表单并抢走焦点（src/web/app.js + src/web/components/form-draft.js）
+- **现象**：dashboard 每轮刷新都整块重建 `innerHTML`；有实例在跑时 live-poller 约每 3s 广播一次
+  `index:updated`，于是重建后插入的是一个**全新的空表单**，且无条件 `.focus()` 到 `homePath`。
+  用户输入的路径/别名每 3s 被清空一次，这个表单实际上填不完。
+- **修复**：抽出 `src/web/components/form-draft.js`，在重建前记下各控件值 + 焦点 + 光标位置，
+  重建后原样恢复（只在「本来就没在表单里输入」时才回落到旧的聚焦行为）。光标位置一并还原，
+  否则每 3s 光标就跳到末尾，「在中间补字」依然不可能。
+- **顺带减少重建次数**：SSE 事件合并到 120ms 窗口内只刷一次（一次索引更新会连着广播
+  `index:updated`/`instance:status`/`monitor:updated`）。
+- **回归测试**：`tests/form-draft.test.js`（值/焦点/光标还原、复选框、未出现字段保持默认值、
+  `setSelectionRange` 对 number 输入框抛错不影响恢复）。
+
+#### 单个接口失败会清空整个工作台且没有任何提示（src/web/app.js + src/web/index.html）
+- `renderDashboard` 用了 `Promise.all`：`/api/usage` 一个 500 就会让 `Promise.all` 拒绝，
+  于是**项目 / 会话 / 实例 / 日志四栏一起变空**，而且屏幕上不会出现任何错误信息；
+  `subscribe(() => refresh())` 与 `goDashboard()` 里的 `refresh()` 都没有 catch，
+  每次失败还会产生一个未处理的拒绝。
+- **修复**：改为 `Promise.allSettled`，失败的栏目退化为空态、其余照常渲染；
+  顶部新增 `#note` 提示条（挂在 dashboard 之外，不会被每轮重建清掉）说明具体哪个接口失败；
+  所有 fire-and-forget 的 `refresh()` 都接上 `catch`。
+
+#### getHome 是 listHomes().find(...)，实时轮询因此有 O(N²) 的同步阻塞（src/dshhome/store.js）
+- `listHomes()` 对每个实例都要跑 providers / activeTier / currentSession 三条语句加两次
+  `JSON.parse`；而 live-poller 每约 3s 会对每个实例调用多次 `getHome`。实测 12 实例：
+  `getHome` 0.294 ms（与 `listHomes` 同价）、一次轮询 tick 约 13.9 ms 的**同步**阻塞
+  （node:sqlite 是同步 API，直接卡住事件循环：SSE、HTTP、监控心跳一起等）。
+- **修复**：`getHome` 改为真正的点查（复用同一段 SELECT，只多一个 `WHERE homeId = ?`），
+  预编译语句挂到实例上复用。实测 `getHome` 0.029 ms（约 10×），一次轮询 tick 降到 1.1 ms。
+- **回归测试**：把 `listHomes` 换成一调用就抛，断言 `getHome` 仍然可用且派生字段一致。
+
 #### dsh 版本升级会静默清空该实例的整个索引（src/dshhome/store.js + src/web/components/instance-grid.js）
 - **现象**：`upsertRows` 是「整表替换」语义 —— 先把该 home 的 `sessions`/`workspaces`/`providers`/
   `model_tiers` 全删，再按本次快照插入。而某个元数据文件的 `unit.version` 超出 `SUPPORTED_VERSIONS`
