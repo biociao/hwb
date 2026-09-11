@@ -39,6 +39,9 @@ export function mergeLiveStatus(rows, live, { homeId, generatedAt }) {
       status: l.status ? JSON.stringify(l.status) : null,
       lastActivity: l.lastActivity ?? null,
       generatedAt,
+      // 这行只有实时 RPC 支撑：文件索引里还没有它。liveOnly 让 applyLiveStatus 能在
+      // 「实时列表变成空」时精确清掉它，而不误伤有文件索引支撑的会话。
+      liveOnly: 1,
     });
   }
   return rows;

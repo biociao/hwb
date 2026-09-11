@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   status TEXT,
   lastActivity TEXT,
   generatedAt TEXT,
+  -- 1 = 这行只来自实时 RPC（dsh 的 /api/session/list），文件索引里还没有它。
+  -- 用来在「实时列表变成空」时精确清掉这些行，而不会误伤有文件索引支撑的会话。
+  liveOnly INTEGER NOT NULL DEFAULT 0,
   UNIQUE(homeId, sessionId)
 );
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -125,6 +128,10 @@ export class IndexStore {
     const sess = this.db.prepare("SELECT name FROM pragma_table_info('sessions')").all().map((c) => c.name);
     if (!sess.includes('title')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN title TEXT');
+    }
+    if (!sess.includes('liveOnly')) {
+      // 已有库里的行都来自文件索引或早期实时合并：默认 0 最保守（不会被空实时列表误删）。
+      this.db.exec('ALTER TABLE sessions ADD COLUMN liveOnly INTEGER NOT NULL DEFAULT 0');
     }
     if (!sess.includes('status')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN status TEXT');
@@ -370,13 +377,14 @@ export class IndexStore {
       }
 
       const insSession = this.db.prepare(
-        `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, generatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, generatedAt, liveOnly)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(homeId, sessionId) DO UPDATE SET
            workspaceId=excluded.workspaceId, workspaceTitle=excluded.workspaceTitle,
            project=excluded.project, title=excluded.title, tokenUsage=excluded.tokenUsage,
            contextPressure=excluded.contextPressure, status=excluded.status,
-           lastActivity=excluded.lastActivity, generatedAt=excluded.generatedAt`
+           lastActivity=excluded.lastActivity, generatedAt=excluded.generatedAt,
+           liveOnly=excluded.liveOnly`
       );
       const insWorkspace = this.db.prepare(
         `INSERT INTO workspaces (homeId, workspaceId, title, path, project, archived, sessionCount)
@@ -412,7 +420,8 @@ export class IndexStore {
           case 'session':
             insSession.run(
               row.homeId, row.sessionId, row.workspaceId, row.workspaceTitle,
-              row.project, row.title ?? null, row.tokenUsage, row.contextPressure, row.status, row.lastActivity, row.generatedAt
+              row.project, row.title ?? null, row.tokenUsage, row.contextPressure, row.status, row.lastActivity, row.generatedAt,
+              row.liveOnly ? 1 : 0
             );
             break;
           case 'workspace':
@@ -437,8 +446,18 @@ export class IndexStore {
   }
 
   // 实时刷新只写会话，保留 workspace/provider 等文件索引数据。
+  //
+  // live 为**空数组**是一次成功的读取、含义是「dsh 当前没有会话」——区别于读取失败（poller 传 null
+  // 时根本不会走到这里）。原先空数组被直接 return，于是纯实时行（liveOnly=1，文件索引里还没有它）
+  // 会一直留着：用户在 dsh 里关掉全部会话后，工作台仍显示上一个会话的「运行中」徽标，
+  // 直到 60s 后的文件索引才纠正。现在按标记精确清掉这些行；有文件索引支撑的会话不受影响，
+  // 它们的权威来源是文件索引，不该被实时列表的缺失误删。
   applyLiveStatus(homeId, live) {
-    if (!this.getHome(homeId) || !Array.isArray(live) || !live.length) return;
+    if (!this.getHome(homeId) || !Array.isArray(live)) return;
+    if (!live.length) {
+      this.db.prepare('DELETE FROM sessions WHERE homeId = ? AND liveOnly = 1').run(homeId);
+      return;
+    }
     const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
       .map((row) => ({ ...row, type: 'session' }));
     this.upsertRows(mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() }));

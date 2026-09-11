@@ -72,8 +72,11 @@ export function attachPreviewResize(pane, aside, homeId) {
     setWidth(next);
     save();
   };
-  const observer = new ResizeObserver(layout);
-  observer.observe(pane.el);
+  // ResizeObserver 在 Safari < 13.1 不存在。这里是侧栏宽度自适应的增强，不是功能本身：
+  // 没有它就退化成「改变窗口大小后布局不重算」，不该让整个实例面板挂在 attachFilePreview 上。
+  // （同文件其它地方已经用了 `?.` 做能力检测，这里补齐同一套写法。）
+  const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(layout) : null;
+  observer?.observe(pane.el);
   layout();
-  return () => { finish(); observer.disconnect(); };
+  return () => { finish(); observer?.disconnect(); };
 }

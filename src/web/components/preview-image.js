@@ -40,7 +40,9 @@ export function renderPreviewImage(content, result) {
     nativeFullscreen = false;
     if (document.fullscreenElement === dialog) document.exitFullscreen?.().catch(() => {});
     content.append(viewer);
-    dialog.close();
+    // 与 showModal 的兜底对称：极老浏览器里 <dialog> 连 close() 都没有，那就直接摘掉 open 属性。
+    if (typeof dialog.close === 'function') dialog.close();
+    else dialog.removeAttribute('open');
     full.textContent = '全屏预览';
     update();
     if (!disposed) full.focus();
@@ -48,7 +50,10 @@ export function renderPreviewImage(content, result) {
   full.onclick = async () => {
     if (dialog.open) { leave(); return; }
     dialog.append(viewer);
-    dialog.showModal();
+    // <dialog> 在 Safari < 15.4 之前不支持 showModal()。没有它就退化成非模态展开
+    // （用 open 属性），仍然能看大图，而不是抛错让全屏按钮彻底失效。
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
     full.textContent = '退出全屏';
     full.focus();
     update();
@@ -66,7 +71,7 @@ export function renderPreviewImage(content, result) {
   dialog.addEventListener('cancel', (e) => { e.preventDefault(); leave(); });
   img.onload = update;
   img.onerror = () => { stage.textContent = '图片无法解码，文件可能已损坏或格式不匹配。'; };
-  const observer = new ResizeObserver(() => { if (fit) update(); });
-  observer.observe(stage);
-  return () => { disposed = true; leave(); observer.disconnect(); document.removeEventListener('fullscreenchange', fullscreenChanged); dialog.remove(); };
+  const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (fit) update(); }) : null;
+  observer?.observe(stage);
+  return () => { disposed = true; leave(); observer?.disconnect(); document.removeEventListener('fullscreenchange', fullscreenChanged); dialog.remove(); };
 }

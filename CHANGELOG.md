@@ -91,6 +91,17 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 实时列表变空时工作台仍显示上一个会话的「运行中」（src/dshhome/store.js + reader.js）
+- 一次**成功**的实时读取返回空数组，含义是「dsh 当前没有会话」——这与读取失败（poller 传 `null`，
+  根本不会调到 `applyLiveStatus`）是两回事。原先空数组被直接 `return`，于是**纯实时行**
+  （文件索引里还没有它、只有 RPC 支撑的那些）会一直留着：用户在 dsh 里关掉全部会话后，
+  工作台仍显示上一个会话的「运行中」徽标，要等 60s 后的文件索引才纠正。
+- **修复**：给 `sessions` 加 `liveOnly` 标记（`mergeLiveStatus` 补插的行置 1，文件索引的行置 0），
+  空实时列表时只删 `liveOnly = 1` 的行 —— 有文件索引支撑的会话不受影响，它们的权威来源是文件索引，
+  不该被实时列表的缺失误删。已有库通过 `ALTER TABLE` 补列，历史行默认 0（最保守）。
+- **回归测试**：`tests/live-empty-clear.test.js` —— 空列表清掉纯实时行但保留文件会话、
+  读取失败（非数组）不产生任何清理、dsh 再次报告时能重新补插、文件索引正式收录后不再被删。
+
 #### 远端是 macOS/BSD 时端口检测恒为「未监听」，实例却报 running（src/control/remote.js）
 - **现象**：`listening()` 只用 `ss -tln` / `netstat -tln`，`killport()` 只用 `fuser` —— 三者都是
   Linux 专有。远端若是 macOS，检测恒为 false、回收是空操作：`ensure` 模式于是跳过「复用已在跑的服务」
