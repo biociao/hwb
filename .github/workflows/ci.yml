@@ -16,3 +16,9 @@ jobs:
           node-version: 22
       # 零 npm 依赖，无需 install —— 直接跑测试即可。
       - run: npm test
+      # 端到端冒烟：真起一个隔离实例（显式 --db/--log）、注册假 home、走一遍各 API +
+      # 上传/下载 + SSE + 移除实例 + 优雅退出。单元测试盖的是函数，这一条盖的是**接线**
+      # （本项目一晚上修出来的问题里，相当一部分只在集成层可见：端口记账、用量缓存、
+      # 降级窗口、渲染拟合……）。默认不带 --with-chrome（CI 里不保证有 Chrome）。
+      - name: 端到端冒烟（smoke-e2e）
+        run: node scripts/smoke-e2e.mjs --port 4394

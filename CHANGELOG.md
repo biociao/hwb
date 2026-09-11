@@ -302,6 +302,15 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   扇出量本身不是问题；单客户端的 4 MiB 背压上限也是有效的。
 
 ### Added
+#### CI 里加上端到端冒烟这一步（.github/workflows/ci.yml）
+- 起因：审查在报告里点了一句 —— `scripts/render-check*.js`、`scripts/smoke-e2e.mjs` 这些
+  **不跑在 `npm test` 里**，所以「18/18 宽度通过」「19/19 冒烟通过」都只是手工结论、不是门禁。
+  渲染检查需要 Chrome（CI 里不保证），但**冒烟不需要**：它只起一个隔离实例、用 fetch 打各 API。
+- 现在 CI 在 `npm test` 之后多跑一步 `node scripts/smoke-e2e.mjs --port 4394`，
+  于是「接线层」也有门禁了：注册/索引/用量/SSE/上传下载/移除实例/优雅退出。
+  （本地实测 17/17 通过、约十几秒；端口用 4394 且脚本自带端口预检，CI 里不会撞。）
+
+### Added
 #### 端到端冒烟：scripts/smoke-e2e.mjs（+ scripts/README-smoke-e2e.md）
 - 一条命令跑完整条链路并逐步断言：起**隔离**实例（显式 `--db/--log`）→ 造一个「更早用过」的假 dsh home
   → 注册/索引 → 列表/工作区/用量（含 24h 空窗口那条链）→ SSE 收到 `index:updated` → 真实 multipart
