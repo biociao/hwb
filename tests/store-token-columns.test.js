@@ -192,7 +192,7 @@ test('store: 回填失败后重启必须自愈（不能把历史永久显示成 
   // ③ 修好之后重启：自动完成回填，数字必须分毫不差
   const b = new IndexStore(file);
   assert.equal(b.usageSummary({ days: 30 }).totalTokens, expected, '重启后必须自愈（而不是永久 0）');
-  assert.equal(Number(b.db.prepare('PRAGMA user_version').get().user_version), 1, '成功后才抬 user_version');
+  assert.equal(Number(b.db.prepare('PRAGMA user_version').get().user_version), 2, '成功后才抬 user_version');
   b.close();
 });
 
@@ -253,4 +253,37 @@ test('applyLiveStatus: 实时只带部分计数时，其余计数保持文件索
   assert.equal((typeof row.status === 'string' ? JSON.parse(row.status) : row.status).kind, 'running');
   assert.equal(row.title, 't2');
   store.close();
+});
+
+// user_version 只能证明「这一版代码写过这个库」，证明不了「列里的值与 tokenUsage 一致」。
+// 审查构造的库：四列都在、user_version = 1（旧版本写的），但四列全是 0 —— 版本 1 的闸门直接放行，
+// 于是历史用量**永久显示 0**，正是这套迁移本来要消灭的症状（实测：uv=0 能自愈、uv=1 不自愈）。
+// 把迁移版本抬到 2 之后，所有既有库都会再跑一次幂等回填，列里的脏值随之被纠正。
+test('store: 派生列全为 0 但 user_version=1 的库也要被回填纠正（版本闸门不能当数据正确的证据）', (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'hwb-uv1-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'hwb.db');
+  const expected = 1234 + 56 + 7 + 1;
+  const a = new IndexStore(file);
+  const homeId = a.registerHome({ homePath: '/m', hostType: 'local' });
+  const now = new Date().toISOString();
+  a.upsertRows([{ type: 'session', homeId, sessionId: 's1', project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: 1234, outputTokens: 56, cacheReadTokens: 7, cacheWriteTokens: 1 }),
+    contextPressure: null, status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 }]);
+  assert.equal(a.usageSummary({ days: 30 }).totalTokens, expected, '前置条件：列里有正确的值');
+
+  // 模拟「外部工具改过 / 从别处拷来的库」：触发器还在（不加触发器的话写入会立刻纠正，见下），
+  // 但既有行的派生列是 0，且版本标记停在旧值 1。
+  a.db.exec('DROP TRIGGER IF EXISTS sessions_tok_ai; DROP TRIGGER IF EXISTS sessions_tok_au;');
+  a.db.exec('UPDATE sessions SET tokInput = 0, tokOutput = 0, tokCacheRead = 0, tokCacheWrite = 0');
+  a.db.exec('PRAGMA user_version = 1');
+  a.close();
+
+  const b = new IndexStore(file);
+  assert.equal(b.usageSummary({ days: 30 }).totalTokens, expected,
+    'uv=1 却四列为 0 的库必须被重新回填（否则历史用量永久显示 0）');
+  assert.equal(Number(b.db.prepare('PRAGMA user_version').get().user_version), 2);
+  const trig = b.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger' AND name IN ('sessions_tok_ai','sessions_tok_au')").get();
+  assert.equal(Number(trig.n), 2, '触发器必须补齐');
+  b.close();
 });

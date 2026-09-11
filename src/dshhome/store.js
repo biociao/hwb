@@ -161,7 +161,13 @@ function daysAgoIso(days) {
 // token 派生列的迁移版本（PRAGMA user_version）、列名与回填表达式。
 // 回填表达式与 SCHEMA 里那两个触发器**必须一致** —— 用同一段字符串生成，避免两套算法漂移。
 // （SQLite 的多语句 exec 中途失败时，前面已成功的语句是保留的，所以补列必须逐列判断。）
-const TOKEN_COLUMNS_VERSION = 1;
+//
+// 为什么是 2 而不是 1：`user_version` 只能证明「我们这一版代码写过这个库」，证明不了
+// 「列里的值与 tokenUsage 一致」。审查构造过这样一个库：四列都在、`user_version = 1`，
+// 但四列全是 0（外部工具改过库、或从别处拷来的 hwb.db）—— 版本 1 的闸门直接放行，
+// 于是**历史用量永久显示 0**，正是这套迁移本来要消灭的症状（实测：uv=0 时能自愈，uv=1 时不自愈）。
+// 抬到 2 会让所有既有库**再跑一次幂等回填**（40k 行实测约 60ms，一次性），列里有脏值也就被纠正了。
+const TOKEN_COLUMNS_VERSION = 2;
 const TOKEN_COLUMN_NAMES = ['tokInput', 'tokOutput', 'tokCacheRead', 'tokCacheWrite'];
 const TOKEN_EXPR = {
   tokInput: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END",
