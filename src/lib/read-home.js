@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, lstatSync, openSync, closeSync, constants as fsConstants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import {
@@ -73,7 +73,18 @@ export function buildSnapshot({ homePath, readText, exists }) {
     providers: [],
     degraded,
   };
-  const readJson = (rel) => JSON.parse(readText(rel));
+  // JSON.parse 的错误消息会**带上文件开头的原始字节**（V8 的 "Unexpected token 'o', \"not json…\""），
+  // 而这条消息会被存进 homes.degraded、经 SSE 广播、并渲染到实例卡上 —— 也就是说
+  // 任意被指向的文件的前几十个字节会泄漏到工作台界面（例如一个指向 /etc/passwd 的符号链接）。
+  // 解析失败只需要说「不是合法 JSON」，细节留在服务端日志里。
+  const readJson = (rel) => {
+    const text = readText(rel);
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error(`${rel}: 不是合法的 JSON`);
+    }
+  };
 
   try {
     const v = validateWorkspaceJson(readJson('storages/workspace.json'));
@@ -132,10 +143,49 @@ export function buildSnapshot({ homePath, readText, exists }) {
   return snapshot;
 }
 
+// 元数据文件的读取上限。正常的 4 个文件是 KB 级（projcache ~268 KB，远端上限 32 MiB），
+// 64 MiB 足够宽松，同时挡住「一个 500 MB 的文件让进程吃掉 ~2 GB 内存」。
+const MAX_METADATA_BYTES = 64 * 1024 * 1024;
+
+/**
+ * 读一个元数据文件。**不能**直接 readFileSync：
+ *
+ * · 如果那个路径是 **FIFO**（命名管道），readFileSync 会一直阻塞等写入端 —— 而且是**同步**阻塞，
+ *   整个事件循环停住。因为 Node 把 listen() 的实际 bind 推迟到下一个事件循环轮次，
+ *   阻塞发生在 HTTP 端口存在之前：表现为「端口连不上、日志里什么都没有、SIGTERM 也无效
+ *   （进程卡在同步读里，信号处理函数没机会跑）」，只能 kill -9，且没有任何诊断信息。
+ *   实测确认：mkfifo 一个 session_projcache.json 就能复现。
+ * · 大文件会被整个读进内存（500 MB → RSS ~2 GB），没有任何上限。
+ *
+ * 因此：先 lstat 确认是**普通文件**（不是符号链接、目录、FIFO、设备），再按大小设限，
+ * 最后用 O_NONBLOCK 打开（真正的防线 —— 即使中间被换成 FIFO，非阻塞 open 也不会挂住）。
+ * 这套做法与 lib/file-preview.js 一致（那里的注释同样写着 "Nonblocking open avoids hanging on FIFOs"）。
+ */
+export function readMetadataFile(homePath, rel) {
+  const target = path.join(homePath, rel);
+  const st = lstatSync(target);          // lstat：不跟随符号链接（见 buildSnapshot 的说明）
+  if (st.isSymbolicLink()) {
+    // 跟随符号链接会把 home 之外的任意文件读进来、持久化进 hwb.db 并展示给浏览器。
+    // 元数据文件没有理由是指向别处的链接。
+    throw new Error(`${rel} 是符号链接（元数据文件必须位于 home 目录内）`);
+  }
+  if (!st.isFile()) throw new Error(`${rel} 不是普通文件`);
+  if (st.size > MAX_METADATA_BYTES) {
+    throw new Error(`${rel} 超过 ${MAX_METADATA_BYTES / 1024 / 1024} MiB 读取上限`);
+  }
+  let fd;
+  try {
+    fd = openSync(target, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    return readFileSync(fd, 'utf8');
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* 已关闭 */ } }
+  }
+}
+
 export function readHome(homePath) {
   return buildSnapshot({
     homePath,
-    readText: (rel) => readFileSync(path.join(homePath, rel), 'utf8'),
+    readText: (rel) => readMetadataFile(homePath, rel),
     exists: (rel) => existsSync(path.join(homePath, rel)),
   });
 }

@@ -76,7 +76,21 @@ installCrashHandlers();
 // 0700：hwb 的状态目录里有会话标题、工作区路径与日志，属于当前用户的私有数据。
 // 原先不带 mode → 0755（实测 ~/.hwb 就是 drwxr-xr-x），同机其它用户可读。
 if (opts.db !== ':memory:') mkdirSync(path.dirname(opts.db), { recursive: true, mode: 0o700 });
-const store = new IndexStore(opts.db);
+// 打不开数据库时给一句能照做的提示。裸的 `new DatabaseSync()` 只会抛
+// `unable to open database file`，而它冒成 uncaughtException → crash handler → exit(1)，
+// CLI 那边只看到「启动失败 (1)，查看 service.log」——路径本身就是个目录/不可写这种最常见的
+// 原因，用户完全无从得知。这里明确说出**哪个路径**、以及可能的原因。
+let store;
+try {
+  store = new IndexStore(opts.db);
+} catch (e) {
+  const why = opts.db === ':memory:' ? '' : `（${opts.db}）`;
+  console.error(`hwb: 无法打开数据库${why}: ${e.message}\n`
+    + '  常见原因：该路径已被一个目录占用、父目录不可写、或文件不是 SQLite 数据库。\n'
+    + '  可删除/改名该路径后重试，或用 `hwb config set db <新路径>` 换一个位置。');
+  log.error('无法打开数据库', e, { db: opts.db });
+  process.exit(2);
+}
 // SQLite 自己按 umask 建文件（实测 0644）。它装着全部会话元数据，收紧到 0600。
 if (opts.db !== ':memory:') { try { chmodSync(opts.db, 0o600); } catch { /* 不支持的 fs 上忽略 */ } }
 for (const homePath of opts.homes) {

@@ -4,6 +4,9 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { homeIdOf } from '../lib/read-home.js';
 import { mergeLiveStatus } from './reader.js';
+import { logger } from '../lib/logger.js';
+
+const log = logger('store');
 
 // 每个 home 的子表（整表替换的粒度）。
 const CHILD_TABLES = ['sessions', 'workspaces', 'providers', 'model_tiers'];
@@ -124,6 +127,27 @@ function bucketStepMs(hours) {
   if (hours <= 168) return 3 * 60 * 60_000;  // 3 小时
   if (hours <= 336) return 6 * 60 * 60_000;  // 6 小时
   return 12 * 60 * 60_000;                   // 12 小时
+}
+
+// 读路径上的 JSON 列必须**容错**：这些列由我们写入，但文件可以被外部工具改、进程可能被
+// 强杀在写入中途、旧版本可能写过别的形状。一个坏值不该让整个工作台消失 ——
+// 原实现是裸 JSON.parse，而 `#enrichHome` 会被 LiveStatusPoller 的定时器**同步**调用，
+// 于是 SyntaxError 直接冒成 uncaughtException → crash handler → process.exit(1)。
+// 实测：只要 homes.endpoints / homes.degraded / sessions.status / sessions.tokenUsage
+// 里有一个不是合法 JSON，进程在启动后 3 秒内必退，且日志里只有一句 JSON 解析错误。
+// 这里统一降级为 fallback，并记一次 warn（同一个字段只记一次，避免刷屏）。
+const warnedJsonColumns = new Set();
+function safeJsonParse(raw, fallback, label) {
+  if (raw === null || raw === undefined || raw === '') return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    if (label && !warnedJsonColumns.has(label)) {
+      warnedJsonColumns.add(label);
+      log.warn('数据库里的 JSON 列无法解析，已降级为默认值（该行可能被外部工具改过）', { column: label });
+    }
+    return fallback;
+  }
 }
 
 export class IndexStore {
@@ -359,12 +383,20 @@ export class IndexStore {
     return port;
   }
 
+  // 记录「该实例索引失败」。它经常是从另一个 catch 里被调用的（indexer 的失败分支），
+  // 所以**自己绝不能再抛**：数据库不可写时（文件被删、目录只读、磁盘满）二次异常会顶掉
+  // 原始错误、让调用方的 catch 再次抛出，进而中断当轮剩下的所有实例。
+  // 写失败只记日志；原始错误由调用方照常上报。
   markHomeError(homeId, error) {
-    this.db.prepare(
-      `UPDATE homes SET status = 'degraded',
-       degraded = json_array(json_object('domain', 'index', 'error', ?, 'degraded', json('true')))
-       WHERE homeId = ?`
-    ).run(String(error), homeId);
+    try {
+      this.db.prepare(
+        `UPDATE homes SET status = 'degraded',
+         degraded = json_array(json_object('domain', 'index', 'error', ?, 'degraded', json('true')))
+         WHERE homeId = ?`
+      ).run(String(error), homeId);
+    } catch (e) {
+      log.warn('写入实例错误状态失败（数据库可能不可写）', { homeId, error: e?.message ?? String(e) });
+    }
   }
 
   // Full-refresh per home: child rows for a home are replaced wholesale.
@@ -518,9 +550,9 @@ export class IndexStore {
       project: r.project,
       title: r.title ?? null,
       lastActivity: r.lastActivity,
-      tokenUsage: r.tokenUsage ? JSON.parse(r.tokenUsage) : null,
-      contextPressure: r.contextPressure ? JSON.parse(r.contextPressure) : null,
-      status: r.status ? JSON.parse(r.status) : null,
+      tokenUsage: safeJsonParse(r.tokenUsage, null, 'sessions.tokenUsage'),
+      contextPressure: safeJsonParse(r.contextPressure, null, 'sessions.contextPressure'),
+      status: safeJsonParse(r.status, null, 'sessions.status'),
     };
   }
 
@@ -560,8 +592,8 @@ export class IndexStore {
     );
     return {
       ...h,
-      endpoints: JSON.parse(h.endpoints || '[]'),
-      degraded: JSON.parse(h.degraded || '[]'),
+      endpoints: safeJsonParse(h.endpoints, [], 'homes.endpoints'),
+      degraded: safeJsonParse(h.degraded, [], 'homes.degraded'),
       providers: this.#providersStmt.all(h.homeId),
       activeTier: this.#tiersStmt.get(h.homeId) ?? null,
       current: this.#currentSession(h.homeId),
@@ -629,9 +661,9 @@ export class IndexStore {
        LIMIT ${int(limit, 50)}`
     ).all(...args).map((s) => ({
       ...s,
-      tokenUsage: s.tokenUsage ? JSON.parse(s.tokenUsage) : null,
-      contextPressure: s.contextPressure ? JSON.parse(s.contextPressure) : null,
-      status: s.status ? JSON.parse(s.status) : null,
+      tokenUsage: safeJsonParse(s.tokenUsage, null, 'sessions.tokenUsage'),
+      contextPressure: safeJsonParse(s.contextPressure, null, 'sessions.contextPressure'),
+      status: safeJsonParse(s.status, null, 'sessions.status'),
     }));
   }
 

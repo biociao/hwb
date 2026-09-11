@@ -53,18 +53,26 @@ test('分隔符扫描：8 MiB 上传必须线性完成，不能退化成 O(n²)'
 
 test('分隔符扫描：数据量翻 4 倍时耗时不应接近翻 16 倍（二次增长特征）', async () => {
   const boundary = '----hwbScaleBoundary123456';
-  const timeFor = async (mb) => {
+  // 取**多次运行的最小值**：最小值反映算法本身，受调度噪声影响远小于单次测量。
+  // （第一版用单次测量 + ratio<8，在整个测试套件并行跑、机器繁忙时会偶发假失败。）
+  const bestOf = async (mb, runs = 5) => {
     const buf = body(boundary, 'x.bin', mb * 1024 * 1024);
-    // 先跑一次让 JIT 预热，再看第二次，避免把冷启动算进来
-    await parse(buf, boundary);
-    const t = performance.now();
-    await parse(buf, boundary);
-    return performance.now() - t;
+    await parse(buf, boundary); // JIT 预热
+    let best = Infinity;
+    for (let i = 0; i < runs; i++) {
+      const t = performance.now();
+      await parse(buf, boundary);
+      best = Math.min(best, performance.now() - t);
+    }
+    return best;
   };
-  const small = Math.max(await timeFor(2), 0.5);
-  const large = await timeFor(8);
+  const small = await bestOf(2);
+  const large = await bestOf(8);
   const ratio = large / small;
-  assert.ok(ratio < 8, `4 倍数据耗时放大 ${ratio.toFixed(1)} 倍（二次增长约 16 倍）—— 扫描疑似重新退化成 O(n²)`);
+  // 线性约 4 倍、二次约 16 倍：要求明显低于二次，同时给慢机器/繁忙机器留足余量。
+  assert.ok(ratio < 10, `4 倍数据耗时放大 ${ratio.toFixed(1)} 倍（二次增长约 16 倍）—— 扫描疑似重新退化成 O(n²)`);
+  // 绝对量兜底：8 MiB 若真退化成 O(n²) 会是秒级
+  assert.ok(large < 1500, `8 MiB 解析最快要 ${large.toFixed(0)} ms，超过 1500 ms`);
 });
 
 test('文件名含裸 % 时按原样使用，不再因 decodeURIComponent 抛 URIError 拒掉整个上传', async () => {

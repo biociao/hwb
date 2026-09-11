@@ -103,3 +103,26 @@ test('indexer: remote live state is read after the SSH snapshot completes', asyn
   await indexer.reindexNow(remote.homeId);
   assert.deepEqual(order, ['ssh', 'live']);
 });
+
+// 退避状态按 homeId 记，实例删除后没人清 —— 长跑（反复增删实例）下 backoffMs/nextDue 会一直涨。
+test('Indexer: 实例被移除后，per-home 退避状态会被清掉', async () => {
+  const { mkdtemp } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const pathMod = await import('node:path');
+  const dir = await mkdtemp(pathMod.join(tmpdir(), 'hwb-idx-prune-'));
+  let homes = [];
+  const indexer = new Indexer({
+    store: { upsertRows() {}, markHomeError() {} },
+    homes: () => homes,
+    baseMs: 60_000,
+  });
+  for (let i = 0; i < 20; i++) homes.push({ homeId: `h${i}`, hostType: 'local', homePath: dir });
+  await indexer.reindexNow();
+  assert.equal(indexer.backoffMs.size, 20);
+  assert.equal(indexer.nextDue.size, 20);
+
+  homes = [];
+  await indexer.reindexNow();
+  assert.equal(indexer.backoffMs.size, 0, '实例删除后不该继续留着它的退避状态');
+  assert.equal(indexer.nextDue.size, 0);
+});

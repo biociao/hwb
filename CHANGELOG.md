@@ -492,6 +492,65 @@ Semantic Versioning.
 
 ### Fixed
 
+#### 数据库里一个坏 JSON 列会让整个工作台退出（src/dshhome/store.js + dshhome/live-poller.js）
+- **实测**：`homes.endpoints` / `homes.degraded` / `sessions.status` / `sessions.tokenUsage` 里
+  只要有一个不是合法 JSON，进程启动后 **3 秒内必定 `exit 1`**。原因是读路径上的裸 `JSON.parse`
+  抛 SyntaxError，而 `#enrichHome` 会被 LiveStatusPoller 的定时器**同步**调用 → uncaughtException
+  → crash handler → `process.exit(1)`。更糟的是启动路径上这个崩溃发生在 `listen()` 之前，
+  所以 `hwb start` 只打印一句「启动失败 (1)，查看 service.log」，用户完全不知道哪一行坏了。
+- **修复**：新增 `safeJsonParse`（降级为默认值 + 每个字段只记一次 warn，指明是哪一列）；
+  `LiveStatusPoller` 的 tick 也包了 try/catch（轮询失败只跳过本轮）。
+  修复后同样的库能正常启动，`/api/homes`、`/api/sessions/recent` 都返回 200，
+  日志明确写出 `column=homes.endpoints`。
+
+#### 元数据文件是 FIFO 时进程会永久卡死（src/lib/read-home.js）
+- **实测**：把 `storages/session_projcache.json` 换成 `mkfifo`，同步的 `readFileSync` 会永远等待
+  写入端。因为 Node 把 `listen()` 的实际 bind 推迟到下一个事件循环轮次，**阻塞发生在 HTTP 端口
+  存在之前**：表现为「端口连不上、日志里什么都没有、`kill -TERM` 也无效（进程卡在同步读里，
+  信号处理函数没机会跑）」，只能 `kill -9`，没有任何诊断。
+  同一个缺陷的温和版本是「一个 500 MB 的元数据文件」：首次 HTTP 200 要等 **5.7 秒**，RSS ~2 GB。
+- **修复**：`readMetadataFile()` 先 `lstat` 确认是**普通文件**（同时拒掉符号链接），
+  按 64 MiB 设上限，再用 `O_NONBLOCK` 打开（与 `file-preview.js` 同一套做法）。
+  FIFO 现在 1 ms 内降级；最坏情况的同步阻塞从 5725 ms 降到 **78 ms**。
+
+#### 符号链接把 home 之外的文件读进索引，并把内容泄漏到界面（src/lib/read-home.js）
+- 元数据文件若是符号链接，`readFileSync` 会跟随它 —— 任意文件的内容会被解析、写进 `hwb.db`、
+  并经 API 展示给浏览器（实测把外部 JSON 的会话标题完整读了进来）。另一条泄漏路径是
+  **JSON 解析错误消息会带出文件开头的原始字节**，而那条消息会存进 `homes.degraded`、
+  经 SSE 广播、渲染到实例卡上（例如一个指向 `/etc/passwd` 的符号链接会把文件开头回显出来）。
+- **修复**：`lstat` + 拒绝符号链接；解析错误统一改为固定的「不是合法的 JSON」。
+
+#### 索引失败的记录动作会顶掉原始错误、并中断整批（src/dshhome/store.js + dshhome/indexer.js）
+- `markHomeError` 是从 indexer 的 `catch` 里调用的，而它自己也写库：数据库不可写时
+  （文件被删、目录只读、磁盘满）二次异常会替换掉原始错误，并且直接从 catch 冒出去，
+  让 `#runAll` 的循环半途而废 —— 后面的实例这一轮完全不刷新。
+- **修复**：`markHomeError` 内部 try/catch（只记日志），indexer 的调用点也再包一层。
+
+#### 索引器串行执行，一个慢实例拖住所有实例（src/dshhome/indexer.js）
+- 远程实例的索引要走 SSH（几秒到几十秒），串行时一个慢实例会把后面所有实例的刷新一起拖住。
+- **修复**：把「到点的实例」用**有限并发**（默认 3，上限 8）跑，结果顺序按实例列表还原，
+  per-home 退避与错误隔离都保持不变。
+
+#### 实时状态可能被更旧的快照覆盖（src/dshhome/indexer.js + dshhome/reader.js）
+- indexer 原先**先**抓实时状态、**再**读文件，于是「抓快照」与「落库」之间留出了几秒的窗口：
+  live-poller 写进更新的状态后，被这边更旧的快照覆盖，界面上的状态徽标倒退一拍。
+  改为读完文件（同步、不会让出事件循环）**之后**再抓实时状态，窗口收敛到 0。
+  顺带把 `reader.js` 的「读文件」与「按快照落库」拆成两个导出，供这里组合。
+
+#### 数据库路径不可用、日志文件被删时的可诊断性（src/server.js + src/lib/logger.js）
+- `new IndexStore()` 失败时只抛一句 `unable to open database file`，并冒成
+  uncaughtException → exit(1)，CLI 那边只有「启动失败 (1)」。现在会明确说出**哪个路径**、
+  以及「该路径已被目录占用 / 父目录不可写 / 不是 SQLite 文件」这几种常见原因。
+- 日志文件被 `rm`/`mv` 或被换成目录之后，写入会继续落到**已 unlink 的 inode** 上：
+  进程看起来一切正常、`/api/logs` 也照常有内容，但磁盘上的日志永远不会再增长
+  （`hwb logs` 会说「日志尚不存在」）—— 恰恰是最需要日志的时候失去磁盘线索。
+  现在每 5 秒比对一次 fd 与路径的 inode，不一致就重开。
+
+- **回归测试**：新增 `tests/hostile-env.test.js`（10 例）：坏 JSON 列不再带崩进程、
+  轮询抛错只跳过本轮、FIFO 立即降级、符号链接被拒且不泄漏外部内容、解析错误不回显文件字节、
+  超限文件被拒、记录失败状态抛错时整批仍继续、并发不打乱顺序且有上限、
+  实时状态不被旧快照覆盖、日志文件被删后自动重建。
+
 #### multipart：非文件字段在前时，后面的文件被整个吞掉（src/lib/multipart.js）
 - `field` 状态找的是**收尾**分隔符 `\r\n--boundary--`，于是在遇到第一个普通字段后就直接跳到
   `done` —— 「字段在前、文件在后」的请求里那个文件根本没被解析。表现为解析成功、零文件，

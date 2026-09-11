@@ -330,6 +330,27 @@ function closeFile() {
   }
 }
 
+// 定期检查「我们持有的 fd 是否还对应磁盘上那个路径」。
+// 日志文件被 rm / 被 mv、或被换成一个目录之后，写入会继续落到**已 unlink 的 inode**上：
+// 进程看起来一切正常、/api/logs 也照常有内容，但磁盘上的日志永远不会再增长（`hwb logs`
+// 会说「日志尚不存在」）—— 恰恰是最需要日志的时候失去磁盘线索。
+// `chmod 000` 不受影响（权限在 open 时检查），所以只需要比对 inode。
+const FD_CHECK_INTERVAL_MS = 5_000;
+let nextFdCheckAt = 0;
+
+function fileFdStillValid() {
+  const now = Date.now();
+  if (now < nextFdCheckAt) return true;
+  nextFdCheckAt = now + FD_CHECK_INTERVAL_MS;
+  try {
+    const open = fs.fstatSync(fileFd);
+    const onDisk = fs.statSync(config.file);
+    return open.ino === onDisk.ino && open.dev === onDisk.dev;
+  } catch {
+    return false; // 路径已不存在，或变成了目录
+  }
+}
+
 function writeFileLine(line) {
   // fileFd 为空时按节流重试打开（而不是永久放弃）。打开失败本身不写日志（会递归），
   // 由 reportFileError 在 console 上提示一次。
@@ -337,6 +358,12 @@ function writeFileLine(line) {
     const now = Date.now();
     if (now < nextOpenAttemptAt) return;
     nextOpenAttemptAt = now + openRetryMs;
+    openFile();
+    if (fileFd === null) return;
+  }
+  // 路径上的文件已经被换掉/删掉了：关掉旧 fd 重新打开，让磁盘日志接上。
+  if (!fileFdStillValid()) {
+    closeFile();
     openFile();
     if (fileFd === null) return;
   }

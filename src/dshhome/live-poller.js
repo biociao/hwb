@@ -15,7 +15,17 @@ export class LiveStatusPoller {
     if (this.running) return;
     this.running = true;
     const tick = () => {
-      for (const home of this.homes()) this.refresh(home.homeId);
+      // 这里的 listHomes() 是同步的，跑在 setInterval 回调里 —— 一旦抛错（例如数据库里某行
+      // 的 JSON 列坏了），它会直接变成 uncaughtException：crash handler 走 process.exit(1)，
+      // 整个工作台消失且没有任何界面提示。轮询失败只该跳过这一轮。
+      let homes;
+      try {
+        homes = this.homes();
+      } catch (error) {
+        log.warn('实时轮询读取实例列表失败（本轮跳过）', { error: error?.message ?? String(error) });
+        return;
+      }
+      for (const home of homes) this.refresh(home.homeId);
     };
     tick();
     this.timer = setInterval(tick, this.intervalMs);

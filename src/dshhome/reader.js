@@ -49,9 +49,21 @@ export function mergeLiveStatus(rows, live, { homeId, generatedAt }) {
 
 export function indexHome(store, homePath, live = null) {
   const snapshot = readHome(homePath);
+  const rows = indexSnapshot(store, homePath, snapshot, live);
+  return { snapshot, rows };
+}
+
+// 把「读文件」与「按快照落库」拆开，供调用方在两者之间插入别的异步步骤
+// （indexer 要在读完文件**之后**才抓实时状态，这样抓到的快照与落库之间没有窗口；
+//   参见 dshhome/indexer.js 的注释）。
+export function readHomeSnapshot(homePath) {
+  return readHome(homePath);
+}
+
+export function indexSnapshot(store, homePath, snapshot, live = null) {
   const rows = mergeLiveStatus(normalize(snapshot), live, snapshot);
   store.upsertRows(rows);
-  return { snapshot, rows };
+  return rows;
 }
 
 // 远程实例只读索引（§4.6）：经 SSH cat 元数据 → buildSnapshot → normalize → 入库。
