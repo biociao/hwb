@@ -95,6 +95,12 @@ async function readJsonBounded(res, maxBytes = MAX_RPC_BYTES) {
       }
       chunks.push(value);
     }
+  } catch (error) {
+    // 读取中途失败/被 abort：原因必须**如实**报出来。原先是 `res.json()` 抛错后统一写成
+    // 「rpc response not json」—— 一个 4s 超时被 abort 的请求会显示成「响应不是 JSON」，
+    // 排查时把人引向「对方返回格式不对」（审查指出的小瑕疵）。
+    const name = error?.name ?? '';
+    return { __error: name === 'AbortError' || name === 'TimeoutError' ? 'rpc timeout' : 'rpc read failed' };
   } finally {
     try { reader.releaseLock?.(); } catch { /* 已经释放/已取消 */ }
   }

@@ -132,3 +132,23 @@ test('toLiveRow: 包装形态（{ver,seq,val}）的投影值同样被解开', as
     assert.equal(flat[0].status.kind, 'completed');
   } finally { globalThis.fetch = saved; }
 });
+
+// 读取中途被 abort（4s 超时）原先会被写成「rpc response not json」—— 排查时把人引向
+// 「对方返回格式不对」，而真实原因是超时（审查指出的小瑕疵）。
+test('rpc 读取被 abort 时报「rpc timeout」而不是「not json」', async () => {
+  const { LiveStatusReader } = await import('../src/dshhome/live-status.js');
+  const saved = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"type":"server-response"'));
+        const err = new Error('aborted'); err.name = 'AbortError';
+        controller.error(err);
+      },
+    }), { headers: { 'content-type': 'application/json' } });
+    const reader = new LiveStatusReader();
+    assert.equal(await reader.read('http://127.0.0.1:9/', {}), null);
+    // 状态里记的是 timeout 这个原因（report 只在原因变化时打日志，所以这里直接读 states）
+    assert.equal([...reader.states.values()][0], 'rpc timeout');
+  } finally { globalThis.fetch = saved; }
+});
