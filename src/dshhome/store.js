@@ -879,6 +879,12 @@ export class IndexStore {
     }));
   }
 
+  // ⚠️ 两个「输入」口径不同，别把它们当成同一个数：
+  //   · usageSummary/usageTrend/... 的 inputTokens = **新增输入**（tokInput，不含缓存）
+  //   · recentProjects 的 inputTokens = **总输入**（tokInput + tokCacheRead + tokCacheWrite）
+  // 同一条会话实测 1000 vs 1950。前者与用量卡片的分项对齐，后者是「这个项目一共消耗了多少输入」
+  // （项目卡片就是按这个排序的）。界面上标签已写明（项目卡片 in 的 title 提示含缓存）。
+
   // Token 用量汇总（基于会话聚合 tokenUsage）：总 Tokens / 输入 / 输出 / 缓存命中 / 缓存创建 / 缓存命中率。
   usageSummary({ days = 30 } = {}) {
     const since = daysAgoIso(days);

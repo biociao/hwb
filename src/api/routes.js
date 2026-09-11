@@ -440,9 +440,24 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       if (launcher.status(home.homeId)) {
         const current = home.endpoints?.find((e) => e.id === home.activeEndpointId);
-        const changedEndpoint = patch.endpoints && ((!current && patch.endpoints.length > 0) || JSON.stringify(patch.endpoints.find((e) => e.id === home.activeEndpointId)) !== JSON.stringify(current));
+        // 「正在使用的端点」只有两种动法会真的打断它：改动**当前**端点本身，或新增端点后要切过去。
+        // 原先的判定是「没有 current 且提交了端点就拒绝」—— 而「没有 current」正是**拉起模式**
+        // （实例由 hwb 自己启动、还没配置任何连接端点）的常态：用户想在设置里补一个端点，
+        // 每次都被 409 挡住，而提示还建议「添加其他端点并切换后再修改」——切换 UI 需要 ≥2 个端点，
+        // 所以那句建议在这条路径上**无法执行**（实测：同一请求先断开就 200）。
+        // 现在：新增**与当前无关**的端点不再算「改动当前端点」（id 不同即无关；没有 current 时
+        // 提交的都是新增），只有真的修改/删除当前端点才拒绝。
+        const activeIncoming = current ? patch.endpoints?.find((e) => e.id === current.id) : null;
+        const removedActive = Boolean(current) && Array.isArray(patch.endpoints) && !activeIncoming;
+        const changedEndpoint = Boolean(patch.endpoints) && (removedActive
+          || (activeIncoming && JSON.stringify(activeIncoming) !== JSON.stringify(current)));
         const changesConnection = ['host', 'remotePort', 'localPort', 'accessPort', 'homePath', 'remoteHome', 'remoteCmd', 'remoteLog', 'token'].some((key) => patch[key] !== undefined && patch[key] !== home[key]);
-        if (changedEndpoint || changesConnection) { send(res, 409, { error: '当前连接端点正在使用；可添加其他端点并切换后再修改它' }); return; }
+        if (changedEndpoint || changesConnection) {
+          send(res, 409, { error: current
+            ? '当前连接端点正在使用；可先「断开」，或添加其他端点并在卡片上切换后再修改它'
+            : '当前连接正在使用这份配置；请先「断开」再修改' });
+          return;
+        }
       }
       const updated = store.updateHomeConfig(home.homeId, patch);
       send(res, 200, { home: { ...publicHome(updated), runtime: monitor.get(home.homeId) } });

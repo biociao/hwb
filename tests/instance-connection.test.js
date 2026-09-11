@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { IndexStore } from '../src/dshhome/store.js';
 import { instanceKey, connectedHomes, tabHomes } from '../src/web/instance-state.js';
 import { renderInstanceGrid } from '../src/web/components/instance-grid.js';
+import { Readable } from 'node:stream';
 import { createRouter } from '../src/api/routes.js';
 import { Launcher } from '../src/control/launcher.js';
 
@@ -114,4 +115,54 @@ test('disconnect adopted local closes proxies without stopping the instance', as
   await launcher.disconnect({ homeId: 'local', hostType: 'local' });
   assert.equal(closed, 1);
   assert.equal(launcher.status('local'), null);
+});
+
+// 「正在使用的端点」判定原先把「没有 active 端点 + 提交了端点」也当成改动当前端点 ——
+// 而「没有 active 端点」正是**拉起模式**（hwb 自己启动、还没配连接端点）的常态。
+// 结果是：连接着的实例无法在设置里补第一个端点，409 还建议「添加其他端点并切换后再修改」，
+// 而切换需要 ≥2 个端点，那句建议在这条路径上无法执行。实测：同一请求先断开就 200。
+test('配置更新: 连接中的实例可以新增端点（只有改动/删除当前端点才拒绝）', async () => {
+  const store = new IndexStore(':memory:');
+  const homeId = store.registerHome({ homePath: '/tmp/mock-home', hostType: 'local' });
+  const router = createRouter({
+    store,
+    launcher: { status: () => ({ phase: 'running' }), disconnect: async () => {} },
+    monitor: { get: () => ({ runtime: 'running' }) },
+    indexer: { reindexNow: async () => [] },
+  });
+  const put = async (body) => {
+    const req = new Readable({ read() {} });
+    req.on('error', () => {});
+    req.method = 'PUT';
+    req.headers = { 'content-type': 'application/json', origin: 'http://127.0.0.1:4310', host: '127.0.0.1:4310' };
+    const chunks = [Buffer.from(JSON.stringify(body))];
+    const result = { headers: {} };
+    const res = {
+      setHeader(k, v) { result.headers[k] = v; },
+      writeHead(code, fields) { result.status = code; Object.assign(result.headers, fields || {}); },
+      end(payload) { result.body = payload ? JSON.parse(payload) : null; },
+    };
+    const url = new URL(`http://127.0.0.1/api/homes/${homeId}`);
+    const pending = router(req, res, url).catch((e) => { result.error = e.message; });
+    for (const c of chunks) req.push(c);
+    req.push(null);
+    await pending;
+    return result;
+  };
+
+  // ① 拉起模式（没有 active 端点）：新增一个端点应当被接受
+  const added = await put({ endpoints: [{ host: null, port: 3080 }] });
+  assert.equal(added.status, 200, `新增端点应成功，实际 ${added.status}: ${JSON.stringify(added.body)}`);
+  assert.ok(store.getHome(homeId).endpoints.length >= 1);
+
+  // ② 改动**当前**端点：仍然要拒绝（实例正在用它）
+  const active = store.getHome(homeId);
+  const modified = await put({ endpoints: active.endpoints.map((e) => ({ ...e, port: e.id === active.activeEndpointId ? 9999 : e.port })) });
+  assert.equal(modified.status, 409, '改动正在使用的端点必须拒绝');
+  assert.match(modified.body.error, /断开|切换/);
+
+  // ③ 新增一个与当前无关的端点：允许
+  const extra = await put({ endpoints: [...store.getHome(homeId).endpoints.map((e) => ({ ...e })), { host: null, port: 3099 }] });
+  assert.equal(extra.status, 200, `新增另一个端点应成功，实际 ${extra.status}`);
+  store.close();
 });
