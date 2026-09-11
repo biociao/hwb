@@ -204,3 +204,21 @@ test('live poller: 一轮 tick 只读一次实例列表（不是每个实例一�
   assert.ok(listCalls >= 1, `tick 必须真的跑过（实际读了 ${listCalls} 次实例列表）`);
   assert.ok(listCalls <= 2, `8 个实例只该读 1-2 次实例列表（实际 ${listCalls} 次）—— 传 home 对象正是为此`);
 });
+
+// 每轮每实例的 getHome 从两次减到一次：两行之间没有 await（getHome 是同步的），第二次读到的
+// 必然是同一个值。规模审查实测单个 400k 会话的 home 上 getHome 要 32.6ms，而这里每轮每实例都跑。
+test('live poller: 一轮 refresh 只点查一次该实例（原先是两次相邻的 getHome）', async () => {
+  let gets = 0;
+  const store = {
+    getHome: () => { gets++; return { homeId: 'h1', activeEndpointId: null }; },
+    applyLiveStatus: () => {},
+    liveStatusAt: () => 0,
+  };
+  const poller = new LiveStatusPoller({
+    store, homes: () => [{ homeId: 'h1', activeEndpointId: null }],
+    read: async () => [{ sessionId: 'x', status: { kind: 'idle', label: '空闲' } }], intervalMs: 60_000,
+  });
+  poller.running = true;
+  await poller.refresh('h1');
+  assert.equal(gets, 1, `一次 refresh 只该点查一次实例（实际 ${gets} 次）`);
+});

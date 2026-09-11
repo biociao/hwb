@@ -561,6 +561,15 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   `scripts/render-check-dim-switch.js` 用真浏览器量两条路径（修复前「切维度后」失败）。
 
 ### Fixed
+#### 实时轮询每轮每实例多读一次实例（src/dshhome/live-poller.js）
+- 相邻两行各调一次 `store.getHome(homeId)`：`if (!… || !this.store.getHome(homeId)) return;` 紧接着
+  `if (this.store.getHome(homeId).activeEndpointId !== …) return;`。两行之间**没有 await**（getHome 是
+  同步的），所以第二次读到的必然是同一个值 —— 纯多余。规模审查实测：单个 400k 会话的 home 上
+  `getHome` 要 **32.6ms**，而这个函数**每轮每实例**都会跑。
+- 修复：合并成一次点查。等价性是显然的（同一个 tick 内的同步调用之间不可能有写入）。
+- **回归测试**：`tests/live-poller.test.js` —— 一次 refresh 只允许点查一次（用计数桩）。修复前失败。
+
+### Fixed
 #### 文件索引每 60s 把「纯实时行」删掉一次，几秒后再补插回来（真实数据上每分钟 321 行）
 - **来源**：本轮用真实数据对照时发现的 —— 用户那台机器的 dsh 实时列表有 **500** 条会话，
   而 projcache 文件里只有 **179** 条（逐 sessionId 比对确认：179 条两边都有，另外 **321 条只在库里、

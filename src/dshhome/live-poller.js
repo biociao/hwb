@@ -82,8 +82,12 @@ export class LiveStatusPoller {
     }
     if (!home) return Promise.resolve();
     const work = Promise.resolve().then(() => this.read(home)).then((live) => {
-      if (!this.running || !Array.isArray(live) || !this.store.getHome(homeId)) return;
-      if (this.store.getHome(homeId).activeEndpointId !== home.activeEndpointId) return;
+      // 一次点查就够：两行之间没有 await（getHome 是同步的），所以第二次读到的必然是同一个值 ——
+      // 原先每轮每实例多花一次 `getHome`，而它在大库上是真实成本（规模审查实测：单个 400k 会话的
+      // home 上 `getHome` 要 32.6ms，而这个函数每轮每实例都会被调用）。
+      const current = this.store.getHome(homeId);
+      if (!this.running || !Array.isArray(live) || !current) return;
+      if (current.activeEndpointId !== home.activeEndpointId) return;
       this.store.applyLiveStatus(homeId, live);
       this.writeErrors.delete(homeId);
       this.broadcast('index:updated', { homeId, source: 'live', sessionCount: live.length });
