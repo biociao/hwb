@@ -226,12 +226,19 @@ CREATE TABLE model_tiers (...);
 
 **索引策略：**
 - `idx_sessions_project` — 按项目聚合
-- `idx_sessions_activity` — Recent 排序
+- `idx_sessions_activity` — Recent 排序（`ORDER BY lastActivity DESC … LIMIT`）
 - `idx_sessions_home` — 按实例过滤
+- `idx_sessions_home_ws` — `(homeId, workspaceId)`：`recentProjects` 里「孤立 workspace」那一半
+  （找出挂到某实例、但没有任何会话的 workspace）。**没有它时这一半是全表扫描**：规模审查在
+  400k 会话 / 50k workspace 上实测 **35,340ms 却只产出 0 行**，整个 `recentProjects` 44,311ms，
+  期间并发探针测到**整个服务停顿 9,758ms**（平时 p50 0.3ms）。加上它：35,340ms → **43ms**、
+  整个查询 → 1,224ms。既有库在下次打开时由 `CREATE INDEX IF NOT EXISTS` 自动补上。
 - `homes_access_port` — 接入端口唯一（部分索引）
 
 > 用量聚合现在 SUM 派生整数列，不再逐行 `json_extract`（同一份 40k 数据上等效 5 条聚合
 > 175ms → 76ms；代价是每行插入多一次 UPDATE：20k 行 43ms → 172ms）。
+> 引用这类数字时**要把夹具一起说**：同一个 `/api/usage` 在「40k 全 idle + 单 project」的简化夹具上是
+> 55ms，而在「10 实例 + 偏斜活跃度 + 多 project」的真实形态夹具上是 148ms —— 差的是夹具不是代码。
 
 ### 4.6 远端只读索引（与本地共用同一套 schema）
 
