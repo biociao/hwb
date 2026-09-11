@@ -11,9 +11,11 @@
 //   · 只接受单文件字段，多余部分一律报错而不是静默丢数据。
 //
 // ⚠️ 端到端内存**不是恒定**的：解析器把字节交给同步的 write(chunk)，而落盘写入是异步的，
-// 于是**当前的上传路由**（src/api/routes.js）把每个 chunk 先推进数组、解析完再交给写入端 ——
-// 实测 64 MiB 上传会在解析期间保留约 64 MiB 的 chunk 数组。上限 256 MiB 时是同一量级。
-// 这是有界且短暂的开销（单机工具、单请求），但不要据此声称「内存占用与文件大小无关」；
+// 于是**当前的上传路由**（src/api/routes.js）把每个 chunk 先推进数组、解析完再交给写入端。
+// 实测（64 MiB 上传，同进程内采样）：进程 RSS 峰值 **+202 MiB（≈3× 文件大小）** —— 数组本身
+// 是 1×（保留的是 socket 收到的那些 buffer），其余来自 HTTP 层自身的缓冲与 GC 尚未回收的页。
+// 解析器自身是零拷贝的（`take()` 返回 subarray 视图，见下），所以这部分开销**不在**这里。
+// 上限 256 MiB 时按同一比例 ≈ 800 MiB 峰值：有界、短暂，但对常驻工作台进程不算小。
 // 要改成真流式，需要让解析器支持异步写入端。CHANGELOG 的 [Unreleased] Notes 里有同一条订正。
 export function parseMultipart(req, { boundary, maxBytes, onFileStart, write, onSettle }) {
   // 分隔符一律带前导 CRLF：只匹配 `--boundary` 会误伤头部里的子串（如 "multipart/form-data"

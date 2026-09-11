@@ -267,9 +267,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
           maxBytes: UPLOAD_BYTES,
           // 解析出的文件名（浏览器可能带上目录前缀）交给 writeUpload 再规范化一次。
           // 注意这里是**攒在内存里**：解析器的 write(chunk) 是同步契约，而落盘（uploader.write）
-          // 是异步的，路由无法在回调里 await。实测 64 MiB 上传会在解析期间保留约 64 MiB 的数组
-          // （上限 256 MiB 时同一量级）—— 有界且短暂，但**不是**恒定内存。要改成真流式需要让
-          // 解析器支持异步写入端。CHANGELOG 的 Notes 与 multipart.js 头部都写了同一条订正。
+          // 是异步的，路由无法在回调里 await。实测 64 MiB 上传 → 进程 RSS 峰值 +202 MiB（≈3×），
+          // 上限 256 MiB 时按同一比例 ≈800 MiB 峰值。有界、短暂，但**不是**恒定内存；
+          // 要改成真流式需要让解析器支持异步写入端。multipart.js 头部与 CHANGELOG 的 Notes 有同一条订正。
           onFileStart(name) { current = { name, chunks: [] }; parts.push(current); return true; },
           write(chunk) {
             if (!current) throw new Error('上传请求格式无效');
