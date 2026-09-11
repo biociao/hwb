@@ -170,7 +170,7 @@ test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然�
   // ② 空锁文件（上次在创建与写内容之间被杀）同样算残留 —— 但要**过期**才算：
   // 空锁可能是并发命令刚创建的那一瞬间，那必须视为「被持有」（见下一条用例）。
   fs.writeFileSync(lock, '');
-  const aged = new Date(Date.now() - 60_000);
+  const aged = new Date(Date.now() - 10 * 60_000);
   fs.utimesSync(lock, aged, aged);
   await run('start');
   await run('stop');
@@ -182,7 +182,7 @@ test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然�
 
   // ④ PID 复用：持有者「活着」但这个 PID 其实是无辜的旁观者 —— 只看 PID 活不活会被它永久卡住
   // （macOS 的 PID 上限约 99998，回收很常见）。心跳过期即视为残留。
-  const stale = new Date(Date.now() - 60_000);
+  const stale = new Date(Date.now() - 10 * 60_000);   // 远超过期阈值
   fs.utimesSync(lock, stale, stale);
   const taken = await run('start');
   assert.match(taken.stdout, /已启动/, '心跳过期的锁应被接管，而不是让所有启停命令都失败');
@@ -341,8 +341,33 @@ test('CLI 启停锁：刚创建的空锁算「被持有」，过期空锁才算�
   fs.writeFileSync(lock, '');                       // 空锁 + 刚刚的 mtime = 并发命令正在写
   await assert.rejects(run('start'), /持有/, '空但新鲜的锁必须被视为被持有');
 
-  const old = new Date(Date.now() - 60_000);
+  const old = new Date(Date.now() - 10 * 60_000);
   fs.utimesSync(lock, old, old);                    // 空锁 + 过期 mtime = 上次崩在 open 与 write 之间
+  const taken = await run('start');
+  assert.match(taken.stdout, /已启动/);
+  await run('stop');
+  fs.rmSync(lock, { force: true });
+});
+
+// 心跳阈值必须大于「持有者最长的一次阻塞调用」。`hwb upgrade` 会跑 git pull 与**整套测试**，
+// 而它们走 spawnSync —— 事件循环被整个阻塞，心跳定时器根本不会触发。
+// 若阈值按「心跳的几倍」取（例如 20s），upgrade 跑到一半就会被另一个 start/stop 判成残留并接管，
+// 锁在最该生效的场合失效。这里用「PID 活着 + 60s 没有心跳」来代表一台正在跑阻塞命令的持有者。
+test('CLI 启停锁：持有者正卡在阻塞调用里（心跳暂停）时不得被抢', async t => {
+  const { dir, run } = await fixture(t);
+  const lock = path.join(dir, 'service.lock');
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+
+  // 自己的 PID（活）+ 60s 前的心跳：正常路径下心跳是 5s 一次，但这 60s 里它正在跑阻塞命令
+  fs.writeFileSync(lock, `${process.pid} ${Date.now()}`);
+  const aged = new Date(Date.now() - 60_000);
+  fs.utimesSync(lock, aged, aged);
+  await assert.rejects(run('start'), /持有/, '不能因为心跳暂停就抢走锁');
+
+  // 真过期（10 分钟）才接管
+  const dead = new Date(Date.now() - 10 * 60_000);
+  fs.utimesSync(lock, dead, dead);
   const taken = await run('start');
   assert.match(taken.stdout, /已启动/);
   await run('stop');

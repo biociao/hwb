@@ -152,7 +152,11 @@ function run(command, args, capture = false) {
   const env = { ...process.env };
   // A CLI invoked by a Node test must still run its own test suite.
   delete env.NODE_TEST_CONTEXT;
+  // spawnSync **阻塞事件循环**，心跳定时器在这期间不会触发 —— 前后各摸一次锁，
+  // 让「正在跑长命令」期间锁的 mtime 尽量新（阈值见 LOCK_STALE_MS 的说明）。
+  touchLock();
   const result = spawnSync(command, args, { cwd: root, env, stdio: capture ? 'pipe' : 'inherit', encoding: 'utf8' });
+  touchLock();
   if (result.error) throw result.error;
   if (result.status !== 0) throw Error(`${command} 失败 (${result.status})${result.stderr ? ': ' + result.stderr.trim() : ''}`);
   return result.stdout?.trim();
@@ -272,7 +276,16 @@ function pidAlive(pid) {
 
 // 启停锁的持有者每 REFRESH_MS 更新一次锁文件的 mtime；超过 STALE_MS 没更新就认为它已经不在了。
 const LOCK_REFRESH_MS = 5_000;
-const LOCK_STALE_MS = 20_000;   // 4 次没心跳（留足负载抖动）
+// STALE_MS 的取值**不是**「心跳的几倍」，而是「必须大于持有者最长的一次阻塞调用」：
+// `hwb upgrade` 会依次执行 `git pull` 与**整套测试**，而它们走的是 `spawnSync` —— 事件循环
+// 被整个阻塞住，心跳定时器根本不会触发。若阈值太短（例如按心跳 4 倍取 20s），upgrade 跑到一半
+// 就会被另一个 `hwb stop`/`start` 判成残留并接管，锁在多线程意义上被绕过 —— 而那正是它要防的事。
+// 2 分钟远大于任何单次阻塞调用（本仓库整套测试约 6 秒，git pull 若干秒），
+// 代价是持有者被 kill -9 后，最多要等 2 分钟才自动接管（其间提示里也写明了可手工删除）。
+const LOCK_STALE_MS = 120_000;
+// run() 是阻塞调用，进入/返回时各摸一次锁，让「正在跑长命令」期间 mtime 尽量新。
+let activeLock = null;
+const touchLock = () => { try { activeLock?.touch(); } catch { /* 锁已被清掉 */ } };
 
 // 拿启停锁。
 //
@@ -326,11 +339,19 @@ function acquireLock(lock) {
       fs.writeFileSync(lock, body, { flag: 'wx', mode: 0o600 });
       const beat = setInterval(() => { const now = new Date(); try { fs.utimesSync(lock, now, now); } catch { /* 锁已被清掉 */ } }, LOCK_REFRESH_MS);
       beat.unref?.();
-      return { release() { clearInterval(beat); try { fs.rmSync(lock, { force: true }); } catch { /* 已被清掉 */ } } };
+      const touch = () => { const now = new Date(); try { fs.utimesSync(lock, now, now); } catch { /* 锁已被清掉 */ } };
+      return {
+        touch,
+        release() { clearInterval(beat); try { fs.rmSync(lock, { force: true }); } catch { /* 已被清掉 */ } },
+      };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       const info = lockHeldBy(lock);
-      if (info.held) throw Error(`另一个启停命令（PID ${info.pid}）持有 ${lock}；确认它确实不在运行后，删除该锁文件即可`);
+      if (info.held) {
+        const age = Math.round(info.ageMs / 1000);
+        throw Error(`另一个启停命令（PID ${info.pid}）持有 ${lock}（${age}s 前还有更新）；`
+          + `确认它确实不在运行后，删除该锁文件即可（残留锁最迟 ${Math.round(LOCK_STALE_MS / 1000)}s 后会自动接管）`);
+      }
       if (attempt === 0 && takeOverLock(lock, info.raw)) {
         // 只动这一个锁文件，不碰任何进程。
         const why = info.alive
@@ -350,7 +371,8 @@ async function dispatch() {
   fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
   const lock = path.join(serviceDir, 'service.lock');
   const held = acquireLock(lock);
+  activeLock = held;
   try { return await main(); }
-  finally { held.release(); }
+  finally { activeLock = null; held.release(); }
 }
 dispatch().catch(err => { console.error(`hwb: ${err.message}`); process.exitCode = 1; });
