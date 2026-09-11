@@ -597,3 +597,27 @@ test("CLI: 前台 serve 退出时会清掉 service.port（exit 钩子清理）",
   assert.equal(code, 0, `SIGTERM 后应自行退出（实际 ${code}）`);
   assert.ok(!fs.existsSync(path.join(dir, 'service.port')), '退出时必须清掉端口记录（否则下一次 stop/status 会被陈旧记录带偏）');
 });
+
+// 数据库文件里存着 dsh 的**控制凭据**（`homes.token` / endpoints 里的 token），而 SQLite 按 umask
+// 建文件（实测 0644）—— 同机其它用户可以直接读走凭据。`src/server.js` 启动时会 chmod 0600
+// （提交 61c7cfb），但那条性质一直没有测试。这里用真启动一次前台 serve 来验证。
+test('CLI: 启动服务时会把数据库文件收紧到 0600（里面存着 dsh token）', async (t) => {
+  const fsx = await import('node:fs');
+  const { dir } = await fixture(t);
+  const n = await port();
+  const db = path.join(dir, 'hwb.db');
+  // 先按 umask 建出一个 0644 的库（模拟老版本留下的状态）
+  fsx.writeFileSync(db, '');
+  fsx.chmodSync(db, 0o644);
+  assert.equal(fsx.statSync(db).mode & 0o777, 0o644, '前置条件：库文件是 world-readable');
+  const child = spawn(process.execPath, [cli, 'serve', '--port', String(n), '--db', db, '--log', path.join(dir, 'serve.log')],
+    { env: { ...process.env, HWB_DIR: dir }, stdio: 'ignore' });
+  t.after(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } });
+  let up = false;
+  for (let i = 0; i < 60 && !up; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    up = await fetch(`http://127.0.0.1:${n}/api/homes`).then((r) => r.ok, () => false);
+  }
+  assert.equal(up, true, '前置条件：服务已就绪');
+  assert.equal(fsx.statSync(db).mode & 0o777, 0o600, '库文件必须收紧到 0600（凭据不能 world-readable）');
+});
