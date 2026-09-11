@@ -459,7 +459,9 @@ hwb/
 npm test        # node --test tests/*.test.js
 ```
 
-当前 **359 个用例（45 个测试文件）全绿**，交叉覆盖：schema 校验 / normalize 纯函数 / read-home 读取 /
+当前**全套用例全绿**。确切条数与文件数以 `npm test` 的输出为准 —— 这里刻意不写死任何数字，
+因为那种数字每加一个用例/文件就会过期一次（历史上它从 62 漂到 359 再到 419 都没人发现）。
+`tests/docs-consistency.test.js` 会守住这条「文档不自带会过期的计数」的约定。交叉覆盖：schema 校验 / normalize 纯函数 / read-home 读取 /
 credentials 解析 / status 推导 / quota 适配器与 TTL 缓存 / store 查询与用量聚合 /
 monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深链探测 /
 API 层（跨站写保护、DNS rebinding、请求体上限、UTF-8 分片解码）/ multipart 解析与上传 /

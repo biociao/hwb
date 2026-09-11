@@ -469,6 +469,14 @@ Semantic Versioning.
 - **修复**：`.log-body` 的 `max-height` 由 `260px` 提升到 `520px`，一次可见行数约翻倍；仍 `overflow-y: auto`
   内部滚动，配合「跟随到底」+ 级别过滤，长日志不必频繁滚动。
 
+### Added
+
+- `tests/docs-consistency.test.js`：把「文档与代码不一致」这类问题变成**会失败的测试**，而不是靠人记得同步。
+  覆盖：README 的 REST API 表 vs `routes.js` 里的路由、SSE 事件清单 vs `store.js` 的订阅、
+  Node 门槛 vs `package.json` / `node-version.js`、`package.json` 的 `files` vs README 引用的本地资源，
+  以及「README 不得写死会过期的计数」。README 里原本的「当前 62 个用例」已经漂到 359、又到 419 都没人发现，
+  现在改为不写数字并由此测试守住。
+
 ### Fixed
 
 #### dsh-remote-index / dsh-merged-index 两个独立工具（此前完全没有测试覆盖）
