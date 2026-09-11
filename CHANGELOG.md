@@ -4,6 +4,66 @@ All notable changes to **hwb** are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), this project adheres to
 Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+
+#### 文件预览侧栏支持拖拽上传（src/web/components/file-preview.js + src/lib/file-preview.js + src/api/routes.js）
+- 浏览目录时侧栏显示上传区：拖拽文件到侧栏即上传到**当前预览目录**，也可点「选择文件上传」；
+  多文件串行上传并显示整批进度，完成后自动刷新目录列表。单文件上限 256 MiB（前端先过滤超限文件）。
+- 新增 `PUT /api/homes/{homeId}/upload`：只接受 multipart 文件字段，落盘位置完全由服务端依据
+  已登记工作区 + 当前目录决定（只取文件名，`..`/符号链接/工作区外路径全部拒绝），跨站写入返回 403。
+- **同名不覆盖**：已存在 `data.csv` 时新文件落为 `data(1).csv`（本机与远端一致）。
+- 原子落盘：先写隐藏临时文件、写满后 `link`/`replace` 到最终名；中断只会留下隐藏临时文件，
+  且 `stage`/`cleanup`/`commit` 都会清掉暂存目录，不在项目目录留副产物。
+
+### Notes
+
+- 远程实例的上传**内容经命令行参数按 512 KiB 分片传输**（远端先分片落盘到临时目录再合并）。
+  实测把文件字节写到 `sshBash` 的 stdin 不可行：`bash -s` 会把脚本之后的字节当命令执行
+  （表现为 `...: command not found`，Python 一个字节都读不到）；而「长度前缀」之类的 stdin 协议
+  又会被 bash 的预读吞掉，无法保证字节边界。分片参数传输没有这个问题，也不受 macOS 单参数上限影响。
+- 上传的 multipart 解析是流式的（`src/lib/multipart.js`）：边解析边把文件字节交给写入端，
+  内存占用与文件大小无关；缺失 `Content-Length` 时直接拒绝，以保证写盘前就能设限。
+
+### Fixed
+
+#### 文件预览不再依赖「内嵌页上报会话」这一条链路（src/web/components/file-preview.js）
+- **现象**：侧栏能打开，但一直显示「请先在 dsh 中打开项目会话，预览会自动绑定其工作区」，
+  该实例的文件与目录在预览区完全打不开。
+- **定位**：服务端与索引都是好的——直接请求
+  `GET /api/homes/{homeId}/preview?sessionId=session-085baaae-…` 正常返回 PMAID 的工作区与目录内容，
+  `sessions`/`workspaces` 表里该会话的 `workspaceId` 也齐全。失效点在前端握手：侧栏的绑定只来自
+  内嵌页 `preview-bridge.js` 上报的 `hwb:preview-context`，一旦该上报没有到达（dsh 不使用
+  `?session=` 做 SPA 导航、上报被代理/浏览器策略打断等），面板就只剩一句提示，
+  而浏览/下载/上传全部不可用。
+- **修复**：让侧栏有第二条入口——标题栏新增工作区下拉，直接列出 hwb 索引里该实例的全部工作区
+  （含远端路径），选中即用 `workspaceId` 绑定；首次打开面板若尚无会话上下文，会自动绑定**最近活跃
+  会话所在的工作区**。会话上下文到达时仍然优先跟随，会话消失则退回手选模式。
+- **回归测试**：`tests/file-preview-ui.test.js`（最小假 DOM + 假 fetch）覆盖三种情形：
+  未上报会话时按工作区兜底、上报会话时优先跟随会话、实例没有任何工作区时给明确提示而不崩。
+
+
+#### 根因记录：「跟随 dsh 会话」为何会失效（证据）
+该 dsh 客户端的全部客户端 bundle（主 bundle + 40 余个 `plugins/@deepseek-ai/*/client.js`）里
+`pushState` / `replaceState` / `location.hash` / `location.assign` / `location.replace` 出现次数**均为 0**；
+唯一读 `location.search` 的地方是 `dsh-client-connection.js` 的测试 fixture（`?fixture=`，与会话无关）。
+因此：页面加载时的 `?session=` 只是 hwb 自己拼的 iframe URL（dsh 不读也不写），用户在 dsh 界面里
+切换/新建会话时 **URL 完全不变**，桥接脚本拿不到新会话，上报的 `sessionId` 始终为空——这正是在实例内
+切换会话后侧栏一直提示「请先打开项目会话」的直接原因。桥接现在会把完整 `href` 一并上报，父页优先
+从 URL 解析会话（`src/web/app.js`），未来 dsh 若支持 URL 会话导航即可自动接上。
+
+#### 流式解析与写入的三处可靠性问题（src/lib/multipart.js + src/lib/file-preview.js）
+- **自引用生成器**：路由曾把解析器攒下的数组写成
+  `part.chunks = (async function* () { yield* part.chunks; })()`——属性被覆盖后 `yield* part.chunks`
+  指向生成器自身，`for await` 会**永久挂起**（上传请求永不返回）。改为不覆盖属性的 `asChunks()`。
+- **header 结束空行未消费**：part 头部结束的 CRLF 残留在缓冲区，被 body 状态当成文件内容的开头，
+  导致每个 part 落盘内容整体多出 `\r\n`。
+- **分隔符匹配取最后一个**：改用「最早出现的完整分隔符」，避免一个分片里含多个 part 时后一个
+  part 被并入前一个文件；缓冲尾部保留 hold 字节继续等数据，恒定内存。
+- 本机写入不再依赖 `stream.write` 返回 false 后的 `drain` 事件，改用写回调作为落盘边界
+  （`drain` 与 `await` 组合会出现回调永不到达）。
+
 ## [0.1.1] — 2026-09-06
 
 **第一个补丁版本。** 修复/增强工作台 UI 与静态资源服务，去掉实例 tab 上的「本机/远程」标签。

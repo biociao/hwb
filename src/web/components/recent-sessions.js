@@ -29,12 +29,14 @@ export function renderRecentSessions(sessions) {
          title="点击钻入该会话">
       <div class="t">
         <span class="name">${esc(s.title || s.workspaceTitle || s.project || s.sessionId)}</span>
-        ${statusChip(s.status)}
+        <span class="status-col">
+          ${statusChip(s.status)}
+          <span class="active-time">${timeAgo(s.lastActivity)}</span>
+        </span>
       </div>
       <div class="meta">
         ${s.project ? `<span class="chip proj-chip" style="background:${projColor.bg};color:${projColor.fg}">${esc(s.project)}</span>` : '<span class="chip">unknown</span>'}
         <span>${esc(s.sessionId)}</span>
-        <span>${timeAgo(s.lastActivity)}</span>
       </div>
       ${pressureBar(s.contextPressure)}
     </div>`;

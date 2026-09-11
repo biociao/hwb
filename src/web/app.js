@@ -1,7 +1,11 @@
+import { endpointRow, readEndpoints, endpointSelector } from './components/endpoint-editor.js';
+import { attachFilePreview } from './components/file-preview.js';
 import { api, subscribe, esc } from './store.js';
 import { renderWorkbench } from './components/workbench.js';
 import { renderRecentProjects } from './components/recent-projects.js';
 import { renderRecentSessions } from './components/recent-sessions.js';
+import { connectedHomes, tabHomes } from './instance-state.js';
+import { planPaneNavigation, planPaneRecovery, updatePaneSession } from './instance-navigation.js';
 import { renderInstanceGrid } from './components/instance-grid.js';
 import { renderUsageCard, usageTrendHtml, USAGE_PERIODS } from './components/usage-card.js';
 import { renderHomeForm, renderOnboarding, renderSettingsForm } from './components/add-home.js';
@@ -12,9 +16,13 @@ const dashboardEl = document.getElementById('dashboard');
 const tabs = document.getElementById('tabs');
 const live = document.getElementById('live');
 const modalEl = document.getElementById('modal');
+const themeBtn = document.getElementById('theme-btn');
+const themeMenu = document.getElementById('theme-menu');
 
 let showAddForm = false;
 let lastHomes = [];
+let refreshSequence = 0;
+const endpointSwitching = new Set();
 // Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
 let lastUsage = null;
 let usageDim = 'total';
@@ -24,6 +32,34 @@ let usagePeriod = USAGE_PERIODS[0];
 let view = { kind: 'dashboard' };
 // 每个已打开实例一个持久 iframe 面板：homeId -> { el, iframe, url, sessionId }
 const panes = new Map();
+window.addEventListener('message', (event) => {
+  const type = event.data?.type;
+  if (!['hwb:file-preview', 'hwb:preview-context', 'hwb:open-workspace'].includes(type)) return;
+  if (type === 'hwb:file-preview' && (typeof event.data.path !== 'string' || event.data.path.length > 4096)) return;
+  // 桥接会带上内嵌页的完整 URL；URL 里有 ?session= 时以它为准（比只信任桥接解析更稳），
+  // 没有再退回桥接上报的 sessionId。当前 dsh 客户端不做 URL 导航，所以通常两者都为空。
+  if (type === 'hwb:preview-context' && typeof event.data.href === 'string' && event.data.href.length <= 4096) {
+    try { event.data.sessionId = new URL(event.data.href).searchParams.get('session') || event.data.sessionId || null; } catch { /* URL 不合法则用原值 */ }
+  }
+  if (event.data.sessionId != null && (typeof event.data.sessionId !== 'string' || event.data.sessionId.length > 512)) return;
+  for (const [homeId, pane] of panes) {
+    if ((type === 'hwb:file-preview' && pane.el.hidden) || event.source !== pane.iframe?.contentWindow || !pane.url) continue;
+    if (event.origin !== new URL(pane.url).origin) continue;
+    if (type === 'hwb:open-workspace') {
+      if (pane.el.hidden || typeof event.data.workspaceId !== 'string') return;
+      api(`/api/homes/${homeId}/open-workspace`, { method: 'POST', body: { workspaceId: event.data.workspaceId } }).catch((e) => alert(e.message));
+    } else if (type === 'hwb:preview-context') {
+      pane.preview.context(event.data);
+      if (updatePaneSession(pane, event.data.sessionId) && view.kind === 'instance' && view.homeId === homeId) {
+        view.sessionId = pane.sessionId;
+        view.sessionTitle = null;
+        view.project = null;
+        saveView();
+      }
+    } else pane.preview.receive(event.data);
+    break;
+  }
+});
 // 拖拽排序后短暂抑制紧随其后的 click（避免拖完就切换实例）
 let suppressNavClick = false;
 let dragHomeId = null;
@@ -72,21 +108,24 @@ function saveView() {
 }
 
 function tabLabel(h) {
-  return esc(h.alias || h.homePath);
+  return esc(h.alias || h.serverId || h.homePath);
 }
 
 function renderTabs() {
   const dashboard = `<button class="tab ${view.kind === 'dashboard' ? 'active' : ''}"
                               data-action="nav-dashboard" data-tab="dashboard">◧ 工作台</button>`;
-  const inst = lastHomes.map((h) => {
+  const inst = tabHomes(lastHomes).map((h) => {
     const rt = h.runtime?.runtime ?? 'stopped';
     const active = view.kind === 'instance' && view.homeId === h.homeId;
+    const pane = panes.get(h.homeId);
+    const externalUrl = active && (pane?.externalUrl || pane?.url);
     return `<button class="tab ${active ? 'active' : ''}" draggable="true"
                     data-action="nav-instance" data-home-id="${esc(h.homeId)}"
-                    title="${esc(h.homePath)}">
+                    title="${esc(h.homePath)}${rt === 'unreachable' ? ' · 连接暂时无响应，等待恢复' : ''}">
       <span class="dot ${esc(rt)}"></span>
       <span class="label">${tabLabel(h)}</span>
-    </button>`;
+    </button>${externalUrl ? `<button class="tab tab-popout" data-action="popout"
+      data-url="${esc(externalUrl)}" title="在外部浏览器打开" aria-label="在外部浏览器打开 ${tabLabel(h)}">↗</button>` : ''}`;
   }).join('');
   tabs.innerHTML = dashboard + inst;
 }
@@ -96,20 +135,36 @@ function showView() {
   dashboardEl.hidden = view.kind !== 'dashboard';
   for (const [homeId, pane] of panes) {
     pane.el.hidden = !(view.kind === 'instance' && view.homeId === homeId);
+    pane.preview.toggle.hidden = pane.el.hidden;
   }
-  if (view.kind === 'instance') updateFloatActions(view.homeId);
 }
 
 async function refresh() {
+  const sequence = ++refreshSequence;
   const { homes } = await api('/api/homes');
+  if (sequence !== refreshSequence) return;
   lastHomes = homes;
+  if (view.kind === 'instance' && !tabHomes(homes).some((h) => h.homeId === view.homeId)) {
+    view = { kind: 'dashboard' };
+    saveView();
+  }
+  if (view.kind === 'instance') {
+    const pane = panes.get(view.homeId);
+    const runtime = homes.find((home) => home.homeId === view.homeId)?.runtime;
+    const recovery = planPaneRecovery(pane, runtime);
+    if (recovery) {
+      pane.deeplink = recovery.deeplink;
+      pane.externalUrl = recovery.externalUrl;
+      mountPane(view.homeId, recovery.url, recovery.sessionId, pane, recovery.force);
+    }
+  }
   renderTabs();
   showView();
   if (view.kind === 'instance') return; // 持久 iframe 不被 SSE 刷新打断
-  await renderDashboard();
+  await renderDashboard(sequence);
 }
 
-async function renderDashboard() {
+async function renderDashboard(sequence = refreshSequence) {
   if (lastHomes.length === 0) {
     dashboardEl.dataset.layout = 'onboarding';
     const detected = await api('/api/homes/detect');
@@ -122,10 +177,12 @@ async function renderDashboard() {
     api('/api/sessions/recent'),
     api(`/api/usage?days=${usagePeriod.days}&hours=${usagePeriod.hours}`),
   ]);
+  if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
   lastUsage = usage;
+  const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
   dashboardEl.innerHTML = renderWorkbench({
-    projects: renderRecentProjects(projects, lastHomes),
-    sessions: renderRecentSessions(sessions),
+    projects: connectedIds.size ? renderRecentProjects(projects.filter((p) => connectedIds.has(p.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
+    sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId))) : '<div class="empty">连接实例后显示对应会话</div>',
     homes: renderInstanceGrid(lastHomes),
     usage: renderUsageCard(usage, usageDim, usagePeriod.key),
     logs: logPanelHtml(),
@@ -219,12 +276,12 @@ function paneFor(homeId) {
   el.hidden = true;
   el.innerHTML = `
     <div class="frame-loading">连接 dsh web…</div>
-    <div class="float-actions" hidden></div>
     <div class="frame-cover" hidden><span class="frame-cover-label">加载中…</span></div>`;
   main.appendChild(el);
   // _cookieReady: 该实例 origin 是否已种下 dsh 鉴权 cookie(种过即可直达 ?session=, 少一次重载)
   // _iframed: 是否已挂载过 iframe(触发首次导航)  _navTarget/_navStep: 二段跳+遮罩的剩余状态
   pane = { el, iframe: null, url: null, sessionId: null, _iframed: false, _cookieReady: false, _navTarget: null, _navStep: 0 };
+  pane.preview = attachFilePreview(pane, homeId);
   panes.set(homeId, pane);
   return pane;
 }
@@ -246,6 +303,7 @@ function hideFrameCover(pane) {
 // 说明刚完成种 cookie 的握手, 继续二段跳到最终目标并保持遮罩; 否则(最终目标已到达/普通打开)收起遮罩。
 function onFrameLoad(pane) {
   const iframe = pane.iframe;
+  if (pane.url) iframe.contentWindow?.postMessage({ type: 'hwb:preview-init' }, new URL(pane.url).origin);
   const target = pane._navTarget;
   if (!target) { hideFrameCover(pane); return; }
   if (iframe.src !== target) {
@@ -262,28 +320,14 @@ function onFrameLoad(pane) {
 function destroyPane(homeId) {
   const pane = panes.get(homeId);
   if (!pane) return;
+  pane.preview?.dispose();
   pane.el.remove();
   panes.delete(homeId);
 }
 
-function updateFloatActions(homeId) {
-  const pane = panes.get(homeId);
-  if (!pane) return;
-  const fa = pane.el.querySelector('.float-actions');
-  if (!fa) return;
-  const url = pane.url;
-  fa.innerHTML = url
-    ? `<button data-action="popout" data-url="${esc(url)}">在外部浏览器打开 ↗</button>
-       <button class="danger" data-action="stop-instance" data-home-id="${esc(homeId)}">stop</button>`
-    : '';
-  fa.hidden = !url;
-}
-
-function mountPane(homeId, url, sessionId, pane) {
-  const reload = pane.iframe && sessionId && pane.deeplink && sessionId !== pane.sessionId;
+function mountPane(homeId, url, sessionId, pane, force = false) {
+  const navigation = planPaneNavigation(pane, url, sessionId, force);
   const wantSession = sessionId && pane.deeplink;
-  const sessionUrl = wantSession ? `${stripToken(url)}?session=${encodeURIComponent(sessionId)}` : null;
-  const finalTarget = wantSession ? sessionUrl : url;
   const navLabel = wantSession ? '连接会话…' : 'dsh web 加载中…';
 
   if (!pane.iframe) {
@@ -296,40 +340,30 @@ function mountPane(homeId, url, sessionId, pane) {
     iframe.addEventListener('load', () => onFrameLoad(pane));
   }
 
-  // 首次挂载(新 iframe)或会话切换时才导航; 同一会话重复点不触发, 避免多余重载。
-  if (!pane._iframed || reload) {
+  pane.url = url;
+  // 首次挂载、会话切换或入口变化时导航；普通标签切换仍复用已打开的 iframe。
+  if (navigation) {
     pane._iframed = true;
+    pane._cookieReady = navigation.cookieReady;
+    pane.sessionId = navigation.sessionId;
     // 会话深链且未种过 cookie → 先加载带 token 的入口(种 cookie), 再由 onFrameLoad 二段跳;
     // 已种过 cookie(本实例内切换会话) → 直达 ?session=, 单次加载。
-    const firstTarget = (wantSession && !pane._cookieReady) ? url : finalTarget;
+    const { firstTarget, finalTarget } = navigation;
     pane._navTarget = finalTarget;
     pane._navStep = 0;
     showFrameCover(pane, navLabel);
-    if (pane.iframe.src !== firstTarget) pane.iframe.src = firstTarget;
+    if (force || pane.iframe.src !== firstTarget) pane.iframe.src = firstTarget;
   }
 
-  pane.url = url;
-  if (sessionId) pane.sessionId = sessionId;
-}
-
-// 去掉入口 URL 里的 `?token=`——会话深链必须用「已认证、无 token」的 `/?session=<id>`
-// 二段跳转,因为 dsh 的 `?token=` 首次请求会 303 到 `/` 并丢弃全部 query。
-function stripToken(url) {
-  try {
-    const u = new URL(url);
-    u.searchParams.delete('token');
-    return u.toString();
-  } catch {
-    return url;
-  }
 }
 
 async function enterInstance(homeId, extra = {}) {
   const token = Symbol('view');
-  view = { kind: 'instance', homeId, token, ...extra };
+  const pane = paneFor(homeId);
+  view = { kind: 'instance', homeId, token, sessionId: pane.sessionId, ...extra };
   saveView();
   renderTabs();
-  const pane = paneFor(homeId);
+  pane._opening = token;
   showView(); // 懒创建：先 loading，进程就绪后才挂 iframe
   try {
     const inst = await api(`/api/homes/${homeId}/open`, { method: 'POST' });
@@ -337,14 +371,17 @@ async function enterInstance(homeId, extra = {}) {
     pane.deeplink = !!inst.deeplink;
     // 深链会话用「二段跳转」,入口 URL 始终只带 token(先种 cookie);
     // 是否拼 `?session=` 由 mountPane 在 cookie 就绪后处理。
-    const url = inst.url;
+    const url = inst.iframeUrl || inst.url;
+    pane.externalUrl = inst.url;
     mountPane(homeId, url, view.sessionId, pane);
-    updateFloatActions(homeId);
+    renderTabs();
   } catch (e) {
     if (view.token === token) {
       const loading = pane.el.querySelector('.frame-loading');
       if (loading) loading.textContent = `连接失败: ${e.message}`;
     }
+  } finally {
+    if (pane._opening === token) pane._opening = null;
   }
   refresh(); // runtime 状态已变，更新 tab 圆点
 }
@@ -368,6 +405,12 @@ function openSettings(homeId) {
     <div class="modal-card">
       <h3>编辑实例：${esc(home.alias || home.homePath || homeId)}</h3>
       ${renderSettingsForm(home)}
+      <div class="meta actions">
+        <button data-action="restart" data-home-id="${esc(homeId)}">重启实例</button>
+        <button data-action="stop" data-home-id="${esc(homeId)}">停止实例</button>
+        <button data-action="reindex" data-home-id="${esc(homeId)}">重新索引</button>
+        <button data-action="remove-home" data-home-id="${esc(homeId)}" data-name="${esc(home.alias || home.homePath)}">移除实例</button>
+      </div>
       <div class="modal-actions">
         <button data-action="close-settings">取消</button>
         <button class="primary" data-action="save-settings" data-home-id="${esc(homeId)}">保存</button>
@@ -382,18 +425,14 @@ async function saveSettings(homeId) {
   const form = modalEl.querySelector('#settings-form');
   const home = lastHomes.find((h) => h.homeId === homeId);
   if (!form || !home) return;
-  const body = { alias: form.alias.value.trim() || null };
+  const body = { alias: form.alias.value.trim(), endpoints: readEndpoints(form) };
   if (home.hostType === 'remote') {
-    body.host = form.host.value.trim();
-    body.remotePort = Number(form.remotePort.value);
+    body.accessPort = form.accessPort.value.trim() || null;
     body.remoteHome = form.remoteHome.value.trim() || null;
     body.remoteCmd = form.remoteCmd.value.trim() || null;
     body.remoteLog = form.remoteLog.value.trim() || null;
-    body.token = form.token.value.trim() || null;
   } else {
     body.homePath = form.homePath.value.trim();
-    body.localPort = form.localPort.value.trim() || null;
-    body.token = form.token.value.trim() || null;
   }
   await api(`/api/homes/${homeId}`, { method: 'PUT', body });
   closeModal();
@@ -406,10 +445,11 @@ async function saveSettings(homeId) {
   await refresh();
 }
 
-async function addHome({ homePath, alias, hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort }, form) {
+async function addHome({ homePath, alias, hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort, accessPort }, form) {
   const body = hostType === 'remote'
     ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, token: token || undefined, alias }
     : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
+  if (hostType === 'remote' && accessPort !== undefined) body.accessPort = accessPort;
   const data = await api('/api/homes', { method: 'POST', body });
   if (form && data.warning && data.warning !== null) formMsg(form, data.warning, false);
   showAddForm = false;
@@ -441,13 +481,6 @@ async function handleAction(e) {
       case 'popout':
         window.open(btn.dataset.url, '_blank');
         break;
-      case 'stop-instance':
-        if (!confirm('停止该 dsh web 实例？（会打断正在运行的实例，仅作最后手段；也可考虑在远端自行处理。）')) return;
-        btn.disabled = true;
-        await api(`/api/homes/${btn.dataset.homeId}/stop`, { method: 'POST' });
-        destroyPane(btn.dataset.homeId);
-        goDashboard();
-        break;
       case 'toggle-add-form':
         showAddForm = !showAddForm;
         await refresh();
@@ -455,8 +488,47 @@ async function handleAction(e) {
       case 'add-detected':
         await addHome({ homePath: btn.dataset.path });
         break;
-      case 'open':
-        await enterInstance(btn.dataset.homeId);
+      case 'add-endpoint': {
+        const editor = btn.closest('.endpoint-editor');
+        editor.querySelector('.endpoint-rows').insertAdjacentHTML('beforeend', endpointRow({}, editor.dataset.remote === 'true'));
+        break;
+      }
+      case 'remove-endpoint':
+        btn.closest('.endpoint-row').remove();
+        break;
+      case 'choose-channel': {
+        const home = lastHomes.find((h) => h.homeId === btn.dataset.homeId);
+        if (!home || (home.endpoints?.length || 0) < 2) break;
+        modalEl.innerHTML = `<div class="modal-card"><h3>切换连接通道：${esc(home.alias || home.serverId || home.homePath)}</h3>${endpointSelector(home)}<div class="modal-actions"><button data-action="close-settings">取消</button></div></div>`;
+        modalEl.hidden = false;
+        break;
+      }
+      case 'switch-endpoint': {
+        const id = btn.dataset.homeId;
+        if (endpointSwitching.has(id)) return;
+        const endpointId = btn.closest('.endpoint-switch').querySelector('select').value;
+        btn.disabled = true;
+        btn.textContent = '切换中…';
+        endpointSwitching.add(id);
+        try { await api(`/api/homes/${id}/switch`, { method: 'POST', body: { endpointId } }); }
+        finally { endpointSwitching.delete(id); }
+        closeModal();
+        destroyPane(id);
+        if (view.kind === 'instance' && view.homeId === id) await enterInstance(id);
+        else await refresh();
+        break;
+      }
+      case 'connect':
+        btn.disabled = true;
+        btn.textContent = '连接中…';
+        await api(`/api/homes/${btn.dataset.homeId}/open`, { method: 'POST' });
+        await refresh();
+        break;
+      case 'disconnect':
+        btn.disabled = true;
+        await api(`/api/homes/${btn.dataset.homeId}/disconnect`, { method: 'POST' });
+        destroyPane(btn.dataset.homeId);
+        await refresh();
         break;
       case 'restart':
         // 稳定第一：重启会打断远端实例并换发新 token，属用户主动的最后手段，需要明确授权。
@@ -557,6 +629,9 @@ function handleDragOver(e) {
   tabs.querySelectorAll('.tab').forEach((t) => t.classList.remove('drag-target'));
   if (after == null) tabs.appendChild(dragging);
   else if (after !== dragging) tabs.insertBefore(dragging, after);
+  const popout = tabs.querySelector('.tab-popout');
+  const active = tabs.querySelector('.tab.active[data-action="nav-instance"]');
+  if (popout && active) active.after(popout);
 }
 
 async function handleDragEnd() {
@@ -582,7 +657,61 @@ tabs.addEventListener('dragover', handleDragOver);
 tabs.addEventListener('drop', (e) => e.preventDefault());
 tabs.addEventListener('dragend', handleDragEnd);
 
+// —— 界面主题切换：白天 / 黑夜 / 跟随系统 ——
+const THEME_MODES = ['light', 'dark', 'system'];
+const THEME_KEY = 'hwb:theme';
+const THEME_GLYPH = { light: '☀️', dark: '🌙', system: '🌓' };
+const THEME_LABEL = { light: '白天', dark: '黑夜', system: '跟随系统' };
+function currentThemeMode() {
+  try {
+    const m = localStorage.getItem(THEME_KEY);
+    return THEME_MODES.includes(m) ? m : 'system';
+  } catch { return 'system'; }
+}
+function applyTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  if (themeBtn) {
+    themeBtn.textContent = THEME_GLYPH[mode] || '🌓';
+    themeBtn.title = `界面外观：${THEME_LABEL[mode]}`;
+  }
+  if (themeMenu) {
+    themeMenu.querySelectorAll('.menu-item').forEach((item) => {
+      item.classList.toggle('active', item.dataset.mode === mode);
+    });
+  }
+}
+function setTheme(mode) {
+  try { localStorage.setItem(THEME_KEY, mode); } catch { /* storage 不可用则本次生效 */ }
+  applyTheme(mode);
+  rerenderForTheme();
+}
+// 主题切换后重绘工作台：chip 配色为内联样式，深浅两套调色板需重渲染才能切换
+function rerenderForTheme() {
+  if (view.kind === 'dashboard' && lastHomes.length) renderDashboard();
+}
+function closeThemeMenu() { if (themeMenu) themeMenu.hidden = true; }
+function toggleThemeMenu() { if (themeMenu) themeMenu.hidden = !themeMenu.hidden; }
+themeBtn?.addEventListener('click', (e) => { e.stopPropagation(); toggleThemeMenu(); });
+themeMenu?.addEventListener('click', (e) => {
+  const item = e.target.closest('.menu-item[data-mode]');
+  if (item) { setTheme(item.dataset.mode); closeThemeMenu(); }
+});
+// 点击菜单以外任意处关闭
+document.addEventListener('click', (e) => {
+  if (themeMenu && !themeMenu.hidden && !e.target.closest('#theme-wrap')) closeThemeMenu();
+});
+// 跟随系统时，系统亮暗切换自动刷新按钮图标（配色由 CSS media query 决定）
+(function watchSystemTheme() {
+  const mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+  if (!mq) return;
+  mq.addEventListener?.('change', () => { if (currentThemeMode() === 'system') { applyTheme('system'); rerenderForTheme(); } });
+})();
+
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && themeMenu && !themeMenu.hidden) {
+    themeMenu.hidden = true;
+    return;
+  }
   if (e.key === 'Escape' && !modalEl.hidden) {
     closeModal();
     return;
@@ -609,6 +738,7 @@ main.addEventListener('submit', async (e) => {
         remoteHome: form.remoteHome.value.trim(),
         remoteCmd: form.remoteCmd.value.trim() || null,
         remoteLog: form.remoteLog.value.trim() || null,
+        accessPort: form.accessPort.value.trim() || null,
         token: form.token.value.trim() || null,
         alias,
       }, form);
@@ -638,6 +768,8 @@ dashboardEl.addEventListener('change', (e) => {
   form.remoteLog.hidden = !remote;
   form.token.hidden = false;        // 手填 token：本机/远程直连通用
   form.localPort.hidden = remote;   // 本机直连端口：仅本机模式
+  form.accessPort.hidden = !remote;
+  form.accessPort.disabled = !remote;
   form.homePath.required = !remote;
   form.host.required = remote;
   form.remotePort.required = remote;
@@ -704,11 +836,12 @@ logInit().catch(() => {});
 
 // 启动：先恢复「Token 用量筛选」偏好，再拉取实例列表，最后按需恢复到上次所在的实例视图。
 async function boot() {
+  applyTheme(currentThemeMode()); // 同步右上角主题按钮图标与菜单选中态（<head> 内联脚本已抢先应用 data-theme 防闪烁）
   loadUsagePrefs(); // 在首次 renderDashboard 之前恢复周期/维度，让首屏就用回用户上次的选择
   const restored = loadView(); // 上次刷新前停留在哪个实例（若有）
   await refresh();
   if (restored?.kind === 'instance') {
-    if (lastHomes.some((h) => h.homeId === restored.homeId)) {
+    if (tabHomes(lastHomes).some((h) => h.homeId === restored.homeId)) {
       // 重新挂载该实例的持久 iframe（含会话深链），刷新后位置保持不变。
       await enterInstance(restored.homeId, {
         sessionId: restored.sessionId || null,
