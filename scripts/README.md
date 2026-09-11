@@ -26,6 +26,7 @@
 | `dsh-http-cache.Caddyfile` | 用 Caddy 给远端 dsh web 加一层 HTTP 缓存反代(静态资源强缓存 + 压缩) | [`README-http-cache.md`](README-http-cache.md) |
 | `dsh-http-cache.nginx.conf` | 同上, nginx 版本 | [`README-http-cache.md`](README-http-cache.md) |
 | `render-check.mjs` | 前端「真浏览器」渲染检查(CDP 驱动 headless Chrome, 不依赖 --dump-dom) | [`README-render-check.md`](README-render-check.md) |
+| `smoke-e2e.mjs` | 端到端冒烟: 起服务→注册假 home→索引→各 API→上传/下载→SSE→浏览器→移除实例→优雅退出 | [`README-smoke-e2e.md`](README-smoke-e2e.md) |
 
 ## 快速部署(脚本版, 改动最小)
 
