@@ -99,6 +99,19 @@ async function start() {
   child.unref();
   console.log(`已启动 PID ${child.pid} http://127.0.0.1:${cfg.port}`);
 }
+// 端口上是不是**hwb 自己**在服务（不依赖控制 socket）。
+// 只探测「端口有没有人在听」是不够的：随便一个程序占了配置端口，就会被报成
+// 「前台运行的 hwb serve」—— 那是另一个方向的谎报。这里问一句只有 hwb 会这样答的问题：
+// /api/homes 返回 `{homes:[...]}`（该路由只读、不受同源校验影响，别的服务不会给出这个形状）。
+async function hwbOnPort(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/homes`, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return false;
+    const body = await res.json();
+    return Array.isArray(body?.homes);
+  } catch { return false; }
+}
+
 // 端口上有没有人在监听（不依赖控制 socket）。
 function portInUse(port) {
   return new Promise((resolve) => {
@@ -117,9 +130,15 @@ async function stop() {
     // 原先直接打印「已停止」并返回 0，用户以为停掉了，下一次 `hwb start` 却只报一句
     // 难懂的「启动失败 (1)」（其实是 EADDRINUSE）。这里说清楚实际情况。
     const port = readConfig().port;
+    if (await hwbOnPort(port)) {
+      throw Error(`没有控制 socket，但 http://127.0.0.1:${port} 上有 hwb 在服务 —— `
+        + '多半是前台运行的 `hwb serve`。请到那个终端按 Ctrl-C 停止它。');
+    }
     if (await portInUse(port)) {
-      throw Error(`没有控制 socket，但端口 ${port} 仍被占用 —— 很可能是前台运行的 \`hwb serve\`。`
-        + '请到该终端按 Ctrl-C 停止它。');
+      // 端口被占但不是 hwb：不要说成「前台 hwb serve」，那会把用户引到错误的方向
+      // （去某个终端找 Ctrl-C），而实际该处理的是另一个程序。
+      throw Error(`没有控制 socket，端口 ${port} 被**其它程序**占用（不是 hwb）。`
+        + `可换端口：\`hwb config set port <新端口>\`；或查占用者：\`lsof -i :${port}\`。`);
     }
     console.log('已停止'); return;
   }
@@ -165,8 +184,22 @@ async function main() {
     case 'restart': readConfig(); await stop(); return start();
     case 'status': {
       const state = await request();
-      console.log(state ? JSON.stringify({ status: state.ready ? 'running' : 'starting', ...state }, null, 2) : 'stopped');
-      if (!state?.ready) process.exitCode = 1;
+      if (state) {
+        console.log(JSON.stringify({ status: state.ready ? 'running' : 'starting', ...state }, null, 2));
+        if (!state.ready) process.exitCode = 1;
+        return;
+      }
+      // 没有控制 socket ≠ 没在跑：前台 `hwb serve` 不创建 socket，但它占着配置里的端口。
+      // `stop` 早就为这件事补了端口探测，`status`/`doctor` 当时漏了 —— 于是看板明明在返回 200、
+      // `status` 却说 `stopped` 并以退出码 1 结束（脚本里 `set -e` 会据此当成「服务挂了」）。
+      const port = readConfig().port;
+      if (await hwbOnPort(port)) {
+        console.log(JSON.stringify({ status: 'running', foreground: true, port,
+          note: '前台运行的 hwb serve 不创建控制 socket' }, null, 2));
+        return;   // 确实是 hwb 在服务 → 退出码 0
+      }
+      console.log('stopped');
+      process.exitCode = 1;
       return;
     }
     case 'config': {
@@ -200,11 +233,21 @@ async function main() {
       readConfig();
       if (!isNodeSupported()) throw Error(nodeRequirementMessage());
       const state = await request();
+      let port = state?.port;
+      let up = false;
       if (state?.ready) {
-        const res = await fetch(`http://127.0.0.1:${state.port}/`, { signal: AbortSignal.timeout(3000) });
+        up = true;
+      } else {
+        // 同上：后台服务之外还有「前台 serve」这一种在跑法，它没有控制 socket。
+        port = port || readConfig().port;
+        up = await hwbOnPort(port);
+      }
+      if (up) {
+        const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(3000) });
         if (!res.ok) throw Error(`HTTP ${res.status}`);
       }
-      console.log(`Node ${process.version} ✓ 配置 ✓ 服务 ${state?.ready ? 'HTTP 正常 ✓' : '未运行'}`); return;
+      const how = state?.ready ? '' : '（前台 serve，无控制 socket）';
+      console.log(`Node ${process.version} ✓ 配置 ✓ 服务 ${up ? `HTTP 正常 ✓${how}` : '未运行'}`); return;
     }
     case 'upgrade': {
       if (!fs.existsSync(path.join(root, '.git'))) throw Error('upgrade 仅支持 Git 安装；npm 安装请使用 npm install -g hwb@latest 后 hwb restart');
@@ -227,24 +270,52 @@ function pidAlive(pid) {
   catch (err) { return err.code === 'EPERM'; }
 }
 
-// 拿启停锁。锁文件里写着持有者的 PID，于是「上次启停被 kill -9」留下的残留锁可以识别并接管：
-// 原先这种情况会让 start/stop/restart **全部**失败，只留一句「请删除此锁文件」——
-// 用户得自己找到那个隐藏文件才能把服务救回来（实测复现）。锁是空的也算残留
-// （上次在 openSync 与 writeFileSync 之间被杀）。
+// 启停锁的持有者每 REFRESH_MS 更新一次锁文件的 mtime；超过 STALE_MS 没更新就认为它已经不在了。
+const LOCK_REFRESH_MS = 5_000;
+const LOCK_STALE_MS = 20_000;   // 4 次没心跳（留足负载抖动）
+
+// 拿启停锁。
+//
+// 锁文件里写着持有者 PID，所以「上次启停被 kill -9」留下的残留锁可以被识别并接管 ——
+// 原先这种情况会让 start/stop/restart **全部**失败，只留一句「请删除此锁文件」。
+//
+// 但**只看 PID 活不活是不够的**：PID 会被回收（macOS 上限约 99998）。一个被 kill -9 的启停命令
+// 留下的锁，其 PID 被任何无关进程复用之后，锁就永远「被持有」了 —— 用户再次卡在同一个症状上
+// （实测：拿一个跟 hwb 无关的常驻进程 PID 写进锁文件，start/stop/restart 全部退出码 1）。
+// 因此再加一路**心跳**：持有者活着就每 5s 摸一次锁文件的 mtime；20s 没有心跳即视为残留。
+// 这样「PID 被复用」与「持有者真的死了」都能识别，而正常的长操作（`hwb upgrade` 会跑一整套
+// 测试）因为一直在心跳，不会被误抢。代价写明白：持有者被 SIGSTOP/整机休眠而暂停超过 20s 时，
+// 它也会被判为残留 —— 那种情况下另一个命令接管反而更符合用户期待。
+function lockHeldBy(lock) {
+  const raw = (() => { try { return fs.readFileSync(lock, 'utf8').trim(); } catch { return ''; } })();
+  const pid = Number(raw.split(/\s+/)[0]);
+  const alive = Number.isInteger(pid) && pid > 0 && pidAlive(pid);
+  let ageMs = 0;
+  try { ageMs = Date.now() - fs.statSync(lock).mtimeMs; } catch { return { held: false, pid, alive: false, ageMs: 0, raw }; }
+  return { held: alive && ageMs <= LOCK_STALE_MS, pid, alive, ageMs, raw };
+}
+
 function acquireLock(lock) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { return fs.openSync(lock, 'wx', 0o600); }
-    catch (err) {
+    try {
+      const fd = fs.openSync(lock, 'wx', 0o600);
+      // 立刻写上 PID 并开始心跳：锁文件从创建到写入之间不该是一个「空锁」。
+      fs.writeFileSync(fd, `${process.pid} ${Date.now()}`);
+      const beat = setInterval(() => { const now = new Date(); try { fs.utimesSync(lock, now, now); } catch { /* 锁已被清掉 */ } }, LOCK_REFRESH_MS);
+      beat.unref?.();
+      return { fd, release() { clearInterval(beat); try { fs.closeSync(fd); } catch { /* 已关 */ } try { fs.rmSync(lock, { force: true }); } catch { /* 已被清掉 */ } } };
+    } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      const raw = (() => { try { return fs.readFileSync(lock, 'utf8').trim(); } catch { return ''; } })();
-      const pid = Number(raw);
-      const held = Number.isInteger(pid) && pid > 0 && pidAlive(pid);
-      if (held) throw Error(`另一个启停命令（PID ${pid}）持有 ${lock}；确认它确实不在运行后，删除该锁文件即可`);
+      const info = lockHeldBy(lock);
+      if (info.held) throw Error(`另一个启停命令（PID ${info.pid}）持有 ${lock}；确认它确实不在运行后，删除该锁文件即可`);
       if (attempt === 0) {
         // 只删这一个锁文件，不碰任何进程。两个并发接管者都清掉旧文件后，
         // 仍然只有一个能 'wx' 成功 —— 另一个会拿到 EEXIST 并如实报「被占用」。
         try { fs.rmSync(lock, { force: true }); } catch { /* 已被别人清掉 */ }
-        console.warn(`hwb: 发现残留启停锁 ${lock}（持有者 PID ${raw || '未知'} 已不存在），已接管`);
+        const why = info.alive
+          ? `持有者 PID ${info.pid} 虽在运行，但已 ${Math.round(info.ageMs / 1000)}s 没有心跳（很可能是 PID 被回收了）`
+          : `持有者 PID ${info.raw || '未知'} 已不存在`;
+        console.warn(`hwb: 发现残留启停锁 ${lock}（${why}），已接管`);
         continue;
       }
       throw Error(`另一个启停命令持有 ${lock}；若命令曾异常退出，请确认没有启停操作后删除此锁文件`);
@@ -257,8 +328,8 @@ async function dispatch() {
   if (!['start', 'stop', 'restart'].includes(process.argv[2])) return main();
   fs.mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
   const lock = path.join(serviceDir, 'service.lock');
-  const fd = acquireLock(lock);
-  try { fs.writeFileSync(fd, String(process.pid)); return await main(); }
-  finally { fs.closeSync(fd); fs.rmSync(lock, { force: true }); }
+  const held = acquireLock(lock);
+  try { return await main(); }
+  finally { held.release(); }
 }
 dispatch().catch(err => { console.error(`hwb: ${err.message}`); process.exitCode = 1; });

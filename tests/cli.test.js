@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 const exec = promisify(execFile);
 const cli = new URL('../src/cli.js', import.meta.url).pathname;
@@ -58,7 +58,7 @@ test('CLI service lifecycle, readiness, persisted config, logs and doctor', asyn
 });
 test('CLI refuses occupied ports without stopping the unrelated listener', async t => {
   const { run } = await fixture(t);
-  const server = net.createServer(s => s.end());
+  const server = net.createServer(s => s.destroy());
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   t.after(() => new Promise(r => server.close(r)));
   const n = server.address().port;
@@ -132,12 +132,14 @@ test('CLI upgrade uses the tracked Git branch and rejects dirty or failing updat
 // 下一次 `hwb start` 却只报一句难懂的「启动失败 (1)」（真实原因是 EADDRINUSE）。
 test('CLI stop：没有控制 socket 但端口被占用时如实报错，而不是谎报已停止', async (t) => {
   const { dir, run } = await fixture(t);
-  const server = net.createServer(s => s.end());
+  const server = net.createServer(s => s.destroy());
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   t.after(() => new Promise(r => server.close(r)));
   await run('config', 'set', 'port', String(server.address().port));
 
-  await assert.rejects(run('stop'), /端口 \d+ 仍被占用/);
+  // 端口被占但**不是** hwb 时，不该说成「前台运行的 hwb serve」（那会把用户引去某个终端找 Ctrl-C，
+  // 而真正该处理的是别的程序）。消息里必须点出这是别的程序占的。
+  await assert.rejects(run('stop'), /其它程序\*\*占用/);
   assert.equal(server.listening, true, 'CLI 不该去动这个进程');
 
   // 端口空闲时照常报已停止
@@ -170,10 +172,19 @@ test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然�
   await run('start');
   await run('stop');
 
-  // ③ 持有者**活着**时必须照旧拦住 —— 新增的接管逻辑不能变成「谁都能抢锁」
-  fs.writeFileSync(lock, String(process.pid));
+  // ③ 持有者**活着且心跳新鲜**时必须照旧拦住 —— 接管逻辑不能变成「谁都能抢锁」
+  fs.writeFileSync(lock, `${process.pid} ${Date.now()}`);   // 刚写完 = mtime 刚刚
   await assert.rejects(run('start'), /持有/);
   await assert.rejects(run('stop'), /持有/);
+
+  // ④ PID 复用：持有者「活着」但这个 PID 其实是无辜的旁观者 —— 只看 PID 活不活会被它永久卡住
+  // （macOS 的 PID 上限约 99998，回收很常见）。心跳过期即视为残留。
+  const stale = new Date(Date.now() - 60_000);
+  fs.utimesSync(lock, stale, stale);
+  const taken = await run('start');
+  assert.match(taken.stdout, /已启动/, '心跳过期的锁应被接管，而不是让所有启停命令都失败');
+  assert.match(taken.stderr, /残留启停锁/, '应说明接管原因');
+  await run('stop');
   fs.rmSync(lock, { force: true });
 });
 
@@ -182,7 +193,7 @@ test('CLI 启停锁：残留锁（持有者已死）自动接管，活锁仍然�
 // 而这次其实死于端口占用，终端却让用户去改一个跟当前问题无关的数据库路径。
 test('CLI：启动失败取的是日志里**最后**一条提示，不能把旧故障当成本次原因', async t => {
   const { dir, run } = await fixture(t);
-  const server = net.createServer(s => s.end());
+  const server = net.createServer(s => s.destroy());
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   t.after(() => new Promise(r => server.close(r)));
   const n = server.address().port;
@@ -248,4 +259,70 @@ test('CLI：间隔与端口必须是有界的正整数，不能悄悄退化成 1
   });
   await assert.rejects(serve(['--interval-ms', '1e16', '--port', String(n)]), /--interval-ms 需要 1 到/);
   await assert.rejects(serve(['--port', 'abc']), /--port 需要 1 到/);
+});
+
+// `hwb start` 拉起的是**后台**服务，而 CLI 在子进程报到之前就消失是很常见的
+// （Ctrl-C、关掉终端、supervisor/timeout 杀掉）。那时服务其实**已经监听成功**了，
+// 不该因此死掉：原先 process.send() 在 IPC 通道关闭时会以未捕获的 EPIPE 打死它 ——
+// 实测父进程 30ms 后退出 → 端口连不上 + 日志里一条 FATAL。注意这个失败是**异步**的
+// （错误从 channel 的 'error' 事件冒出来），光用 try/catch 包住 send 是抓不到的。
+test('service: 父进程（hwb start）提前退出时，已监听的服务不该被 EPIPE 杀掉', async t => {
+  const n = await port();
+  const cwd = path.dirname(path.dirname(cli));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-svc-'));
+  const log = path.join(dir, 'service.log');
+  const fd = fs.openSync(log, 'a', 0o600);
+  const child = spawn(process.execPath, [path.join(cwd, 'src', 'service.js'),
+    '--port', String(n), '--db', path.join(dir, 'hwb.db'), '--log', path.join(dir, 'hwb.log')],
+    { cwd, detached: true, stdio: ['ignore', fd, fd, 'ipc'], env: { ...process.env, HWB_DIR: dir, HWB_SERVICE_PORT: String(n) } });
+  fs.closeSync(fd);
+  child.on('error', () => {});
+  child.unref();
+  t.after(() => {
+    try { process.kill(child.pid, 'SIGKILL'); } catch { /* 已经退出 */ }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await new Promise(r => setTimeout(r, 30));
+  try { child.disconnect(); } catch { /* 通道可能已断 */ }   // 模拟 CLI 死亡
+
+  const reachable = async () => new Promise((resolve) => {
+    const s = net.createConnection({ port: n, host: '127.0.0.1' });
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('error', () => resolve(false));
+  });
+  let up = false;
+  for (let i = 0; i < 60 && !up; i++) { await new Promise(r => setTimeout(r, 100)); up = await reachable(); }
+  assert.equal(up, true, '服务应仍在监听（不该被 EPIPE 打死）');
+  assert.doesNotMatch(fs.readFileSync(log, 'utf8'), /EPIPE/, '日志里不该出现 EPIPE');
+});
+
+// `status` 原先只认控制 socket：前台 `hwb serve` 不创建 socket，于是看板明明在返回 200，
+// `status` 却说 stopped 并**以退出码 1 结束**（脚本里 set -e 会据此认为服务挂了），
+// `doctor` 则报「服务 未运行」还退出 0。`stop` 早就为这件事补了端口探测，这两条当时漏了。
+test('CLI: status/doctor 对「前台 hwb serve」必须如实报告在运行', async t => {
+  const { dir, run } = await fixture(t);
+  const n = await port();
+  await run('config', 'set', 'port', String(n));
+  const cwd = path.dirname(path.dirname(cli));
+  const out = fs.openSync(path.join(dir, 'serve.log'), 'a', 0o600);
+  const fg = spawn(process.execPath, [cli, 'serve'], { cwd, env: { ...process.env, HWB_DIR: dir }, stdio: ['ignore', out, out] });
+  fs.closeSync(out);
+  fg.on('error', () => {});
+  t.after(() => { try { process.kill(fg.pid, 'SIGKILL'); } catch { /* 已退出 */ } });
+
+  const reachable = async () => new Promise((resolve) => {
+    const s = net.createConnection({ port: n, host: '127.0.0.1' });
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('error', () => resolve(false));
+  });
+  let up = false;
+  for (let i = 0; i < 60 && !up; i++) { await new Promise(r => setTimeout(r, 100)); up = await reachable(); }
+  assert.equal(up, true, '前台 serve 应当起来了（夹具前提）');
+
+  const status = await run('status');            // 没有控制 socket，但端口在服务
+  assert.match(status.stdout, /running/, `status 应报在运行，实际：${status.stdout}`);
+  assert.match(status.stdout, /foreground/);
+  const doctor = await run('doctor');
+  assert.match(doctor.stdout, /HTTP 正常/, `doctor 应报服务正常，实际：${doctor.stdout}`);
 });

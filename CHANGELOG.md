@@ -149,6 +149,39 @@ Semantic Versioning.
   token 既不落盘也不进环缓冲与控制台、目录/文件权限、以及「已存在的 0644 文件会被纠正」。
 
 ### Fixed
+#### CLI 与服务：三条「谎报 / 自杀 / 永久卡住」的问题（src/cli.js + src/service.js）
+- **`status`/`doctor` 把正在服务的前台 `hwb serve` 报成「已停止」**（MEDIUM）。前台 serve 不创建
+  控制 socket，而这两个命令只看 socket：看板明明在返回 200，`status` 却打印 `stopped` 并**以退出码 1
+  结束**（脚本里 `set -e` 会据此认为服务挂了），`doctor` 则报「服务 未运行」还退出 0。
+  修复：没有 socket 时补一次探测，并且**确认对面真的是 hwb**（请求 `/api/homes`，只有 hwb 会回
+  `{homes:[...]}`）—— 只探测「端口有人听」是不够的：随便一个程序占了配置端口就会被说成
+  「前台运行的 hwb serve」，那是另一个方向的谎报。`stop` 的措辞也据此变精确：确认是 hwb 才说
+  「多半是前台 serve」，否则明说「被**其它程序**占用（不是 hwb）」并给出换端口/lsof 的命令。
+- **父进程（`hwb start`）提前退出会把刚起来的后台服务打死**（MEDIUM）。CLI 在子进程报到之前就消失
+  （Ctrl-C、关终端、supervisor/timeout 杀掉）时，子进程其实**已经监听成功**，却因 `process.send`
+  失败而死于未捕获的 EPIPE（crash handler → exit 1）。
+  注意这个失败是**异步**的：错误从 IPC channel 的 `'error'` 事件冒出来，`try/catch` 抓不到 ——
+  只加 try/catch 实测仍然崩（父进程 30ms 退出 → 端口连不上 + 日志一条 FATAL）。
+  修复：`process.on('error')` 忽略 EPIPE / `ERR_IPC_CHANNEL_CLOSED` / `ERR_IPC_DISCONNECTED`
+  （其它错误照旧抛出，不在这里变成静默），并在 send 前检查 `process.connected`。
+- **残留启停锁的接管只看 PID 活不活，遇到 PID 复用就再次卡死**（MEDIUM）。PID 会被回收
+  （macOS 上限约 99998）：一个被 `kill -9` 的启停命令留下的锁，其 PID 被任何无关进程复用之后，
+  锁就永远「被持有」，start/stop/restart 全部退出码 1 —— 正是上一个提交想消掉的症状。
+  修复：加一路**心跳** —— 持有者每 5s 更新锁文件 mtime，20s 没有心跳即视为残留（无论 PID 是否活着），
+  接管时说明原因（「PID 虽在运行，但已 Ns 没有心跳（很可能是 PID 被回收了）」）。正常的长操作
+  （`hwb upgrade` 会跑一整套测试）一直在心跳，不会被误抢；代价是持有者被 SIGSTOP/整机休眠
+  超过 20s 时也会被判为残留 —— 那种情况下另一个命令接管更符合用户期待，已在注释里写明。
+- **service.js 两处小加固**：`'exit'` 清理改为**先**注册再 chmod（监听回调是 async，chmod 抛错会
+  变成 unhandledRejection，而 crash handler 要等 `await import` 才装好，此时没人接得住）；
+  `HWB_DIR` 指向共享目录（`/`、`$HOME`、系统临时目录）时不再 chmod 0700 —— 那会把不属于 hwb 的
+  目录重新授权（`/tmp` 的 sticky/world 位会掉），socket 自身的 0600 不受影响。
+- **回归测试**：`tests/cli.test.js` 新增/更新四条 —— 前台 serve 下 `status` 必须报 running 且
+  `doctor` 报 HTTP 正常；PID 存活但心跳过期时（PID 复用）必须接管、心跳新鲜时必须拦住；
+  端口被非 hwb 程序占用时消息必须点明「其它程序」；父进程 30ms 后退出后服务必须仍在监听且日志无 EPIPE。
+  逐条验证过回退后失败。**顺带修掉测试自身的一个坑**：假监听器用 `s.end()` 只做半关闭，
+  客户端（CLI 子进程）已退出时 `server.close()` 永不回调，测试钩子悬住 → 整条用例被判
+  `cancelledByParent`（`net.Server` 也没有 `closeAllConnections`）；改用 `s.destroy()`。
+
 #### dsh-remote-index：取一行的非 zstd 分支会把整个会话读进内存（dsh-remote-index/dsh-instance-index.mjs）
 - **现象**：脚本自称「lightweight / 只读 session header」，但非 zstd 分支用 `readFile` 把整个
   `session.jsonl` 读进内存再取第一行。实测一个 300 MB 的 `session.jsonl`：峰值 RSS
