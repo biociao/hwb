@@ -17,6 +17,11 @@ const PHASE_RUNTIME = {
   gone: 'gone',
 };
 
+// status() 每次返回新对象，按连接属性识别同一连接，而非比较对象引用。
+function connectionKey(home, inst, gone) {
+  return JSON.stringify([home.hostType, home.homePath, gone, inst?.url, inst?.port, inst?.pid, inst?.kind]);
+}
+
 export class Monitor {
   constructor({ store, launcher, registry = new InstanceRegistry(), broadcast = () => {}, probe = httpProbe, exists = existsSync, intervalMs = 30_000 }) {
     this.store = store;
@@ -29,6 +34,8 @@ export class Monitor {
     this.timer = null;
     this.running = false;
     this.degradedTimers = new Map(); // homeId -> 重连 timeout
+    this.checks = new Map(); // homeId -> 当前连接正在进行的探测，合并手动刷新与心跳。
+    this.health = new Map(); // homeId -> 当前连接的成功记录与连续失败次数。
   }
 
   start() {
@@ -51,7 +58,10 @@ export class Monitor {
     const runtime = e.phase === 'unknown' ? 'stopped' : (PHASE_RUNTIME[e.phase] ?? e.phase);
     return {
       runtime,
+      checkedAt: e.checkedAt ?? null,
+      latencyMs: e.latencyMs ?? null,
       url: e.url,
+      iframeUrl: e.iframeUrl,
       port: e.port,
       pid: e.pid,
       deeplink: e.deeplink,
@@ -79,9 +89,15 @@ export class Monitor {
       this.registry.seed(home.homeId);
       await this.#check(home.homeId, home);
     }
+    this.broadcast('monitor:updated', {});
     for (const e of this.registry.list()) {
       if (!this.store.getHome(e.homeId)) {
+        // 删除路径的兜底清理；显式删除 API 会先 disconnect，避免等待下次心跳。
+        // :switch 是 Launcher 尚未提交的端点候选，不属于已删除实例。
+        if (!e.homeId.endsWith(':switch')) await this.launcher.disconnect?.({ homeId: e.homeId });
         this.registry.delete(e.homeId);
+        this.checks.delete(e.homeId);
+        this.health.delete(e.homeId);
         this.#clearReconnect(e.homeId);
         log.info('实例已移除', { homeId: e.homeId });
         this.broadcast('instance:status', { homeId: e.homeId, runtime: 'removed' });
@@ -89,28 +105,74 @@ export class Monitor {
     }
   }
 
-  async #check(homeId, home) {
-    if (!home) return this.registry.get(homeId);
+  #check(homeId, home) {
+    if (!home) {
+      this.checks.delete(homeId);
+      this.health.delete(homeId);
+      this.#clearReconnect(homeId);
+      return Promise.resolve(this.registry.get(homeId));
+    }
     const prev = this.registry.seed(homeId);
-    let phase;
-    let patch = {};
-
     const gone = home.hostType !== 'remote' && !this.exists(home.homePath);
     const inst = gone ? null : this.launcher.status(homeId);
+    const key = connectionKey(home, inst, gone);
+    const pending = this.checks.get(homeId);
+    if (pending?.key === key && pending.prev === prev) return pending.promise;
+
+    const check = { key, prev };
+    // 先登记，再执行：无连接的同步分支也必须能使旧探测失效。
+    check.promise = Promise.resolve().then(() => this.#runCheck(homeId, home, inst, gone, check)).finally(() => {
+      if (this.checks.get(homeId) === check) this.checks.delete(homeId);
+    });
+    this.checks.set(homeId, check);
+    return check.promise;
+  }
+
+  async #runCheck(homeId, home, inst, gone, check) {
+    if (this.checks.get(homeId) !== check) return this.checks.get(homeId)?.promise ?? this.registry.get(homeId);
+    const currentHome = this.store.getHome(homeId);
+    const currentGone = currentHome && currentHome.hostType !== 'remote' && !this.exists(currentHome.homePath);
+    const currentInst = currentGone ? null : this.launcher.status(homeId);
+    if (this.registry.get(homeId) !== check.prev || !currentHome
+      || connectionKey(currentHome, currentInst, currentGone) !== check.key) return this.#check(homeId, currentHome);
+    const { prev, key } = check;
+    let phase;
+    let patch = {};
+    let health = this.health.get(homeId);
+    // Launcher 也写入 registry；即使 URL 被复用，断开/切换后的新连接也不能沿用旧成功记录。
+    if (health?.key !== key || health.entry !== prev) health = { key, confirmed: false, failures: 0 };
     if (gone) {
       phase = 'gone';
     } else if (!inst) {
       phase = 'stopped';
-      patch = { url: null, port: null, pid: null, deeplink: false };
+      patch = { url: null, iframeUrl: null, port: null, pid: null, deeplink: false };
+    } else if (inst.recovering) {
+      // SSH 已退出时由 Launcher 有界重连；保留旧入口，使前端等待新地址而非关闭页面。
+      phase = 'degraded';
+      patch = { url: inst.url, iframeUrl: inst.iframeUrl, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
     } else {
-      const ok = await this.probe(inst.url);
-      patch = { url: inst.url, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
-      phase = ok ? 'running' : 'degraded';
+      const started = Date.now();
+      const ok = await Promise.resolve().then(() => this.probe(inst.url, home.hostType === 'remote' ? 10_000 : 3000)).catch(() => false);
+      const latestHome = this.store.getHome(homeId);
+      const latestGone = latestHome && latestHome.hostType !== 'remote' && !this.exists(latestHome.homePath);
+      const latestInst = latestGone ? null : this.launcher.status(homeId);
+      // 旧连接响应不得覆盖断开、端点切换或更新的探测，也不得累计到新连接的失败次数。
+      if (this.checks.get(homeId) !== check) return this.checks.get(homeId)?.promise ?? this.registry.get(homeId);
+      if (this.registry.get(homeId) !== prev || !latestHome
+        || connectionKey(latestHome, latestInst, latestGone) !== key) {
+        return this.#check(homeId, latestHome);
+      }
+      patch = { latencyMs: ok ? Date.now() - started : null, url: inst.url, iframeUrl: inst.iframeUrl, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
+      health = { ...health, confirmed: health.confirmed || ok, failures: ok ? 0 : health.failures + 1 };
+      // 仅对已成功探测的远程连接容忍短暂拥塞；冷启动失败仍立即不可达。
+      phase = ok || (home.hostType === 'remote' && health.confirmed && health.failures < 3) ? 'running' : 'degraded';
     }
 
-    const attempts = phase === 'degraded' ? prev.attempts + 1 : 0;
-    const next = this.registry.set(homeId, { phase, attempts, ...patch });
-    if (prev.phase !== next.phase || prev.url !== next.url || prev.port !== next.port) {
+    const attempts = phase === 'degraded' ? (health.entry === prev ? prev.attempts : 0) + 1 : 0;
+    const next = this.registry.set(homeId, { phase, attempts, checkedAt: new Date().toISOString(), latencyMs: null, ...patch });
+    if (inst) this.health.set(homeId, { ...health, entry: next });
+    else this.health.delete(homeId);
+    if (prev.phase !== next.phase || prev.url !== next.url || prev.iframeUrl !== next.iframeUrl || prev.port !== next.port) {
       // 仅在状态迁移/URL 变化时记录，避免每 30s 心跳刷屏。
       if (next.phase === 'degraded') {
         log.warn('实例降级（unreachable），安排退避重连', {
@@ -126,13 +188,14 @@ export class Monitor {
         homeId,
         runtime: PHASE_RUNTIME[next.phase] ?? next.phase,
         url: next.url,
+        iframeUrl: next.iframeUrl,
         port: next.port,
         pid: next.pid,
         deeplink: next.deeplink,
       });
     }
 
-    if (phase === 'degraded') this.#scheduleReconnect(homeId);
+    if (phase === 'degraded' && !inst?.recovering) this.#scheduleReconnect(homeId);
     else this.#clearReconnect(homeId);
     return next;
   }

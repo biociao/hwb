@@ -58,15 +58,20 @@ function expandHome(p) {
 // `exec` 可注入（测试用假 sshBash）；缺省用真实 sshBash。
 export async function readHomeRemote(home, exec = sshBash) {
   const remoteHome = expandHome(home.remoteHome);
-  const r = await exec(home.host, buildCatScript(), [remoteHome]);
+  // projcache 常超过启动日志使用的 64 KiB；必须完整传输，超限明确失败。
+  const r = await exec(home.host, buildCatScript(), [remoteHome], undefined, { maxStdoutBytes: 32 * 1024 * 1024 });
   if (r.code !== 0) {
-    const reason = (r.stderr || r.stdout || '').trim().split('\n').pop() || 'ssh 返回异常';
+    const reason = (r.stderr || '').trim().split('\n').pop() || 'ssh 返回异常';
     log.error('读取远程 dsh home 元数据失败', {
-      host: home.host, remoteHome, code: r.code, stderr: r.stderr, stdout: r.stdout,
+      host: home.host, remoteHome, code: r.code,
     });
     throw new Error(`读取远程 dsh home 失败(${home.host}): ${reason}`);
   }
   const files = parseCatOutput(r.stdout);
+  // cat 脚本即使遇到缺失文件也会输出标记。标记消失表示传输残缺，不能当作文件缺失入库。
+  if (FILES.some((rel) => !(rel in files))) {
+    throw new Error('远程元数据输出不完整（文件分隔标记缺失）；保留已有索引');
+  }
   // 远端解析出文件集校验：至少 workspace 或 projcache 任一存在，否则判为「不可读」，交给 indexer 降级。
   return buildSnapshot({
     homePath: home.homePath || `ssh://${home.host}`,

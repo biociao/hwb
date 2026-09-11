@@ -214,3 +214,14 @@ test('REMOTE_START: ensure + 已在监听且日志有 token（新版在跑）→
     cleanup(dir);
   }
 });
+
+test('REMOTE_START: endpoint switch never starts a missing remote service', async () => {
+  const dir = makeTemp();
+  try {
+    const marker = join(dir, 'cmd-ran');
+    const script = withListening(REMOTE_START, LISTENING_FALSE);
+    const r = await runScript(script, ['4080', join(dir, 'web.log'), `touch ${marker}`, '1', 'connect']);
+    assert.notEqual(r.code, 0);
+    assert.equal(existsSync(marker), false);
+  } finally { cleanup(dir); }
+});
