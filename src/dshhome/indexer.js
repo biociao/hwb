@@ -4,6 +4,23 @@ import { logger } from '../lib/logger.js';
 
 const log = logger('indexer');
 
+// 同一实例的同一失败原因：首次记全（含栈），之后每 ERROR_REPEAT_MS 记一次摘要，成功即复位。
+// 见 Indexer 构造器里 lastFailure 的说明（真实日志里 700 次同一句话 + 700 套栈帧）。
+const ERROR_REPEAT_MS = 10 * 60_000;
+function logFailure(homeId, error, fields) {
+  const reason = error?.message ?? String(error);
+  const prev = this.lastFailure.get(homeId);
+  const now = Date.now();
+  if (prev && prev.reason === reason && now - prev.at < ERROR_REPEAT_MS) return;   // 已记过，静默
+  const repeated = prev && prev.reason === reason;
+  this.lastFailure.set(homeId, { reason, at: now });
+  if (repeated) {
+    log.error('索引该 home 仍然失败（同一原因，已抑制重复日志）', null, { homeId, reason: String(reason).slice(0, 200), ...fields });
+  } else {
+    log.error('索引该 home 失败', error, { homeId, ...fields });
+  }
+}
+
 const DOMAINS = ['workspace', 'projcache', 'modelTier', 'credentials'];
 
 // Data Index Loop (§6): 60s baseline，失败 ×2 capped at 5min，连续成功 ÷1.5 回到 baseline。
@@ -28,6 +45,13 @@ export class Indexer {
     this.maxMs = maxMs;
     this.concurrency = Math.max(1, Math.min(8, Number(concurrency) || 3)); // 同时索引的实例数上限
     this.backoffMs = new Map(); // homeId -> 该实例当前间隔（失败 ×2 / 成功 ÷1.5）
+    // homeId -> 上一次失败原因 + 上次记录时间（用于**抑制重复的同一失败**的日志噪音）。
+    // 为什么需要：一个长期不可达的远端（实测用户真实日志里占了大头 —— 16,334 行 hwb.log 里
+    // 约 700 次同一句「读取远程 dsh home 失败(bot@cms.lo)」，每次都带一整套 async 栈帧，
+    // 也就是 10 行/次、7,000 行）会把有用的信息淹掉，并让日志以 ~20 MB/h 的速度增长。
+    // 同一个 home 的同一原因只在**首次**记全（含栈），之后每 ERROR_REPEAT_MS 记一次摘要行；
+    // 原因变了或成功一次就复位。
+    this.lastFailure = new Map();
     this.nextDue = new Map();   // homeId -> 下一次索引时间戳
     this.timer = null;
     this.running = false;
@@ -162,7 +186,7 @@ export class Indexer {
       // 所以再包一层 —— 原实现里 markHomeError 的二次异常会直接从 catch 里冒出去，
       // 让 #runAll 的循环半途而废（后续实例这一轮完全不刷新）。
       try { this.store.markHomeError(homeId, e.message); } catch { /* 已在 store 内部记录 */ }
-      log.error('索引该 home 失败', e, { homeId, host: home.host, homePath: home.homePath });
+      logFailure.call(this, homeId, e, { host: home.host, homePath: home.homePath });
       results.push({ homeId, ok: false, error: e.message });
       return false;
     }
@@ -184,6 +208,7 @@ export class Indexer {
       } else if (snapshot.degraded.length) {
         log.debug('部分域降级（其余照常索引）', { homeId, degraded: snapshot.degraded });
       }
+    this.lastFailure.delete(homeId);   // 成功了 → 复位「重复失败」抑制（下次失败要重新记全）
     this.broadcast('index:updated', payload);
     results.push({ homeId, ok: !failed, ...payload });
     return !failed;

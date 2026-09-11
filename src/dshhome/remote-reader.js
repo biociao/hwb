@@ -56,17 +56,30 @@ function expandHome(p) {
 
 // 读取一个远程 dsh home 的元数据快照。home: { homePath, host, remoteHome }。
 // `exec` 可注入（测试用假 sshBash）；缺省用真实 sshBash。
+// 同一 host 的同一失败原因在窗口内只记一次（见下面的用法说明）。
+const FAILURE_LOG_WINDOW_MS = 10 * 60_000;
+const failureLog = new Map();   // host -> { key, at }
+
 export async function readHomeRemote(home, exec = sshBash) {
   const remoteHome = expandHome(home.remoteHome);
   // projcache 常超过启动日志使用的 64 KiB；必须完整传输，超限明确失败。
   const r = await exec(home.host, buildCatScript(), [remoteHome], undefined, { maxStdoutBytes: 32 * 1024 * 1024 });
   if (r.code !== 0) {
     const reason = (r.stderr || '').trim().split('\n').pop() || 'ssh 返回异常';
-    log.error('读取远程 dsh home 元数据失败', {
-      host: home.host, remoteHome, code: r.code,
-    });
+    // 同一个 host 的同一个原因只记一次（10 分钟窗口）：一个长期不可达的远端会在每轮索引里
+    // 记一条，而它只是**同一件事**。真实日志里这条占了噪音大头（用户那台机器 16,334 行 hwb.log
+    // 里约 700 次 `读取远程 dsh home 失败(bot@cms.lo)`，每次都带一整套 async 栈帧）。
+    // 原因变化或成功一次即复位（成功路径见下面的 rm failureLog.delete）。
+    const key = `${home.host}|${reason}`;
+    const now = Date.now();
+    const prev = failureLog.get(home.host);
+    if (prev?.key !== key || now - prev.at > FAILURE_LOG_WINDOW_MS) {
+      failureLog.set(home.host, { key, at: now });
+      log.error('读取远程 dsh home 元数据失败', { host: home.host, remoteHome, code: r.code });
+    }
     throw new Error(`读取远程 dsh home 失败(${home.host}): ${reason}`);
   }
+  failureLog.delete(home.host);   // 这次读成功了 → 复位抑制（下次失败要重新记全）
   const files = parseCatOutput(r.stdout);
   // cat 脚本即使遇到缺失文件也会输出标记。标记消失表示传输残缺，不能当作文件缺失入库。
   if (FILES.some((rel) => !(rel in files))) {

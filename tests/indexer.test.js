@@ -261,3 +261,34 @@ test('indexer: 端点切换后丢弃这份 live（快照属于旧端点）', asy
   await indexer.reindexNow(local.homeId);
   assert.ok(!capturedRows.rows.some((r) => r.sessionId === 'ep-session'), '端点已切换，旧端点的快照不能落库');
 });
+
+// 真实日志里的噪音大头：一个长期不可达的远端每次索引都记一句「索引该 home 失败」+ **一整套 async
+// 栈帧**。用户那台机器的 hwb.log 16,334 行里约 700 次同一句 `读取远程 dsh home 失败(bot@cms.lo)`
+// （10 行/次 ⇒ 约 7,000 行）—— 有用的信息被淹掉，日志也以 ~20 MB/h 长。
+// 现在同一实例的同一原因只在首次记全，之后每 10 分钟记一次摘要；原因变了或成功一次就复位。
+test('indexer: 同一实例的同一失败原因不再每次记全套栈（首次记全 + 10 分钟一次摘要）', async () => {
+  const { initLogger, getLogs } = await import('../src/lib/logger.js');
+  initLogger({ level: 'info', file: false, color: false, silent: true });
+  const before = getLogs({ limit: 1000 }).length;
+  const store = { upsertRows: () => {}, markHomeError: () => {} };
+  // 用**远端不可达**这条真实路径（用户日志里的噪音正是它）：本机路径的「目录不存在」不会抛，
+  // 而是优雅降级成 degraded 域（这点已经是对的），所以复现不出这套日志噪音。
+  const remote = { homeId: 'bb'.repeat(8), homePath: 'ssh://fake:3080', hostType: 'remote', host: 'fake', remoteHome: '~/.dsh' };
+  const indexer = new Indexer({
+    store, homes: () => [remote], broadcast: () => {}, baseMs: 1, maxMs: 1, liveStatus: null,
+    remoteExec: async () => ({ code: 255, stdout: '', stderr: 'Connection closed by remote host' }),
+  });
+  for (let i = 0; i < 5; i++) {
+    indexer.nextDue.set(remote.homeId, 0);
+    await indexer.reindexNow(remote.homeId);
+  }
+  // 两种形态都要算：首次是「索引该 home 失败」（带栈），被抑制后如果窗口过了会记成
+  // 「仍然失败（同一原因，已抑制重复日志）」。我第一版只匹配前者，于是**变异也照样通过**
+  // （抑制被去掉后 5 条都变成后者）—— 又是一次「断言比它声称的性质窄」，自查时抓到的。
+  const failures = getLogs({ limit: 1000 }).slice(before)
+    .filter((e) => /索引该 home 失败|仍然失败/.test(String(e.message)));
+  assert.equal(failures.length, 1, `5 次同样的失败只该记 1 条（实际 ${failures.length}）—— 首次那条带栈，之后静默`);
+  const remoteNoise = getLogs({ limit: 1000 }).slice(before)
+    .filter((e) => String(e.message).includes('读取远程 dsh home 元数据失败'));
+  assert.equal(remoteNoise.length, 1, `remote-reader 那条同理只该记 1 条（实际 ${remoteNoise.length}）`);
+});
