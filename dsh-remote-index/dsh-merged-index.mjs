@@ -20,6 +20,11 @@ const indexerPath = join(here, "dsh-instance-index.mjs");
 // 一个实例的索引 JSON 上限。默认的 1 MiB 太小（大实例会被判成「离线: exit null」）。
 const MAX_INDEX_BYTES = 256 * 1024 * 1024;
 
+// 单个实例的采集超时。没有它时只有「错」被隔离、**「慢」不被隔离**：一台黑洞主机能让整轮采集
+// 卡在系统 TCP 超时上（分钟级），而采集是串行的 —— 健康的实例也跟着不刷新。可用
+// `--collect-timeout-ms` 调（测试用它把 60s 缩短）。
+const COLLECT_TIMEOUT_MS = Number(arg("--collect-timeout-ms", "60000")) || 60000;
+
 const indexerSource = await readFile(indexerPath, "utf8");
 
 function arg(name, fallback) {
@@ -27,15 +32,31 @@ function arg(name, fallback) {
   return i >= 0 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
+// 远端命令的每个参数都必须过一遍 shell 引号：`ssh host cmd a b` 这一串会被**远端 shell 重新按空白
+// 分段**（本项目的 dsh-remote-web.sh 里专门写明了这一点，那里用 printf '%q' 解决）。不引号的话：
+//   · 路径里有空格 → `--root /a/My Sessions/x` 被拆成两段，实例静默变成「离线」且原因误导；
+//   · 值里有 `;` 或 `$( )` → 直接在远端执行（instances.json 虽是本地配置，但没有理由留这个洞）。
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 async function collectInstance(inst) {
   const args = ["--root", inst.sessionsRoot, "--cache", inst.cacheRoot, "--instance", inst.id];
   let res;
   if (!inst.host) {
-    res = spawnSync(inst.nodeBin || "node", [indexerPath, ...args], { encoding: "utf8", maxBuffer: MAX_INDEX_BYTES });
+    res = spawnSync(inst.nodeBin || "node", [indexerPath, ...args],
+      { encoding: "utf8", maxBuffer: MAX_INDEX_BYTES, timeout: COLLECT_TIMEOUT_MS, killSignal: "SIGKILL" });
   } else {
     // Publish the indexer to the remote via stdin:  ssh host <nodeBin> - <args>  <script-source>
-    res = spawnSync("ssh", [inst.host, inst.nodeBin || "node", "-", ...args],
-      { input: indexerSource, encoding: "utf8", maxBuffer: MAX_INDEX_BYTES });
+    // BatchMode/ConnectTimeout：没有它们时一台黑洞主机会让采集卡在系统的 TCP 超时上（分钟级），
+    // 而采集是**串行**的，于是旁边所有实例都跟着不刷新。
+    res = spawnSync("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", inst.host,
+      inst.nodeBin || "node", "-", ...args.map(shQuote)],
+      { input: indexerSource, encoding: "utf8", maxBuffer: MAX_INDEX_BYTES, timeout: COLLECT_TIMEOUT_MS, killSignal: "SIGKILL" });
+  }
+  if (res.error?.code === "ETIMEDOUT" || res.signal === "SIGKILL") {
+    // 「慢」也要隔离：只有错误被隔离是不够的，一台卡住的主机会让整轮采集停在系统超时上。
+    return { instance: inst.id, error: `采集超时（超过 ${Math.round(COLLECT_TIMEOUT_MS / 1000)}s）` };
   }
   if (res.error) {
     // spawnSync 的默认 maxBuffer 只有 1 MiB：索引 JSON 约 350 B/会话，且会话在
@@ -81,17 +102,31 @@ function parseIndexOutput(stdout) {
   }
 }
 
+// 一条会话条目的规范化。渲染层直接用了 `s.id.slice(...)`，所以 `id` 是数字（或整个条目是 null）时，
+// 一次渲染就抛错 → **整页不写、退出码 1**：一个实例的一个坏字段足以让旁边健康实例的卡片也一起消失。
+// 这与本文件反复强调的「单个实例的抖动不该拖垮看板」直接冲突 —— 采集期做了隔离，渲染期又漏了。
+// 归一化放在 merge 这个唯一入口：`id` 一律转成字符串，非对象条目整条丢掉。
+function normalizeSession(s, instance) {
+  if (!s || typeof s !== "object") return null;
+  const id = s.id == null ? "" : String(s.id);
+  return { instance, ...s, id };
+}
+
 function merge(raws) {
   const projects = [];
   const sessions = [];
   for (const raw of raws) {
-    for (const s of raw.sessions || []) sessions.push({ instance: raw.instance, ...s });
+    for (const s of raw.sessions || []) {
+      const row = normalizeSession(s, raw.instance);
+      if (row) sessions.push(row);
+    }
     for (const p of raw.projects || []) {
+      if (!p || typeof p !== "object") continue;
       projects.push({
         instance: raw.instance,
         key: p.key,
         path: p.path,
-        sessions: (p.sessions || []).map((s) => ({ instance: raw.instance, ...s })),
+        sessions: (p.sessions || []).map((s) => normalizeSession(s, raw.instance)).filter(Boolean),
       });
     }
   }

@@ -339,6 +339,26 @@ Semantic Versioning.
   并对实现做一条结构断言：取头部的函数里**不许出现 `readFile(`**、必须用 `createReadStream`。
   回退修复后该用例失败。（内存数字本身不写成断言：GC/平台差异会抖。）
 
+#### 聚合索引页：渲染期没有故障隔离、远端参数没有引号、慢实例会拖住所有实例（dsh-remote-index/dsh-merged-index.mjs）
+- **现象**（独立审查第 7 轮，三条都实测复现）：
+  · **渲染期会把整页打死**：`card()` 直接用 `s.id.slice(...)`，所以一个数字型 `id`
+    （或 `sessions:[null]`）就让 `renderHtml` 抛错 → **整页不写、退出码 1**，
+    连旁边健康实例的卡片也一起消失。采集期早就做了隔离，渲染期漏了 —— 与文件自己写的
+    「单个实例的抖动不该拖垮看板」直接冲突。
+  · **远端参数没引号**：`ssh host cmd a b` 会被远端 shell 重新按空白分段。路径里一个空格就能
+    让 `--root` 被拆开（实例静默变「离线」且原因误导），值里有 `;`/`$()` 就直接在远端执行。
+    隔壁 `dsh-remote-web.sh` 早就用 `printf '%q'` 处理了同一件事。
+  · **「慢」不被隔离**：采集是串行的，而 `spawnSync` 没有 `timeout` —— 一台黑洞主机能让整轮
+    卡在系统 TCP 超时上（分钟级），旁边所有实例都不刷新（实测 `--watch 2` 的节奏被一台 6s 的机器拖住）。
+- **修复**：①在 `merge()` 这个唯一入口规范化会话条目（`id` 一律转字符串、非对象条目丢掉），
+  渲染期不再可能因为一个坏字段整页失败；②远端每个参数过 shell 引号（`shQuote`），
+  并补 `-o BatchMode=yes -o ConnectTimeout=10`；③`spawnSync` 加 `timeout` + `killSignal: SIGKILL`
+  （可用 `--collect-timeout-ms` 调，默认 60s），超时按该实例的离线原因呈现。
+- **回归测试**：`tests/dsh-remote-index.test.js` 三条 —— 坏条目+健康实例必须出图且健康卡片在位；
+  慢实例按超时隔离（`sleep 5` 的实例不该拖满 5s）且健康实例仍出图；
+  用 PATH 前置的假 ssh 记录远端命令，断言含空格与 `;` 的路径被整体引号包住、且带 BatchMode。
+  修复前三条全部失败。
+
 #### dsh-remote-index：一个实例的坏输出会让整轮刷新作废、JSON 模式静默空输出（dsh-remote-index/dsh-merged-index.mjs）
 - **现象**：三个独立缺陷，实测复现：
   · 某个实例的 stdout 混入带 `{` 的登录 banner（如 `Welcome to {buildhost} - node 22`）时，

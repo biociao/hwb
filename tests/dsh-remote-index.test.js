@@ -259,3 +259,95 @@ test('merged-index: JSON 模式失败时给出结构化错误并非零退出（�
   assert.match(out.error, /ENOENT/, 'stdout 应是结构化的失败文档，而不是空文件');
   assert.deepEqual(out.projects, []);
 });
+
+// ── 渲染期的故障隔离 + 远端参数引号 + 单实例采集超时 ──
+// 采集期早就做了「一个实例失败不影响别的」，但**渲染期**没有：`card()` 直接用 `s.id.slice(...)`，
+// 所以一个数字型 id（或 sessions:[null]）会让整个 renderHtml 抛错 → **整页不写、退出码 1** ——
+// 旁边健康实例的卡片也一起消失。实测（修前）：一个坏实例 + 一个健康实例 → 没有 HTML。
+async function makeMixedInstances(t) {
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-mi-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const bin = path.join(base, 'bin');
+  await mkdir(bin, { recursive: true });
+  const write = async (name, body) => {
+    const p = path.join(bin, name);
+    await writeFile(p, `#!/bin/bash\n${body}\n`);
+    await chmod(p, 0o755);
+    return p;
+  };
+  // 坏实例：id 是数字、且 sessions 里混了 null；同时带一个正常的项目会话，验证它仍会渲染
+  const bad = await write('node-bad', `printf '%s' '{"instance":"bad","resources":["bad"],`
+    + `"projects":[{"key":"pb","path":"/r/pb","sessions":[{"id":777,"cwd":"/r/pb","updatedAt":1}]}],`
+    + `"sessions":[null,{"id":777}]}'`);
+  // 健康实例：带一个项目，卡片必须被渲染出来
+  const good = await write('node-good', `printf '%s' '{"instance":"good","resources":["good"],`
+    + `"projects":[{"key":"pg","path":"/r/pg","sessions":[{"id":"session-good-1","cwd":"/r/pg","updatedAt":2}]}],`
+    + `"sessions":[{"id":"session-good-1"}]}'`);
+  const slow = await write('node-slow', `sleep 5\nprintf '%s' '{"instance":"slow","resources":["slow"],"projects":[],"sessions":[]}'`);
+  const instances = path.join(base, 'instances.json');
+  await writeFile(instances, JSON.stringify({ instances: [
+    { id: 'bad', nodeBin: bad, sessionsRoot: path.join(base, 'r'), cacheRoot: path.join(base, 'c') },
+    { id: 'good', nodeBin: good, sessionsRoot: path.join(base, 'r'), cacheRoot: path.join(base, 'c') },
+  ] }));
+  const slowInstances = path.join(base, 'instances-slow.json');
+  await writeFile(slowInstances, JSON.stringify({ instances: [
+    { id: 'slow', nodeBin: slow, sessionsRoot: path.join(base, 'r'), cacheRoot: path.join(base, 'c') },
+    { id: 'good', nodeBin: good, sessionsRoot: path.join(base, 'r'), cacheRoot: path.join(base, 'c') },
+  ] }));
+  return { base, instances, slowInstances };
+}
+
+test('merged-index: 一个实例的坏条目不再让整页渲染失败（健康实例的卡片要留下）', async (t) => {
+  const { base, instances } = await makeMixedInstances(t);
+  const out = path.join(base, 'out.html');
+  const { stdout } = await exec(process.execPath, [MERGED_INDEX, '--instances', instances, '--html', out],
+    { timeout: 30000 });
+  assert.match(stdout, /good/, '健康实例应出现在这一轮的统计里');
+  const html = await readFile(out, 'utf8');
+  // 页面对 id 做 slice(0,13) 截断显示（"session-good-1" → "session-good-"），断言按截断后的形态
+  assert.match(html, /session-good-/, '健康实例的会话卡片必须被渲染出来');
+  assert.match(html, /777/, '坏实例里那条 id 是数字的会话应被规范成字符串后正常渲染');
+});
+
+test('merged-index: 单个实例卡住时按超时隔离，其余实例照常出图', async (t) => {
+  const { base, slowInstances } = await makeMixedInstances(t);
+  const out = path.join(base, 'out-slow.html');
+  const started = Date.now();
+  const { stdout } = await exec(process.execPath, [MERGED_INDEX, '--instances', slowInstances,
+    '--html', out, '--collect-timeout-ms', '800'], { timeout: 30000 });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 4000, `应在超时后立刻继续（sleep 5 的实例不该拖满 5s），实际 ${elapsed}ms`);
+  assert.match(stdout, /离线: slow/, '慢实例应被标成离线并给出原因');
+  const html = await readFile(out, 'utf8');
+  assert.match(html, /session-good-/, '健康实例仍要出图');
+});
+
+// `ssh host cmd a b` 会被**远端 shell 重新按空白分段**：路径里有空格就会被拆开（实例静默变离线），
+// 值里有 `;`/`$()` 就会在远端执行。dsh-remote-web.sh 早就用 printf '%q' 处理了同一件事。
+// 这里用 PATH 前置一个假 ssh，把「远端命令」原样记录下来。
+test('merged-index: 远端参数必须过 shell 引号（空格不拆、元字符不执行）', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hwb-sshq-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const bin = path.join(base, 'bin');
+  await mkdir(bin, { recursive: true });
+  const log = path.join(base, 'ssh.log');
+  const fakeSsh = path.join(bin, 'ssh');
+  // 记录收到的参数（每行一个），然后输出一份合法索引 JSON
+  await writeFile(fakeSsh, `#!/bin/bash\nprintf '%s\\n' "$@" >> ${JSON.stringify(log)}\n`
+    + `printf '%s' '{"instance":"r1","resources":["r1"],"projects":[],"sessions":[]}'\n`);
+  await chmod(fakeSsh, 0o755);
+  const instances = path.join(base, 'instances.json');
+  const nastyRoot = '/tmp/x/My Sessions/.dsh/sessions; touch /tmp/hwb-should-not-exist;';
+  await writeFile(instances, JSON.stringify({ instances: [
+    { id: 'r1', host: 'fake@host', sessionsRoot: nastyRoot, cacheRoot: '/tmp/x/c' },
+  ] }));
+  await exec(process.execPath, [MERGED_INDEX, '--instances', instances], {
+    timeout: 30000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+  });
+  const argv = (await readFile(log, 'utf8')).split('\n').filter(Boolean);
+  const joined = argv.join(' ');
+  // 空格必须落在引号里（`'...My Sessions/.dsh/sessions; touch ...;'`）
+  assert.match(joined, /'[^']*My Sessions\/\.dsh\/sessions; touch \/tmp\/hwb-should-not-exist;'/,
+    `含空格与 ; 的路径必须整体被引号包住，实际远端命令：${joined.slice(0, 200)}`);
+  assert.ok(argv.includes('-o') && argv.includes('BatchMode=yes'), '应带 BatchMode（避免交互式挂起）');
+});
