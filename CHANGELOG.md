@@ -338,6 +338,19 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   与 `model-tier.json`（`schema 2`、`activeId`、`schemes[].tiers`）都与 hwb 的解析器逐字段吻合。
 
 ### 变更说明（证据，不是猜测）
+#### 在**用户真实库的副本**上验证了今晚的全部 schema 迁移（uv 0 → 2 + 新索引）
+- 做法：把 `~/.hwb/hwb.db` **复制**到 `/tmp` 后用新代码打开（源库只读、不动），前后各用**裸 SQL**
+  取独立预言机比对。真实数据形态：553 会话 / 5 实例 / 24 MB 级库，`user_version = 0`、
+  **四个派生列一个都没有**（也就是说这台机器上的服务还是今晚之前的代码）。
+- 结果（实测）：
+  · 迁移：`user_version 0 → 2`；四个派生列补齐；`idx_sessions_home_ws` 建好；**耗时 3ms**。
+  · 数字正确：派生列求和 **3,937,139,946** == 用 `json_extract` 直接算的预言机 **3,937,139,946**；
+    `usageSummary({days:3650}).totalTokens` 也是同一个数。
+  · 没有丢数据：迁移前后 `sessions` 553 / `homes` 5 不变。
+  · 读路径全通：`recentProjects` 20 个项目（1ms）、`recentSessions` 20 条、`listHomes` 5 个实例。
+- 结论：这个库重启后会自动完成迁移与新索引，历史用量分毫不差；用户不需要任何手工动作。
+
+### 变更说明（证据，不是猜测）
 #### projcache 的版本支持从「只认 3」放宽到「3/4/5」——否则新版 dsh 写过的 home 会被判降级
 - **证据**：dsh 自己的域声明是
   `projectionCacheDomainSpec = { name: 'session_projcache', version: 5, compatibleVersions: [3, 4],
