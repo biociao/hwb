@@ -187,3 +187,30 @@ test('极端查询参数不再把接口打成 500', async (t) => {
     }
   }
 });
+
+// 三处 HTTP 细节，都是独立审查第 8 轮提出的：
+//  · `/api/*` 的响应原先一条 Cache-Control 都没有（preview/download 单独设了 no-store，其余没有）——
+//    这是个无鉴权 API，响应里有实例元数据与会话标题，不该进浏览器缓存或反代。
+//  · 路由只匹配 `method === 'GET'`，于是 `curl -I /api/homes`（HEAD）**404** ——
+//    任何基于 HEAD 的健康检查都会认为 API 挂了。
+//  · 静态 403/404 与 500 没带 Content-Type / charset。
+test('HTTP: /api/* 带 no-store 与 nosniff，HEAD 与 GET 行为一致', async () => {
+  const { server } = makeServer();
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const get = await fetch(`${base}/api/homes`);
+    assert.equal(get.status, 200);
+    assert.equal(get.headers.get('cache-control'), 'no-store', '/api/* 必须不可缓存');
+    assert.equal(get.headers.get('x-content-type-options'), 'nosniff');
+
+    const head = await fetch(`${base}/api/homes`, { method: 'HEAD' });
+    assert.equal(head.status, 200, 'HEAD 应与 GET 同样可达（健康检查常用）');
+    assert.equal(await head.text(), '', 'HEAD 不该有 body');
+
+    const missing = await fetch(`${base}/api/nope`);
+    assert.equal(missing.status, 404);
+    assert.match(missing.headers.get('content-type') || '', /application\/json/);
+    assert.equal(missing.headers.get('cache-control'), 'no-store');
+  } finally { await new Promise((r) => server.close(r)); }
+});

@@ -78,7 +78,11 @@ export function getLogs({ level, limit = 100 } = {}) {
   const out = level
     ? ring.filter((e) => (LEVELS[e.level] ?? levelVal('info')) >= levelVal(level))
     : [...ring];
-  return out.slice(-Math.max(0, limit));
+  // `limit <= 0` 必须返回**空**：`slice(-Math.max(0, limit))` 在 limit=0 时算的是 `slice(-0)`
+  // 而 `-0 === 0` → `slice(0)` → 把整个环缓冲返回。HTTP 路径目前把 limit 夹在 [1,1000] 所以没暴露，
+  // 但这是个等着被踩的陷阱（任何新调用方传 0 都会拿到全部日志）。
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  return out.slice(-limit);
 }
 
 // 清空环缓冲。
@@ -179,10 +183,49 @@ function emit(level, scope, message, err, fields) {
 //
 // 只匹配「token 的值」而不动其它内容：`?token=xxx`、`&token=xxx`、`token=xxx`、
 // `"token": "xxx"`（safeJson 之后的形态）都要覆盖，值字符集与 captureDshToken 对齐。
-const TOKEN_PATTERN = /((?:[?&\s"']|^)?token(?:=|"\s*:\s*")[\s]*)([A-Za-z0-9_-]+)/gi;
+// 脱敏规则（唯一收口，在 emit() 里对**最终字符串**执行）。
+//
+// 为什么值字符集用「分隔符取反」而不是 `[A-Za-z0-9_-]`：后者只吃前缀，`token=abc+DEF/ghi==`
+// 会被脱敏成 `token=[已脱敏]+DEF/ghi==`（**值的一半还留在日志里**）。分隔符取反能一次吃掉整个值，
+// 又不会溢出到下一个字段（遇到空白、引号、&、逗号、分号、右括号、`]`、`}` 即停）。
+//
+// 为什么不止匹配 `token`：真实 dsh token 是 base64url，今天的形态本来就被覆盖，所以这一段是
+// **加固**而不是已发生的泄漏 —— 但既然这里已经是唯一收口，就没有理由只认一种键名。
+// 键名允许是单词后缀（`DCS_PAT` / `MY_API_KEY` 都要命中），代价是偶尔多脱敏一点，
+// 这正是本文件一贯的取舍：宁可误脱敏也不能漏。
+// 值里**同时排除 `[` 与 `]`**：脱敏标记本身是 `[已脱敏]`，若不排除 `[`，第二次替换会把标记
+// 吃掉一半、留下一个多余的 `]`（实测 `--token <v>` 变成 `--token [已脱敏]]`）。
+// 排除之后 redactSecrets 是幂等的 —— 这很重要，因为同一行会在 console、文件、环缓冲三条路上
+// 各过一次，而日志行本身也可能包含上一次的输出。
+const VALUE = `[^\\s&"',;)\\]}\\[]+`;
+const SECRET_KEY = '(?:token|access_token|refresh_token|pat|api[-_]?key|secret|password|passwd)';
+// 形如 `token=…` / `token: …` / `"token": "…"` / `DCS_PAT=…`（键名允许是单词后缀）
+const KEY_VALUE = new RegExp(`((?:[?&\\s"']|^|[\\w-])(?:${SECRET_KEY})(?:\\s*[:=]\\s*|"\\s*:\\s*"))(${VALUE})`, 'gi');
+// Authorization 单独处理：必须把 scheme 也放进前缀一起吃掉，否则会「脱敏 Bearer、留下真 token」。
+// 这里**不**把裸 `token ` 当分隔符 —— 那会把普通散文里的「token 只是…」也吃掉（过度脱敏，
+// 而且让日志变得难读）。命令行形态由下面的 SPACED_FLAG 覆盖。
+// `Authorization: Bearer <v>`：scheme 必须**强制**出现在前缀里。写成「scheme 可选」会在第二次
+// 替换时把已脱敏结果里的 `Bearer` 当成值吃掉（`Authorization: [已脱敏]`）—— 实测非幂等。
+// 注意 `authorization...` 这一段是**必需**的：写成可选就等于「任何 beacon/bearer 开头的散文都会被脱敏」
+// （实测 `the bearer of bad news` 被吃掉一半）。裸 `Bearer <值>` 由下面的 BEARER_BARE 负责，
+// 且带「值至少 16 个凭据字符」的前提。
+const AUTH_SCHEME = new RegExp(`((?:authorization\\s*[:=]\\s*(?:bearer|basic)\\s+))(${VALUE})`, 'gi');
+// 没有 scheme 的形态（`authorization: <v>`）。负向断言排除 scheme 词，否则同样会在第二次替换时
+// 把 `Bearer` 当值吃掉。
+const AUTH_BARE = new RegExp(`((?:authorization\\s*[:=]\\s*))((?!(?:bearer|basic|token)\\b)${VALUE})`, 'gi');
+// 裸 `Bearer <v>`（HTTP 头被单独打印时很常见）。要求值至少 16 个「凭据字符」：
+// 不加这个前提会把散文里的「the bearer of bad news」也脱敏掉（实测过），日志会变得没法读。
+const BEARER_BARE = new RegExp(`((?:\\bbearer\\s+))((?=[\\w.~+/=-]{16,})${VALUE})`, 'gi');
+// 形如 `--token <v>` / `--api-key <v>`
+const SPACED_FLAG = new RegExp(`((?:--(?:${SECRET_KEY})\\s+))(${VALUE})`, 'gi');
 
 export function redactSecrets(value) {
-  return String(value ?? '').replace(TOKEN_PATTERN, (m, prefix) => `${prefix}[已脱敏]`);
+  return String(value ?? '')
+    .replace(KEY_VALUE, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(AUTH_SCHEME, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(AUTH_BARE, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(BEARER_BARE, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(SPACED_FLAG, (m, prefix) => `${prefix}[已脱敏]`);
 }
 
 function redactFields(fields) {

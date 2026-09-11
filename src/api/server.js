@@ -21,7 +21,7 @@ async function serveStatic(webRoot, pathname, req, res) {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const file = path.normalize(path.join(webRoot, rel));
   if (!file.startsWith(webRoot + path.sep)) {
-    res.writeHead(403).end('forbidden');
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' }).end('forbidden');
     return;
   }
   try {
@@ -46,7 +46,7 @@ async function serveStatic(webRoot, pathname, req, res) {
     res.writeHead(200, base);
     res.end(body);
   } catch {
-    res.writeHead(404).end('not found');
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' }).end('not found');
   }
 }
 
@@ -101,6 +101,16 @@ export function createApiServer({ store, indexer, hub, launcher, monitor, quota,
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {
+      // 所有 /api/* 响应统一带 no-store：这些 JSON 里有实例元数据、会话标题、错误上下文，
+      // 而这个 API 无鉴权（回环 != 只有你能访问）。preview/download 早就单独设了 no-store，
+      // 其余路由此前一条都没有 —— 浏览器 HTTP 缓存或前面的反代都可能把它留下来。
+      // 同时给 nosniff：JSON 响应被当成别的类型解析是额外风险。
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      // HEAD 落到与 GET 同一条路由：路由只匹配 `method === 'GET'`，于是 `curl -I /api/homes`
+      // 会 404 —— 任何基于 HEAD 的健康检查都会认为 API 挂了。Node 对 HEAD 会自动不写 body，
+      // 所以这里把方法改成 GET 交给同一套逻辑即可（用副本，不改原对象以免影响后续日志/判断）。
+      if (req.method === 'HEAD') req.method = 'GET';
       if (!isLoopbackHost(req.headers.host, allowedHosts)) {
         log.warn('拒绝非回环 Host 的 API 请求（疑似 DNS rebinding）', { host: req.headers.host, path: url.pathname });
         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -110,7 +120,7 @@ export function createApiServer({ store, indexer, hub, launcher, monitor, quota,
       route(req, res, url).catch((e) => {
         // API 处理抛错：记录请求路径 + 错误栈，返回 500；前端能拿到 message，日志能还原根因。
         log.error('API 请求处理失败', e, { method: req.method, path: url.pathname });
-        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: e.message }));
       });
       return;

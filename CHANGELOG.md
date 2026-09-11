@@ -339,6 +339,37 @@ Semantic Versioning.
   并对实现做一条结构断言：取头部的函数里**不许出现 `readFile(`**、必须用 `createReadStream`。
   回退修复后该用例失败。（内存数字本身不写成断言：GC/平台差异会抖。）
 
+#### 日志脱敏的「值」只吃前缀；`getLogs({limit:0})` 会倒出整个环缓冲（src/lib/logger.js）
+- **现象**（独立审查第 7 轮）：
+  · 值字符集写的是 `[A-Za-z0-9_-]`，于是 `token=abc+DEF/ghi==` 只被脱敏成
+    `token=[已脱敏]+DEF/ghi==` —— **值的一半还在日志里**；键名也只认 `token`，
+    `Authorization: Bearer …`、`api_key=…`、`DCS_PAT=…`、`token: …` 一律漏。
+    真实 dsh token 是 base64url（今天的形态本来就被覆盖，审查也确认没有现成的泄漏调用点），
+    所以这是**加固**而不是已发生的泄漏 —— 但这里已经是唯一收口，没有理由只认一种键名。
+  · `getLogs({limit: 0})` 会返回**整个环缓冲**：`slice(-Math.max(0, limit))` 在 limit=0 时
+    算的是 `slice(-0)`，而 `-0 === 0` → `slice(0)`。HTTP 路径把 limit 夹在 [1,1000] 所以没暴露，
+    但这是个等着被踩的陷阱。
+- **修复**：值改成「分隔符取反」（一次吃掉整个值，又不会溢出到下一个字段）；
+  键名扩到 `token/access_token/refresh_token/pat/api[-_]?key/secret/password/passwd` 且允许单词后缀
+  （`DCS_PAT`、`MY_API_KEY` 都要命中）；`Authorization` 单独一条规则，且**必须**把 scheme 放进前缀
+  一起吃掉 —— 否则会「脱敏 Bearer、留下真 token」。`limit <= 0`（含 NaN）直接返回空数组。
+- **两个自己踩出来的坑**（都写进注释与测试）：①值里必须同时排除 `[` 与 `]`，否则标记
+  `[已脱敏]` 会被第二次替换吃掉一半，留下一个多余的 `]`（`--token [已脱敏]]`）——
+  现在断言**幂等**；②`bearer` 不能无条件当分隔符，否则散文「the bearer of bad news」也被脱敏，
+  裸 `Bearer <值>` 改成「值至少 16 个凭据字符」才匹配。
+- **回归测试**：`tests/logger-security.test.js` —— 11 种泄漏形态（含幂等断言）+ 3 种不该动的普通文本
+  + `limit` 为 0/负数/NaN 必须为空。修复前两条用例都失败。
+
+#### `/api/*` 的响应头（src/api/server.js）
+- **现象**（独立审查第 8 轮）：`/api/*` 的响应**一条 Cache-Control 都没有**（preview/download 单独设了
+  `no-store`，其余没有）；`curl -I /api/homes`（HEAD）返回 **404** —— 路由只匹配 `method === 'GET'`，
+  于是任何基于 HEAD 的健康检查都会认为 API 挂了；静态 403/404 与 500 缺 Content-Type/charset。
+- **修复**：`/api/*` 统一加 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`
+  （这是个无鉴权 API，响应里有实例元数据与会话标题，不该进浏览器缓存或中间代理）；
+  HEAD 映射到 GET 交给同一套逻辑（Node 对 HEAD 本来就不写 body）；错误响应补 content-type。
+- **回归测试**：`tests/api-server-hardening.test.js` —— HEAD 必须 200 且无 body、`/api/*` 必须
+  `no-store` + nosniff、404 也要带 JSON content-type 与 no-store。修复前失败。
+
 #### `/api/usage` 的 8 个同步聚合把整个服务冻住（src/api/routes.js + src/web/app.js）
 - **现象**（独立审查第 8 轮，HIGH）：`node:sqlite` 是同步的，`/api/usage` 一次要跑**八个**聚合；
   用 40k 会话的真实库实测：合计 **~330ms**（summary 38.6 / trend 35.2 / byProject 28.7 /

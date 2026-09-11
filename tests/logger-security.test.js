@@ -113,3 +113,48 @@ test('文件打开失败后会按节流重试，故障恢复即恢复写入', as
   const body = await readFile(target, 'utf8');
   assert.match(body, /恢复之后/, '文件日志必须在故障恢复后自己续上，而不是永久静默');
 });
+
+// 脱敏原先的值字符集是 `[A-Za-z0-9_-]`，只吃前缀：`token=abc+DEF/ghi==` 会脱敏成
+// `token=[已脱敏]+DEF/ghi==`（**值的一半还留在日志里**）。键名也只认 token，
+// `Authorization: Bearer …` / `api_key=…` / `DCS_PAT=…` / `token: …` 一律漏。
+// 真实 dsh token 是 base64url（今天的形态本来就覆盖），所以这是**加固**；但这里已经是唯一收口。
+test('logger: 脱敏覆盖更多键名与值形态，且幂等、不误伤散文', async () => {
+  const { redactSecrets } = await import('../src/lib/logger.js');
+  const leaks = [
+    ['launch url', 'http://127.0.0.1:3080/?token=abc123'],
+    ['加号/斜杠/等号', 'token=abc+DEF/ghi=='],
+    ['冒号形态', 'token: abc123def'],
+    ['命令行 flag', '--token abc123def'],
+    ['Authorization Bearer', 'Authorization: Bearer sk-live-abcdef123456'],
+    ['裸 Bearer', 'Bearer sk-live-abcdef123456'],
+    ['api_key', 'api_key=sk-live-123456'],
+    ['DCS_PAT', 'DCS_PAT=dcs_pat_abcdef'],
+    ['JSON 形态', '"token": "json-shaped-value"'],
+    ['password', 'password=hunter2'],
+    ['cookie', 'dsh_token=abcdef123456;'],
+  ];
+  for (const [label, text] of leaks) {
+    const out = redactSecrets(text);
+    assert.doesNotMatch(out, /(sk-live|abc123|hunter2|dcs_pat|json-shaped|abcdef123456)/, `${label} 仍有明文：${out}`);
+    assert.match(out, /已脱敏/, `${label} 应出现脱敏标记`);
+    // 幂等：同一行会在 console、文件、环缓冲三条路上各过一次
+    assert.equal(redactSecrets(out), out, `${label} 的脱敏结果必须幂等（否则标记会被二次吃掉）`);
+  }
+  // 不误伤：散文里的 token/bearer 只是普通词
+  assert.equal(redactSecrets('这段文本里 token 只是一个词，没有分隔符'), '这段文本里 token 只是一个词，没有分隔符');
+  assert.equal(redactSecrets('the bearer of bad news arrived'), 'the bearer of bad news arrived');
+  assert.equal(redactSecrets('indexed 5 sessions in 12ms'), 'indexed 5 sessions in 12ms');
+});
+
+// `slice(-Math.max(0, limit))`：limit=0 时算的是 `slice(-0)`，而 `-0 === 0` → `slice(0)` → 返回整个环。
+test('logger: getLogs({limit:0}) 返回空，而不是把整个环缓冲倒出来', async () => {
+  const { initLogger, logger: log, getLogs, clearLogs } = await import('../src/lib/logger.js');
+  initLogger({ level: 'info', file: false, silent: true });
+  clearLogs();
+  const l = log('t');
+  for (let i = 0; i < 5; i++) l.info(`条目 ${i}`);
+  assert.equal(getLogs({ limit: 3 }).length, 3);
+  assert.equal(getLogs({ limit: 0 }).length, 0, 'limit=0 必须是空数组');
+  assert.equal(getLogs({ limit: -5 }).length, 0, '负数同样为空');
+  assert.equal(getLogs({ limit: Number.NaN }).length, 0, 'NaN 也要安全');
+});
