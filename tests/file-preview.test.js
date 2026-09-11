@@ -139,3 +139,31 @@ test('session workspace uses project when ID is missing, but never guesses dupli
   assert.equal(sessionWorkspace([...rows, { workspaceId: 'c', project: 'p', path: '/c' }], { project: 'p' }), null);
   assert.equal(sessionWorkspace(rows, null), null);
 });
+
+// 本机下载不再走 base64。走 base64 的代价是三层同尺寸副本：
+// 原 buffer → base64 字符串（1.33×）→ JSON.stringify 的结果（又一份）→ 调用方再解一遍。
+// 实测 64 MiB 文件的额外堆占用约 170 MiB（合计约 235 MB 峰值）。
+// 远端仍用 base64（那是 ssh 传输的需要），所以调用方必须两种都能处理。
+test('download 本机返回 Buffer（不做 base64），远端仍是 base64 字符串', async (t) => {
+  const { root } = await fixture(t);
+  const local = { hostType: 'local' };
+  const remote = { hostType: 'remote', host: 'fixture' };
+  await writeFile(path.join(root, 'plain.txt'), 'hello world');
+
+  const localResult = await readFilePreview(local, root, 'plain.txt', execRemote, { download: true });
+  assert.equal(Buffer.isBuffer(localResult.data), true, '本机下载应交回 Buffer，避免 base64 + JSON 的两层副本');
+  assert.equal(localResult.data.toString(), 'hello world');
+
+  const remoteResult = await readFilePreview(remote, root, 'plain.txt', execRemote, { download: true });
+  assert.equal(typeof remoteResult.data, 'string', '远端经 ssh 传回，仍应是 base64 字符串');
+  assert.equal(Buffer.from(remoteResult.data, 'base64').toString(), 'hello world');
+});
+
+test('download 本机：Buffer 路径不做额外拷贝（同一底层内存）', async (t) => {
+  const { root } = await fixture(t);
+  await writeFile(path.join(root, 'plain.txt'), 'abc');
+  const r = await readFilePreview({ hostType: 'local' }, root, 'plain.txt', execRemote, { download: true });
+  assert.equal(Buffer.isBuffer(r.data), true);
+  assert.equal(r.data.length, 3);
+  assert.equal(r.size, 3);
+});

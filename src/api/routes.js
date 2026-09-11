@@ -117,7 +117,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         if (preview[2] === 'download') {
           const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { download: true });
           const name = encodeURIComponent(path.basename(result.path)).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16));
-          const bytes = Buffer.from(result.data, 'base64');
+          // 本机下载回的是 Buffer（见 readLocalPreview：避免 base64 + JSON 的两层同尺寸副本），
+          // 远端下载经 ssh 传回，仍是 base64 字符串。两条路径都在这里收敛成响应用的字节。
+          const bytes = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data, 'base64');
           res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
             'Content-Disposition': `attachment; filename="download"; filename*=UTF-8''${name}`, 'X-Content-Type-Options': 'nosniff' });
           res.end(bytes);

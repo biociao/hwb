@@ -89,6 +89,13 @@ Semantic Versioning.
 - 上传的 multipart 解析是流式的（`src/lib/multipart.js`）：边解析边把文件字节交给写入端，
   内存占用与文件大小无关；缺失 `Content-Length` 时直接拒绝，以保证写盘前就能设限。
 
+### Changed
+
+- 本机**下载**不再经 base64 中转（`readLocalPreview` 直接交回 `Buffer`）。原先的链路上有三层同尺寸
+  副本：原 buffer → base64 字符串（1.33×）→ `JSON.stringify` 的结果（又一份）→ 调用方再解一遍，
+  实测 64 MiB 文件额外堆占用约 170 MiB（合计约 235 MB 峰值）。远端仍用 base64（ssh 传输需要），
+  调用方按类型分别处理。实测本机 64 MiB 下载的 RSS 增量从 ~235 MB 降到 64 MB。
+
 ### Fixed
 
 #### 拖拽排序提交的是「部分顺序」，会把刚排好的顺序打乱（src/web/app.js）

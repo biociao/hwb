@@ -54,7 +54,12 @@ export async function readLocalPreview(root, requested = '.', download = false) 
         length += bytesRead;
       }
       if (length !== st.size) throw new Error('文件在读取时发生变化，请重试');
-      return { ...base, kind: 'download', size: length, data: buffer.subarray(0, length).toString('base64') };
+      // 本机下载直接交回 Buffer，**不做 base64**。
+      // 走 base64 的代价是三层同尺寸副本：原 buffer → base64 字符串（1.33×）→
+      // JSON.stringify 的结果（又一份）→ 调用方 Buffer.from 再解一遍。
+      // 64 MiB 的文件峰值约 300 MB。远端路径仍用 base64（那是 ssh 传输的需要），
+      // 调用方按类型分别处理（Buffer 直接写出，字符串才解码）。
+      return { ...base, kind: 'download', size: length, data: buffer.subarray(0, length) };
     }
     const mime = IMAGE_TYPES[path.extname(target).toLowerCase()];
     if (mime && st.size > IMAGE_BYTES) throw new Error('图片超过 2 MiB 预览上限');
