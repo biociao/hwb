@@ -40,6 +40,9 @@ let lastUsageKey = null;
 // 期间整个单线程服务都停着）。所以渲染路径上不再「每次都要」：同一个统计周期 15s 内复用。
 const usageCache = createUsageCache(15_000);
 const usageKey = () => `${usagePeriod.days}:${usagePeriod.hours}`;
+// 实例集合或名称变了（新增/移除/改名）之后必须丢掉这层缓存：用量数据（尤其「按实例」维度）
+// 已经不是同一份了 —— 否则刚移除的实例最多还在图表里挂 15 秒（服务端那层 10s 记忆同理，已在路由里清）。
+function dropUsageCache() { usageCache.invalidate(); }
 function fetchUsage({ force = false } = {}) {
   const key = usageKey();
   if (!force) {
@@ -502,6 +505,7 @@ async function saveSettings(homeId) {
     body.homePath = form.homePath.value.trim();
   }
   await api(`/api/homes/${homeId}`, { method: 'PUT', body });
+  dropUsageCache();   // 别名决定「按实例」维度的显示名；改名后不该还挂着旧名字
   closeModal();
   // 若该实例正处于打开视图（或配置变更导致 homeId 变化），保存后自动回工作台并清理其 pane。
   if (view.kind === 'instance' && view.homeId === homeId) {
@@ -523,6 +527,7 @@ async function addHome({ homePath, alias, hostType = 'local', host, remotePort, 
   // —— 服务端明明回了「这个目录看起来不像 dsh home」，用户一个字都看不到。
   const warning = form && data.warning ? data.warning : null;
   showAddForm = false;
+  dropUsageCache();   // 新实例可能立刻带来一批历史会话，别让「按实例」图滞后 15s
   await refresh();
   if (warning) {
     // 粘性：这类提示描述的是「需要你处理的事实」，不是「刚刚那一轮刷新失败了」，
@@ -643,6 +648,7 @@ async function handleAction(e) {
           }
           await api(`/api/homes/${id}`, { method: 'DELETE' });
           destroyPane(id);
+          dropUsageCache();
           await refresh();
         }
         break;

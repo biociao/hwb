@@ -131,3 +131,47 @@ test('endpoints: 不回传端点 token，且「留空保持不变 / 显式清除
     assert.equal(store.getHome(homeId).endpoints[0].token, 'NEW-TOKEN');
   } finally { await new Promise((r) => server.close(r)); store.close(); }
 });
+
+// 用量数据的服务端 10s 记忆（USAGE_TTL_MS）本意是削峰，但它不知道**实例集合变了**：
+// 移除一个实例之后，`/api/usage` 的「按实例」维度还会把那个实例带出来，最长 10s
+// （客户端还有一层 15s，合计更久）。用户视角就是「我已经移除它了，图表里还在」。
+// 现在三条会改变用量数据集的写路由都会清掉这份记忆。
+test('移除实例后 /api/usage 立刻不再包含它（10s 记忆不能盖住实例集合的变化）', async () => {
+  const store = new IndexStore(':memory:');
+  const keep = store.registerHome({ homePath: '/tmp/keep', alias: 'keep-alias', hostType: 'local' });
+  const drop = store.registerHome({ homePath: '/tmp/drop', alias: 'drop-alias', hostType: 'local' });
+  const now = new Date().toISOString();
+  for (const [homeId, n] of [[keep, 111], [drop, 222]]) {
+    store.upsertRows([{ type: 'session', homeId, sessionId: `s-${homeId}`, project: 'p', title: null,
+      tokenUsage: JSON.stringify({ uncachedInputTokens: n, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }),
+      contextPressure: null, status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 }]);
+  }
+  const server = createApiServer({
+    store,
+    indexer: { reindexNow: async () => [] },
+    hub: { broadcast() {}, handle() {} },
+    launcher: { status: () => null, disconnect: async () => {} },
+    monitor: { get: () => ({ runtime: 'stopped' }), refresh: async () => {} },
+    quota: { list: () => [], refresh: async () => ({}) },
+    logApi: { getLogs: () => [] },
+    webRoot: '/nonexistent-web-root',
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const instances = async () => {
+      const body = await (await fetch(`${base}/api/usage?days=30&hours=720`)).json();
+      return [...new Set(body.trendBy.instance.buckets.flatMap((b) => Object.keys(b.groups)))].sort();
+    };
+    assert.deepEqual(await instances(), ['drop-alias', 'keep-alias'], '前置条件：两个实例都在图里');
+
+    const res = await fetch(`${base}/api/homes/${drop}`, { method: 'DELETE' });
+    assert.equal(res.status, 200);
+
+    // 不清记忆时这里会返回缓存里的旧 body（仍然是两个实例），要等 10s 才消失
+    assert.deepEqual(await instances(), ['keep-alias'], '移除后必须立刻只剩未被移除的那个实例');
+  } finally {
+    await new Promise((r) => server.close(r));
+    store.close();
+  }
+});

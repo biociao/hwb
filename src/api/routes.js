@@ -171,6 +171,10 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     usageMemo.set(key, { at: Date.now(), body });
     return body;
   };
+  // 实例集合/名称变了（新增、移除、改别名），缓存的 body 就不再是同一份数据：
+  // 「按实例」维度会继续显示一个**已经被移除**的实例，最多 10s（客户端还有一层 15s，合计更久）。
+  // 这类写操作很少，直接整表清空最省心 —— 代价是紧随其后的一次 /api/usage 会真跑一遍聚合。
+  const dropUsageMemo = () => usageMemo.clear();
 
   const reindexInBackground = (homeId) => {
     try {
@@ -342,6 +346,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         // 注册后立即触发一次该实例的索引（不等结果：远程走 SSH，不可达时要等超时，
         // 同步等待会卡住注册响应；索引完成后会广播 index:updated，前端经 SSE 自动刷新）。
         reindexInBackground(homeId);
+        dropUsageMemo();   // 同上：新实例立刻参与「按实例」维度
         send(res, 200, { homeId, warning: null, result: null });
         return;
       }
@@ -363,6 +368,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       const token = typeof body.token === 'string' && body.token.trim() ? body.token.trim() : null;
       const homeId = store.registerHome({ homePath, alias, hostType: 'local', localPort, token, endpoints: body.endpoints, activeEndpointId: body.activeEndpointId, accessPort });
       const results = await indexer.reindexNow(homeId);
+      dropUsageMemo();   // 新实例可能已经带了一批会话（接入已有 dsh），「按实例」维度要立刻反映
       send(res, info.looksLikeDshHome ? 200 : 202, {
         homeId,
         warning: info.looksLikeDshHome ? null : 'directory does not look like a dsh home (storages/workspace.json missing)',
@@ -464,6 +470,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         }
       }
       const updated = store.updateHomeConfig(home.homeId, patch);
+      dropUsageMemo();   // 别名决定「按实例」维度里的显示名，改名后不该还挂着旧名字
       send(res, 200, { home: { ...publicHome(updated), runtime: monitor.get(home.homeId) } });
       return;
     }
@@ -483,6 +490,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         // 否则它会一直占着端口与 DSH_HOME，且再也无法从 UI/API 触达。
         await launcher.disconnect(home, { release: true });
         store.removeHome(homeId);
+        dropUsageMemo();   // 否则「按实例」图里还会留着刚移除的实例（见 dropUsageMemo 的注释）
         hub.broadcast('index:updated', { homeId, removed: true });
         send(res, 200, { ok: true, homeId });
       } finally { connecting.delete(key); }

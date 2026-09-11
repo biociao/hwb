@@ -216,6 +216,17 @@ Semantic Versioning.
   无 0 值散点、日志面板有历史行、添加实例的 warning 在 SSE 刷新后仍在。
 
 ### Fixed
+#### 移除/新增/改名实例后，用量图还会带着旧实例（服务端 10s + 客户端 15s 两层记忆）（src/api/routes.js + src/web/app.js）
+- **现象**：删掉一个实例之后，「按实例」维度的用量图里仍然挂着它，最长十几秒才消失（用户视角
+  就是「我已经移除它了，图上还在」）。改别名同理：图上还显示旧名字。
+- **根因**：两层记忆都只按「周期」做键（服务端 `USAGE_TTL_MS = 10s`，客户端 `createUsageCache(15s)`，
+  为的是把 8 个同步聚合的尖峰压下去），却不知道**实例集合变了** —— 缓存里那份 body 已经不成立。
+- **修复**：服务端加 `dropUsageMemo()`，在会改变用量数据集的三条写路由里清空（新增/移除/更新实例）；
+  客户端 `dropUsageCache()` 在 addHome / remove-home / saveSettings 之后调用，让下一次渲染强制拉取。
+- **回归测试**：`tests/api-token-exposure.test.js` —— 两个实例都在图里 → DELETE 其中一个 →
+  同一个 `/api/usage` 请求必须立刻只剩一个（修复前返回缓存里的旧 body，实测失败）。
+
+### Fixed
 #### 数据库被另一个进程占用时，给的是「改名或换路径」这条错误建议（src/dshhome/store.js）
 - **现象**：两个 hwb 用同一个 `hwb.db`（或外部工具持着写锁）时，第二个进程立刻报
   `database is locked`，而包装后的消息只教用户「改名或换一个路径」—— 那等于让他把库换掉。
