@@ -13,9 +13,10 @@
 // Requires a Node with zstd in `node:zlib` (Node >= 22.15 / >= 21.2).
 
 import { readdir, readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { zstdDecompressSync } from "node:zlib";
+import { createZstdDecompress } from "node:zlib";
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -31,13 +32,50 @@ const activeTolMs = Number(arg("--active-tol", "90000")); // "recently active" w
 // path-encoded segment equals the raw id. Cache files are keyed by that same
 // segment (legacy records may use the bare id; the loader normalizes both).
 
+// 只读第一行 —— 但 zstd 是流式压缩，取一行必须先解压。
+//
+// 原生实现用 zstdDecompressSync(整个文件)：本文件自称「lightweight / 只读 session header」，
+// 实际上一个 19 KB 的 session.jsonl.zstd（解压后 200 MB）会让峰值 RSS 到 480 MB ——
+// 而这个脚本还会经 ssh 在**远端主机**上跑，大会话能把远端的 dsh 一起拖下水。
+// 改成流式解压，拿到第一个换行就销毁流；并对 header 长度设硬上限（正常 header 只有几百字节）。
+const HEADER_LIMIT = 64 * 1024;
+
 async function readHeaderFirstLine(path, suffix) {
-  const buf = await readFile(path);
-  if (suffix === ".jsonl.zstd") {
-    const raw = zstdDecompressSync(buf);
-    return raw.subarray(0, raw.indexOf(0x0a) === -1 ? raw.length : raw.indexOf(0x0a)).toString("utf8");
-  }
-  return buf.subarray(0, buf.indexOf(0x0a) === -1 ? buf.length : buf.indexOf(0x0a)).toString("utf8");
+  // 两条分支都要**流式**。这里曾经只有 zstd 分支是流式的：非 zstd 分支用 readFile 把整个
+  // session.jsonl 读进内存，只为取第一行 —— 实测一个 300 MB 的 session.jsonl 峰值 RSS 344 MB
+  // （基线 13 MB）。本脚本是经 ssh 在**远端主机**上跑的，大会话足以把远端的 dsh 一起拖下水
+  // （与 zstd 那条注释里写的是同一个故障模式，只是当时漏了这一个分支）。
+  return new Promise((resolve, reject) => {
+    const raw = createReadStream(path);
+    const streams = [raw];
+    let source = raw;
+    if (suffix === ".jsonl.zstd") {
+      const unzstd = createZstdDecompress();
+      streams.push(unzstd);
+      raw.pipe(unzstd);
+      source = unzstd;
+    }
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      for (const s of streams) s.destroy();
+      if (err) return reject(err);
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    source.on("data", (chunk) => {
+      // 换行不会跨 chunk，所以在单个 chunk 内找即可。
+      const nl = chunk.indexOf(0x0a);
+      if (nl !== -1) { chunks.push(chunk.subarray(0, nl)); return finish(null); }
+      chunks.push(chunk);
+      total += chunk.length;
+      if (total > HEADER_LIMIT) return finish(null);
+    });
+    source.on("end", () => finish(null));
+    for (const s of streams) s.on("error", finish);
+  });
 }
 
 function parseHeader(line) {
@@ -100,6 +138,11 @@ async function main() {
     rootDirs = [];
   }
 
+  // 缓存目录是**全局**的（会按 sessionId 对上下面的每个项目），所以只读一次。
+  // 原先它放在 for 里，每个项目目录都重扫一遍缓存目录并解析全部 json：
+  // 30 个项目 × 100 个缓存文件 = 3000 次 readFile；真实 home（214 项目 × 428 文件）约 91k 次。
+  const cacheRows = await loadCache();
+
   for (const p of rootDirs) {
     const projDir = join(root, p.name);
     const sessions = [];
@@ -153,7 +196,6 @@ async function main() {
 
     // Enrich with projection-cache metadata (title/stats/goal/tokens).
     const byId = new Map(sessions.map((s) => [s.id, s]));
-    const cacheRows = await loadCache();
     for (const [id, rows] of cacheRows) {
       const s = byId.get(id);
       if (!s) continue;

@@ -133,6 +133,10 @@ async function serveAsset(req, res, distRoot) {
   }
   let rel = pathname
   if (rel.startsWith('/assets/')) rel = rel.slice('/assets/'.length)
+  // 收掉多余的前导斜杠：`/assets//a.js` 会得到 rel = '/a.js'，被 resolve 当成**绝对路径**，
+  // 于是越界检查把它判成 403 —— 文件明明存在却拒绝。这是**误拒**（不是逃逸），
+  // 正常的浏览器不会发这种 URL，但手工编辑/拼接出来的地址会出现。
+  rel = rel.replace(/^\/+/, '')
   if (rel === '' || rel.includes('..') || rel.includes('\0')) {
     res.writeHead(400); res.end(); return
   }
@@ -152,6 +156,12 @@ async function serveAsset(req, res, distRoot) {
     }
     throw err
   }
+  // stat() 对**目录**是成功的（所以上面那个 EISDIR 分支其实永远不会命中），一路走到 readFile
+  // 才抛 EISDIR。dist/assets 下真的存在目录（例如 assets/langs、assets/fonts），于是
+  // `GET /assets/langs` 会让这个处理器的 promise 拒绝：dsh 的 webserver 会兜住它，
+  // 但用户拿到的是 400 而不是 404，而且每次命中都往 dsh 日志里写一段 warn+堆栈。
+  // 这里在 readFile 之前显式判掉非普通文件。
+  if (!st.isFile()) { res.writeHead(404); res.end(); return }
   const type = MIME[extname(target).toLowerCase()] ?? 'application/octet-stream'
   const etag = `"${st.mtimeMs.toString(16)}-${st.size.toString(16)}"`
   const lastModified = st.mtime.toUTCString()
@@ -166,7 +176,19 @@ async function serveAsset(req, res, distRoot) {
     res.end()
     return
   }
-  const body = await readFile(target)
+  // readFile 失败（文件在 stat 与 read 之间被删/换、或权限不足、或磁盘错误）原先会让整个
+  // 处理器拒绝：dsh 的 webserver 兜住后回 **400** 并往日志里写一段 warn+堆栈，而正确答案是 404
+  // （与上面目录那条是同一类问题，当时只修了目录）。触发点很现实：`npm i -g` / dsh 升级过程中
+  // 资源被替换，而浏览器正好在刷新页面。
+  let body
+  try {
+    body = await readFile(target)
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'EACCES' || err.code === 'EISDIR' || err.code === 'EIO') {
+      res.writeHead(404); res.end(); return
+    }
+    throw err
+  }
   res.writeHead(200, {
     'content-type': type,
     'cache-control': CACHE_DIRECTIVE,

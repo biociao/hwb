@@ -1,6 +1,41 @@
+import { normalizeEndpoints, endpointPatch, legacyEndpoint } from '../lib/endpoints.js';
+import { normalizeAccessPort } from '../lib/access-port.js';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { homeIdOf } from '../lib/read-home.js';
+import { mergeLiveStatus } from './reader.js';
+import { logger } from '../lib/logger.js';
+
+const log = logger('store');
+
+// 每个 home 的子表（整表替换的粒度）。
+const CHILD_TABLES = ['sessions', 'workspaces', 'providers', 'model_tiers'];
+
+// 降级域 → 它负责填充的子表。见 upsertRows 的注释：降级域对应的表必须保留上次成功的行。
+// 未列出的域（例如 markHomeError 写的 'index'）不保护任何表——那类失败走的是 catch 分支，
+// 不会经过 upsertRows。
+const DOMAIN_TABLES = {
+  projcache: 'sessions',
+  workspace: 'workspaces',
+  credentials: 'providers',
+  modelTier: 'model_tiers',
+};
+
+function degradedTables(degraded) {
+  const tables = new Set();
+  for (const entry of Array.isArray(degraded) ? degraded : []) {
+    const table = DOMAIN_TABLES[entry?.domain];
+    if (table) tables.add(table);
+  }
+  return tables;
+}
+
+// listHomes 与 getHome 共用的实例基础查询：单实例点查只需在末尾拼一个 WHERE。
+const HOME_SELECT = `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
+              h.endpoints, h.activeEndpointId, h.serverId, h.host, h.remotePort, h.localPort, h.accessPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
+              (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
+              (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
+       FROM homes h`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS homes (
@@ -29,10 +64,26 @@ CREATE TABLE IF NOT EXISTS sessions (
   project TEXT,
   title TEXT,
   tokenUsage TEXT,
+  -- tokenUsage 的派生列：四个计数从 JSON 里解出来的整数。
+  -- 为什么要冗余：/api/usage 要跑八个聚合，而逐行 json_extract 在真实规模下很贵
+  -- （实测 40k 会话合计 ~330ms，而 node:sqlite 是同步的 —— 那段时间整个单线程服务都停着）。
+  -- 落成整数列之后聚合就是普通 SUM。真相仍是 tokenUsage（读接口照旧返回它），
+  -- 这两列由下面的触发器维护（任何写入者都算数），并与「直接对 JSON 跑 json_extract」的结果
+  -- 在 tests/store-token-columns.test.js 里逐项对拍。
+  -- 代价（实测 20k 行）：有触发器 172ms / 无 43ms —— 每行多一次 UPDATE；换来的是读侧
+  -- 等价 5 条聚合 175ms → 76ms（同一份 40k 数据）。按秒计的阻塞是净减少的。
+  -- 注意：这段注释里不能出现反引号 —— 它在 SCHEMA 模板字符串内部，反引号会提前结束字符串。
+  tokInput INTEGER NOT NULL DEFAULT 0,
+  tokOutput INTEGER NOT NULL DEFAULT 0,
+  tokCacheRead INTEGER NOT NULL DEFAULT 0,
+  tokCacheWrite INTEGER NOT NULL DEFAULT 0,
   contextPressure TEXT,
   status TEXT,
   lastActivity TEXT,
   generatedAt TEXT,
+  -- 1 = 这行只来自实时 RPC（dsh 的 /api/session/list），文件索引里还没有它。
+  -- 用来在「实时列表变成空」时精确清掉这些行，而不会误伤有文件索引支撑的会话。
+  liveOnly INTEGER NOT NULL DEFAULT 0,
   UNIQUE(homeId, sessionId)
 );
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -62,10 +113,90 @@ CREATE TABLE IF NOT EXISTS model_tiers (
   model TEXT,
   UNIQUE(homeId, tierId)
 );
+-- 派生列由**触发器**维护，而不是由 JS 写入：任何写入者（包括裸 SQL、外部工具改库）都不会
+-- 让两列与 tokenUsage 漂移。JS 侧不再参与，读路径也不解析 JSON。
+-- 表达式与旧的 json_valid/json_extract 写法逐项等价（json_valid 挡住非法 JSON → 0）。
+-- 注意 AFTER INSERT 里的 UPDATE 不会递归触发下面那个 UPDATE 触发器：SQLite 默认
+-- recursive_triggers=OFF（本文件不打开它）——若哪天要打开，这两个触发器必须重新设计。
+CREATE TRIGGER IF NOT EXISTS sessions_tok_ai AFTER INSERT ON sessions BEGIN
+  UPDATE sessions SET
+    tokInput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END,
+    tokOutput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.outputTokens'), 0) ELSE 0 END,
+    tokCacheRead = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheReadTokens'), 0) ELSE 0 END,
+    tokCacheWrite = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheWriteTokens'), 0) ELSE 0 END
+  WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_tok_au AFTER UPDATE OF tokenUsage ON sessions BEGIN
+  UPDATE sessions SET
+    tokInput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END,
+    tokOutput = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.outputTokens'), 0) ELSE 0 END,
+    tokCacheRead = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheReadTokens'), 0) ELSE 0 END,
+    tokCacheWrite = CASE WHEN json_valid(NEW.tokenUsage) THEN COALESCE(json_extract(NEW.tokenUsage, '$.cacheWriteTokens'), 0) ELSE 0 END
+  WHERE id = NEW.id;
+END;
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(lastActivity DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_home ON sessions(homeId);
+-- (homeId, workspaceId)：recentProjects 的「孤立 workspace」那一半要按 homeId 找没有会话的
+-- workspace。没有这个索引时，SQLite 只能 SCAN 整张 workspaces 表并逐行做关联 —— 规模测试实测
+-- （400k 会话 / 50k workspace）：那一半本身 35,340ms 却只产出 0 行，整个 recentProjects 44,311ms，
+-- 期间**整个服务停住**（并发探针实测最大停顿 9,758ms）。加上它之后：35,340ms → 43ms、
+-- 整个查询 → 1,224ms。测试规模的对照（20k 会话 / 4k workspace）：368ms → 6ms。
+CREATE INDEX IF NOT EXISTS idx_sessions_home_ws ON sessions(homeId, workspaceId);
 `;
+
+// 把「N 天前」算成 ISO 时间戳。上限 100 年：既覆盖任何合理查询，也保证结果一定落在
+// ECMAScript 的日期范围内（|ms| ≤ 8.64e15）。超出范围时 toISOString 会抛 RangeError，
+// 而那会把一次查询变成 500。
+function daysAgoIso(days) {
+  const n = Number(days);
+  const safe = Number.isFinite(n) ? Math.min(Math.max(n, 0), 36_500) : 0;
+  return new Date(Date.now() - safe * 86_400_000).toISOString();
+}
+
+// tokenUsage 是 TEXT 列，里面存 JSON。`json_extract` 遇到**非法 JSON** 会直接让整条 SQL
+// 报 `malformed JSON` —— 于是**一行**脏数据就把 /api/usage 与 /api/projects/recent 打成 500
+// （读路径上的 safeJsonParse 只保护行映射，管不到 SQL 聚合）。
+// 因此下面所有取值都写成 `CASE WHEN json_valid(x) THEN json_extract(x,'$.k') ELSE NULL END`
+// （外层再 COALESCE 成 0）：非法 JSON 视同「该字段不存在」，按 0 计入，
+// 而不是让整块面板一起不可用。
+//
+// 注意：加法一定要**逐项** COALESCE。写成 COALESCE(SUM(a + b + c + d), 0) 时，
+// 只要某个键缺失，整个相加就是 NULL、SUM 又忽略 NULL —— totalTokens 会变成 0。
+
+// token 派生列的迁移版本（PRAGMA user_version）、列名与回填表达式。
+// 回填表达式与 SCHEMA 里那两个触发器**必须一致** —— 用同一段字符串生成，避免两套算法漂移。
+// （SQLite 的多语句 exec 中途失败时，前面已成功的语句是保留的，所以补列必须逐列判断。）
+//
+// 为什么是 2 而不是 1：`user_version` 只能证明「我们这一版代码写过这个库」，证明不了
+// 「列里的值与 tokenUsage 一致」。审查构造过这样一个库：四列都在、`user_version = 1`，
+// 但四列全是 0（外部工具改过库、或从别处拷来的 hwb.db）—— 版本 1 的闸门直接放行，
+// 于是**历史用量永久显示 0**，正是这套迁移本来要消灭的症状（实测：uv=0 时能自愈，uv=1 时不自愈）。
+// 抬到 2 会让所有既有库**再跑一次幂等回填**（40k 行实测约 60ms，一次性），列里有脏值也就被纠正了。
+const TOKEN_COLUMNS_VERSION = 2;
+const TOKEN_COLUMN_NAMES = ['tokInput', 'tokOutput', 'tokCacheRead', 'tokCacheWrite'];
+const TOKEN_EXPR = {
+  tokInput: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.uncachedInputTokens'), 0) ELSE 0 END",
+  tokOutput: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.outputTokens'), 0) ELSE 0 END",
+  tokCacheRead: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.cacheReadTokens'), 0) ELSE 0 END",
+  tokCacheWrite: "CASE WHEN json_valid(tokenUsage) THEN COALESCE(json_extract(tokenUsage, '$.cacheWriteTokens'), 0) ELSE 0 END",
+};
+const TOKEN_COLUMNS_SET = TOKEN_COLUMN_NAMES.map((c) => `${c} = ${TOKEN_EXPR[c]}`).join(', ');
+
+// 用量聚合直接 SUM 派生整数列（由触发器维护，见 SCHEMA）。收益：40k 会话下八个聚合从 ~330ms
+// 降到普通 SUM 的量级（node:sqlite 是同步的，那段时间整个服务都停着）。
+const TOK = {
+  input: 'COALESCE(SUM(tokInput), 0)',
+  output: 'COALESCE(SUM(tokOutput), 0)',
+  cacheRead: 'COALESCE(SUM(tokCacheRead), 0)',
+  cacheWrite: 'COALESCE(SUM(tokCacheWrite), 0)',
+  total: 'COALESCE(SUM(tokInput + tokOutput + tokCacheRead + tokCacheWrite), 0)',
+};
+
+// 「实时写入活跃」的宽限期：该 home 在这个窗口内有过实时状态写入时，文件索引的整表替换不能把
+// status/lastActivity 一起带走（见 upsertRows）。比轮询间隔（3s）宽裕，又足够短：通道一停，
+// 宽限期结束，文件索引重新拿到权威。
+const LIVE_GRACE_MS = 10_000;
 
 const int = (v, dflt) => {
   const n = Number(v);
@@ -82,11 +213,90 @@ function bucketStepMs(hours) {
   return 12 * 60 * 60_000;                   // 12 小时
 }
 
+// 读路径上的 JSON 列必须**容错**：这些列由我们写入，但文件可以被外部工具改、进程可能被
+// 强杀在写入中途、旧版本可能写过别的形状。一个坏值不该让整个工作台消失 ——
+// 原实现是裸 JSON.parse，而 `#enrichHome` 会被 LiveStatusPoller 的定时器**同步**调用，
+// 于是 SyntaxError 直接冒成 uncaughtException → crash handler → process.exit(1)。
+// 实测：只要 homes.endpoints / homes.degraded / sessions.status / sessions.tokenUsage
+// 里有一个不是合法 JSON，进程在启动后 3 秒内必退，且日志里只有一句 JSON 解析错误。
+// 这里统一降级为 fallback，并记一次 warn（同一个字段只记一次，避免刷屏）。
+const warnedJsonColumns = new Set();
+function safeJsonParse(raw, fallback, label) {
+  if (raw === null || raw === undefined || raw === '') return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    if (label && !warnedJsonColumns.has(label)) {
+      warnedJsonColumns.add(label);
+      log.warn('数据库里的 JSON 列无法解析，已降级为默认值（该行可能被外部工具改过）', { column: label });
+    }
+    return fallback;
+  }
+}
+
 export class IndexStore {
+  // homeId -> 最近一次实时状态写入时间（见 liveStatusAt/applyLiveStatus）
+  #liveWrittenAt;
+  // 「数据被改过」的单调计数（见 dataVersion）。
+  #writeVersion = 0;
+  // homeId -> **最近一次实时列表里的 sessionId 集合**（见 applyLiveStatus/upsertRows）
+  #liveIds;
   constructor(dbPath = ':memory:') {
     this.db = new DatabaseSync(dbPath);
-    this.db.exec(SCHEMA);
-    this.migrate();
+    this.#liveWrittenAt = new Map();
+    this.#liveIds = new Map();
+    this.dbPath = dbPath;
+    try {
+      this.db.exec(SCHEMA);   // 建表 + 建触发器（在只读库上这一步就会写失败）
+      this.migrate();
+    } catch (error) {
+      // 把「初始化/迁移失败」说清楚：底层可能只是 `attempt to write a readonly database`
+      // 或 `database or disk is full`，用户看不出该怎么恢复。迁移与建表都是**幂等**的，
+      // 所以明确告诉他「修好后重启会自动继续」，而不是让他以为库坏了要重建。
+      //
+      // 但要**分情况**给建议：`database is locked` 时的正确做法是「先看看是不是另一个 hwb 在用它」，
+      // 而不是「改名或换一个路径」—— 那把用户的库整个换掉了（审查提过：这条建议对瞬时锁是错的）。
+      // （SCHEMA 里的 CREATE TABLE IF NOT EXISTS 也要拿写锁，所以另一个进程持锁时第一步就会失败。）
+      const busy = /\blocked\b|database is busy|SQLITE_BUSY/i.test(String(error?.message ?? ''));
+      const hint = busy
+        ? '看起来是另一个进程正在使用这个数据库：先 `hwb status` / `lsof -nP -iTCP:<端口>` 确认没有第二个 hwb 在跑，'
+          + '或稍后重试（瞬时锁会自行消失）。'
+        : '若是权限或磁盘空间问题，修复后重启会自动重试（建表与迁移都是幂等的）；'
+          + '若这个文件根本不是 SQLite 数据库，请改名或换一个路径。';
+      throw new Error(`数据库初始化/迁移失败（${dbPath}）：${error?.message ?? error}。${hint}`);
+    }
+  }
+
+  // 派生列的迁移：补列 + 回填，**同一个事务**，并用 `PRAGMA user_version` 记录「回填成功」。
+  //
+  // 为什么必须这样（审查实测过旧实现的失败后果）：旧的写法里四个 ALTER 各自自动提交（DDL 不在
+  // 事务里），而回填另起一个事务。回填一旦失败（磁盘满、进程被杀 —— 4 万行回填约 60ms，窗口真实
+  // 存在），列已经存在，于是下次启动那个「按列判断」的闸门不会再回填 → **所有历史用量永久为 0**，
+  // 没有任何报错、没有 degraded 标记。实测：SQLITE_FULL 之后第二次启动 usageSummary.totalTokens = 0，
+  // 而直接对 JSON 跑 json_extract 的预言机是 82000000。
+  // 另外逐列判断缺哪补哪：SQLite 的多语句 exec 在中途失败时**前面成功的语句是保留的**，
+  // 于是可能出现「四列只加了一两列」的库，那种库会让每个用量查询报 no such column（审查也复现了）。
+  // 回填表达式与触发器共用同一段 SQL（TOKEN_COLUMNS_SET）：两边各写一套算法迟早漂移。
+  // 失败时抛出去，由 server.js 打印明确提示并退出 —— 宁可启动失败并说清楚，也不要静默把整段
+  // 历史显示成 0；user_version 没抬上去 ⇒ 下次启动会自动重试（回填幂等）。
+  #migrateTokenColumns(sess) {
+    const missing = TOKEN_COLUMN_NAMES.filter((c) => !sess.includes(c));
+    const applied = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0) >= TOKEN_COLUMNS_VERSION;
+    if (missing.length === 0 && applied) return;
+    try {
+      // BEGIN 也要在 try 里：只读库上它自己就会抛（实测），那样就绕过下面这层包装，
+      // 用户只会看到一句 `attempt to write a readonly database`，不知道是迁移失败、更不知道该重试。
+      this.db.exec('BEGIN');
+      for (const name of missing) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`);
+      this.db.exec(`UPDATE sessions SET ${TOKEN_COLUMNS_SET} WHERE tokenUsage IS NOT NULL`);
+      this.db.exec(`PRAGMA user_version = ${TOKEN_COLUMNS_VERSION}`);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* 磁盘满时 SQLite 可能已经自动回滚 */ }
+      throw new Error(`数据库迁移失败（token 派生列）：${error?.message ?? error}。`
+        + '修复磁盘空间/权限后重启会自动重试（回填是幂等的）；在此之前请勿继续使用，'
+        + '否则历史用量会显示为 0。');
+    }
   }
 
   migrate() {
@@ -94,9 +304,14 @@ export class IndexStore {
     if (!sess.includes('title')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN title TEXT');
     }
+    if (!sess.includes('liveOnly')) {
+      // 已有库里的行都来自文件索引或早期实时合并：默认 0 最保守（不会被空实时列表误删）。
+      this.db.exec('ALTER TABLE sessions ADD COLUMN liveOnly INTEGER NOT NULL DEFAULT 0');
+    }
     if (!sess.includes('status')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN status TEXT');
     }
+    this.#migrateTokenColumns(sess);
     const homes = this.db.prepare("SELECT name FROM pragma_table_info('homes')").all().map((c) => c.name);
     if (!homes.includes('sortIndex')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN sortIndex INTEGER');
@@ -110,6 +325,22 @@ export class IndexStore {
     if (!homes.includes('localPort')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN localPort INTEGER');
     }
+    if (!homes.includes('accessPort')) this.db.exec('ALTER TABLE homes ADD COLUMN accessPort INTEGER');
+    this.db.exec("UPDATE homes SET accessPort = NULL WHERE hostType != 'remote' AND accessPort IS NOT NULL");
+    // 先去掉重复的 accessPort 再建唯一索引：手改过库（或早期版本写坏）时，重复值会让这条
+    // DDL 失败 —— 而它在启动路径上，于是**每次启动都失败**，用户只能自己拿 sqlite 去改库。
+    // 保留 sortIndex 最小（界面顺序靠前）的那条，其余置空；用户重新分配即可。
+    const dupPorts = this.db.prepare(
+      'SELECT accessPort FROM homes WHERE accessPort IS NOT NULL GROUP BY accessPort HAVING COUNT(*) > 1'
+    ).all();
+    for (const d of dupPorts) {
+      const keep = this.db.prepare(
+        'SELECT homeId FROM homes WHERE accessPort = ? ORDER BY COALESCE(sortIndex, 2147483647), homeId LIMIT 1'
+      ).get(d.accessPort);
+      this.db.prepare('UPDATE homes SET accessPort = NULL WHERE accessPort = ? AND homeId <> ?').run(d.accessPort, keep.homeId);
+      log.warn('发现重复的接入端口，已保留一个并清空其余（可在界面重新分配）', { accessPort: d.accessPort, kept: keep.homeId });
+    }
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS homes_access_port ON homes(accessPort) WHERE accessPort IS NOT NULL');
     if (!homes.includes('remoteHome')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteHome TEXT');
     }
@@ -119,17 +350,67 @@ export class IndexStore {
     if (!homes.includes('remoteLog')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN remoteLog TEXT');
     }
+    if (!homes.includes('serverId')) {
+      this.db.exec('ALTER TABLE homes ADD COLUMN serverId TEXT');
+      // 用户确认的同机双通道；仅迁移这两个明确的 SSH 别名。
+      const channels = this.db.prepare("SELECT homeId, host FROM homes WHERE hostType = 'remote'").all();
+      const assign = this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?');
+      for (const h of channels) {
+        if (['cms.lo', 'cms.tun'].includes(h.host?.split('@').pop())) assign.run('cms', h.homeId);
+      }
+    }
     if (!homes.includes('token')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN token TEXT');
     }
+    if (!homes.includes('endpoints')) this.#migrateEndpoints();
+  }
+
+  // 预编译语句的缓存位（见 #enrichHome：listHomes 与 getHome 共用同一组语句）。
+  #providersStmt = null;
+  #tiersStmt = null;
+
+  #migrateEndpoints() {
+    this.db.exec('BEGIN');
+    try {
+      this.db.exec("ALTER TABLE homes ADD COLUMN endpoints TEXT NOT NULL DEFAULT '[]'");
+      this.db.exec('ALTER TABLE homes ADD COLUMN activeEndpointId TEXT');
+      const homes = this.db.prepare('SELECT * FROM homes ORDER BY (sortIndex IS NULL), sortIndex, homeId').all();
+      const groups = new Map();
+      for (const home of homes) {
+        const endpoint = legacyEndpoint(home);
+        const remoteHome = (home.remoteHome || '~/.dsh').replace(/\/+$/, '');
+        const user = remoteHome.startsWith('/') ? '' : (home.host?.includes('@') ? home.host.slice(0, home.host.lastIndexOf('@')) : '');
+        const key = home.hostType === 'remote' && home.serverId
+          ? JSON.stringify([home.serverId, user, remoteHome]) : home.homeId;
+        const group = groups.get(key);
+        if (!group) { groups.set(key, { home, endpoints: endpoint ? [endpoint] : [] }); continue; }
+        if (endpoint && !group.endpoints.some((e) => e.host === endpoint.host && e.port === endpoint.port)) group.endpoints.push(endpoint);
+        // 同一逻辑实例的索引归入保留的 homeId；重复 session/workspace 只保留一份。
+        for (const table of ['sessions', 'workspaces', 'providers', 'model_tiers']) {
+          this.db.prepare(`UPDATE OR IGNORE ${table} SET homeId = ? WHERE homeId = ?`).run(group.home.homeId, home.homeId);
+          this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(home.homeId);
+        }
+        this.db.prepare('DELETE FROM homes WHERE homeId = ?').run(home.homeId);
+      }
+      const update = this.db.prepare('UPDATE homes SET endpoints = ?, activeEndpointId = ? WHERE homeId = ?');
+      for (const { home, endpoints } of groups.values()) update.run(JSON.stringify(endpoints), endpoints[0]?.id || null, home.homeId);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   close() {
     this.db.close();
   }
 
-  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null }) {
+  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null, serverId = null, endpoints, activeEndpointId, accessPort }) {
     const homeId = homeIdOf(homePath);
+    if (hostType !== 'remote' && normalizeAccessPort(accessPort) !== null) throw new Error('本机实例直接使用 dsh 服务端口，无需本地接入端口');
+    if (accessPort !== undefined) accessPort = this.#checkAccessPort(homeId, accessPort);
+    const previous = this.getHome(homeId);
+    const supplied = endpoints !== undefined;
+    const normalized = supplied ? normalizeEndpoints(endpoints, hostType) : null;
+    if (supplied && activeEndpointId && !normalized.some((e) => e.id === activeEndpointId)) throw new Error('未知连接端点');
+
     // 新 home 排在末尾；已存在（冲突）只更新路径/别名/远程配置，保留原 sortIndex。
     const { n } = this.db.prepare('SELECT COALESCE(MAX(sortIndex), -1) + 1 AS n FROM homes').get();
     this.db.prepare(
@@ -142,6 +423,10 @@ export class IndexStore {
          remoteCmd = excluded.remoteCmd, remoteLog = excluded.remoteLog,
          token = excluded.token, localPort = excluded.localPort`
     ).run(homeId, homePath, alias, hostType, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
+    const choices = normalized ?? (previous?.endpoints?.length ? previous.endpoints.map((e) => e.id === previous.activeEndpointId ? { ...e, host, port: hostType === 'remote' ? remotePort : localPort, token } : e) : [legacyEndpoint({ homeId, hostType, host, remotePort, localPort, token })].filter(Boolean));
+    if (choices.length || hostType === 'local') this.updateHomeConfig(homeId, { endpoints: choices, activeEndpointId: activeEndpointId || previous?.activeEndpointId || choices[0]?.id || null });
+    if (serverId) this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?').run(serverId, homeId);
+    if (accessPort !== undefined) this.db.prepare('UPDATE homes SET accessPort = ? WHERE homeId = ?').run(accessPort, homeId);
     return homeId;
   }
 
@@ -167,9 +452,10 @@ export class IndexStore {
     }
   }
 
-  getHome(homeId) {
-    return this.listHomes().find((h) => h.homeId === homeId) ?? null;
-  }
+  // 注意：getHome 定义在下方 listHomes 附近（两者共用 HOME_SELECT）。
+  // 这里原先还有一份 `getHome() { return this.listHomes().find(...) }`，改成点查时忘删 ——
+  // JS 里后定义的会静默覆盖先定义的，所以行为是对的，但留着一份永不执行的旧实现极其危险：
+  // 下次有人改上面那份会以为改的就是真正生效的那个。已删除。
 
   removeHome(homeId) {
     this.db.exec('BEGIN');
@@ -178,6 +464,7 @@ export class IndexStore {
         this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(homeId);
       }
       this.db.exec('COMMIT');
+      this.#writeVersion++;   // 实例集合变了，缓存里的聚合结果不再成立
     } catch (e) {
       this.db.exec('ROLLBACK');
       throw e;
@@ -189,6 +476,21 @@ export class IndexStore {
   updateHomeConfig(homeId, patch = {}) {
     const cur = this.getHome(homeId);
     if (!cur) return null;
+    if (cur.hostType !== 'remote' && normalizeAccessPort(patch.accessPort) !== null) throw new Error('本机实例直接使用 dsh 服务端口，无需本地接入端口');
+    if (patch.accessPort !== undefined) patch = { ...patch, accessPort: this.#checkAccessPort(homeId, patch.accessPort) };
+    const choices = patch.endpoints !== undefined ? normalizeEndpoints(patch.endpoints, cur.hostType) : cur.endpoints;
+    let selected = patch.activeEndpointId !== undefined ? patch.activeEndpointId : cur.activeEndpointId;
+    if (patch.endpoints !== undefined && !choices.some((e) => e.id === selected)) selected = choices[0]?.id || null;
+    if (selected && !choices.some((e) => e.id === selected)) throw new Error('未知连接端点');
+    if (patch.endpoints !== undefined || patch.activeEndpointId !== undefined) {
+      const endpoint = choices.find((e) => e.id === selected);
+      patch = { ...patch, ...(endpoint ? endpointPatch(cur, endpoint) : { localPort: null }), endpoints: choices, activeEndpointId: selected };
+    } else if (choices.length && ['host', 'remotePort', 'localPort', 'token'].some((key) => patch[key] !== undefined)) {
+      const merged = { ...cur, ...patch };
+      patch = { ...patch, endpoints: choices.map((e) => e.id === selected ? { ...e, host: merged.hostType === 'remote' ? merged.host : null, port: merged.hostType === 'remote' ? merged.remotePort : merged.localPort, token: merged.token } : e) };
+      if (cur.hostType === 'local' && !merged.localPort) patch = { ...patch, endpoints: [], activeEndpointId: null };
+      else patch.endpoints = normalizeEndpoints(patch.endpoints, cur.hostType);
+    }
 
     if (cur.hostType === 'local' && typeof patch.homePath === 'string' && patch.homePath.trim()) {
       const newPath = path.resolve(patch.homePath.trim());
@@ -212,7 +514,11 @@ export class IndexStore {
       }
     }
 
+    if (patch.endpoints !== undefined) this.db.prepare('UPDATE homes SET endpoints = ? WHERE homeId = ?').run(JSON.stringify(patch.endpoints), homeId);
+    if (patch.activeEndpointId !== undefined) this.db.prepare('UPDATE homes SET activeEndpointId = ? WHERE homeId = ?').run(patch.activeEndpointId, homeId);
     const cur2 = this.getHome(homeId);
+    if (patch.serverId !== undefined) this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?').run(patch.serverId, homeId);
+    if (patch.accessPort !== undefined) this.db.prepare('UPDATE homes SET accessPort = ? WHERE homeId = ?').run(patch.accessPort, homeId);
     const alias = patch.alias !== undefined ? patch.alias : cur2.alias;
     const host = patch.host !== undefined ? patch.host : cur2.host;
     const remotePort = patch.remotePort !== undefined ? patch.remotePort : cur2.remotePort;
@@ -226,37 +532,139 @@ export class IndexStore {
     return this.getHome(homeId);
   }
 
+  #checkAccessPort(homeId, value) {
+    const port = normalizeAccessPort(value);
+    if (port && this.db.prepare('SELECT homeId FROM homes WHERE accessPort = ? AND homeId != ?').get(port, homeId)) {
+      throw new Error(`本地端口 ${port} 已被另一个实例保留`);
+    }
+    return port;
+  }
+
+  // 记录「该实例索引失败」。它经常是从另一个 catch 里被调用的（indexer 的失败分支），
+  // 所以**自己绝不能再抛**：数据库不可写时（文件被删、目录只读、磁盘满）二次异常会顶掉
+  // 原始错误、让调用方的 catch 再次抛出，进而中断当轮剩下的所有实例。
+  // 写失败只记日志；原始错误由调用方照常上报。
   markHomeError(homeId, error) {
-    this.db.prepare(
-      `UPDATE homes SET status = 'degraded',
-       degraded = json_array(json_object('domain', 'index', 'error', ?, 'degraded', json('true')))
-       WHERE homeId = ?`
-    ).run(String(error), homeId);
+    try {
+      this.db.prepare(
+        `UPDATE homes SET status = 'degraded',
+         degraded = json_array(json_object('domain', 'index', 'error', ?, 'degraded', json('true')))
+         WHERE homeId = ?`
+      ).run(String(error), homeId);
+    } catch (e) {
+      log.warn('写入实例错误状态失败（数据库可能不可写）', { homeId, error: e?.message ?? String(e) });
+    }
   }
 
   // Full-refresh per home: child rows for a home are replaced wholesale.
+  //
+  // 但「整表替换」遇上降级域会变成一个静默的数据清空：某个元数据文件的 unit.version
+  // 超出支持范围时（dsh 升级后的必然情形），该域被判 degraded 并产出 0 行，
+  // 照删不误就等于把上一次成功索引的内容删光 —— 用户在仪表盘上看到「这个实例的会话和项目全没了」，
+  // 而界面上没有任何地方显示 degraded，完全无法归因。
+  // 因此：某域降级时**跳过它对应的表的 DELETE**，保留上次成功的行；其余域照常刷新。
   upsertRows(rows) {
     const homeRows = rows.filter((r) => r.type === 'home');
-    const homeIds = homeRows.map((r) => r.homeId);
+    const preservedSessions = new Map(); // homeId -> Map(sessionId -> 上一版的 workspace 归属)
+    const preservedLiveStatus = new Map(); // homeId -> [{sessionId,status,lastActivity}]（见下）
+    const linkCleanupHomes = new Set();    // 需要清理悬空 workspace 归属的 home（见下）
 
     this.db.exec('BEGIN');
     try {
-      for (const homeId of homeIds) {
-        for (const table of ['sessions', 'workspaces', 'providers', 'model_tiers']) {
-          this.db.prepare(`DELETE FROM ${table} WHERE homeId = ?`).run(homeId);
+      for (const home of homeRows) {
+        const protectedTables = degradedTables(home.degraded);
+        // 跨表牵连：sessions 的 workspaceId/workspaceTitle/project 是从 workspace.json **推导**出来的
+        // （normalize 反查 workspace.sessionIds）。workspace 域降级时 snapshot.workspaces 为空，
+        // 新产出的会话行 workspaceId 全是 null —— 而 workspaces 表保留着旧行，于是会话与工作区断开：
+        // sessionWorkspace() 直接返回 null，preview / download / upload 对一个完全正常的会话报
+        // 「当前会话尚未关联可用的 project 工作区」，保留的 workspace 也变成孤儿。
+        // 这里把上一版的归属回填到新行上（workspace 域恢复后会被新数据自然覆盖）。
+        // 注意必须在下面的 DELETE **之前**读：workspace 降级时 sessions 本身仍会被替换掉。
+        if (protectedTables.has('workspaces')) preservedSessions.set(home.homeId, this.#sessionWorkspaceLinks(home.homeId));
+        // sessions 被保护（保留旧行）时，旧行里的 workspaceId 可能指向这次刷新后**已消失**的
+        // workspace —— 那会让 sessionWorkspace() 返回 null，preview/upload 对完全正常的会话报
+        // 「尚未关联可用的 project 工作区」。两种触发路径都要清理：workspaces 降级（链接是回填的）
+        // 与 sessions 降级（链接是上一次索引留下的）。
+        if (protectedTables.has('sessions') || protectedTables.has('workspaces')) linkCleanupHomes.add(home.homeId);
+        // 实时状态保护：索引器写的是文件快照（projcache 的**冻结**值，可能是几分钟前的），
+        // 而轮询器每 3s 写实时值。整表替换会把实时状态一起删掉再用文件值重建 ——
+        // 于是「索引器刚跑完，徽标就退回陈旧状态」（实测：dsh 报 running、轮询器刚写「运行中」，
+        // 索引器把它打回「空闲」）。只要这个 home 最近有实时写入，就在替换前记下这两列、替换后写回。
+        // 只在实时通道**确实在写**的时间窗内让步：通道停了（实例停止、RPC 连续失败）就没有实时写入，
+        // 宽限期一过文件索引重新拿到权威 —— 否则会退化成「会话永远挂着旧徽标」那个已修的缺陷。
+        //
+        // 但「宽限期内有实时写入」**不等于**「这一行现在还有实时支撑」：轮询器每 3s 写一次，
+        // 只要 dsh 里还有**任意一个**会话活着，宽限期就永远成立，于是这层保护会把该 home **所有**
+        // 非 NULL 的 status 一起写回 —— 包括实时列表里已经不存在的那些会话（dsh 里归档/关掉的）。
+        // 实测（A/B，3/3 一致）：s1 一小时前活跃（文件推导为 idle）、实时列表只报 s2，保护前
+        // s1=idle s2=running（正确），加了保护后 s1=running s2=running —— 文件索引再也清不掉它，
+        // 幽灵清理只删 liveOnly=1 的行，于是这个错误徽标一直挂到 dsh 停止为止。这正是本项目
+        // 已经修过的「会话永久显示运行中」缺陷类（CHANGELOG 里那 18/179 个会话），而且比它更糟：
+        // 它绕过了 lib/status.js 的 RUNNING_STALE_MS 陈旧度闸门，把 60s 的陈旧变成永久。
+        // 所以只对**当前实时列表里确实存在的**会话保留（#liveIds 由 applyLiveStatus 记账）。
+        const liveIds = this.#liveIds.get(home.homeId);
+        if (liveIds && Date.now() - this.liveStatusAt(home.homeId) < LIVE_GRACE_MS) {
+          const live = this.db.prepare('SELECT sessionId, status, lastActivity FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(home.homeId)
+            .filter((r) => liveIds.has(r.sessionId));
+          if (live.length) preservedLiveStatus.set(home.homeId, live);
+        }
+        for (const table of CHILD_TABLES) {
+          if (protectedTables.has(table)) continue; // 该域降级 → 保留上次成功的行
+          // sessions 的替换在**实时通道正在写**时不动 liveOnly=1 的行：那些行只由实时通道支撑、
+          // 由 applyLiveStatus 管生命周期（不在实时列表里就删、进了文件索引就由下面的 ON CONFLICT 归零）。
+          // 原先它们会被文件索引整表删掉、3s 后再由轮询器补插回来 —— 每 60s 一次无谓的删除+重插，
+          // 而**中间那几秒里工作台会少显示这些会话**。真实数据上的规模：用户那台机器的 dsh 实时列表有
+          // 500 条、projcache 只有 179 条，也就是每分钟 321 行被删掉再插回来（用真实库副本比对确认过）。
+          //
+          // 但**只在通道还活着时**才保护它们：否则一次「曾经连上、后来再没连上」的实例会把那些行
+          // 永远留着（它们带着最后一次实时写入的状态，可能一直显示「运行中」—— 正是本项目修过的那类
+          // 幽灵徽标）。判据复用 LIVE_GRACE_MS：通道停了超过宽限期，下一次文件索引就把它们收回去
+          // （它们不在文件快照里，本来就不该由文件索引负责保留）。
+          const liveActive = Date.now() - this.liveStatusAt(home.homeId) < LIVE_GRACE_MS;
+          const where = table === 'sessions' && liveActive ? 'WHERE homeId = ? AND liveOnly = 0' : 'WHERE homeId = ?';
+          this.db.prepare(`DELETE FROM ${table} ${where}`).run(home.homeId);
         }
       }
 
+      // 注意：不能用 `ON CONFLICT ... CASE` 来保护实时状态 —— 这条路径在插入之前就把该 home 的
+      // sessions **整表删掉**了（见上面的 DELETE 循环），新行是**插入**而不是冲突更新，
+      // ON CONFLICT 分支根本不会执行。实测确认过：加在 ON CONFLICT 里的保留逻辑是死代码。
+      // 真正有效的做法是在替换前记下实时状态、替换后写回（见 preservedLiveStatus）。
       const insSession = this.db.prepare(
-        `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, generatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage,
+                               contextPressure, status, lastActivity, generatedAt, liveOnly)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(homeId, sessionId) DO UPDATE SET
+           -- 「文件索引撑起来的行」不能被「只有实时 RPC 支撑的新行」抹掉。
+           -- 触发条件：库里这行是 liveOnly=0（有文件索引依据），而这次写入的是 liveOnly=1
+           -- （说明本次文件快照里没有这条会话 —— projcache 域降级、文件还没更新、或刚升级到
+           -- 不认识的 unit.version，正是降级路径存在的原因）。
+           -- 原先这种冲突会用 live 行的空值覆盖 title/workspaceId/project/tokenUsage，并把
+           -- liveOnly 从 0 翻成 1：于是用量面板整段历史归零（实测 1520550 → 620550，
+           -- 丢了 59%），会话丢掉标题与工作区归属；更要命的是翻成 1 之后，下一次「实时列表为空」
+           -- 的轮询会把它**删掉**（那一分支专门删 liveOnly=1）。文件快照坏掉不该等于历史被删。
+           -- 实时能提供的仍然是状态与活跃时间（这才是徽标要的），所以只保留这两列照旧覆盖。
+           workspaceId=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.workspaceId ELSE excluded.workspaceId END,
+           workspaceTitle=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.workspaceTitle ELSE excluded.workspaceTitle END,
+           project=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.project ELSE excluded.project END,
+           title=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.title ELSE excluded.title END,
+           tokenUsage=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.tokenUsage ELSE excluded.tokenUsage END,
+           contextPressure=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.contextPressure ELSE excluded.contextPressure END,
+           status=excluded.status,
+           lastActivity=excluded.lastActivity, generatedAt=excluded.generatedAt,
+           liveOnly=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN 0 ELSE excluded.liveOnly END`
       );
       const insWorkspace = this.db.prepare(
         `INSERT INTO workspaces (homeId, workspaceId, title, path, project, archived, sessionCount)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       );
+      // ON CONFLICT 而不是裸 INSERT：providers 有 UNIQUE(homeId, ref)，而 ref 来自凭据/文件内容。
+      // 上游已经按 ref 去重（read-home.parseCredentialsYaml），这里是第二道保险 ——
+      // 一次约束冲突会让整个 upsertRows 事务回滚，该实例的会话/工作区一行都提交不了、
+      // 状态永久 degraded 并每 60s 重试一次同样失败。
       const insProvider = this.db.prepare(
-        `INSERT INTO providers (homeId, ref, provider) VALUES (?, ?, ?)`
+        `INSERT INTO providers (homeId, ref, provider) VALUES (?, ?, ?)
+         ON CONFLICT(homeId, ref) DO UPDATE SET provider = excluded.provider`
       );
       const insTier = this.db.prepare(
         `INSERT INTO model_tiers (homeId, tierId, active, provider, model) VALUES (?, ?, ?, ?, ?)`
@@ -271,41 +679,196 @@ export class IndexStore {
            degraded = excluded.degraded`
       );
 
-      for (const row of rows) {
-        switch (row.type) {
+      for (const rawRow of rows) {
+        // 注意：这里不能靠「遍历键把 undefined 换成 null」—— 字段**整个缺失**时键根本不出现，
+        // 那种行照样会把 undefined 绑给 SQLite 并抛「Provided value cannot be bound to SQLite
+        // parameter N」，于是在事务里让该 home 的整批行回滚。所以下面每个绑定点都显式 `?? null`。
+        const row = rawRow;
+        switch (row?.type) {
           case 'home':
             upHome.run(
-              row.homeId,
-              row.homePath,
-              row.degraded.length === 0 ? 'ok' : 'degraded',
-              row.generatedAt,
-              JSON.stringify(row.degraded)
+              row.homeId ?? null,
+              row.homePath ?? null,
+              (row.degraded ?? []).length === 0 ? 'ok' : 'degraded',
+              row.generatedAt ?? null,
+              JSON.stringify(row.degraded ?? [])
             );
             break;
-          case 'session':
+          case 'session': {
+            const link = row.workspaceId == null ? preservedSessions.get(row.homeId)?.get(row.sessionId) : null;
             insSession.run(
-              row.homeId, row.sessionId, row.workspaceId, row.workspaceTitle,
-              row.project, row.title ?? null, row.tokenUsage, row.contextPressure, row.status, row.lastActivity, row.generatedAt
+              row.homeId ?? null, row.sessionId ?? null,
+              row.workspaceId ?? link?.workspaceId ?? null,
+              row.workspaceTitle ?? link?.workspaceTitle ?? null,
+              // project 同理：workspace 域降级时它退化成 basename(cwd)，回填上一版更准的值。
+              link?.project ?? row.project ?? null,
+              row.title ?? null, row.tokenUsage ?? null, row.contextPressure ?? null, row.status ?? null,
+              row.lastActivity ?? null, row.generatedAt ?? null,
+              row.liveOnly ? 1 : 0
             );
             break;
+          }
           case 'workspace':
             insWorkspace.run(
-              row.homeId, row.workspaceId, row.title, row.path,
-              row.project, row.archived ? 1 : 0, row.sessionCount
+              row.homeId ?? null, row.workspaceId ?? null, row.title ?? null, row.path ?? null,
+              row.project ?? null, row.archived ? 1 : 0, row.sessionCount ?? null
             );
             break;
           case 'provider':
-            insProvider.run(row.homeId, row.ref, row.provider);
+            insProvider.run(row.homeId ?? null, row.ref ?? null, row.provider ?? null);
             break;
           case 'modelTier':
-            insTier.run(row.homeId, row.tierId, row.active ? 1 : 0, row.provider, row.model);
+            insTier.run(row.homeId ?? null, row.tierId ?? null, row.active ? 1 : 0, row.provider ?? null, row.model ?? null);
             break;
         }
       }
+      // 把实时状态写回（替换期间被 DELETE 带走了）。新行里没有这条会话（文件快照里没有）也不用管：
+      // 它要么是 liveOnly 行、由下一次轮询重建，要么本来就不该有。
+      // 保留的 workspace 归属也可能已经悬空：workspace 域降级 + workspace.json 刷新后删掉了某个
+      // workspace，而 sessions 行里还留着它的 id → sessionWorkspace() 返回 null，
+      // preview/upload 会对一个完全正常的会话报「尚未关联可用的 project 工作区」。
+      // 这里清理掉指向不存在 workspace 的归属（顺带也能修好库里既有的悬空链接）。
+      for (const hid of linkCleanupHomes) {
+        // EXISTS 那半句很重要：workspace.json 缺失/降级时该 home 一条 workspace 行都没有，
+        // 那种情况下我们**并不掌握**工作区清单，不能凭「子查询里没有」就断定链接悬空
+        // （否则会把本来正确的归属一并清掉）。只有确实有工作区数据时才做清理。
+        this.db.prepare(
+          `UPDATE sessions SET workspaceId = NULL, workspaceTitle = NULL
+            WHERE homeId = ? AND workspaceId IS NOT NULL
+              AND EXISTS (SELECT 1 FROM workspaces WHERE homeId = ?)
+              AND workspaceId NOT IN (SELECT workspaceId FROM workspaces WHERE homeId = ?)`
+        ).run(hid, hid, hid);
+      }
+      for (const [hid, list] of preservedLiveStatus) {
+        const upd = this.db.prepare('UPDATE sessions SET status = ?, lastActivity = ? WHERE homeId = ? AND sessionId = ?');
+        for (const r of list) upd.run(r.status, r.lastActivity, hid, r.sessionId);
+      }
       this.db.exec('COMMIT');
+      this.#writeVersion++;   // 用量面板据此判断「缓存的聚合结果是否还需要重算」（见 dataVersion）
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      // 回滚本身失败时不要把真正的错误吞掉：磁盘满等情况下 SQLite 已经自动回滚，
+      // 此时 ROLLBACK 会抛「cannot rollback - no transaction is active」，覆盖掉真实原因。
+      try { this.db.exec('ROLLBACK'); } catch { /* 已经回滚过了 */ }
       throw e;
+    }
+  }
+
+  // 实时刷新只写会话，保留 workspace/provider 等文件索引数据。
+  //
+  // live 为**空数组**是一次成功的读取、含义是「dsh 当前没有会话」——区别于读取失败（poller 传 null
+  // 时根本不会走到这里）。原先空数组被直接 return，于是纯实时行（liveOnly=1，文件索引里还没有它）
+  // 会一直留着：用户在 dsh 里关掉全部会话后，工作台仍显示上一个会话的「运行中」徽标，
+  // 直到 60s 后的文件索引才纠正。现在按标记精确清掉这些行；有文件索引支撑的会话不受影响，
+  // 它们的权威来源是文件索引，不该被实时列表的缺失误删。
+  // 数据版本：每次成功写入（文件索引 / 实时状态 / 移除实例）都会变。
+  // 用途：`/api/usage` 的服务端记忆据此判断「这份聚合结果还有效吗」—— 数据没变就不必重算。
+  // 为什么不能只看时间：那 8 个聚合是**同步**的（40k 会话实测 ~330ms，期间整个单线程服务都停着），
+  // 而一个空闲的仪表盘（没有实例在跑 ⇒ 没有实时写入）一个字节都不会变，却仍然每 10s 白跑一次。
+  dataVersion() { return this.#writeVersion; }
+
+  // 最近一次「实时状态写入」的时间戳（按 home）。索引器在抓实时状态前会记下时间，
+  // 抓完如果发现这期间轮询器已经写过更新的数据，就丢弃自己这份（多半已经过期）。
+  // 见 src/dshhome/indexer.js 里的守卫。
+  liveStatusAt(homeId) {
+    return this.#liveWrittenAt.get(homeId) ?? 0;
+  }
+
+  applyLiveStatus(homeId, live) {
+    if (!this.getHome(homeId) || !Array.isArray(live)) return;
+    // 记账「这次实时列表里有哪些会话」：upsertRows 在宽限期内回写 status/lastActivity 时
+    // 只认这些 sessionId（见那里的注释）。空列表同样是**有效信息**（dsh 当前没有会话），
+    // 所以要记空集合而不是留着上一次的集合 —— 否则宽限期内还按旧的集合回写陈旧状态。
+    // 读取失败（非数组）在上面就 return 了，不动账本：那才是「不知道」，不是「没有」。
+    const liveIds = new Set(live.map((l) => l?.sessionId).filter(Boolean));
+    this.#liveIds.set(homeId, liveIds);
+    if (!live.length) {
+      this.db.prepare('DELETE FROM sessions WHERE homeId = ? AND liveOnly = 1').run(homeId);
+      // 如果 projcache 域正降级，剩下的会话行是**上次成功索引**的冻结快照，谁也刷新不了它们
+      // （整表替换被跳过）。此时 dsh 明确报告「没有会话」，那些行上的 status 就一定是陈旧的——
+      // 用户会看到一个永远显示「运行中」的幽灵会话。清掉状态徽标（而不是删行）：UI 退回「空闲」，
+      // 数据仍在，等 projcache 恢复后由文件索引覆盖。
+      const home = this.getHome(homeId);
+      if (degradedTables(home?.degraded).has('sessions')) {
+        this.db.prepare('UPDATE sessions SET status = NULL WHERE homeId = ?').run(homeId);
+      }
+      return;
+    }
+    // 幽灵行清理：liveOnly=1 的行**只由实时列表支撑**，所以一旦它不在这次列表里，就该消失。
+    // 原先只在「列表完全为空」那一分支清理，于是只要有任意一条会话还活着，先前消失的会话就会
+    // 一直留在库里：永远显示「运行中」、占着 sessionCount、还会造出一个幻影项目 ——
+    // 实测在实时列表里移除一条会话后，它整整 70 秒（直到下一轮文件索引）都还在，
+    // 而在 projcache 降级时是**永久**的（文件索引永远覆盖不了它）。
+    // 逐行删而不是 `sessionId NOT IN (...)`：实时列表可能有几千条，SQL 变量数有上限。
+    let ghostsDeleted = false;
+    const ghosts = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND liveOnly = 1').all(homeId);
+    if (ghosts.length) {
+      const del = this.db.prepare('DELETE FROM sessions WHERE id = ?');
+      for (const g of ghosts) if (!liveIds.has(g.sessionId)) { del.run(g.id); ghostsDeleted = true; }
+    }
+    // 降级窗口里的「幽灵徽标」：上面的清状态原先**只**在「实时列表为空」那一分支执行，可是
+    // 只要 dsh 里还有任意一条会话活着，列表就非空 —— 而从列表里消失的 file-backed 行既不会被
+    // 幽灵清理删掉（那只删 liveOnly=1），也刷不动（sessions 域降级 ⇒ 文件索引的整表替换被跳过），
+    // 于是停在最后一次实时写入的状态上**永远**挂着。审查实测：s1 在 dsh 里关掉后，又跑了
+    // 3 轮轮询 + 3 轮文件索引仍是 running；而 projcache 一恢复就立刻自愈 ——
+    // 也就是说窗口 = 「dsh 升级到 hwb 还不认识的 unit.version」这段时间（天到周）。
+    // 清的是状态徽标而不是行：数据仍在，UI 退回「空闲」。
+    let clearedStale = false;
+    if (degradedTables(this.getHome(homeId)?.degraded).has('sessions')) {
+      const stale = this.db.prepare('SELECT id, sessionId FROM sessions WHERE homeId = ? AND status IS NOT NULL').all(homeId);
+      const clear = this.db.prepare('UPDATE sessions SET status = NULL WHERE id = ?');
+      for (const r of stale) if (!liveIds.has(r.sessionId)) { clear.run(r.id); clearedStale = true; }
+    }
+    const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
+      .map((row) => ({ ...row, type: 'session' }));
+    // 逐行比对「实时通道拥有的那几列」：都没变时**跳过整表写**。
+    // 为什么值得：upsertRows 对一个 home 是「整表替换」，代价正比于该实例的**总会话数**
+    // （规模审查实测：40k/10 实例时每轮 891ms ≈ 每 3s 一次约 30% 的同步阻塞；单个 home 有
+    // 200k 会话时单次 3,494ms）。而一个**空闲**的 dsh（没有新 prompt、没有状态迁移）每 3s
+    // 送来的内容与库里一模一样 —— 那 891ms 纯属白跑。
+    // 只做「全等就跳过」这一档：任何一处不同就仍然走原来的整表替换路径（语义完全不变），
+    // 所以这条优化不可能改变写入结果。幽灵清理与降级清理仍然照做（它们有自己的计数）。
+    // 注意：`mergeLiveStatus` 会**原地修改并返回同一个数组**（还会往里 push 实时独有的新会话），
+    // 所以「库里原来有哪些会话」必须在合并**之前**记下来 —— 我第一版把 existing 放在合并之后算，
+    // 于是新会话被当成了「已存在」，那条新行再也不会被插入（测试立刻抓到：rpc-only 没进库）。
+    const before = new Map();
+    const existing = new Set();
+    for (const row of rows) {
+      existing.add(row.sessionId);
+      if (liveIds.has(row.sessionId)) before.set(row.sessionId, JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]));
+    }
+    const merged = mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() });
+    const changed = merged.filter((row) => before.get(row.sessionId) !== undefined
+      && before.get(row.sessionId) !== JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]));
+    const newRows = merged.filter((row) => !existing.has(row.sessionId));
+    if (!changed.length && !newRows.length && !ghostsDeleted && !clearedStale) {
+      log.debug('实时状态与库里完全一致，跳过整表写', { homeId, sessions: rows.length });
+    } else if (!newRows.length && !ghostsDeleted && !clearedStale) {
+      // **只写变了的行**。整表替换的代价正比于该实例的**总会话数**，而一轮实时刷新通常只动了
+      // 少数几条（正在跑的会话）—— 规模审查实测 40k/10 实例每轮 891ms（≈每 3s 一次、约占 30%
+      // 的同步阻塞），其中绝大部分是在重写没变的行。
+      // 等价性：`merged` 是从**库里那几行**复制出来再合并实时字段的，所以对已存在的行而言，
+      // 整表替换实际改变的只有 status/lastActivity/tokenUsage/title/generatedAt（其余列的值
+      // 都等于库里原值）。这里逐行改这几列，结果与整表替换一致（有差分测试守着）。
+      // 有新增行（实时列表里有库里还没有的会话）或幽灵行要删时仍走整表替换 —— 那条路径要插入/删除行。
+      // 一处**有意**的差异：整表替换会把所有行的 generatedAt 刷成本次时间，这里只刷变化行。
+      // 该列目前**没有任何读取方**（grep 过 api/ 与 web/：只写不读），所以不影响行为；
+      // 若将来要用它做「本行何时被刷新」的判断，记得把这条优化一起考虑（见 #updateLiveRows）。
+      this.#updateLiveRows(homeId, changed);
+      log.debug('实时状态只写了变化的行', { homeId, changed: changed.length, total: rows.length });
+    } else {
+      this.upsertRows(merged);
+    }
+    this.#liveWrittenAt.set(homeId, Date.now());
+  }
+
+  // 只更新实时通道拥有的那几列（见 applyLiveStatus 里的等价性论证）。
+  #updateLiveRows(homeId, rows) {
+    const upd = this.db.prepare(`UPDATE sessions
+      SET status = ?, lastActivity = ?, tokenUsage = ?, title = ?, generatedAt = ?
+      WHERE homeId = ? AND sessionId = ?`);
+    for (const row of rows) {
+      upd.run(row.status ?? null, row.lastActivity ?? null, row.tokenUsage ?? null, row.title ?? null,
+        row.generatedAt ?? null, homeId, row.sessionId);
     }
   }
 
@@ -325,55 +888,81 @@ export class IndexStore {
       project: r.project,
       title: r.title ?? null,
       lastActivity: r.lastActivity,
-      tokenUsage: r.tokenUsage ? JSON.parse(r.tokenUsage) : null,
-      contextPressure: r.contextPressure ? JSON.parse(r.contextPressure) : null,
-      status: r.status ? JSON.parse(r.status) : null,
+      tokenUsage: safeJsonParse(r.tokenUsage, null, 'sessions.tokenUsage'),
+      contextPressure: safeJsonParse(r.contextPressure, null, 'sessions.contextPressure'),
+      status: safeJsonParse(r.status, null, 'sessions.status'),
     };
   }
 
   listHomes() {
-    const homes = this.db.prepare(
-      `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
-              h.host, h.remotePort, h.localPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
-              (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
-              (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
-       FROM homes h ORDER BY (h.sortIndex IS NULL), h.sortIndex, h.homeId`
-    ).all();
-    const providers = this.db.prepare('SELECT homeId, ref, provider FROM providers WHERE homeId = ? ORDER BY provider');
-    const tiers = this.db.prepare("SELECT homeId, tierId, provider, model FROM model_tiers WHERE homeId = ? AND active = 1 ORDER BY CASE WHEN tierId = 'default' THEN 0 ELSE 1 END");
-    return homes.map((h) => ({
+    return this.db.prepare(`${HOME_SELECT} ORDER BY (h.sortIndex IS NULL), h.sortIndex, h.homeId`)
+      .all()
+      .map((h) => this.#enrichHome(h));
+  }
+
+  // 按 id 取单个实例。**不能**再用 listHomes().find(...)：listHomes 对每个实例都要跑
+  // providers / activeTier / currentSession 三条语句加两次 JSON.parse，而实时轮询每约 3s 就会
+  // 对每个实例多次调用 getHome —— 一个实例时无感，十几个实例时就是每轮十几毫秒的同步阻塞
+  // （node:sqlite 是同步 API，直接卡住事件循环：SSE、HTTP、监控心跳一起等）。
+  getHome(homeId) {
+    if (!homeId) return null;
+    const row = this.db.prepare(`${HOME_SELECT} WHERE h.homeId = ?`).get(homeId);
+    return row ? this.#enrichHome(row) : null;
+  }
+
+  // 该 home 现有会话行的 workspace 归属（供 workspace 域降级时回填）。
+  #sessionWorkspaceLinks(homeId) {
+    const map = new Map();
+    for (const row of this.db.prepare(
+      'SELECT sessionId, workspaceId, workspaceTitle, project FROM sessions WHERE homeId = ?'
+    ).all(homeId)) {
+      map.set(row.sessionId, { workspaceId: row.workspaceId, workspaceTitle: row.workspaceTitle, project: row.project });
+    }
+    return map;
+  }
+
+  #enrichHome(h) {
+    // 预编译语句懒初始化并复用：原先它们被提到 listHomes 的 map 之外，
+    // 现在 getHome 也要用，所以挂到实例上（每个 store 实例生命周期内只 prepare 一次）。
+    this.#providersStmt ??= this.db.prepare('SELECT homeId, ref, provider FROM providers WHERE homeId = ? ORDER BY provider');
+    this.#tiersStmt ??= this.db.prepare(
+      "SELECT homeId, tierId, provider, model FROM model_tiers WHERE homeId = ? AND active = 1 ORDER BY CASE WHEN tierId = 'default' THEN 0 ELSE 1 END"
+    );
+    return {
       ...h,
-      degraded: JSON.parse(h.degraded || '[]'),
-      providers: providers.all(h.homeId),
-      activeTier: tiers.get(h.homeId) ?? null,
+      endpoints: safeJsonParse(h.endpoints, [], 'homes.endpoints'),
+      degraded: safeJsonParse(h.degraded, [], 'homes.degraded'),
+      providers: this.#providersStmt.all(h.homeId),
+      activeTier: this.#tiersStmt.get(h.homeId) ?? null,
       current: this.#currentSession(h.homeId),
-    }));
+    };
   }
 
   // Recent projects: cross-instance, active within `days`, ordered by last activity (§7.1).
   // 每个 project 附带"它所属的实例 + 该 project 最新会话"，供点击直接跳转。
-  recentProjects({ days = 7, limit = 20 } = {}) {
-    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  recentProjects({ days = 7, limit = 20, homeIds = null } = {}) {
+    const since = daysAgoIso(days);
+    const scope = homeIds === null ? null : JSON.stringify(homeIds);
     const projects = this.db.prepare(
-      `SELECT s.project,
+      `WITH visible_sessions AS (
+         SELECT * FROM sessions WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?)))
+       ) SELECT s.project,
               COUNT(*) AS sessionCount,
               MAX(s.lastActivity) AS lastActivity,
-              SUM(COALESCE(json_extract(s.tokenUsage, '$.uncachedInputTokens'), 0)
-                + COALESCE(json_extract(s.tokenUsage, '$.cacheReadTokens'), 0)
-                + COALESCE(json_extract(s.tokenUsage, '$.cacheWriteTokens'), 0)) AS inputTokens,
-              SUM(COALESCE(json_extract(s.tokenUsage, '$.outputTokens'), 0)) AS outputTokens,
-              (SELECT x.homeId FROM sessions x WHERE x.project = s.project
-                 ORDER BY x.lastActivity DESC, x.rowid DESC LIMIT 1) AS homeId,
-              (SELECT x.sessionId FROM sessions x WHERE x.project = s.project
-                 ORDER BY x.lastActivity DESC, x.rowid DESC LIMIT 1) AS sessionId,
-              (SELECT x.workspaceId FROM sessions x WHERE x.project = s.project
-                 ORDER BY x.lastActivity DESC, x.rowid DESC LIMIT 1) AS workspaceId
-       FROM sessions s
+              SUM(s.tokInput + s.tokCacheRead + s.tokCacheWrite) AS inputTokens,
+              SUM(s.tokOutput) AS outputTokens,
+              (SELECT x.homeId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS homeId,
+              (SELECT x.sessionId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS sessionId,
+              (SELECT x.workspaceId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS workspaceId
+       FROM visible_sessions s
        WHERE s.project IS NOT NULL AND s.lastActivity IS NOT NULL AND s.lastActivity >= ?
        GROUP BY s.project
        ORDER BY s.lastActivity DESC
        LIMIT ${int(limit, 20)}`
-    ).all(since);
+    ).all(scope, scope, since);
 
     // Workspaces with no sessions still show up as projects (§4.5) — 跳到其所属实例，
     // 无最新会话，sessionId 为 null。
@@ -382,10 +971,10 @@ export class IndexStore {
               0 AS inputTokens, 0 AS outputTokens,
               w.homeId AS homeId, NULL AS sessionId, w.workspaceId AS workspaceId
        FROM workspaces w
-       WHERE w.archived = 0 AND NOT EXISTS (
+       WHERE (? IS NULL OR w.homeId IN (SELECT value FROM json_each(?))) AND w.archived = 0 AND NOT EXISTS (
          SELECT 1 FROM sessions s WHERE s.homeId = w.homeId AND s.workspaceId = w.workspaceId
        )`
-    ).all();
+    ).all(scope, scope);
     const seen = new Set(projects.map((p) => p.project));
     for (const w of orphanWs) {
       if (!seen.has(w.project)) projects.push(w);
@@ -393,9 +982,14 @@ export class IndexStore {
     return projects.slice(0, int(limit, 20));
   }
 
-  recentSessions({ homeId = null, limit = 50 } = {}) {
-    const where = homeId ? 'WHERE homeId = ?' : '';
-    const args = homeId ? [homeId] : [];
+  getSession(homeId, sessionId) {
+    return this.db.prepare('SELECT sessionId, workspaceId, project FROM sessions WHERE homeId = ? AND sessionId = ?').get(homeId, sessionId) || null;
+  }
+
+  recentSessions({ homeId = null, limit = 50, homeIds = null } = {}) {
+    const scope = homeIds === null ? null : JSON.stringify(homeIds);
+    const where = 'WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?))) AND (? IS NULL OR homeId = ?)';
+    const args = [scope, scope, homeId, homeId];
     return this.db.prepare(
       `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
        FROM sessions ${where}
@@ -403,26 +997,29 @@ export class IndexStore {
        LIMIT ${int(limit, 50)}`
     ).all(...args).map((s) => ({
       ...s,
-      tokenUsage: s.tokenUsage ? JSON.parse(s.tokenUsage) : null,
-      contextPressure: s.contextPressure ? JSON.parse(s.contextPressure) : null,
-      status: s.status ? JSON.parse(s.status) : null,
+      tokenUsage: safeJsonParse(s.tokenUsage, null, 'sessions.tokenUsage'),
+      contextPressure: safeJsonParse(s.contextPressure, null, 'sessions.contextPressure'),
+      status: safeJsonParse(s.status, null, 'sessions.status'),
     }));
   }
 
+  // ⚠️ 两个「输入」口径不同，别把它们当成同一个数：
+  //   · usageSummary/usageTrend/... 的 inputTokens = **新增输入**（tokInput，不含缓存）
+  //   · recentProjects 的 inputTokens = **总输入**（tokInput + tokCacheRead + tokCacheWrite）
+  // 同一条会话实测 1000 vs 1950。前者与用量卡片的分项对齐，后者是「这个项目一共消耗了多少输入」
+  // （项目卡片就是按这个排序的）。界面上标签已写明（项目卡片 in 的 title 提示含缓存）。
+
   // Token 用量汇总（基于会话聚合 tokenUsage）：总 Tokens / 输入 / 输出 / 缓存命中 / 缓存创建 / 缓存命中率。
   usageSummary({ days = 30 } = {}) {
-    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const since = daysAgoIso(days);
     const r = this.db.prepare(
       `SELECT
          COUNT(*) AS sessionCount,
-         COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')), 0) AS inputTokens,
-         COALESCE(SUM(json_extract(tokenUsage, '$.outputTokens')), 0) AS outputTokens,
-         COALESCE(SUM(json_extract(tokenUsage, '$.cacheReadTokens')), 0) AS cacheRead,
-         COALESCE(SUM(json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS cacheWrite,
-         COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')
-                 + json_extract(tokenUsage, '$.outputTokens')
-                 + json_extract(tokenUsage, '$.cacheReadTokens')
-                 + json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS totalTokens
+         ${TOK.input} AS inputTokens,
+         ${TOK.output} AS outputTokens,
+         ${TOK.cacheRead} AS cacheRead,
+         ${TOK.cacheWrite} AS cacheWrite,
+         ${TOK.total} AS totalTokens
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?`
     ).get(since);
@@ -439,26 +1036,35 @@ export class IndexStore {
     };
   }
 
-  // 分时用量趋势：按小时分桶（最后 `hours` 小时），填充空白桶使图表连续。
+  // 分时用量趋势：按小时分桶（最后 `hours` 个整小时），填充空白桶使图表连续。
   usageTrend({ hours = 24 } = {}) {
     const now = Date.now();
-    const start = now - hours * 3_600_000;
-    const startIso = new Date(start).toISOString();
+    // 桶范围必须**包含当前这一小时**：原实现只列到 `floor(now/H) - 1` —— 当前这一小时的数据
+    // 被 SQL 选出来了却没有桶可放，于是被静默丢掉（实测真实库 24h 窗口里丢了 3.5% 的 token，
+    // 全部落在当前小时）。同时改为从旧到新（与 usageTrendGrouped 一致，图表不该反着画）。
+    const endHour = Math.floor(now / 3_600_000);
+    const startHour = endHour - hours + 1;
+    // SQL 窗口必须与**桶的范围**完全重合（这是 usageTrendGrouped 的做法）。
+    // 原实现写 `now - hours * 3600_000`：它比首个桶的起点更早（早 H - (now mod H)），
+    // 于是那一小段「落在窗口里、却没有桶可放」的行被查出来又丢掉 —— 白查一趟，
+    // 而且两条趋势口径在同一条边界上悄悄不一致。改成对齐后，取出的每一行都必定有桶。
+    const startIso = new Date(startHour * 3_600_000).toISOString();
     const rows = this.db.prepare(
-      `SELECT CAST(STRFTIME('%s', lastActivity) / 3600 AS INTEGER) AS h,
-              COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')), 0) AS inputTokens,
-              COALESCE(SUM(json_extract(tokenUsage, '$.outputTokens')), 0) AS outputTokens,
-              COALESCE(SUM(json_extract(tokenUsage, '$.cacheReadTokens')), 0) AS cacheRead,
-              COALESCE(SUM(json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS cacheWrite
+      // 与 usageTrendGrouped 同样的夹取：lastActivity 在未来（远端时钟偏）时，原先它的桶号超出
+      // [startHour, endHour]，于是汇总算了、趋势图整条丢掉（实测 summary 6000 / trend 0）。
+      // STRFTIME 解析不出来（脏时间戳）同样兜到最后一只桶。
+      `SELECT COALESCE(MIN(CAST(STRFTIME('%s', lastActivity) / 3600 AS INTEGER), ?), ?) AS h,
+              ${TOK.input} AS inputTokens,
+              ${TOK.output} AS outputTokens,
+              ${TOK.cacheRead} AS cacheRead,
+              ${TOK.cacheWrite} AS cacheWrite
        FROM sessions
        WHERE lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY h`
-    ).all(startIso);
+    ).all(endHour, endHour, startIso);
     const byH = new Map(rows.map((r) => [r.h, r]));
-    const startHour = Math.floor(start / 3_600_000);
     const buckets = [];
-    for (let i = hours - 1; i >= 0; i--) {
-      const h = startHour + i;
+    for (let h = startHour; h <= endHour; h++) {
       const r = byH.get(h);
       buckets.push({
         ts: new Date(h * 3_600_000).toISOString(),
@@ -473,14 +1079,11 @@ export class IndexStore {
 
   // 按项目拆分的 Token 用量（跨实例聚合）。
   usageByProject({ days = 30, limit = 15 } = {}) {
-    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const since = daysAgoIso(days);
     return this.db.prepare(
       `SELECT project,
               COUNT(*) AS sessionCount,
-              COALESCE(SUM(json_extract(tokenUsage, '$.uncachedInputTokens')
-                      + json_extract(tokenUsage, '$.outputTokens')
-                      + json_extract(tokenUsage, '$.cacheReadTokens')
-                      + json_extract(tokenUsage, '$.cacheWriteTokens')), 0) AS tokens
+              ${TOK.total} AS tokens
        FROM sessions
        WHERE project IS NOT NULL AND lastActivity IS NOT NULL AND lastActivity >= ?
        GROUP BY project
@@ -500,6 +1103,24 @@ export class IndexStore {
     const endBucket = Math.floor(now / stepMs);      // 当前桶索引（对齐 UTC 纪元）
     const startBucket = endBucket - bucketCount + 1;
     const startIso = new Date(startBucket * stepMs).toISOString();
+    // 「按 Model」只能拿到**当前档位配置**，不是会话真实用的模型 —— 这一点必须让用户看得见。
+    //
+    // 会话真实用过的模型只在会话日志（`sessions/<项目>/<会话>/session.jsonl.zstd`）里，
+    // 而本项目的硬性规则是**永不碰 `*.zstd`**（README「Reader 只读取以下 4 个文件」/ docs/topology /
+    // 架构文档 §数据源，共 8 处）：工作台活在投影缓存（projection cache）第一层，绝不下探日志。
+    // 这条规则不是洁癖 —— 日志格式是 dsh 的内部细节（多帧拼接的 zstd，node 的
+    // zstdDecompressSync 只解第一帧就静默返回），下探它等于把仪表盘绑在一个随时会变的实现上。
+    // 2026-09-13 曾实现过「解压日志取真实模型」并实测有效（Model 维度 2 项 → 7 项），
+    // 因为它与这条规则直接冲突而**整体回退**（详见 CHANGELOG 该条）。
+    //
+    // 所以这里改为**如实标注来源**：model_tiers 是当前 model-tier.json 的 default 档，标成
+    // 「<模型>（档位推定）」；读不到档位配置的实例标成 'unknown'（前端显示为
+    // 「未识别（该实例读不到会话日志）」，而不是把它当成一个模型名列进图例）。
+    // 为什么不用「看起来更干净」的裸模型名：那会让读者以为这是事实，而它还会随用户改默认模型
+    // 而**改写历史**（model_tiers 每次索引整表重建）。
+    const tierModel = `(SELECT NULLIF(model, '') FROM model_tiers t
+               WHERE t.homeId = s.homeId AND t.active = 1
+               ORDER BY CASE WHEN t.tierId = 'default' THEN 0 ELSE 1 END LIMIT 1)`;
     const groupExpr = dimension === 'instance'
       ? 's.homeId'
       : dimension === 'provider'
@@ -511,25 +1132,25 @@ export class IndexStore {
              'unknown')`
         : dimension === 'model'
           ? `COALESCE(
-               (SELECT NULLIF(model, '') FROM model_tiers t
-                 WHERE t.homeId = s.homeId AND t.active = 1
-                 ORDER BY CASE WHEN t.tierId = 'default' THEN 0 ELSE 1 END LIMIT 1),
+               CASE WHEN ${tierModel} IS NULL THEN NULL ELSE ${tierModel} || '（档位推定）' END,
                'unknown')`
           : dimension === 'total'
             ? "'合计'"
             : `COALESCE(s.project, '(未分类)')`;
     const rows = this.db.prepare(
-      `SELECT CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER) AS h,
+      // MIN(..., endBucket)：lastActivity 在**未来**（远端时钟偏、或 dsh 写了将来时间）时，
+      // 原先它的桶号超出 [startBucket, endBucket]，于是用量汇总把它算进去了、趋势图却整条丢掉
+      // （实测：summary 6000 / trend 1000）。夹到最后一只桶之后两边口径一致。
+      // STRFTIME 解析不出来时返回 NULL，同样落进最后一只桶（MIN 忽略 NULL 的语义在这里不合适，
+      // 所以用 COALESCE 兜到 endBucket）。
+      `SELECT COALESCE(MIN(CAST(STRFTIME('%s', s.lastActivity) / ? AS INTEGER), ?), ?) AS h,
               ${groupExpr} AS grp,
-              COALESCE(SUM(json_extract(s.tokenUsage, '$.uncachedInputTokens')
-                      + json_extract(s.tokenUsage, '$.outputTokens')
-                      + json_extract(s.tokenUsage, '$.cacheReadTokens')
-                      + json_extract(s.tokenUsage, '$.cacheWriteTokens')), 0) AS tokens
+              COALESCE(SUM(s.tokInput + s.tokOutput + s.tokCacheRead + s.tokCacheWrite), 0) AS tokens
        FROM sessions s
        WHERE s.lastActivity IS NOT NULL AND s.lastActivity >= ?
        GROUP BY h, grp
        ORDER BY h, tokens DESC`
-    ).all(stepSec, startIso);
+    ).all(stepSec, endBucket, endBucket, startIso);
 
     // instance 维度 group 是 homeId，在这里映射为可读标签（alias || 目录名 || homeId）。
     const homeLabel = this.#homeLabelMap();
@@ -554,9 +1175,19 @@ export class IndexStore {
   #homeLabelMap() {
     const homes = this.db.prepare('SELECT homeId, homePath, alias FROM homes').all();
     const m = new Map();
+    // 标签必须**唯一**：图上每个分组是一张图例，同名的两条会被合并成一条。
+    // `basename(homePath)` 撞名很常见 —— dsh 默认 home 目录就叫 `.dsh`，两个实例
+    // （各自用户目录下）会都叫 `.dsh`：实测 1000 + 7000 被画成一条 `.dsh: 8000`。
+    // 撞名时补一段 homeId 前缀，让用户能区分（而不是让数字悄悄合到一起）。
+    const used = new Set();
     for (const h of homes) {
-      const base = h.homePath ? path.basename(h.homePath) : h.homeId;
-      m.set(h.homeId, (h.alias && String(h.alias).trim()) || base);
+      const base = (h.alias && String(h.alias).trim()) || (h.homePath ? path.basename(h.homePath) : h.homeId);
+      let label = base;
+      if (used.has(label)) label = `${base} (${h.homeId.slice(0, 6)})`;
+      let n = 2;
+      while (used.has(label)) label = `${base} (${h.homeId.slice(0, 6)}-${n++})`;
+      used.add(label);
+      m.set(h.homeId, label);
     }
     return m;
   }

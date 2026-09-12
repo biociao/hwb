@@ -80,3 +80,24 @@ test('normalize carries degraded domains onto the home row', () => {
   const home = normalize(s).find((r) => r.type === 'home');
   assert.equal(home.degraded[0].domain, 'projcache');
 });
+
+// node:sqlite 绑 TEXT 时按 C 字符串处理：值里的 U+0000 会把后面**全部静默截掉**（没有报错、
+// 没有 degraded）。实测（审查）：`run('A\u0000B')` 读回 `'A'`，`run('\u0000leading')` 读回 `''`。
+// 外部 dsh home 的 title / cwd / path 里一旦有 NUL，入库时就只剩前半截 —— 界面上看不出少了什么。
+// 现在在产出侧（normalize）统一剥掉 NUL。
+test('normalize: 文本字段里的 NUL 会被剥掉（否则入库时被静默截断）', () => {
+  const rows = normalize({
+    homeId: 'h1', homePath: '/p', generatedAt: 'now', wsVersion: 2, pcVersion: 3,
+    workspaces: [{ workspaceId: 'ws-1', title: 'A\u0000B', path: '/r/\u0000x', archived: false, sessionIds: ['s1'] }],
+    sessions: [{ sessionId: 's1', title: '\u0000leading', cwd: '/r/demo', lastActivity: 'now' }],
+    providers: [{ ref: 'X\u0000API_KEY', provider: 'x' }],
+    modelTier: null, degraded: [],
+  });
+  const ws = rows.find((r) => r.type === 'workspace');
+  assert.equal(ws.title, 'AB', 'NUL 剥掉而不是截断到 NUL 之前');
+  assert.equal(ws.path, '/r/x');
+  const sess = rows.find((r) => r.type === 'session');
+  assert.equal(sess.title, 'leading', '开头的 NUL 也要剥掉（原先整个值会变成空串）');
+  assert.equal(sess.workspaceTitle, 'AB');
+  assert.equal(rows.find((r) => r.type === 'provider').ref, 'XAPI_KEY');
+});

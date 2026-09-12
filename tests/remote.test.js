@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { REMOTE_START, defaultRemoteCmd, normalizeWebToken, selfServiceHint } from '../src/control/remote.js';
+import { REMOTE_START, defaultRemoteCmd, normalizeWebToken, selfServiceHint, sshBash } from '../src/control/remote.js';
 
 test('defaultRemoteCmd: 用向下兼容的 `dsh web --port <n>`（不带 --profile/--no-open）', () => {
   assert.equal(defaultRemoteCmd(3080), 'dsh web --port 3080');
@@ -77,7 +77,10 @@ test('selfServiceHint: 尊重用户配置的 remoteCmd/remoteLog', () => {
 // 所以这里通过替换 REMOTE_START 里的 `listening()` 定义来桩定端口探测：
 //   return 0 → listening（真）；return 1 → 未 listening（假）。
 
-const LISTENING_REAL = "listening() { { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E \"[.:]$port[[:space:]]\" >/dev/null 2>&1; }";
+// 用正则整段替换 listening() 函数体，而不是匹配一行字面量：
+// 该函数已经是多行的（lsof 优先 + ss/netstat 兜底），写死单行会在实现一改动时静默失配，
+// 于是 stub 没生效、真实检测照跑 —— 测试仍然「通过/失败」但测的已经不是它以为的东西。
+const LISTENING_REAL = /listening\(\) \{[\s\S]*?\n\}/;
 const LISTENING_TRUE = 'listening() { return 0; }';
 const LISTENING_FALSE = 'listening() { return 1; }';
 
@@ -213,4 +216,24 @@ test('REMOTE_START: ensure + 已在监听且日志有 token（新版在跑）→
   } finally {
     cleanup(dir);
   }
+});
+
+test('REMOTE_START: endpoint switch never starts a missing remote service', async () => {
+  const dir = makeTemp();
+  try {
+    const marker = join(dir, 'cmd-ran');
+    const script = withListening(REMOTE_START, LISTENING_FALSE);
+    const r = await runScript(script, ['4080', join(dir, 'web.log'), `touch ${marker}`, '1', 'connect']);
+    assert.notEqual(r.code, 0);
+    assert.equal(existsSync(marker), false);
+  } finally { cleanup(dir); }
+});
+
+// spawn **同步**抛错时（参数含 NUL → ERR_INVALID_ARG_VALUE）原先会让 sshBash 变成一次
+// rejection：所有调用方都只检查返回值里的 code，rejection 会冒成未处理拒绝（crash handler
+// 会把它记成 fatal 并退出）。异步的 ENOENT 早就走 proc.on('error') 变成返回值了，同步这条漏了。
+test('sshBash: spawn 同步抛错也返回错误码，不把 rejection 抛给调用方', async () => {
+  const result = await sshBash('bot@x\u0000y', 'echo hi', [], 5000);
+  assert.equal(result.code, -2, `应返回 -2（spawn 失败），实际 ${JSON.stringify(result)}`);
+  assert.match(result.stderr, /spawn failed/);
 });

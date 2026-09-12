@@ -21,7 +21,7 @@ async function serveStatic(webRoot, pathname, req, res) {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const file = path.normalize(path.join(webRoot, rel));
   if (!file.startsWith(webRoot + path.sep)) {
-    res.writeHead(403).end('forbidden');
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' }).end('forbidden');
     return;
   }
   try {
@@ -46,20 +46,98 @@ async function serveStatic(webRoot, pathname, req, res) {
     res.writeHead(200, base);
     res.end(body);
   } catch {
-    res.writeHead(404).end('not found');
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' }).end('not found');
   }
 }
 
 // Listens on 127.0.0.1 only, no auth (§11).
-export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot }) {
-  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi });
+// API 只接受回环地址的 Host —— DNS rebinding 防护。
+//
+// 「只监听 127.0.0.1 + 无鉴权」并不足以限定谁能访问：攻击者可以把自己的域名解析到 127.0.0.1，
+// 让受害者的浏览器直接连上本机端口。此时请求里 Host 与 Origin 都是攻击者的域名、
+// Sec-Fetch-Site 甚至是 same-origin，所以 routes.js 里那套同源检查会**全部通过**
+// （它比较的两个值都由攻击者控制）。唯一能区分「本机页面」与「rebinding 页面」的信号就是
+// Host 是否指向回环地址本身。
+//
+// 实测影响面（未加此校验时）：跨站页面可读到 GET /api/homes 返回的 dsh token 与本地路径、
+// 经 preview/download 读取工作区文件、并经 upload 写入文件。
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+/**
+ * 解析 Host 头里的主机名（去掉端口与 IPv6 方括号）。
+ */
+export function hostNameOf(hostHeader) {
+  const raw = String(hostHeader ?? '').trim();
+  if (!raw) return '';
+  return (raw.startsWith('[') && raw.includes(']') ? raw.slice(1, raw.indexOf(']')) : raw.split(':')[0]).toLowerCase();
+}
+
+/**
+ * 该 Host 是否允许访问 API。
+ *
+ * 默认只允许回环地址（DNS rebinding 防护）。`extraAllowed` 是显式的逃生口：
+ * /etc/hosts 别名、devcontainer/Codespaces 的转发域名、以及会保留浏览器 authority 的反代，
+ * 都会让 Host 不是回环名 —— 那时 SPA 能加载但每个 /api/* 都 403，且没有任何办法自证是本人。
+ * 通过 `HWB_ALLOWED_HOSTS=a.example,b.example` 或创建服务器时的 `allowedHosts` 显式放行，
+ * 同时把安全后果写清楚（放行等于允许该主机名来源的页面访问本地 API）。
+ */
+export function isLoopbackHost(hostHeader, extraAllowed = []) {
+  const hostname = hostNameOf(hostHeader);
+  if (!hostname) return false;
+  if (LOOPBACK_HOSTNAMES.has(hostname)) return true;
+  return extraAllowed.some((allowed) => String(allowed ?? '').trim().toLowerCase() === hostname);
+}
+
+/** 从 `HWB_ALLOWED_HOSTS`（逗号分隔）读逃生口列表。 */
+export function allowedHostsFromEnv(env = process.env) {
+  return String(env.HWB_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+// 兜底网：路由**已经 return 但一个字节都没写响应**时，请求会一直挂在客户端上
+// （实测 `curl -d 'null' .../api/homes` 6s 超时后 `HTTP 000`，连接与 socket 都不释放）。
+// 这类缺陷的共同后果是「客户端永远等不到响应」，不该只靠逐个 handler 自觉 —— 而它确实发生过：
+// 用 `null` 同时表示「解析失败」与「正文就是 null」，四个写路由一起中招。
+// 判据刻意用「没写过响应头」而不只是「没 end」：SSE（/api/events）会立刻发头、然后长时间挂着连接，
+// 那种情况绝不能在这里补 500 把它掐掉。返回 true 表示这次真的由兜底网响应了。
+export function ensureResponded(res, log, meta) {
+  if (res.writableEnded || res.headersSent) return false;
+  log.error('API 路由返回时没有产生任何响应（已兜底回 500）', new Error('route returned without responding'), meta);
+  res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ error: '内部错误：请求未被处理' }));
+  return true;
+}
+
+export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec, usageTtlMs, maxConcurrentUploads }) {
+  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs, maxConcurrentUploads });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {
-      route(req, res, url).catch((e) => {
+      // 所有 /api/* 响应统一带 no-store：这些 JSON 里有实例元数据、会话标题、错误上下文，
+      // 而这个 API 无鉴权（回环 != 只有你能访问）。preview/download 早就单独设了 no-store，
+      // 其余路由此前一条都没有 —— 浏览器 HTTP 缓存或前面的反代都可能把它留下来。
+      // 同时给 nosniff：JSON 响应被当成别的类型解析是额外风险。
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      // HEAD 落到与 GET 同一条路由：路由只匹配 `method === 'GET'`，于是 `curl -I /api/homes`
+      // 会 404 —— 任何基于 HEAD 的健康检查都会认为 API 挂了。Node 对 HEAD 会自动不写 body，
+      // 所以这里把方法改成 GET 交给同一套逻辑即可（用副本，不改原对象以免影响后续日志/判断）。
+      if (req.method === 'HEAD') req.method = 'GET';
+      if (!isLoopbackHost(req.headers.host, allowedHosts)) {
+        log.warn('拒绝非回环 Host 的 API 请求（疑似 DNS rebinding）', { host: req.headers.host, path: url.pathname });
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'API 仅接受来自本机回环地址的请求' }));
+        return;
+      }
+      route(req, res, url).then(() => {
+        // 路由正常返回后仍要确认它真的写了响应（见 ensureResponded 的说明）。
+        ensureResponded(res, log, { method: req.method, path: url.pathname });
+      }).catch((e) => {
         // API 处理抛错：记录请求路径 + 错误栈，返回 500；前端能拿到 message，日志能还原根因。
         log.error('API 请求处理失败', e, { method: req.method, path: url.pathname });
-        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: e.message }));
       });
       return;

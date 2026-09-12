@@ -17,6 +17,14 @@ import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const indexerPath = join(here, "dsh-instance-index.mjs");
+// 一个实例的索引 JSON 上限。默认的 1 MiB 太小（大实例会被判成「离线: exit null」）。
+const MAX_INDEX_BYTES = 256 * 1024 * 1024;
+
+// 单个实例的采集超时。没有它时只有「错」被隔离、**「慢」不被隔离**：一台黑洞主机能让整轮采集
+// 卡在系统 TCP 超时上（分钟级），而采集是串行的 —— 健康的实例也跟着不刷新。可用
+// `--collect-timeout-ms` 调（测试用它把 60s 缩短）。
+const COLLECT_TIMEOUT_MS = Number(arg("--collect-timeout-ms", "60000")) || 60000;
+
 const indexerSource = await readFile(indexerPath, "utf8");
 
 function arg(name, fallback) {
@@ -24,14 +32,39 @@ function arg(name, fallback) {
   return i >= 0 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
+// 远端命令的每个参数都必须过一遍 shell 引号：`ssh host cmd a b` 这一串会被**远端 shell 重新按空白
+// 分段**（本项目的 dsh-remote-web.sh 里专门写明了这一点，那里用 printf '%q' 解决）。不引号的话：
+//   · 路径里有空格 → `--root /a/My Sessions/x` 被拆成两段，实例静默变成「离线」且原因误导；
+//   · 值里有 `;` 或 `$( )` → 直接在远端执行（instances.json 虽是本地配置，但没有理由留这个洞）。
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 async function collectInstance(inst) {
   const args = ["--root", inst.sessionsRoot, "--cache", inst.cacheRoot, "--instance", inst.id];
   let res;
   if (!inst.host) {
-    res = spawnSync(inst.nodeBin || "node", [indexerPath, ...args], { encoding: "utf8" });
+    res = spawnSync(inst.nodeBin || "node", [indexerPath, ...args],
+      { encoding: "utf8", maxBuffer: MAX_INDEX_BYTES, timeout: COLLECT_TIMEOUT_MS, killSignal: "SIGKILL" });
   } else {
     // Publish the indexer to the remote via stdin:  ssh host <nodeBin> - <args>  <script-source>
-    res = spawnSync("ssh", [inst.host, inst.nodeBin || "node", "-", ...args], { input: indexerSource, encoding: "utf8" });
+    // BatchMode/ConnectTimeout：没有它们时一台黑洞主机会让采集卡在系统的 TCP 超时上（分钟级），
+    // 而采集是**串行**的，于是旁边所有实例都跟着不刷新。
+    res = spawnSync("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", inst.host,
+      inst.nodeBin || "node", "-", ...args.map(shQuote)],
+      { input: indexerSource, encoding: "utf8", maxBuffer: MAX_INDEX_BYTES, timeout: COLLECT_TIMEOUT_MS, killSignal: "SIGKILL" });
+  }
+  if (res.error?.code === "ETIMEDOUT" || res.signal === "SIGKILL") {
+    // 「慢」也要隔离：只有错误被隔离是不够的，一台卡住的主机会让整轮采集停在系统超时上。
+    return { instance: inst.id, error: `采集超时（超过 ${Math.round(COLLECT_TIMEOUT_MS / 1000)}s）` };
+  }
+  if (res.error) {
+    // spawnSync 的默认 maxBuffer 只有 1 MiB：索引 JSON 约 350 B/会话，且会话在
+    // 「扁平列表」与「按项目嵌套」里各出现一次 —— 大约 1.4k 个会话就越过上限，
+    // 于是 ENOBUFS。此时 status 是 null、stderr 是空的，原先掉进下面的分支后
+    // 界面上只显示「exit null」：既不说明原因，也看不出该改什么。
+    return { instance: inst.id, error: `${res.error.code || res.error.message}`
+      + (res.error.code === "ENOBUFS" ? "（索引输出超过 maxBuffer 上限）" : "") };
   }
   if (res.status !== 0) {
     // Mark the instance as unreachable rather than throwing: a transient SSH
@@ -39,21 +72,61 @@ async function collectInstance(inst) {
     // snapshot for this instance and flags it offline.
     return { instance: inst.id, error: (res.stderr || "").trim().slice(0, 300) || `exit ${res.status}` };
   }
-  const data = JSON.parse(res.stdout);
+  let data;
+  try {
+    data = parseIndexOutput(res.stdout);
+  } catch (error) {
+    // 解析失败只让**这一个**实例离线。整个脚本的设计意图就是「单个实例的抖动不该拖垮看板」
+    // （ssh 非零退出已经这么处理了），但 parse 失败原先会冒到 runOnce → tickGuarded：
+    // 于是**一个**混进登录 banner 的实例会让旁边完全健康的实例也一整轮不刷新，
+    // --watch 的 HTML 永远停在旧快照上。故障要隔离在实例粒度。
+    return { instance: inst.id, error: String(error.message || error).slice(0, 300) };
+  }
   return { instance: inst.id, ...data };
+}
+
+// 远端的 stdout 不干净：登录 shell 的 banner（`.bashrc`/profile 里的 echo、motd）、
+// ssh 的告警都会混在 JSON 前面。原生实现直接 JSON.parse(res.stdout)，于是远端一句
+// "Welcome to ..." 就让整份合并索引报 SyntaxError（--watch 模式下每轮都死，HTML 一直是旧的，
+// 而错误信息完全没提到 banner 这个真实原因）。
+// 这里从第一个 `{` 开始解析；仍然失败时把原始输出片段带上，让原因可见。
+function parseIndexOutput(stdout) {
+  const text = String(stdout ?? "");
+  const start = text.indexOf("{");
+  const candidate = start === -1 ? text : text.slice(start);
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const preview = text.trim().split("\n").slice(0, 3).join(" ⏎ ").slice(0, 300);
+    throw new Error(`远端索引输出不是 JSON（可能混入了登录 banner）: ${error.message} — 实际输出开头: ${preview || "(空)"}`);
+  }
+}
+
+// 一条会话条目的规范化。渲染层直接用了 `s.id.slice(...)`，所以 `id` 是数字（或整个条目是 null）时，
+// 一次渲染就抛错 → **整页不写、退出码 1**：一个实例的一个坏字段足以让旁边健康实例的卡片也一起消失。
+// 这与本文件反复强调的「单个实例的抖动不该拖垮看板」直接冲突 —— 采集期做了隔离，渲染期又漏了。
+// 归一化放在 merge 这个唯一入口：`id` 一律转成字符串，非对象条目整条丢掉。
+function normalizeSession(s, instance) {
+  if (!s || typeof s !== "object") return null;
+  const id = s.id == null ? "" : String(s.id);
+  return { instance, ...s, id };
 }
 
 function merge(raws) {
   const projects = [];
   const sessions = [];
   for (const raw of raws) {
-    for (const s of raw.sessions || []) sessions.push({ instance: raw.instance, ...s });
+    for (const s of raw.sessions || []) {
+      const row = normalizeSession(s, raw.instance);
+      if (row) sessions.push(row);
+    }
     for (const p of raw.projects || []) {
+      if (!p || typeof p !== "object") continue;
       projects.push({
         instance: raw.instance,
         key: p.key,
         path: p.path,
-        sessions: (p.sessions || []).map((s) => ({ instance: raw.instance, ...s })),
+        sessions: (p.sessions || []).map((s) => normalizeSession(s, raw.instance)).filter(Boolean),
       });
     }
   }
@@ -62,6 +135,15 @@ function merge(raws) {
   for (const p of projects) p.sessions.sort(byUp);
   projects.sort((a, b) => Math.max(...b.sessions.map((s) => s.updatedAt), 0) - Math.max(...a.sessions.map((s) => s.updatedAt), 0));
   return { mergedAt: Date.now(), resources: raws.map((r) => r.instance), projects, sessions, offline: raws.filter((r) => r.error).map((r) => ({ instance: r.instance, error: r.error })) };
+}
+
+// 数值字段同样来自**远端**投影缓存（sessionStats.val），不是本地可信数据：
+// 直接 `\${s.turns}` 插进模板就是一个 HTML 注入面（构造缓存即可产出
+// `class="turns"><img src=x onerror=...>`）。这个页面聚合了所有实例的标题与路径，
+// 一旦注入成功就能读走全部内容。统一走数值规范化。
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function esc(s) {
@@ -98,8 +180,8 @@ function renderHtml(data, showHost) {
       <div class="meta">
         <span>${when(s.updatedAt)}</span>
         <span class="ago">${rel(s.updatedAt)}</span>
-        <span class="turns">${s.turns ?? 0} 轮 / ${s.steps ?? 0} 步</span>
-        ${s.llmMs ? `<span>LLM ${(s.llmMs / 1000).toFixed(1)}s</span>` : ""}
+        <span class="turns">${num(s.turns)} 轮 / ${num(s.steps)} 步</span>
+        ${num(s.llmMs) ? `<span>LLM ${(num(s.llmMs) / 1000).toFixed(1)}s</span>` : ""}
       </div>
       <div class="foot">
         <span class="path">${p(s.cwd)}</span>
@@ -197,7 +279,34 @@ async function tick() {
   }
 }
 
-await tick();
+// 单轮失败（远端 banner / SSH 抖动 / 临时读不到 instances.json）不该让整个 watch 进程退出 ——
+// 那会让 HTML 永远停在旧快照上，而且用户看不到任何提示。记录并等下一轮。
+async function tickGuarded() {
+  try {
+    await tick();
+    return true;
+  } catch (error) {
+    process.stderr.write(`[${when(Date.now())}] 本轮刷新失败，等下一轮：${error.message}\n`);
+    // JSON 模式（没有 --html）下 stdout 是给机器消费的（`hwb-index > index.json`）。
+    // 原先失败时**什么都不输出**、命令却以 0 退出 —— 下游拿到一个空的 index.json 且毫不知情，
+    // 而「空文件 + 成功退出」是最难排查的一种失败。现在给出结构化的失败文档 + 非零退出码。
+    if (!htmlPath) {
+      process.stdout.write(JSON.stringify({
+        error: String(error.message || error).slice(0, 300), offline: [], projects: [], sessions: [], resources: [],
+      }));
+    }
+    return false;
+  }
+}
+
+// stdout 被下游提前关闭是**正常用法**（`hwb-index | head`、`| grep -q`），
+// 默认行为却是未捕获的 EPIPE 异常 + 一堆栈帧。EPIPE 安静退出，其它错误照常抛。
+process.stdout.on("error", (error) => {
+  if (error.code === "EPIPE") process.exit(0);
+  throw error;
+});
+
+if (!await tickGuarded()) process.exitCode = 1;
 if (watchSec > 0) {
-  setInterval(tick, watchSec * 1000);
+  setInterval(tickGuarded, watchSec * 1000);
 }

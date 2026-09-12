@@ -98,3 +98,60 @@ test('readHomeRemote degrades a required file that is missing remotely', async (
   // 两个必需文件都缺失 → 各自降级；可选文件缺失不降级。
   assert.deepEqual(snap.degraded.map((d) => d.domain).sort(), ['projcache', 'workspace']);
 });
+
+test('remote reader preserves workspace and large projcache through SSH stdout collection', async () => {
+  const { sshBash } = await import('../src/control/remote.js');
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const bigPc = JSON.parse(PC);
+  bigPc.tables.sessions.s1.rows.title.val = '会话'.repeat(40000);
+  const output = catOutput({ 'storages/workspace.json': WS, 'storages/session_projcache.json': JSON.stringify(bigPc) });
+  const spawnProcess = () => {
+    const proc = new EventEmitter();
+    proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.stdin = new PassThrough();
+    proc.kill = () => {};
+    proc.stdin.on('finish', () => {
+      const bytes = Buffer.from(output);
+      // Deliberately split multibyte text across chunks.
+      for (let i = 0; i < bytes.length; i += 8191) proc.stdout.write(bytes.subarray(i, i + 8191));
+      proc.stdout.end();
+      proc.emit('close', 0);
+    });
+    return proc;
+  };
+  const exec = (host, script, args, timeout, options) => sshBash(host, script, args, timeout, { ...options, spawnProcess });
+  const snapshot = await readHomeRemote({ homePath: 'ssh://cms:3080', host: 'cms' }, exec);
+  assert.deepEqual(snapshot.degraded, []);
+  assert.equal(snapshot.workspaces.length, 1);
+  assert.equal(snapshot.sessions[0].title, '会话'.repeat(40000));
+});
+
+test('SSH output overflow is an explicit failure instead of a successful truncated tail', async () => {
+  const { sshBash } = await import('../src/control/remote.js');
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  let killed = false;
+  const spawnProcess = () => {
+    const proc = new EventEmitter();
+    proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.stdin = new PassThrough();
+    proc.kill = () => { killed = true; };
+    proc.stdin.on('finish', () => { proc.stdout.write('x'.repeat(100)); proc.emit('close', 0); });
+    return proc;
+  };
+  const result = await sshBash('cms', 'test', [], 1000, { maxStdoutBytes: 50, spawnProcess });
+  assert.equal(result.code, -3);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /exceeded 50 bytes/);
+  assert.equal(killed, true);
+});
+
+test('truncated remote file framing fails without replacing existing sessions', async () => {
+  const store = new IndexStore(':memory:');
+  const home = { homePath: 'ssh://cms:3080', host: 'cms', hostType: 'remote' };
+  store.registerHome(home);
+  try {
+    await indexRemoteHome(store, home, async () => ({ code: 0, stdout: catOutput({ 'storages/workspace.json': WS, 'storages/session_projcache.json': PC }), stderr: '' }));
+    await assert.rejects(() => indexRemoteHome(store, home, async () => ({ code: 0, stdout: catOutput({}).slice(20), stderr: '' })), /输出不完整/);
+    assert.equal(store.listHomes()[0].sessionCount, 1);
+  } finally { store.close(); }
+});

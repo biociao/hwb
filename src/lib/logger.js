@@ -58,6 +58,7 @@ export function initLogger(cfg = {}) {
   if (cfg.silent !== undefined) config.silent = Boolean(cfg.silent);
   if (cfg.color !== undefined) config.color = Boolean(cfg.color);
   if (cfg.rotateBytes !== undefined && cfg.rotateBytes > 0) config.rotateBytes = cfg.rotateBytes;
+  if (cfg.openRetryMs !== undefined && cfg.openRetryMs >= 0) openRetryMs = cfg.openRetryMs;
   // 切换日志文件时关闭旧 fd，避免句柄泄漏/写错文件（生产只 init 一次；测试会多次切换）。
   if (config.file !== prevFile) closeFile();
   if (config.file) openFile();
@@ -77,7 +78,11 @@ export function getLogs({ level, limit = 100 } = {}) {
   const out = level
     ? ring.filter((e) => (LEVELS[e.level] ?? levelVal('info')) >= levelVal(level))
     : [...ring];
-  return out.slice(-Math.max(0, limit));
+  // `limit <= 0` 必须返回**空**：`slice(-Math.max(0, limit))` 在 limit=0 时算的是 `slice(-0)`
+  // 而 `-0 === 0` → `slice(0)` → 把整个环缓冲返回。HTTP 路径目前把 limit 夹在 [1,1000] 所以没暴露，
+  // 但这是个等着被踩的陷阱（任何新调用方传 0 都会拿到全部日志）。
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  return out.slice(-limit);
 }
 
 // 清空环缓冲。
@@ -162,24 +167,122 @@ function normalize(message, errOrContext, maybeContext) {
 
 function emit(level, scope, message, err, fields) {
   if (LEVELS[level] < LEVELS[config.level]) return; // 低于阈值 → 丢弃（console 与 file 都拦）
-  const line = formatLine(level, scope, message, err, fields);
+  // 对**最终字符串**再脱敏一次：这是最强的一道防线，token 无论是从 fields、message
+  // 还是 err 拼进来的，都不可能出现在落盘/console 的内容里。
+  const line = redactSecrets(formatLine(level, scope, message, err, fields));
   writeConsole(level, line);
   writeFileLine(line);
   pushRing(makeEntry(level, scope, message, err, fields));
 }
 
 // 构造结构化日志条目（供内存环缓冲 + SSE 推送到「日志区域」）。
+// dsh 的启动 URL 形如 `http://127.0.0.1:<port>/?token=<launchToken>`，持有它等于持有该实例的
+// 完整控制权（dsh web 的工具能执行 shell、写文件）。而这个 URL 会被 monitor / launcher 直接写进
+// 日志字段，日志又要落盘（~/.hwb/hwb.log）并经 SSE 推到浏览器 —— 所以 token 必须在**写入通道之前**
+// 就抹掉，而不是指望调用方记得别传。这里做统一的最后一道防线。
+//
+// 只匹配「token 的值」而不动其它内容：`?token=xxx`、`&token=xxx`、`token=xxx`、
+// `"token": "xxx"`（safeJson 之后的形态）都要覆盖，值字符集与 captureDshToken 对齐。
+// 脱敏规则（唯一收口，在 emit() 里对**最终字符串**执行）。
+//
+// 为什么值字符集用「分隔符取反」而不是 `[A-Za-z0-9_-]`：后者只吃前缀，`token=abc+DEF/ghi==`
+// 会被脱敏成 `token=[已脱敏]+DEF/ghi==`（**值的一半还留在日志里**）。分隔符取反能一次吃掉整个值，
+// 又不会溢出到下一个字段（遇到空白、引号、&、逗号、分号、右括号、`]`、`}` 即停）。
+//
+// 为什么不止匹配 `token`：真实 dsh token 是 base64url，今天的形态本来就被覆盖，所以这一段是
+// **加固**而不是已发生的泄漏 —— 但既然这里已经是唯一收口，就没有理由只认一种键名。
+// 键名允许是单词后缀（`DCS_PAT` / `MY_API_KEY` 都要命中），代价是偶尔多脱敏一点，
+// 这正是本文件一贯的取舍：宁可误脱敏也不能漏。
+// 值里**同时排除 `[` 与 `]`**：脱敏标记本身是 `[已脱敏]`，若不排除 `[`，第二次替换会把标记
+// 吃掉一半、留下一个多余的 `]`（实测 `--token <v>` 变成 `--token [已脱敏]]`）。
+// 排除之后 redactSecrets 是幂等的 —— 这很重要，因为同一行会在 console、文件、环缓冲三条路上
+// 各过一次，而日志行本身也可能包含上一次的输出。
+const VALUE = `[^\\s&"',;)\\]}\\[]+`;
+const SECRET_KEY = '(?:token|access_token|refresh_token|pat|api[-_]?key|secret|password|passwd)';
+// 形如 `token=…` / `token: …` / `"token": "…"` / `DCS_PAT=…`（键名允许是单词后缀）
+// 前缀字符类要**放得足够宽**：审查实测原先的 `[?&\s"']|^|[\w-]` 漏掉了
+// `(token=S)`、`a,b,token=S`、`x;token=S`、`{token=S}`、`err:token=S`、`a=token=S`、`path/token=S`
+// 这些形态（前缀字符是 `( , ; { : = /` 之一）—— 也就是说「带键名的凭据」只在少数几种标点前面才被脱敏。
+// 改成「任意一个字符或行首」：`[\w-]` 带来的「单词后缀也认」（DCS_PAT=…）依然成立。
+const KEY_VALUE = new RegExp(`((?:^|[\\s\\S])(?:${SECRET_KEY})(?:\\s*[:=]\\s*|"\\s*:\\s*"))(${VALUE})`, 'gi');
+// Authorization 单独处理：必须把 scheme 也放进前缀一起吃掉，否则会「脱敏 Bearer、留下真 token」。
+// 这里**不**把裸 `token ` 当分隔符 —— 那会把普通散文里的「token 只是…」也吃掉（过度脱敏，
+// 而且让日志变得难读）。命令行形态由下面的 SPACED_FLAG 覆盖。
+// `Authorization: Bearer <v>`：scheme 必须**强制**出现在前缀里。写成「scheme 可选」会在第二次
+// 替换时把已脱敏结果里的 `Bearer` 当成值吃掉（`Authorization: [已脱敏]`）—— 实测非幂等。
+// 注意 `authorization...` 这一段是**必需**的：写成可选就等于「任何 beacon/bearer 开头的散文都会被脱敏」
+// （实测 `the bearer of bad news` 被吃掉一半）。裸 `Bearer <值>` 由下面的 BEARER_BARE 负责，
+// 且带「值至少 16 个凭据字符」的前提。
+// 允许 JSON 引号形态：`{"Authorization":"Bearer <v>"}` —— 原先 `[:=]` 之后紧跟引号就匹配不上，
+// 于是这种（很常见的）形态整条漏掉。
+const AUTH_SCHEME = new RegExp(`((?:authorization\\s*[:=]\\s*["']?\\s*(?:bearer|basic)\\s+))(${VALUE})`, 'gi');
+// 没有 scheme 的形态（`authorization: <v>`）。负向断言排除 scheme 词，否则同样会在第二次替换时
+// 把 `Bearer` 当值吃掉。
+const AUTH_BARE = new RegExp(`((?:authorization\\s*[:=]\\s*))((?!(?:bearer|basic|token)\\b)${VALUE})`, 'gi');
+// 裸 `Bearer <v>`（HTTP 头被单独打印时很常见）。要求值至少 16 个「凭据字符」：
+// 不加这个前提会把散文里的「the bearer of bad news」也脱敏掉（实测过），日志会变得没法读。
+const BEARER_BARE = new RegExp(`((?:\\bbearer\\s+))((?=[\\w.~+/=-]{16,})${VALUE})`, 'gi');
+// 形如 `--token <v>` / `--api-key <v>`
+const SPACED_FLAG = new RegExp(`((?:--(?:${SECRET_KEY})\\s+))(${VALUE})`, 'gi');
+
+// 裸的凭据**形状**：没有 `token=` 这类前缀，就一个 sk-… / dcs_pat_… 混在错误消息里。
+// 上游 SDK 的报错经常带请求内容（header 值就是 key），而这正是 balance.js 里
+// classifyBalanceError 存在的原因 —— 那条路径已经不记原始消息了，但别的路径仍可能把
+// 「不带键名的 key」写进日志，所以这里按形状兜一层。前缀取自本项目会用到的服务：
+// DeepSeek/OpenAI 的 sk-、Anthropic 的 sk-ant-、GitHub 的 ghp_/gho_、Slack 的 xox*-、
+// AWS 的 AKIA、以及 DCS 的 dcs_pat_。
+const BARE_SECRET = /\b(?:sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|sk_live_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,}|dcs_pat_[A-Za-z0-9_-]{8,})/g;
+
+export function redactSecrets(value) {
+  return String(value ?? '')
+    .replace(KEY_VALUE, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(AUTH_SCHEME, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(AUTH_BARE, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(BEARER_BARE, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(SPACED_FLAG, (m, prefix) => `${prefix}[已脱敏]`)
+    .replace(BARE_SECRET, '[已脱敏]');
+}
+
+function redactFields(fields) {
+  if (!fields || typeof fields !== 'object') return fields;
+  let changed = false;
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    const redacted = redactValue(v);
+    if (redacted !== v) changed = true;
+    out[k] = redacted;
+  }
+  return changed ? out : fields;
+}
+
+function redactValue(v) {
+  if (typeof v === 'string') return redactSecrets(v);
+  if (Array.isArray(v)) {
+    let changed = false;
+    const out = v.map((x) => { const r = redactValue(x); if (r !== x) changed = true; return r; });
+    return changed ? out : v;
+  }
+  if (v && typeof v === 'object') {
+    let changed = false;
+    const out = {};
+    for (const [k, x] of Object.entries(v)) { const r = redactValue(x); if (r !== x) changed = true; out[k] = r; }
+    return changed ? out : v;
+  }
+  return v;
+}
+
 function makeEntry(level, scope, message, err, fields) {
   const entry = {
     ts: timestamp(),
     level,
     scope,
-    message,
+    message: redactSecrets(message),
   };
-  if (fields && Object.keys(fields).length) entry.fields = fields;
+  const safeFields = redactFields(fields);
+  if (safeFields && Object.keys(safeFields).length) entry.fields = safeFields;
   if (err != null) {
-    entry.error = err instanceof Error ? err.message : String(err);
-    entry.stack = err instanceof Error && err.stack ? err.stack : null;
+    entry.error = redactSecrets(err instanceof Error ? err.message : String(err));
+    entry.stack = err instanceof Error && err.stack ? redactSecrets(err.stack) : null;
   }
   return entry;
 }
@@ -195,6 +298,7 @@ function pushRing(entry) {
 function pad(level) { return level.toUpperCase().padEnd(5); }
 
 function formatLine(level, scope, message, err, fields) {
+  fields = redactFields(fields);
   const ts = timestamp();
   const tag = config.color
     ? `${ANSI[LEVEL_COLOR[level] ?? 'gray']}${pad(level)}${ANSI.reset}`
@@ -258,12 +362,46 @@ function writeConsole(level, line) {
 function openFile() {
   if (!config.file || fileFd !== null) return;
   try {
-    fs.mkdirSync(path.dirname(config.file), { recursive: true });
-    fileFd = fs.openSync(config.file, 'a');
+    // 0700/0600：日志里有本地路径、会话标题等，且这是每个用户自己的私有状态目录。
+    // 原先 openSync 不带 mode → 0666 & ~umask = 0644（实测 ~/.hwb/hwb.log 就是 -rw-r--r--），
+    // 同机其它用户可读。已存在的旧文件也要纠正权限，否则升级后仍是 0644。
+    const dir = path.dirname(config.file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // `mkdirSync` 的 mode 只对新目录生效：**已存在**的目录（老版本建的 0755）不会被改动。
+    // 而目录可遍历就等于泄露了里面有什么（config.json / hwb.db 的存在与名字），
+    // 所以这里显式收一次。与 src/service.js 同一套白名单：HWB_DIR 被误设成 /tmp、$HOME、/
+    // 这类共享位置时**不**动权限（那会把不属于 hwb 的目录重新授权）。
+    try {
+      const resolved = path.resolve(dir);
+      const cwd = path.resolve(process.cwd());
+      const shared = new Set(['/', path.resolve(os.homedir()), path.resolve(os.tmpdir()),
+        (() => { try { return fs.realpathSync(os.tmpdir()); } catch { return ''; } })()]);
+      // 绝不改动**当前目录及其祖先**：日志路径可以是相对的（`--log hwb.log`、`hwb config set log x`），
+      // 那样 `path.dirname()` 就是 `.` 或 `..` —— 无条件 chmod 会把用户的工作目录（甚至家的上一级）
+      // 改成 0700，这比它想防的「目录可被遍历」严重得多。自查本轮改动时发现的。
+      const touchesCwd = resolved === cwd || cwd.startsWith(resolved + path.sep);
+      if (!shared.has(resolved) && !touchesCwd) fs.chmodSync(resolved, 0o700);
+    } catch { /* 尽力而为 */ }
+    fileFd = fs.openSync(config.file, 'a', 0o600);
+    try { fs.fchmodSync(fileFd, 0o600); } catch { /* 某些文件系统不支持，忽略 */ }
+    // 轮转代（.1/.2）也要收权限：它们由**老版本**以 0644 写出，里面同样有 `?token=…`
+    // （审查实测：一次轮转后 .1 变成 0600，而被它顶到 .2 的那一代仍是 0644 且含旧 token ——
+    // 升级路径下这个泄露一直留着）。fchmod 只作用于活文件的 fd，所以这里按路径收。
+    for (let i = 1; i <= KEEP_ROTATED; i++) {
+      try { fs.chmodSync(`${config.file}.${i}`, 0o600); } catch { /* 不存在/不支持：忽略 */ }
+    }
   } catch (e) {
     reportFileError(e);
   }
 }
+
+// 打开失败后的重试节流：openFile() 原先只在 initLogger 与 rotate() 里被调用，而 rotate()
+// 又只在 writeFileLine() 里可达 —— 后者在 fileFd === null 时直接 return。也就是说一次
+// **瞬时**失败（EACCES/ENOSPC、日志目录被临时改名）之后，文件日志会在整个进程生命周期里
+// 静默停掉，只留 console 里一行提示；而 help 文案恰恰叫用户去看那个文件。
+const OPEN_RETRY_MS = 30_000;
+let openRetryMs = OPEN_RETRY_MS;   // 可被 initLogger 覆盖（测试用）
+let nextOpenAttemptAt = 0;
 
 function closeFile() {
   if (fileFd !== null) {
@@ -272,8 +410,43 @@ function closeFile() {
   }
 }
 
+// 定期检查「我们持有的 fd 是否还对应磁盘上那个路径」。
+// 日志文件被 rm / 被 mv、或被换成一个目录之后，写入会继续落到**已 unlink 的 inode**上：
+// 进程看起来一切正常、/api/logs 也照常有内容，但磁盘上的日志永远不会再增长（`hwb logs`
+// 会说「日志尚不存在」）—— 恰恰是最需要日志的时候失去磁盘线索。
+// `chmod 000` 不受影响（权限在 open 时检查），所以只需要比对 inode。
+const FD_CHECK_INTERVAL_MS = 5_000;
+let nextFdCheckAt = 0;
+
+function fileFdStillValid() {
+  const now = Date.now();
+  if (now < nextFdCheckAt) return true;
+  nextFdCheckAt = now + FD_CHECK_INTERVAL_MS;
+  try {
+    const open = fs.fstatSync(fileFd);
+    const onDisk = fs.statSync(config.file);
+    return open.ino === onDisk.ino && open.dev === onDisk.dev;
+  } catch {
+    return false; // 路径已不存在，或变成了目录
+  }
+}
+
 function writeFileLine(line) {
-  if (fileFd === null) return;
+  // fileFd 为空时按节流重试打开（而不是永久放弃）。打开失败本身不写日志（会递归），
+  // 由 reportFileError 在 console 上提示一次。
+  if (fileFd === null) {
+    const now = Date.now();
+    if (now < nextOpenAttemptAt) return;
+    nextOpenAttemptAt = now + openRetryMs;
+    openFile();
+    if (fileFd === null) return;
+  }
+  // 路径上的文件已经被换掉/删掉了：关掉旧 fd 重新打开，让磁盘日志接上。
+  if (!fileFdStillValid()) {
+    closeFile();
+    openFile();
+    if (fileFd === null) return;
+  }
   try {
     // 写前检查体积（同步 stat 开销可忽略：日志量级低）。
     const st = fs.fstatSync(fileFd);
@@ -290,11 +463,20 @@ function rotate() {
   const f = config.file;
   // 丢弃最旧一代（.KEEP_ROTATED），再把备份整体右移一位：.1 -> .2（若有），当前文件 -> .1。
   // 注意当前活文件是 f（索引 0），不是 f.0——之前误把 f.0 当成活文件导致永不轮转。
-  try { if (fs.existsSync(`${f}.${KEEP_ROTATED}`)) fs.rmSync(`${f}.${KEEP_ROTATED}`, { force: true }); } catch { /* best-effort */ }
-  try { if (fs.existsSync(`${f}.1`)) fs.renameSync(`${f}.1`, `${f}.2`); } catch { /* best-effort */ }
-  try { fs.renameSync(f, `${f}.1`); } catch { /* best-effort */ }
+  let failed = null;
+  const attempt = (what, fn) => { try { fn(); } catch (e) { failed ??= { what, e }; } };
+  attempt('清理最旧一代', () => { if (fs.existsSync(`${f}.${KEEP_ROTATED}`)) fs.rmSync(`${f}.${KEEP_ROTATED}`, { force: true }); });
+  attempt('.1 -> .2', () => { if (fs.existsSync(`${f}.1`)) fs.renameSync(`${f}.1`, `${f}.2`); });
+  attempt('当前文件 -> .1', () => fs.renameSync(f, `${f}.1`));
   openFile();
+  // 失败必须说出来：日志不会轮转意味着文件**无上限增长**，而这条路径原先完全静默。
+  // 用 console.error 而不是结构化日志 —— 这里正在日志的写入通道内部，回调 logger 会递归。
+  if (failed && !rotateErrorLogged) {
+    rotateErrorLogged = true;
+    console.error(`[logger] 日志轮转失败（${failed.what}），文件会继续增长: ${failed.e?.message ?? failed.e}`);
+  }
 }
+let rotateErrorLogged = false;
 
 function reportFileError(e) {
   if (fileErrorLogged) return;

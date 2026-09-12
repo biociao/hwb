@@ -112,7 +112,7 @@ Greenfield 让你完全自主（解决 PR 被忽略问题），也让数据平�
 ```
 ┌─ local:  直接 fs.readFileSync 读取本地 ~/.dsh/...                     ┐
 │  - 同步读取 4 个文件（schema-versioned）                                │
-├─ remote: 单条 SSH 命令:  node -e '<extract.js>'                        │
+├─ remote: 单条 `ssh <host> bash -s`（脚本经 stdin）在远端 `cat` 出 4 个元数据文件                        │
 │  - 在远端执行提取脚本，JSON 输出到 stdout                               │
 │  - 脚本只读，不注入密钥，不修改任何文件                                 │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -195,12 +195,24 @@ CREATE TABLE sessions (
   workspaceId TEXT,
   workspaceTitle TEXT,
   project TEXT,
-  tokenUsage TEXT,             -- JSON
+  tokenUsage TEXT,             -- JSON（真相）
+  -- 派生列：tokenUsage 里四个计数的整数形式。由触发器从 tokenUsage 维护（见下），
+  -- 存在的唯一理由是性能：用量面板要跑八个聚合，逐行 json_extract 在真实规模下很贵
+  -- （40k 会话实测 ~330ms；而 node:sqlite 是同步的，那段时间整个服务停着）。
+  tokInput INTEGER NOT NULL DEFAULT 0,
+  tokOutput INTEGER NOT NULL DEFAULT 0,
+  tokCacheRead INTEGER NOT NULL DEFAULT 0,
+  tokCacheWrite INTEGER NOT NULL DEFAULT 0,
   contextPressure TEXT,        -- JSON
   lastActivity TEXT,
   generatedAt TEXT,
   UNIQUE(homeId, sessionId)
 );
+
+-- 派生列由触发器维护，而不是由应用代码写：这样任何写入者（裸 SQL、外部工具改库）都不会
+-- 让两列与 tokenUsage 漂移。（当前实现只写 tokenUsage；触发器负责派生列。）
+CREATE TRIGGER sessions_tok_ai AFTER INSERT ON sessions BEGIN ... END;
+CREATE TRIGGER sessions_tok_au AFTER UPDATE OF tokenUsage ON sessions BEGIN ... END;
 
 -- workspaces: 工作区（无会话的项目也展示）
 CREATE TABLE workspaces (...);
@@ -214,8 +226,37 @@ CREATE TABLE model_tiers (...);
 
 **索引策略：**
 - `idx_sessions_project` — 按项目聚合
-- `idx_sessions_activity` — Recent 排序
+- `idx_sessions_activity` — Recent 排序（`ORDER BY lastActivity DESC … LIMIT`）
 - `idx_sessions_home` — 按实例过滤
+- `idx_sessions_home_ws` — `(homeId, workspaceId)`：`recentProjects` 里「孤立 workspace」那一半
+  （找出挂到某实例、但没有任何会话的 workspace）。**没有它时这一半是全表扫描**：规模审查在
+  400k 会话 / 50k workspace 上实测 **35,340ms 却只产出 0 行**，整个 `recentProjects` 44,311ms，
+  期间并发探针测到**整个服务停顿 9,758ms**（平时 p50 0.3ms）。加上它：35,340ms → **43ms**、
+  整个查询 → 1,224ms。既有库在下次打开时由 `CREATE INDEX IF NOT EXISTS` 自动补上。
+- `homes_access_port` — 接入端口唯一（部分索引）
+
+> 用量聚合现在 SUM 派生整数列，不再逐行 `json_extract`（同一份 40k 数据上等效 5 条聚合
+> 175ms → 76ms；代价是每行插入多一次 UPDATE：20k 行 43ms → 172ms）。
+> 引用这类数字时**要把夹具一起说**：同一个 `/api/usage` 在「40k 全 idle + 单 project」的简化夹具上是
+> 55ms，而在「10 实例 + 偏斜活跃度 + 多 project」的真实形态夹具上是 148ms —— 差的是夹具不是代码。
+
+### 4.6 远端只读索引（与本地共用同一套 schema）
+
+远端实例不挂载、不同步，只经一次 `ssh <host> bash -s` 把同样的 4 个元数据文件 **cat 出来**：
+
+```
+ssh <host> bash -s -- <remoteHome>   # 脚本本体经 stdin 传入，参数走 argv
+  └─ 远端依次 cat 4 个文件，用 __DSH_FILE_BEGIN__ / __DSH_FILE_END__ 分隔并标注文件名
+     → Node 侧 parseCatOutput 切分 → buildSnapshot → 与本地完全相同的 validate/normalize
+```
+
+要点（`src/dshhome/remote-reader.js` + `src/control/remote.js`）：
+
+- **不注入密钥、不修改任何远端文件**，只有 `cat` 与 `test -d` 两类只读命令。
+- projcache 常超过启动日志用的 64 KiB，`sshBash` 的 stdout 上限因此提高到 32 MiB，
+  超限**明确失败**而不是悄悄截断。
+- 输出缺少文件分隔标记时判为**传输残缺**并保留已有索引 —— 而不是把「没传成功」误记成「文件缺失」。
+- 远端路径一律整体加引号后再交给远端 shell（`test -d "$HOME"'/…'`），既防注入也防空格路径被拆成多个参数。
 
 ---
 
@@ -231,15 +272,29 @@ CREATE TABLE model_tiers (...);
 ### 5.2 状态机（继承旧项目）
 
 ```
-unknown → probing → running → degraded → crashed
+unknown → probing → running → degraded（对外呈现为 unreachable）→ stopped / gone
             ↓         ↓          ↓
           stopped   stopped   stopped
 ```
 
-- **running**: dsh web 进程存活，HTTP 端口响应
-- **degraded**: 隧道断开或进程无响应，退避重连中（1/2/4/8/16/30s）
-- **crashed**: 进程确认死亡，需手动拉起
-- **stopped**: 用户显式停止
+- **running**: dsh web 进程存活，**并且入口鉴权通过**。判据是 `prober.probeAlive()`
+  （`status < 500` **且不是** 401/403）—— 401 栅栏页面说明 token 失效/填错，对用户来说和挂了没区别：
+  原先心跳用 `httpProbe`（`status < 500`），于是 token 填错时界面一片绿、iframe 里是 401（实测）。
+  注意 `httpProbe` 的口径**故意不同**：它服务的是「那个端口上有没有 dsh web 在听」这类判断，
+  那里 401 恰恰是「在听」的证据（`Launcher.#connectRemote` 的端口探测继续用它）。
+- **degraded**: 隧道断开、鉴权失败或进程无响应，退避重连中；对外 runtime 呈现为 `unreachable`
+- **stopped**: 用户显式停止，或实例未连接
+- **gone**: 本地 home 目录已不存在
+
+> `stop()` 是**确认式**的：SIGTERM → 等 3s → SIGKILL → 再等 2s；只有子进程确实退出才写
+> `phase: 'stopped'` 并丢弃句柄。杀不掉就保留句柄、注册表保持 running，并向调用方抛错
+> （API 回 500 带 pid 与端口）—— 「报 success 而进程还活着」是本项目明确要避免的一类缺陷。
+> 退出路径同理：`shutdown()` 先 `await launcher.stopAll()` 再 `process.exit(0)`，
+> 否则忽略 SIGTERM 的 dsh web 会变成孤儿（父进程没了、端口还占着）。
+
+> 说明：`PHASES` 里保留了 `crashed` 这个名字，但 `Monitor.#runCheck` 只产出
+> `running` / `degraded` / `stopped` / `gone`（见 `src/control/monitor.js`），代码从不设置 `crashed`。
+> 与之对应，`Registry.PHASES` 缺少实际会产生的 `gone`。这里以实际行为为准。
 
 ### 5.3 隧道策略（按需 vs 长期）
 
@@ -253,7 +308,7 @@ unknown → probing → running → degraded → crashed
     → 存在且活跃: 直接复用
   → 返回映射 URL: http://127.0.0.1:{local_port}
   → 打开外部浏览器（shell.openExternal 或用户默认浏览器）
-  → 实例关闭后 5 分钟无活动 → 自动断开隧道（可配置）
+  → 实例关闭（关闭/移除实例）时立刻拆掉隧道（`Launcher.disconnect`）。当前**没有**空闲超时自动断开，隧道在接入期间一直保留（见 `src/control/tunnel.js`：只有 `-N -L`，无空闲定时器）
 ```
 
 **为什么改按需：** 旧项目的长期隧道在实例多时会占用大量本地端口和 SSH 连接。按需策略把资源占用降到最小。
@@ -326,20 +381,23 @@ hwb 连接机制的核心原则（已落地）：**dsh 实例以稳定运行为�
    - 规范化：`normalizeWebToken(input)` 兼容 `?token=x` / `token=x` / 裸 `x` / 完整 URL（含 LAN
      尾部），统一为 `?token=x`；空 / `__NO_TOKEN__` / 无法识别 → null（回退远端抓取兜底）。
 
-### 5.5 反向代理（hwb 侧, 根路径 1:1）——仅远程 home 使用
+### 5.5 反向代理（hwb 侧, 根路径 1:1）
 
-> **变更**：本地 home 的 `Launcher.#openLocal` **不再创建反代**。本机 dsh web 与浏览器同机可达，
-> iframe 与「在外部浏览器打开」一律给**原始服务连接**
-> `http://127.0.0.1:<dshPort>/?token=<x>`——token 可见、不依赖 hwb 进程存活的反代入口。反代
-> （`src/control/proxy.js`）**只保留给远程 home**（ssh -L 隧道本身不可被浏览器直达）。
-
-各实例的 iframe 走固定可寻址入口；仅**远程 home** 走 hwb 自有的**反向代理**入口
-（`src/control/proxy.js`）,不为浏览器暴露隧道端口:
+> **变更（现状）**：本地 home 的**「在外部浏览器打开」**不再走反代 —— 本机 dsh web 与浏览器同机
+> 可达，「外部打开」给的是**原始服务连接** `http://127.0.0.1:<dshPort>/?token=<x>`（token 可见、
+> 不依赖 hwb 进程存活的反代入口）。
+> 但**内嵌 iframe 仍然经过反代**：`Launcher.#withPreview` 对**所有**实例（本地与远程）
+> 都会 `createProxy({ preview: true })`，本地实例自动分配端口，代理会注入 `preview-bridge.js`
+> 以便工作区/文件点击与 parent 通信。只有「外部打开」这一条路径是直连。
 
 ```
-本地 home:  浏览器 ──(直连原始服务连接)──► 127.0.0.1:<dshPort>       √ 主机直接可达，无代理
-远程 home:  浏览器 ──► hwb 代理 127.0.0.1:<proxyPort> ──(1:1 根路径转发)──► 127.0.0.1:<ssh -L 隧道端口>
+本地 home:  外部打开 ──(直连原始服务连接)──► 127.0.0.1:<dshPort>      √ 主机直接可达
+            内嵌 iframe ──► hwb 预览代理 127.0.0.1:<autoPort> ──► 127.0.0.1:<dshPort>
+远程 home:  外部打开 / 内嵌 iframe ──► hwb 代理 127.0.0.1:<accessPort> ──(1:1 根路径)──► 127.0.0.1:<ssh -L 隧道端口>
 ```
+
+远程 home 的反代端口可持久化（「本地接入端口」`accessPort`）；本地 home 的预览代理端口每次
+自动分配，不保存（`src/control/launcher.js` 的 `#withPreview`）。
 
 **为什么必须根路径**（远程代理）：dsh web 的 `index.html` 用**根绝对路径**（`<base href="/">`、
 `<script src="/plugins/...">`、`/assets/...`、`/api/...`）。若挂在 hwb 的子路径（`/proxy/<id>/`）下,
@@ -377,10 +435,10 @@ hwb 连接机制的核心原则（已落地）：**dsh 实例以稳定运行为�
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-**退避策略：**
-- 索引失败 → 间隔 ×2，封顶 5min
-- 连续成功 → 间隔 ÷1.5，恢复 60s 基线
-- 单个 home 失败 → 标记 `degraded`，保留上次有效数据，不影响其他 home
+**退避策略（按实例独立计算）：**
+- 索引失败 → 该实例间隔 ×2，封顶 5min
+- 连续成功 → 该实例间隔 ÷1.5，恢复 60s 基线
+- 单个 home 失败 → 标记 `degraded`，保留上次有效数据；退避只拖慢该实例自己的节奏，不影响其他 home 的 60s 基线
 
 ---
 
@@ -393,7 +451,7 @@ hwb 连接机制的核心原则（已落地）：**dsh 实例以稳定运行为�
 - 展示三栏：
   1. **Recent Projects**（跨实例聚合，最近 7 天活跃，按最后活动时间降序）
   2. **Recent Sessions**（最近 50 个，带 token 用量 chip、上下文压力指示器）
-  3. **Instance Grid**（每个 dsh 实例：状态 chip、项目数、会话数、额度卡片）
+  3. **Instance Grid**（每个 dsh 实例：状态 chip、项目数、会话数；额度卡片由 `renderQuotaCards` 实现但**尚未接线**，见 README「已知限制」）
 
 **模式 B: Drill-in（单会话）**
 - 唯一挂载 iframe 的位置
@@ -438,9 +496,9 @@ interface QuotaProvider {
 | Provider | Balance API | 凭证来源 |
 |---------|------------|---------|
 | DeepSeek | `GET /user/balance` | `.credentials.yaml` DEEPSEEK_API_KEY |
-| Z.AI | 官方 usage endpoint | `.credentials.yaml` ZAI_API_KEY |
+| Z.AI | 无公开余额 API（显式降级为「余额不可用」） | `.credentials.yaml` ZAI_API_KEY |
 | Kimi | 官方 usage endpoint | `.credentials.yaml` KIMI_CODE_API_KEY |
-| MiniMax | 官方 usage endpoint | `.credentials.yaml` MINIMAX_CN_API_KEY |
+| MiniMax | 无公开余额 API（显式降级为「余额不可用」） | `.credentials.yaml` MINIMAX_CN_API_KEY |
 
 **UI 展示：**
 ```
@@ -463,30 +521,46 @@ interface QuotaProvider {
 ## 9. 项目结构
 
 ```
-dsh-workbench/
-├── package.json              # type: "module", engines: {node: ">=22"}
+hwb/
+├── package.json              # type: "module", engines: {node: ">=22.5.0", 零 npm 依赖}
 ├── src/
+│   ├── cli.js                # hwb 统一管理命令（start/stop/status/logs/config/doctor/upgrade）
 │   ├── server.js             # HTTP 服务器入口 + 调度器启动
+│   ├── service.js            # 后台服务进程（私有控制 socket）
 │   ├── lib/                  # 纯内核（零副作用，可单元测试）
 │   │   ├── schema.js         # 4 个文件的手写验证器
 │   │   ├── normalize.js      # HomeSnapshot → IndexedRows（纯函数）
 │   │   ├── read-home.js      # 本地 fs 读取 + 最小 YAML 解析器
 │   │   ├── balance.js        # Provider 额度适配器
-│   │   ├── errors.js         # 错误类型定义
-│   │   └── version.js        # 版本比较工具
+│   │   ├── status.js         # 会话状态推导（纯函数）
+│   │   ├── time.js           # 毫秒时间戳 → ISO（越界降级）
+│   │   ├── node-version.js   # Node 版本门槛（单一事实来源）
+│   │   ├── file-preview.js   # 预览/下载/上传
+│   │   ├── multipart.js      # 流式 multipart 解析
+│   │   ├── endpoints.js      # 连接端点规范化
+│   │   ├── access-port.js    # 本地接入端口校验
+│   │   ├── open-workspace.js # Finder 打开工作区（macOS）
+│   │   └── service-config.js # ~/.hwb/config.json
 │   ├── dshhome/              # 数据平面
 │   │   ├── reader.js         # 编排 read + normalize + store
-│   │   ├── indexer.js        # 后台索引循环（60s debounce + 退避）
+│   │   ├── remote-reader.js  # 远端只读索引（ssh bash -s cat 4 个元数据文件）
+│   │   ├── indexer.js        # 后台索引循环（60s debounce + 按实例退避）
+│   │   ├── live-status.js    # 直接读运行中 dsh 的实时会话状态
+│   │   ├── live-poller.js    # 实时状态轮询（3s）
 │   │   └── store.js          # node:sqlite 封装 + 查询方法
 │   ├── control/              # 控制平面（继承优良基因，重新拥有）
 │   │   ├── registry.js       # 实例注册表
 │   │   ├── monitor.js        # 进程/端口探测（30s 循环）
-│   │   ├── prober.js         # SSH 连通性探测
-│   │   ├── launcher.js       # dsh web 启动/停止
+│   │   ├── prober.js         # HTTP/进程/SSH/远端路径探测
+│   │   ├── launcher.js       # dsh web 启动/停止 + token 抓取 + 端点切换
 │   │   ├── tunnel.js         # ssh -L 隧道管理
+│   │   ├── ssh-opts.js       # SSH 参数统一
+│   │   ├── proxy.js          # 根路径 1:1 反代 + WebSocket 升级 + 预览注入
+│   │   ├── remote.js         # 远端 dsh web 启停 + 抓 token
+│   │   ├── workspace-menu.js # 预览页工作区下拉注入
 │   │   └── guard.js          # 进程指纹校验（防误杀）
 │   ├── api/                  # 通信层
-│   │   ├── server.js         # Node HTTP 服务器
+│   │   ├── server.js         # Node HTTP 服务器 + /api 来源校验
 │   │   ├── routes.js         # REST 路由
 │   │   └── sse.js            # SSE 广播中心
 │   └── web/                  # 展示平面（原生 ESM，无构建）
@@ -495,22 +569,24 @@ dsh-workbench/
 │       ├── store.js          # 前端数据缓存（SSE 订阅）
 │       └── components/
 │           ├── workbench.js      # 仪表盘布局
-│           ├── recent-projects.js
-│           ├── recent-sessions.js
-│           ├── instance-grid.js
+│           ├── recent-projects.js / recent-sessions.js / instance-grid.js
+│           ├── usage-card.js
+│           ├── add-home.js       # 添加/编辑实例表单
+│           ├── endpoint-editor.js
+│           ├── file-preview.js   # 预览/下载/上传侧栏
+│           ├── log-panel.js
+│           ├── form-draft.js     # 表单草稿存取
 │           ├── quota-card.js
-│           └── session-pane.js   # 唯一 iframe 容器
+│           └── preview-image.js / preview-resize.js
+├── scripts/                  # 远程 dsh web 冷启动/缓存/隧道脚本
+├── dsh-remote-index/         # 多实例会话索引（独立工具）
+├── dsh-static-cache/         # dsh 前端静态缓存插件
 ├── tests/
 │   ├── mock-home/            # 模拟 dsh home 目录（用于本地测试）
-│   │   ├── storages/
-│   │   │   ├── workspace.json
-│   │   │   └── session_projcache.json
-│   │   ├── model-tier.json
-│   │   └── .credentials.yaml
 │   ├── init-mock.js          # 生成 mock 数据脚本
 │   └── *.test.js             # 单元测试
-└── docs/
-    └── ARCHITECTURE.md       # 本文件
+├── docs/topology.md          # 拓扑可视化附录
+└── DSH_Workbench_Fusion_Architecture.md   # 本文件
 ```
 
 ---
@@ -531,8 +607,16 @@ dsh-workbench/
 
 ## 11. 安全与数据卫生
 
-- **Manager 监听 127.0.0.1**，无鉴权，不暴露公网（同旧项目）
-- **API Key 永不越界**：`.credentials.yaml` 中的 key 只用于服务端查余额，浏览器只收到 `{ provider, remaining, currency }`
+- **Manager 监听 127.0.0.1**，无鉴权，不暴露公网（同旧项目）。
+  但**回环不是访问控制**：同机其它用户也能连上这个端口，因此不要把端口暴露到回环之外。
+  写方法统一要求同站来源、`/api/*` 只接受回环 Host（DNS rebinding 防护），非浏览器客户端
+  （curl）不带这两个头，照常可用 —— 这是单人本机工具的定位，不是多用户服务。
+- **API Key 永不越界**：`.credentials.yaml` 中的 key 只用于服务端查余额，浏览器只收到 `{ provider, remaining, currency }`；
+  分类错误也**只给分类结果**（原始错误消息可能带请求内容），且日志侧已按「键名」与「凭据形状」双层脱敏。
+- **dsh token 的暴露面**：读接口（`GET /api/homes` 与更新响应）都不回传 token —— 实例级与连接端点级
+  都不回传，端点只给 `tokenSet: true`（端点编辑器因此把输入框留空显示为「已配置」，留空 = 保持不变，
+  清除要显式表达）。唯一的例外是打开实例必经的 `POST /homes/{id}/open`：它必须返回带 token 的
+  iframe 入口 URL。也就是说边界是「谁能访问这个端口」，而不是「响应里有没有这个字段」。
 - **远程读取只读**：SSH 单条命令只提取元数据，不注入密钥，不修改远程文件
 - **进程指纹**：若保留 guard，作为**自主选择**而非继承法则，明确写入文档
 

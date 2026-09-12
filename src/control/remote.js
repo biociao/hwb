@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { logger } from '../lib/logger.js';
+import { sshOpts, withConnectRetry } from './ssh-opts.js';
 
 const log = logger('remote');
 
@@ -8,35 +9,79 @@ const log = logger('remote');
 // 在【远端】拉起 dsh web 并抓回 stdout 里的 `?token=...`,供 hwb 拼 token URL。
 // 完整 token URL 由 Launcher 负责(建隧道后拼 `http://127.0.0.1:<local>/<token>`)。
 
-const SSHO = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
+// 连接策略统一由 ssh-opts 提供：放宽 ConnectTimeout（高延迟链路）、加保活、启用复用。
+// 原实现硬编码 ConnectTimeout=10，实测经 tun 的远端建连需 11.7–14.0s，导致脚本化连接
+// 必然 255 超时（而手动 ssh 无上限故能成功）——见 ssh-opts.js 的说明。
 const DEFAULT_TIMEOUT = 90_000;     // 远端脚本整体超时(ms)
 const TOKEN_WAIT_SECONDS = 40;      // 远端 poll 日志等 token 的秒数
 
-/** 在远端执行 `bash -s -- args`,stdin 写脚本,返回 { code, stdout, stderr }。 */
-function sshBash(host, script, args = [], timeoutMs = DEFAULT_TIMEOUT) {
+/**
+ * 在远端执行 `bash -s -- args`,stdin 写脚本,返回 { code, stdout, stderr }。
+ * 注意:stdin 只能用来传脚本本身。bash 会把 stdin 里脚本之后的字节当命令继续执行
+ * (实测:数据会被当成“……: command not found”),所以大量数据不能走这条 stdin——
+ * 请改用命令行参数分片传输(见 src/lib/file-preview.js 的远端上传)。
+ *
+ * 连接级瞬时失败（握手超时 / mux 套接字失效 / 链路抖动）会按退避重试，`retries: 0` 可关闭
+ * （测试注入 fake spawn 时需要保持单次调用语义）。
+ */
+function sshBash(host, script, args = [], timeoutMs = DEFAULT_TIMEOUT, { maxStdoutBytes = 64 * 1024, spawnProcess = spawn, retries = 2 } = {}) {
   if (!host) return Promise.resolve({ code: -2, stdout: '', stderr: 'no host' });
-  return new Promise((resolve) => {
-    // 关键:ssh 会把「远程命令」交给远端 shell 重新按空白分段。含空格的命令(如
-    // `dsh --profile web --port 3080`)必须用双引号括成【一个】参数,否则会被拆开,
-    // 导致 $3=$cmd 变成 `dsh`、$4 变成 `--profile`。这里用 JSON.stringify 给每个参数
-    // 加双引号。双引号内 $HOME 等变量会在远端展开(用户填的 wrapper 路径)。
-    const remoteCmd = ['bash', '-s', '--', ...args.map((a) => JSON.stringify(String(a)))].join(' ');
-    const proc = spawn('ssh', [...SSHO, host, remoteCmd], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+  // 关键:ssh 会把「远程命令」交给远端 shell 重新按空白分段。含空格的命令(如
+  // `dsh --profile web --port 3080`)必须用双引号括成【一个】参数,否则会被拆开,
+  // 导致 $3=$cmd 变成 `dsh`、$4 变成 `--profile`。这里用 JSON.stringify 给每个参数
+  // 加双引号。双引号内 $HOME 等变量会在远端展开(用户填的 wrapper 路径)。
+  const remoteCmd = ['bash', '-s', '--', ...args.map((a) => JSON.stringify(String(a)))].join(' ');
+  const attempt = () => new Promise((resolve) => {
+    const startedAt = Date.now();
+    let proc;
+    try {
+      proc = spawnProcess('ssh', [...sshOpts({ host }), host, remoteCmd], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      // spawn **同步**抛错（例如参数里含 NUL → ERR_INVALID_ARG_VALUE，或 cwd/env 非法）。
+      // 异步的 ENOENT 由下面的 proc.on('error') 处理，但同步抛错会变成一次 rejection：
+      // sshBash 的约定是「失败也用返回值表达」，rejection 会绕过所有调用方的 code 检查，
+      // 冒成未处理拒绝。这里统一成返回值（-2，与 spawn 失败同码）。
+      resolve({ code: -2, stdout: '', stderr: `ssh spawn failed: ${error?.message ?? String(error)}`, elapsedMs: Date.now() - startedAt });
+      return;
+    }
     let stdout = '';
+    let stdoutBytes = 0;
+    let overflow = false;
     let stderr = '';
     const timer = setTimeout(() => {
       proc.kill('SIGKILL');
-      resolve({ code: -1, stdout: stdout.trim(), stderr: `${stderr}\n[ssh bash timed out after ${timeoutMs}ms]`.trim() });
+      resolve({ code: -1, stdout: stdout.trim(), stderr: `${stderr}\n[ssh bash timed out after ${timeoutMs}ms]`.trim(), elapsedMs: Date.now() - startedAt, timedOutByClient: true });
     }, timeoutMs);
-    proc.stdout.on('data', (d) => { stdout += d; if (stdout.length > 64 * 1024) stdout = stdout.slice(-64 * 1024); });
+    proc.stdout.setEncoding('utf8');
+    proc.stdout.on('data', (d) => {
+      if (overflow) return;
+      stdoutBytes += Buffer.byteLength(d);
+      if (stdoutBytes > maxStdoutBytes) {
+        overflow = true;
+        stdout = '';
+        clearTimeout(timer);
+        resolve({ code: -3, stdout: '', stderr: `ssh stdout exceeded ${maxStdoutBytes} bytes; output discarded`, elapsedMs: Date.now() - startedAt });
+        proc.kill('SIGKILL');
+        return;
+      }
+      stdout += d;
+    });
     proc.stderr.on('data', (d) => { stderr += d; if (stderr.length > 64 * 1024) stderr = stderr.slice(-64 * 1024); });
-    proc.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() }); });
-    proc.on('error', (e) => { clearTimeout(timer); resolve({ code: -2, stdout: stdout.trim(), stderr: String(e.message) }); });
+    proc.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout: stdout.trim(), stderr: stderr.trim(), elapsedMs: Date.now() - startedAt }); });
+    proc.on('error', (e) => { clearTimeout(timer); resolve({ code: -2, stdout: stdout.trim(), stderr: String(e.message), elapsedMs: Date.now() - startedAt }); });
     proc.stdin.on('error', () => {});
     proc.stdin.write(script);
     proc.stdin.end();
+  });
+  return withConnectRetry(async () => {
+    const r = await attempt();
+    // 客户端整体超时（-1）重试无意义：那不是连接级故障，而是远端脚本本身跑太久。
+    return { ...r, ok: r.code === 0 || r.timedOutByClient === true || r.code === -3 };
+  }, { retries }).then((r) => {
+    if (!r.ok) log.warn('ssh 连接失败（重试后仍失败）', { host, code: r.code, elapsedMs: r.elapsedMs, stderr: (r.stderr || '').split('\n').pop() });
+    return r;
   });
 }
 
@@ -57,14 +102,40 @@ for d in "$HOME/.nvm/versions/node/"*/bin "$HOME/.npm-global/bin" "$HOME/.local/
   [ -d "$d" ] || continue
   case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH";; esac
 done
-listening() { { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E "[.:]$port[[:space:]]" >/dev/null 2>&1; }
-killport() { if command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; sleep 1; fi; }
+# 端口监听检测 / 回收。必须跨 Linux 与 BSD(macOS) 远端都能用:
+#   · 原生实现只用 ss + netstat -tln + fuser —— 三者都是 Linux 专有。远端若是 macOS,
+#     listening() 恒为 false、killport() 是空操作:ensure 模式于是跳过「复用已在跑的服务」
+#     又去起一个 dsh(端口被占起不来),日志轮询等满 40s 拿到 __NO_TOKEN__,
+#     最后 hwb 却把这个实例报成 running —— 仪表盘一片绿,iframe 里是 401。
+#   · lsof 在 macOS 与 Linux 上都有,-nP -iTCP:<port> -sTCP:LISTEN 的输出形态也一致,
+#     所以优先用它;lsof 不存在时才退回 ss/netstat。
+#     (旧脚本 scripts/dsh-remote-web.sh 早就因为同样的原因用了 lsof。)
+listening() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  { ss -tln 2>/dev/null || netstat -tln 2>/dev/null; } | grep -E "[.:]$port[[:space:]]" >/dev/null 2>&1
+}
+killport() {
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+      # 不用 xargs(BSD 的 xargs 没有 -r),逐个 kill 才是可移植写法。
+      for p in $pids; do kill "$p" >/dev/null 2>&1 || true; done
+      sleep 1
+      return 0
+    fi
+  fi
+  if command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; sleep 1; fi
+}
 # ensure + 已在跑:若日志有 token 则复用;否则(旧版 dsh / 日志未写 token)不动它,返回裸 URL 哨兵。
-if [ "$mode" = "ensure" ] && listening; then
+if { [ "$mode" = "ensure" ] || [ "$mode" = "connect" ]; } && listening; then
   tok="$(grep -oE '\?token=[A-Za-z0-9_-]+' "$log" 2>/dev/null | tail -1 || true)"
   if [ -n "$tok" ]; then printf '%s' "$tok"; exit 0; fi
   printf '__NO_TOKEN__'; exit 0
 fi
+[ "$mode" = "connect" ] && { printf 'endpoint is not listening\n' >&2; exit 1; }
 start_line=0
 [ -f "$log" ] && start_line="$(wc -l < "$log" 2>/dev/null || echo 0)"
 if [ "$mode" = "restart" ] || listening; then killport; fi
@@ -88,7 +159,7 @@ printf '__NO_TOKEN__'
 
 // 抓取/保证远端 dsh web 在跑并带回 token(或 __NO_TOKEN__)。home: { host, remotePort, remoteLog?, remoteCmd? }
 async function ensureRemoteToken(home) {
-  const r = await sshBash(home.host, REMOTE_START, remoteArgs(home, 'ensure'));
+  const r = await sshBash(home.host, REMOTE_START, remoteArgs(home, home.connectOnly ? 'connect' : 'ensure'));
   return r.code === 0 ? r.stdout : throwSsh(r, '启动远程 dsh web', home);
 }
 
@@ -98,10 +169,48 @@ async function restartRemoteToken(home) {
   return r.code === 0 ? r.stdout : throwSsh(r, '重启远程 dsh web', home);
 }
 
-// 停止远端 dsh web(按端口 kill,尽力而为)。
+// 停止远端 dsh web(按端口 kill)。
+//
+// 判据必须与 REMOTE_START 里的 killport() **同一套**：lsof 优先（macOS/Linux 都有），
+// 没有再退回 fuser。原先这里只用 fuser 且「找不到 fuser 就 echo no-fuser; exit 0」——
+// 最小化的 Linux/容器镜像里没有 fuser，于是 hwb 报「已停止」、隧道也拆了，
+// 而远端 dsh web 仍占着 remotePort 与 DSH_HOME（审查复现：「no-fuser」分支返回 0 且什么都没杀）。
+// 现在：杀完复核一次（还在监听就升级 SIGKILL 再复核），确实收不掉就以非 0 退出 ——
+// 宁可让用户看到「远端没停下来」，也不要谎报成功。
+export const REMOTE_STOP = `#!/bin/bash
+port="$1"
+killed=0
+if command -v lsof >/dev/null 2>&1; then
+  pids="$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  for p in $pids; do kill "$p" >/dev/null 2>&1 || true; killed=1; done
+fi
+if [ "$killed" = 0 ] && command -v fuser >/dev/null 2>&1; then
+  fuser -k "$port/tcp" >/dev/null 2>&1 && killed=1
+fi
+if [ "$killed" = 0 ]; then
+  # 没有任何进程在监听 = 本来就停着，算成功；连杀进程的工具都没有才是真的没法确认。
+  if command -v lsof >/dev/null 2>&1 || command -v fuser >/dev/null 2>&1; then
+    echo "not-listening"; exit 0
+  fi
+  echo "neither lsof nor fuser is available on the remote host" >&2
+  exit 1
+fi
+sleep 1
+if command -v lsof >/dev/null 2>&1; then
+  still="$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$still" ]; then
+    for p in $still; do kill -9 "$p" >/dev/null 2>&1 || true; done
+    sleep 1
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "port $port is still listening after SIGKILL" >&2
+      exit 1
+    fi
+  fi
+fi
+echo killed`;
+
 async function stopRemote(home) {
-  const script = `#!/bin/bash\nport="$1"\nif command -v fuser >/dev/null 2>&1; then fuser -k "$port/tcp" >/dev/null 2>&1 || true; echo killed; exit 0; fi\necho "no-fuser"`;
-  const r = await sshBash(home.host, script, [String(home.remotePort)], 20_000);
+  const r = await sshBash(home.host, REMOTE_STOP, [String(home.remotePort)], 20_000);
   if (r.code !== 0) {
     log.error('停止远程 dsh web 失败', { homeId: home.homeId, host: home.host, remotePort: home.remotePort, code: r.code, stderr: r.stderr, stdout: r.stdout });
     throw new Error(`停止远程 dsh web 失败(${home.host}:${home.remotePort}): ${r.stderr || r.stdout}`);

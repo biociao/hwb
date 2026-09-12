@@ -34,7 +34,23 @@ TOKEN_ONLY=0
 KILL_TUNNEL=0
 DRY_RUN=0
 VERBOSE=0
-TUNNEL_PID_FILE="${TUNNEL_PID_FILE:-/tmp/.dsh-remote-web.tunnel}"
+# 状态文件放在**用户私有目录**里，而不是 /tmp 下的固定可预测路径：
+#   · /tmp 是全局可写的，任何本地用户都能在文件不存在时抢先创建它（sticky 位只保护已存在的条目）；
+#   · 旧实现会把文件内容当 PID 直接 kill，于是「内容写成 0」等于 kill 掉调用者的整个进程组，
+#     而一个过期的 PID（隧道早退了、PID 被系统复用）会打死一个毫不相干的进程；
+#   · 旧实现还把隧道输出重定向到固定的 /tmp 路径且不先 rm —— 谁提前放一个指向
+#     ~/.ssh/authorized_keys 的符号链接，重定向就会把那个文件截成 0 字节。
+# 统一放进 0700 的私有运行目录，并且 kill 之前校验「这个 PID 确实是我们的 ssh 隧道」。
+RUNTIME_DIR="${DSH_REMOTE_WEB_DIR:-${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web}"
+# 只对**我们自己新建的**目录收 0700：DSH_REMOTE_WEB_DIR 允许指向任意路径，
+# 无条件 chmod 会把共享目录（例如 /tmp 下的公共目录）重新授权，影响的远不只是这条隧道。
+if [ ! -d "$RUNTIME_DIR" ]; then
+  mkdir -p "$RUNTIME_DIR" 2>/dev/null || true
+  [ -d "$RUNTIME_DIR" ] && chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+fi
+TUNNEL_PID_FILE="${TUNNEL_PID_FILE:-$RUNTIME_DIR/tunnel.pid}"
+TUNNEL_OUT="${TUNNEL_OUT:-$RUNTIME_DIR/tunnel.out}"
+TUNNEL_ERR="${TUNNEL_ERR:-$RUNTIME_DIR/tunnel.err}"
 
 usage() {
   printf 'dsh-remote-web.sh <ssh-host> [options]\n\n'
@@ -69,6 +85,9 @@ while [ $# -gt 0 ]; do
     --no-restart)   NO_RESTART=1; shift ;;
     --token-only)   TOKEN_ONLY=1; NO_RESTART=1; shift ;;
     --kill-tunnel)  KILL_TUNNEL=1; shift ;;
+    # 文档（README-dsh-remote-web.md）一直写着这个选项，但解析器里从来没有它 ——
+    # 「远端没有 fuser 时」的兜底于是完全用不了，只能改用环境变量 KILL_PATTERN。
+    --kill-pattern) KILL_PATTERN="${2:?--kill-pattern 需要一个值}"; shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --verbose)      VERBOSE=1; shift ;;
     -h|--help)      usage; exit 0 ;;
@@ -123,7 +142,7 @@ log="$1"; cmd="$2"; port="$3"; killp="$4"; norestart="$5"; token_only="$6"
 
 # 不重启:直接取整个日志里最新的一条 token(要求该实例的 token 已写入日志)
 if [ "$token_only" = "1" ] || [ "$norestart" = "1" ]; then
-  tok="$(grep -o '?token=[^ ]*' "$log" 2>/dev/null | tail -1 || true)"
+  tok="$(grep -oE '\?token=[A-Za-z0-9_-]+' "$log" 2>/dev/null | tail -1 || true)"
   if [ -n "$tok" ]; then printf '%s' "$tok"; exit 0; fi
   echo "NO_TOKEN: no token found in $log" >&2
   exit 1
@@ -138,7 +157,9 @@ sleep 1
 # 追加写日志启动,便于保留历史并抓「本次」的新 token
 nohup $cmd >> "$log" 2>&1 < /dev/null &
 for i in $(seq 1 40); do
-  tok="$(tail -n +$((start_line+1)) "$log" 2>/dev/null | grep -o '?token=[^ ]*' | tail -1 || true)"
+  # 字符集必须与 remote.js / launcher.js 一致（[A-Za-z0-9_-]）：真实 dsh 输出里 token 后面
+  # 会跟右括号之类的标点，宽字符集会把标点并进 token，拼出的 URL 直接 401。
+  tok="$(tail -n +$((start_line+1)) "$log" 2>/dev/null | grep -oE '\?token=[A-Za-z0-9_-]+' | tail -1 || true)"
   if [ -n "$tok" ]; then printf '%s' "$tok"; exit 0; fi
   sleep 1
 done
@@ -148,13 +169,42 @@ exit 1
 RS
 }
 
+# 只回收「确实是我们那条 ssh -L 隧道」的 PID。
+# 拒绝空/非数字（尤其 `0` —— kill 0 会 SIGTERM 掉调用者的整个进程组），
+# 并用 ps 比对命令行，避免 PID 被复用后打死无关进程（编辑器、agent、本机 dsh web…）。
+stop_tunnel() {
+  [ -f "$TUNNEL_PID_FILE" ] || return 0
+  local pid cmd
+  pid="$(cat "$TUNNEL_PID_FILE" 2>/dev/null || true)"
+  # 注意：**不能**在这里就删记录。原先无条件 rm，于是「拒绝 kill」的分支（PID 非法/ps 不可用/
+  # 命令行不匹配）会把记录删掉却留下仍在跑的隧道 —— 那条隧道从此再也无法用 --kill-tunnel 管到，
+  # 而命令还返回 0 说成功。删除只发生在「确实杀掉」或「确认已不存在」之后。
+  case "$pid" in
+    ''|*[!0-9]*) echo "忽略无效的隧道 PID 记录: '${pid}'（拒绝 kill）" >&2; return 1 ;;
+    0) echo "忽略 PID 0（kill 0 会杀掉整个进程组）" >&2; return 1 ;;
+  esac
+  # 没有 ps 就无从验证身份。宁可留着一条隧道，也不误杀一个不相干的进程 ——
+  # 明确告诉用户手工确认，而不是假装回收成功。
+  if ! command -v ps >/dev/null 2>&1; then
+    echo "系统没有 ps，无法验证 PID $pid 的身份；为避免误杀，请手动确认后再 kill $pid" >&2
+    return 1
+  fi
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$cmd" in
+    # 只有这一条：确实是我们那条隧道 → kill 之后删掉记录
+    *ssh*-N*-L*) kill "$pid" 2>/dev/null || true; rm -f "$TUNNEL_PID_FILE"; echo "killed tunnel pid $pid" ;;
+    # ps 读不到既可能是进程已退出，也可能是 ps 被限制（受限沙箱）。分不开：
+    # 不 kill（宁可留一条隧道，也不误杀），记录也留着，并让调用方知道没做成。
+    '') echo "ps 读不到 PID ${pid}（可能已退出，或 ps 被限制）——为安全起见不做 kill，记录保留" >&2; return 1 ;;
+    *) echo "PID $pid 现在跑的不是 ssh 隧道，拒绝 kill: $cmd" >&2; return 1 ;;
+  esac
+  return 0
+}
+
 # ---- kill-tunnel ------------------------------------------------------------
 if [ "$KILL_TUNNEL" = 1 ]; then
-  if [ -f "$TUNNEL_PID_FILE" ]; then
-    pid="$(cat "$TUNNEL_PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; echo "killed tunnel pid $pid"; fi
-    rm -f "$TUNNEL_PID_FILE"
-  fi
+  # 停止失败（拒绝 kill / 记录无效）必须让调用方看见，而不是一律 exit 0。
+  stop_tunnel || exit 1
   exit 0
 fi
 
@@ -172,10 +222,17 @@ fi
 vlog "grabbing token from $REMOTE (log=$REMOTE_LOG cmd=$REMOTE_CMD)"
 TMP_RS="$(mktemp)"
 remote_script > "$TMP_RS"
+# ssh 会把 host 之后的**所有 argv 用空格拼成一个字符串**交给远端 shell 重新切分。
+# 不逐个引用的话，默认的 REMOTE_CMD（`bash $HOME/scripts/dsh-web-cached.sh web`，含空格）
+# 会把后面每个参数整体错位一格 —— 实测远端拿到的是
+#   cmd=[bash] port=[$HOME/scripts/dsh-web-cached.sh] killp=[web]
+# 于是：远端跑了一个裸 `bash`（永远等不到 token，40s 后超时），
+# 而 `pkill -f "$killp"` 变成了 **`pkill -f web`** —— 把远端机器上任何命令行含 "web"
+# 的进程都杀掉。用 bash 的 %q 逐参引用即可原样传过去（远端就是 bash -s）。
+REMOTE_ARGS="$(printf '%q ' "$REMOTE_LOG" "$REMOTE_CMD" "$REMOTE_PORT" "$KILL_PATTERN" "$NO_RESTART" "$TOKEN_ONLY")"
 set +e
-TOKEN="$(ssh "$REMOTE" bash -s \
-    "$REMOTE_LOG" "$REMOTE_CMD" "$REMOTE_PORT" "$KILL_PATTERN" \
-    "$NO_RESTART" "$TOKEN_ONLY" < "$TMP_RS")"
+# shellcheck disable=SC2086  # 这里就是要把逐个引用好的参数拼进远端命令行
+TOKEN="$(ssh "$REMOTE" bash -s $REMOTE_ARGS < "$TMP_RS")"
 SSH_RC=$?
 set -e
 rm -f "$TMP_RS"
@@ -187,24 +244,40 @@ vlog "captured token fragment: ${TOKEN:0:24}..."
 
 if [ "$TOKEN_ONLY" = 1 ]; then
   printf 'token = %s\n' "$TOKEN"
-  printf 'URL   = http://127.0.0.1:%s/%s\n' "$REMOTE_PORT" "$TOKEN"
+  # 这里**没有**建隧道：下面这个地址是「远端自己那个端口」，只有你在远端本机访问才有效。
+  # 以前的措辞看起来像可以直接打开，而若本地恰好有别的进程占着同一个端口，--open
+  # 会把这个 token 直接交给它。
+  printf 'URL   = http://127.0.0.1:%s/%s   (远端地址，未建隧道；本地访问请另行建隧道或直接取 token)\n' "$REMOTE_PORT" "$TOKEN"
   exit 0
 fi
 
 # ---- 2) 建 SSH 隧道 --------------------------------------------------------
 LOCAL_PORT="$(pick_free_port)"
 vlog "local port = $LOCAL_PORT"
-if [ -f "$TUNNEL_PID_FILE" ]; then
-  old="$(cat "$TUNNEL_PID_FILE" 2>/dev/null || true)"
-  [ -n "$old" ] && kill "$old" 2>/dev/null || true
-  rm -f "$TUNNEL_PID_FILE"
-fi
+stop_tunnel   # 复用同一套校验：只回收确实是隧道的 PID
+# 先删掉旧的重定向目标：固定路径 + 不先删 = 谁提前放个符号链接就能把目标文件截成 0 字节。
+rm -f "$TUNNEL_OUT" "$TUNNEL_ERR"
 ssh -N -L "${LOCAL_PORT}:${REMOTE_TARGET_HOST}:${REMOTE_PORT}" "$REMOTE" \
-  >/tmp/.dsh-remote-web.tunnel.out 2>/tmp/.dsh-remote-web.tunnel.err &
+  >"$TUNNEL_OUT" 2>"$TUNNEL_ERR" &
 TUNNEL_PID=$!
-echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+# 写不进 PID 记录时必须立刻回收这条隧道：否则 ssh 已在后台跑着、却没有任何记录能管到它
+# （--kill-tunnel 找不到、URL 也不会打印），只剩一个孤儿隧道占着端口。
+if ! echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE" 2>/dev/null; then
+  echo "无法写入隧道 PID 记录 ${TUNNEL_PID_FILE}（目录不可写？）——已回收刚启动的隧道" >&2
+  kill "$TUNNEL_PID" 2>/dev/null || true
+  exit 1
+fi
 vlog "tunnel pid $TUNNEL_PID -> $REMOTE:$REMOTE_PORT"
-for i in $(seq 1 20); do port_ready "$LOCAL_PORT" && break; sleep 0.5; done
+tunnel_up=0
+for i in $(seq 1 20); do port_ready "$LOCAL_PORT" && { tunnel_up=1; break; }; sleep 0.5; done
+if [ "$tunnel_up" != 1 ]; then
+  # 以前的实现不管端口有没有起来都照样打印 URL 并 exit 0 —— 用户拿到一个打不开的地址、
+  # 退出码却是成功，真正的错误（ssh 的 stderr）被丢在临时文件里没人看。
+  echo "SSH 隧道未就绪: 127.0.0.1:${LOCAL_PORT} 没有开始监听" >&2
+  [ -s "$TUNNEL_ERR" ] && { echo "--- ssh stderr ---" >&2; tail -n 15 "$TUNNEL_ERR" >&2; }
+  stop_tunnel
+  exit 1
+fi
 
 # ---- 3) 打印 URL -----------------------------------------------------------
 URL="http://127.0.0.1:${LOCAL_PORT}/${TOKEN}"

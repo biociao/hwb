@@ -18,10 +18,16 @@
 
 ## 文件
 
-| 文件 | 用途 |
-|------|------|
-| `dsh-web-cached.sh` | 替换 `nohup dsh web &` 的启动包装脚本(缓存 + 关遥测 + vmtouch 预热 + exec dsh) |
-| `dsh-web-cached.service` | 可选: systemd 用户服务, 托管 dsh web(开机自启 + 崩溃重启 + 启动前预热) |
+| 文件 | 用途 | 详述 |
+|------|------|------|
+| `dsh-web-cached.sh` | 替换 `nohup dsh web &` 的启动包装脚本(缓存 + 关遥测 + vmtouch 预热 + exec dsh) | 本文件 |
+| `dsh-web-cached.service` | 可选: systemd 用户服务, 托管 dsh web(开机自启 + 崩溃重启 + 启动前预热) | 本文件 |
+| `dsh-remote-web.sh` | 在**本地**一键完成: SSH 到远端拉起 `dsh web`、抓回 token、建隧道、打印可直接打开的 URL | [`README-dsh-remote-web.md`](README-dsh-remote-web.md) |
+| `dsh-http-cache.Caddyfile` | 用 Caddy 给远端 dsh web 加一层 HTTP 缓存反代(静态资源强缓存 + 压缩) | [`README-http-cache.md`](README-http-cache.md) |
+| `dsh-http-cache.nginx.conf` | 同上, nginx 版本 | [`README-http-cache.md`](README-http-cache.md) |
+| `render-check.mjs` | 前端「真浏览器」渲染检查(CDP 驱动 headless Chrome, 不依赖 --dump-dom) | [`README-render-check.md`](README-render-check.md) |
+| `memory-check.mjs` | 前端内存对照检查: 隔离 hwb + 假 dsh + headless Chrome, 量「访问 N 个实例后浏览器还占多少内存」(有/无 iframe 预算两组) | [`README-memory-check.md`](README-memory-check.md) |
+| `smoke-e2e.mjs` | 端到端冒烟: 起服务→注册假 home→索引→各 API→上传/下载→SSE→浏览器→移除实例→优雅退出 | [`README-smoke-e2e.md`](README-smoke-e2e.md) |
 
 ## 快速部署(脚本版, 改动最小)
 

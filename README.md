@@ -16,7 +16,8 @@
 它也不会替代 dsh web——只一站式托管它、快速找到它、直达会话，让你在一处总揽所有实例的工作状态。
 
 > 设计文档（三平面架构、数据模型、控制状态机、里程碑）见
-> [`DSH_Workbench_Fusion_Architecture.md`](DSH_Workbench_Fusion_Architecture.md)。
+> [`DSH_Workbench_Fusion_Architecture.md`](DSH_Workbench_Fusion_Architecture.md)；
+> 拓扑可视化附录见 [`docs/topology.md`](docs/topology.md)。
 > 变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
@@ -47,7 +48,7 @@
 
 - 读取多个 dsh home，聚合出**跨实例**的统一视图：最近项目、最近会话、各实例状态与额度。
 - 为每个实例展示 **Token 用量**：总量、输入/输出、缓存命中/创建、缓存命中率，以及
-  按 **维度**（合计 / 项目 / LLM provider / 实例）**堆叠**的分时趋势柱状图。
+  按 **维度**（合计 / 项目 / LLM provider / 按 Model / 实例）**堆叠**的分时趋势柱状图。
 - **托管** dsh web：本机直接拉起子进程，远端经 `ssh -L` 按需隧道接入。
 - 每个实例给浏览器一个**直接可寻址**的入口：**本地** home 用原始服务连接
   `http://127.0.0.1:<port>/?token=<x>`（同机直连，无需转发）；**远程** home 经 hwb 的
@@ -102,6 +103,62 @@ node src/server.js
 > （见下文「添加实例」），首次启动的 onboarding 会自动检测 `~/.dsh` 并提示添加。
 > `--home` 只是**可选**的启动时预注册捷径，不传完全正常。
 
+### 统一管理命令
+
+在仓库目录执行一次 `npm link`，即可在任意目录使用 `hwb`（Node.js 22.5+，macOS / Linux）。
+
+> **如果 `hwb` 报 `zsh: permission denied: hwb`（而 `which hwb` 找得到它）**：
+> 全局 bin 是个软链（`~/.nvm/.../bin/hwb -> …/hwb/src/cli.js`），症状说明**目标文件**丢了可执行位。
+> `chmod +x src/cli.js` 即可恢复；仓库现在把 `src/cli.js` 记为 **100755**，所以正常 clone 不会再遇到。
+> 之所以要写在这里：这种丢失 `git status` **不会提示**（索引原本就是 0644），只能靠症状认出来。
+
+```bash
+hwb start                  # 后台启动，等待 HTTP 监听成功
+hwb status                 # 状态、PID、启动时间、实际监听端口
+hwb stop                   # 优雅停止
+hwb restart                # 重启并应用新配置
+hwb logs -n 100             # 最近 100 行日志
+hwb logs -f                # 持续跟随日志（支持轮转）
+hwb config show            # 查看完整配置
+hwb config set port 4320
+hwb config set verbose true
+hwb config set homes '["~/.dsh"]'
+hwb config update ./hwb.json # 合并 JSON 文件；校验成功后原子保存
+hwb restart                # 更新配置后执行
+hwb doctor                 # Node、配置与运行服务 HTTP 检查
+hwb test                   # 全部测试
+hwb test --test-name-pattern=CLI
+hwb upgrade                # Git 快进更新 → 测试 → 原在运行则重启
+hwb --help
+```
+
+`hwb` / `hwb serve` 保留前台运行方式，并读取同一份配置；原有 `--port` 等选项可覆盖配置。
+`node src/server.js` 和 `npm start` 仍是原来的直接启动方式，不读取新配置文件，也不受后台管理命令控制。
+
+配置保存在 `~/.hwb/config.json`，支持 `port`、`db`、`intervalMs`、`homes`、`log`、`verbose`、`silent`；
+`log: false` 禁用结构化文件日志。`hwb config path` 显示配置位置。相对路径在保存时转为绝对路径。
+设置 `HWB_DIR=/其他目录 hwb ...` 可隔离一套服务的配置、数据库和运行文件（多服务需配置不同端口）。
+实例及连接端点继续通过工作台管理，保存在数据库中。
+
+后台服务不依赖终端，但不提供开机自启或崩溃自动拉起。它通过权限为 `0600` 的本地套接字管理自身，
+不会按端口或 PID 文件杀进程。启动失败会把原因（以及完整日志的位置）直接打在终端上，
+完整的 `~/.hwb/service.log` 仍然是权威记录。
+
+`status` 的退出码可以直接用于脚本：服务在运行 → 0，未运行 → 1。
+前台运行的 `hwb serve` **不创建控制套接字**，所以 `status`/`doctor` 会额外探测配置端口，
+并且**确认对面确实是 hwb**（只有 hwb 才会以 `{"homes":[...]}` 回应 `/api/homes`）：
+真的在服务就报 `running`（并注明是前台运行），端口被**别的程序**占用则如实说明，不会说成「已停止」，
+也不会把别人的服务认成 hwb。
+
+启停命令通过锁文件串行执行：锁里记着持有者 PID 并且持有者持续心跳，
+被 `kill -9`（甚至 PID 之后被系统回收）留下的残留锁会被自动接管并提示；只有在锁**确实被活着**的
+启停命令持有时才会拒绝，此时按提示确认后可删除 `~/.hwb/service.lock`。
+停止、重启会关闭 hwb 托管的 dsh 子进程，应在相关会话空闲时操作。
+
+`upgrade` 仅用于 Git 安装：要求工作区干净且当前分支有 upstream，只执行 `git pull --ff-only`。
+测试失败时不会重启服务，也不会自动回滚已更新的源码；修复后重新测试并重启。
+npm 安装可使用 `npm install -g hwb@latest` 后执行 `hwb restart`。
+
 命令用 npm 脚本：
 
 ```bash
@@ -124,9 +181,14 @@ npm test           # node --test tests/*.test.js
 
 > **日志与排查**：所有输出走同一套结构化日志（`src/lib/logger.js`），分级（debug/info/warn/error/fatal）、
 > 带时间戳与作用域（如 `[launcher]`、`[monitor]`），出错时把**上下文字段**（homeId / host / 端口 /
-> 子进程 stderr 尾部 / 退出码）一并带上，Error 对象打印完整堆栈。日志文件默认 `~/.hwb/hwb.log`，
-> 超过 1MiB 自动轮转保留 `.1/.2` 两代。当 dsh web 启动失败、SSH 隧道断连、远端 home 不可达时，
-> 查看该文件即可定位根因。
+> 子进程 stderr 尾部 / 退出码）一并带上。日志文件默认 `~/.hwb/hwb.log`，超过 1MiB 自动轮转保留
+> `.1/.2` 两代（同样是 0600）；`service.log`（子进程 stdout/stderr 的重定向目标，只增不减）
+> 在每次 `hwb start` 之前做一次性上限控制：超过 8MiB 就轮转成 `.1`（**不是**运行中实时轮转 ——
+> fd 已经交给子进程，父进程退出后不再持有）。
+> **同一实例的同一失败原因不会刷屏**：首次记全（含 Error 完整堆栈），之后 10 分钟内静默、
+> 窗口过后记一条摘要行；原因变化或成功一次即复位。这条是为「一个长期不可达的远端每轮索引都重记
+> 同一件事」准备的 —— 实测那会让日志里 16,000 行里有 7,000 行是同一句话 + 一整套 async 栈帧。
+> 当 dsh web 启动失败、SSH 隧道断连、远端 home 不可达时，查看该文件即可定位根因。
 
 打开 `http://127.0.0.1:4310`，首次会看到一个 **onboarding 引导**：自动检测 `~/.dsh` 或手动添加。
 
@@ -135,31 +197,45 @@ npm test           # node --test tests/*.test.js
 ## 工作台怎么用
 
 顶部是一个 **tab 栏**：`◧ 工作台` + 每个实例一个可拖拽排序的 tab。视图切换只 show/hide，
-**绝不销毁重建 iframe**（持久化、不重载）。
+**不重建热 iframe**（切回是瞬时的）—— 但「热」有上限：见下面的 **iframe 预算**。
 
 **工作台（仪表盘，纯元数据、零 iframe）** 分五块：
 
 1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
 2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
-3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip、索引状态、workspace/会话数，
-   **连接（连接到 / 必要时拉起 dsh web）** / stop / restart / reindex / remove 等操作按钮。
+3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip（已连接 / 连接不可达 / 未连接，域降级时另加
+   「⚠ <域> 降级」chip）、workspace/会话数，以及 **连接（连接到 / 必要时拉起 dsh web）** / **断开** /
+   **切换**（配置了多个连接端点时）/ **⚙ 设置** 按钮。
+   重启 / 停止 / 重新索引 / 移除 在 **⚙ 设置** 弹窗内（不在卡片上，避免误点）。
    远程实例经 SSH 只读索引入库后同样显示。
    （实例卡不再重复展示「当前项目/当前会话」——该信息已由 Recent Projects / Recent Sessions 聚合呈现。）
 4. **Token 用量** —— 汇总卡 + 分时趋势堆叠柱状图（支持 24h / 3天 / 7天 / 14天 / 30天 周期，
-   按 合计 / 项目 / LLM provider / 实例 维度切换）+ 按项目拆分。
+   按 合计 / 项目 / LLM provider / 按 Model / 实例 维度切换）+ 按项目拆分。
 5. **运行日志** —— 后端结构化日志实时面板：分级着色（debug/info/warn/error）、按级别过滤、
    自动跟随（滚动到底部）、点击某行展开完整堆栈、清空视图。启动即回填环缓冲历史
    （分不清级别时可用 `-v` 开启 debug 级；查看磁盘日志见 `--log` 文件）。
 
 > **项目 ↔ 会话联动高亮**：把鼠标悬停在某个项目（或会话）上，会在两栏间同步高亮同名项目。
 
-**钻入某个实例 / 会话**：点实例 tab 或某项目/会话行，会懒创建一个持久 iframe 挂载该 dsh web
-（本地直连端口，或远端经 SSH 隧道 + 反代）。退出时只隐藏，再次进入不重载。
+**钻入某个实例 / 会话**：点实例 tab 或某项目/会话行，会懒创建一个 iframe 挂载该 dsh web
+（本地经预览代理，远端经 SSH 隧道 + 反代）。切走只隐藏；被预算释放过的实例再次进入时重新加载
+（dsh 支持会话深链时会回到同一个会话）。
+
+> **iframe 预算（前端内存的上界）**：每个实例 iframe 都是一整个 dsh web SPA（自己的实时通道、
+> 会话 DOM、插件脚本），隐藏的 iframe 并不会被冻结。原先「切走只 hidden、永不销毁」的代价是
+> 浏览器内存随**访问过的实例数**单调增长、且永不归还——2026-09-12 实测 Safari 的一个 WebKit
+> WebContent 进程 2.3 GB / 26% CPU 常驻 7 小时，Safari 以「此网页使用了大量内存」把页面重载。
+> 现在最多保留 **3** 个热 iframe（最近用过的），超出的按 LRU 释放：只拆 iframe 与预览侧栏，
+> 标签页、入口 URL、会话 id 全部保留，重新进入时按会话深链恢复；正在看的那个永不释放。
+> 释放过的标签在悬停提示里标出「已释放内存（重新进入时重新加载）」。
+> 用 `http://127.0.0.1:4310/?frames=N` 可以临时调整预算（N ≥ 1；低内存机器可调小，
+> `scripts/memory-check.mjs` 用它做对照实验）。
 
 **添加实例**（工作台 Instances 区块「＋ 添加」）：
 - **本机**：填 dsh home 路径，如 `~/.dsh`；可选填「本机 dsh web 端口」+「鉴权 token」直接接入
   已在跑的那台实例（**同机直连、无端口转发、不新拉起**；端口留空则按需拉起一台）。
-- **SSH 远程**：填 SSH 主机（别名 / `user@host`）+ 远端 dsh web 监听端口（默认 `3080`），
+- **SSH 远程**：填 SSH 主机（别名 / `user@host`）+ 远端 dsh web 监听端口（**必填**；
+  常见值是 `3080`，但以远端实际监听端口为准，留空会被服务端拒绝），
   可选填远端 home 路径、远端启动命令、token 日志路径，以及**鉴权 token**（填入则跳过远端抓取）。
   远程实例经 hwb 的 1:1 根路径反代接入（浏览器无法直达 ssh 隧道）。
 
@@ -167,7 +243,46 @@ npm test           # node --test tests/*.test.js
 > 远程重建一条 ssh 隧道接入**已运行**的 dsh web；**绝不**因连接问题重启或杀掉一个健康实例。
 > `stop / restart` 是需二次确认的最后手段，远端自更新 dsh 后填入新 token 即可直连。
 
+远程隧道启用 SSH 压缩；代理为带内容指纹的静态资源补充浏览器缓存，减少重复刷新时的下载。
+远程探活等待最多 10 秒，已成功探测的连接连续失败 3 次才显示不可达；临时不可达时保留实例页面。
+SSH 意外退出后按 1/2/4/8/16 秒退避，最多重连 5 次，只重建到已有服务的隧道；仍失败时可手动点「连接」重试。
+连接恢复后，页面会重新认证并恢复所选会话。主动断开、停止或移除会取消重连。
+
+**本地接入端口（仅 SSH 远程实例）**：添加远程实例或在其设置中填写 hwb 页面接入端口；留空时首次连接自动分配并保存。
+重连、切换远端端点和重启 hwb 后均复用该端口，便于浏览器继续使用静态资源缓存。
+它与「连接端点」中的 dsh 服务端口独立；外部打开仍沿用原服务入口。需要更换时先断开实例，
+清空后保存可重新自动分配。保存的端口若被占用会报错，不会自动换成其他端口。
+本机实例的外部打开直连 dsh 服务端口；内嵌页面使用自动分配端口的预览代理，注入工作区与文件点击通信脚本。本机无需配置或保存接入端口。
+
 ---
+
+## 文件预览侧边栏
+
+在 hwb 内打开本机或 SSH 远程 dsh 实例后，单击会话中的文件路径或“产物”文件按钮，即可在右侧预览（点击由注入的桥接脚本拦截，因此不会触发 dsh 原生「用宿主系统应用打开」——远端无 GUI 时那条路必然失败并提示 `xdg-open: no method available`；若某次点击仍漏过桥接，iframe 右下角会浮出一条会自动消失的小提示（不在会话正文里插入任何控件），提供「在 hwb 文件预览里打开」的动作）；单击目录可浏览其内容。也可以点击右上角主题切换按钮左侧的 **文件预览** 按钮，直接浏览当前会话的 project 工作区，或输入项目内的相对／绝对路径。侧栏自动跟随会话切换；若内嵌页没有上报会话，用标题栏下拉手选工作区（见下节）。侧栏提供上级、项目根目录、刷新和关闭操作。拖动侧栏左边缘可调整宽度（按实例记忆），双击分隔条恢复默认；聚焦分隔条后也可用左右方向键微调。Cmd/Ctrl 等组合点击保留原有行为。在外部浏览器直连本机 dsh 时，文件打开沿用 dsh 原有行为。
+
+首次更新此功能需要重启 **hwb 服务**，然后刷新整个 hwb 页面；仅切换实例标签不会重建热 iframe（超出预算的被释放后会在重新进入时加载，见上文的 **iframe 预算**）。重启 hwb 会终止它管理的 dsh 子进程，应等相关会话空闲后再操作；手填端口接入的已有本地 dsh 进程不由 hwb 终止。
+
+文件范围限制在已登记的项目目录内。文本显示行号，最多预览前 24 KiB；目录最多显示 200 项；SVG、PNG、ICO、JPEG、GIF、WebP 显示图片（最多 2 MiB）；其他二进制文件暂不展示正文。图片工具栏支持放大、缩小、100% 原尺寸、适应窗口和全屏预览，按 Esc 或点击“退出全屏”返回侧栏。**HTML 文件默认渲染显示**（按浏览器方式排版，最大 32 MiB），工具栏可切到「源码」（前 24 KiB，带行号）、在浏览器里打开或下载完整文件；渲染走 `/asset` 原字节，因此内联图表的报告不必再受文本预览 24 KiB 截断。为安全起见，渲染时不执行页面里的脚本与表单（服务端 CSP `sandbox` + 前端 iframe `sandbox`），静态排版、内联样式与图片正常显示。点击“下载文件”可将完整原文件保存到本地（单文件最多 64 MiB，暂不打包目录），不受文本预览截断限制；不支持预览的文件也可下载。远程实例通过 SSH 在远端读取，需要 Python 3。会话缺少 workspaceId 时，按 project 匹配唯一的已登记工作区；无法确定时显示关联错误，不猜测其他项目。外部浏览器直接打开 dsh 的页面仍使用 dsh 原有文件打开行为。
+
+### 两种绑定方式：跟随会话 / 手选工作区
+
+侧栏有两条并存的入口，任一条可用即可浏览、下载与上传：
+
+1. **跟随 dsh 会话（首选）**：内嵌页里的会话会通过 `hwb:preview-context` 上报会话 ID，侧栏据此解析出该会话的 project 工作区——这是「点会话里的文件路径就能预览」的来源。
+2. **手选工作区（兜底）**：侧栏标题栏的下拉列出该实例在 hwb 索引里的**全部工作区**（含远端路径）。内嵌页没有上报会话时（例如该 dsh 版本的 URL 不带 `?session=`、会话是文档内新建的、或上报链路被代理/浏览器策略打断），直接在下拉里选一个工作区即可；首次打开面板时若尚无会话上下文，会**自动绑定最近活跃会话所在的工作区**。
+
+> 兜底存在的意义：会话上下文依赖内嵌页与侧栏的 postMessage 握手，任何一环（代理未注入桥接脚本、dsh 不用 `?session=` 导航）都会让它失效；工作区列表来自 hwb 自己的索引，不受该链路影响，因此文件预览不会因为握手失败而完全不可用。下拉选「（跟随 dsh 会话）」可随时切回自动跟随。
+
+### 上传文件（拖拽）
+
+浏览到某个目录时，侧栏会显示上传区：把文件**拖到侧栏**即上传到**当前所在目录**，也可以点「选择文件上传」或直接拖到目录内容区域。多文件会逐个串行上传，进度条显示整批进度与当前文件名，完成后自动刷新目录列表（想传到子目录，先点进那个目录再拖）。
+
+- 单文件上限 **256 MiB**；超限文件在拖入时就被跳过并提示，不会白传一遍。
+- **同名不覆盖**：已存在 `data.csv` 时新文件自动落为 `data(1).csv`，上传完成后明确提示改名结果。
+- 先写隐藏临时文件、写满后才原子落名：中断只留下隐藏临时文件，不会出现“半截但看起来正常”的结果文件或临时残留。
+- 只接受「文件名」，落盘位置完全由服务端依据已登记工作区与当前目录决定；`..`、符号链接、工作区外路径一律拒绝，写请求校验同源（跨站写入返回 403）。
+- 远程实例经 SSH 在**远端**同名目录写入（同样需要 Python 3）：内容按 512 KiB 分片经命令行参数传输、远端先分片落盘到临时目录再合并，避开 stdin 与命令行长度限制；速度受链路带宽限制，大文件会比本机慢。
+
 
 ## 读取的 dsh home 文件
 
@@ -209,24 +324,30 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
   Reader 统一抽象了 `readText/exists`：本地走 fs，远程经一次 SSH cat（`remote-reader`），
   两者共用同一套 schema 验证与域降级语义。控制平面与数据平面**单向解耦**（Control → Data 只传递实例/隧道状态）。
 - **展示平面**默认渲染本地索引元数据（O(索引行)），**绝不**同时挂 N 个 iframe；
-  iframe 只在钻入单个会话时按需创建、退出销毁。
+  iframe 只在钻入实例时按需创建，且活跃 iframe 数由预算上限兜住（默认 3，LRU 释放，见
+  「iframe 预算」）—— 因为每个 iframe 都是一整个 dsh web SPA，隐藏不等于不占内存。
 
 关键设计原则（详见架构文档）：
 
 - 工作台仪表盘**绝不**挂载 N 个 iframe——它从本地 SQLite 读元数据。
-- 每个实例的 iframe 统一走固定可寻址入口：**本地**用原始服务连接（同机直连），**远程**经 hwb 的
+- 每个实例的 iframe 使用预览代理注入通信脚本；**本地**外部打开仍直连服务，**远程**经 hwb 的
   **根路径 1:1 反向代理**，因为它不重写路径，所以 `/plugins/*`、`/assets/*`、WebSocket 全部走通。
-- 双循环刷新：控制循环 30s + 索引循环 60s（debounced），互不阻塞。
+- 状态刷新：控制循环 30s + 文件索引循环 60s（失败退避）；运行中实例的会话状态另以 3s 周期独立读取，不受 SSH 文件索引退避影响。连接后的定向索引会排队执行，不会被正在运行的批次吞掉。
 
 ---
 
 ## REST API
 
-`createServer` 仅绑定 `127.0.0.1`，**无鉴权**（§11 安全声明）。
+`createServer` 仅绑定 `127.0.0.1`，**无鉴权**（§11 安全声明）。但**无鉴权 ≠ 任意来源可用**：
+`/api/*` 只接受回环 Host（DNS rebinding 防护），且所有写方法要求同站来源（详见「安全边界」）。
 
 | Method | Path | 说明 |
 |--------|------|------|
-| `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `quota:updated`） |
+| `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `monitor:updated` / `quota:updated` / `log:event`） |
+| `GET` | `/api/homes/{homeId}/preview` | 预览文件/目录（`?sessionId=` 或 `?workspaceId=`，`&path=`），只读 |
+| `GET` | `/api/homes/{homeId}/asset` | 按真实 MIME 返回文件原字节（HTML 渲染预览用；带 CSP `sandbox`，只读、只限工作区内） |
+| `GET` | `/api/homes/{homeId}/download` | 下载单个文件（≤64 MiB，不打包目录） |
+| `PUT` | `/api/homes/{homeId}/upload` | 上传文件到当前目录（multipart；`?sessionId=`+`&dir=`，≤256 MiB/文件，同名自动改名，跨站拒绝） |
 | `GET` | `/api/homes` | 全部实例（含 runtime 状态） |
 | `GET` | `/api/homes/detect` | 检测默认 `~/.dsh` 是否存在 |
 | `POST` | `/api/homes` | 注册实例（本机 `homePath`；远程 `host`+`remotePort`） |
@@ -234,15 +355,19 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 | `DELETE` | `/api/homes/{homeId}` | 移除实例（只删 hwb 索引，不碰 dsh 文件） |
 | `POST` | `/api/homes/order` | 持久化拖拽排序 |
 | `POST` | `/api/homes/{homeId}/reindex` | 强制重新索引 |
-| `POST` | `/api/homes/{homeId}/open` | 打开实例（本机拉起 / 远端建隧道） |
+| `POST` | `/api/homes/{homeId}/open` | 打开实例（本机拉起 / 远端建隧道）。**连接前会验证入口鉴权**：token 失效/填错时返回 500 并说明补救办法，而不是把 401 栅栏页记成「已连接」 |
 | `POST` | `/api/homes/{homeId}/restart` | 重启实例 |
-| `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web） |
+| `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web）。**确认式**：SIGTERM→3s→SIGKILL→2s，只有进程真的退出才回 `{ok:true}`；收不掉则回 500（带 pid/端口）且保留句柄。远端停止失败时也会以 500 上报（本地连接仍已断开）。响应里的 `stopped` 表示**这次是否确实停掉了一个受管子进程**（直连已有实例时为 false） |
 | `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
 | `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`） |
 | `GET` | `/api/workspaces` | 工作区列表 |
 | `GET` | `/api/usage` | 用量汇总 + 趋势 + 按项目（`?days=30&hours=24`） |
 | `GET` | `/api/quota` | 额度列表（TTL 缓存；只读） |
 | `POST` | `/api/quota/refresh` | 强制刷新额度 |
+| `POST` | `/api/homes/{homeId}/open-workspace` | 在本机 Finder 中打开该实例的工作区目录（仅本机实例、仅 macOS） |
+| `POST` | `/api/homes/{homeId}/switch` | 切换到另一个连接端点（body `{endpointId}`）；先验证新端点再释放旧连接 |
+| `POST` | `/api/homes/{homeId}/disconnect` | 仅断开 hwb 接入（不停止远端 dsh web，也不回收本机受管进程） |
+| `GET` | `/api/logs` | 后端结构化日志环缓冲快照（`?level=&limit=`，limit ≤ 1000） |
 
 > 额度（§8）**只返回** `{ provider, remaining, currency }`；**API key 永不越界**——
 > key 只在服务端内存（读 `.credentials.yaml` 后查余额），浏览器拿不到。
@@ -283,52 +408,77 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 
 ```
 hwb/
-├── package.json                 # type:module, engines:node>=22, 零依赖
+├── package.json                 # type:module, engines:node>=22.5.0, 零 npm 依赖
 ├── src/
+│   ├── cli.js                   # hwb 统一管理命令（start/stop/status/logs/config/doctor/upgrade）
 │   ├── server.js                # HTTP 入口 + 调度器启动 + 退出清理
+│   ├── service.js               # 后台服务进程（私有控制 socket，不用 PID 文件）
 │   ├── lib/                     # 纯内核（零副作用，可单测）
 │   │   ├── logger.js            # 结构化日志（分级/时间戳/作用域/上下文/轮转落盘/crash handler）
 │   │   ├── schema.js            # 4 个文件的手写验证器（unit.version）
 │   │   ├── normalize.js         # HomeSnapshot → IndexedRows（纯函数）
 │   │   ├── read-home.js         # 本地读取 + 最小 YAML 解析（provider 名）
 │   │   ├── balance.js           # Provider 额度适配器（readCredentials/queryBalance）
-│   │   └── status.js            # 会话工作状态推导（纯函数）
+│   │   ├── status.js            # 会话工作状态推导（纯函数）
+│   │   ├── time.js              # 毫秒时间戳 → ISO（越界降级为 null）
+│   │   ├── node-version.js      # Node 版本门槛（engines / doctor / 启动预检 同源）
+│   │   ├── file-preview.js      # 预览/下载/上传（本机 fs + 远端 python，含路径围栏）
+│   │   ├── multipart.js         # 流式 multipart 解析（线性扫描 + 边界保持）
+│   │   ├── endpoints.js         # 连接端点规范化（host/port/唯一 id）
+│   │   ├── access-port.js       # 本地接入端口校验
+│   │   ├── open-workspace.js    # 在 Finder 中打开工作区（仅 macOS）
+│   │   └── service-config.js    # ~/.hwb/config.json 的读写与校验
 │   ├── dshhome/                 # 数据平面
 │   │   ├── reader.js            # 编排 read + normalize + store
-│   │   ├── indexer.js           # 后台索引循环（60s debounce + 退避）
+│   │   ├── remote-reader.js     # 远端只读索引（一次 ssh bash -s cat 4 个元数据文件）
+│   │   ├── indexer.js           # 后台索引循环（60s debounce + 按实例退避）
+│   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC）
+│   │   ├── live-poller.js       # 实时状态轮询（3s，仅运行中的本机实例）
 │   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目）
 │   │   └── quota.js             # 额度服务（TTL 缓存 60s，单 flight）
 │   ├── control/                 # 控制平面
 │   │   ├── registry.js          # 实例注册表（状态机 + 退避）
 │   │   ├── monitor.js           # 进程/端口探测（30s 循环）
-│   │   ├── launcher.js          # dsh web 启动/停止/重启 + token 抓取 + 深链探测
+│   │   ├── launcher.js          # dsh web 启动/停止/重启 + token 抓取 + 深链探测 + 端点切换
 │   │   ├── tunnel.js            # ssh -L 按需隧道
-│   │   ├── proxy.js             # 根路径 1:1 反向代理（含 WebSocket 升级）
+│   │   ├── ssh-opts.js          # SSH 参数统一（连接复用/压缩/跳板机）
+│   │   ├── proxy.js             # 根路径 1:1 反向代理（含 WebSocket 升级 + 预览注入）
 │   │   ├── remote.js            # 远端 dsh web 启停 + 抓 token
 │   │   ├── prober.js            # HTTP/进程/SSH/远端路径探测（独立可测）
-│   │   └── guard.js             # 进程指纹（防误杀）
+│   │   ├── guard.js             # 进程指纹（防误杀）
+│   │   └── workspace-menu.js    # 预览页的工作区下拉菜单注入
 │   ├── api/
-│   │   ├── server.js            # Node HTTP 服务器 + 静态资源
-│   │   ├── routes.js            # REST 路由
-│   │   └── sse.js               # SSE 广播中心
+│   │   ├── server.js            # Node HTTP 服务器 + 静态资源 + /api 来源校验
+│   │   ├── routes.js            # REST 路由 + 跨站写保护 + 请求体上限
+│   │   └── sse.js               # SSE 广播中心（背压上限 + 心跳）
 │   └── web/                     # 展示平面（原生 ESM，无构建）
 │       ├── index.html           # 布局 + 全部样式
 │       ├── app.js               # 路由 + 状态管理 + 持久 iframe
 │       ├── store.js             # 前端缓存（SSE 订阅 + 工具）
+│       ├── instance-navigation.js / instance-state.js   # 实例入口与实例键
+│       ├── preview-bridge.js    # 内嵌页 → 父页的工作区/会话上报
+│       ├── file-preview.css
 │       └── components/
 │           ├── workbench.js         # 仪表盘布局
-│           ├── recent-projects.js
-│           ├── recent-sessions.js
-│           ├── instance-grid.js
+│           ├── recent-projects.js / recent-sessions.js / instance-grid.js
 │           ├── usage-card.js        # 用量卡 + 堆叠趋势图 + 周期/维度切换
 │           ├── quota-card.js        # 额度卡片（见「已知限制」）
-│           └── add-home.js          # 添加/编辑实例表单 + onboarding
+│           ├── add-home.js          # 添加/编辑实例表单 + onboarding
+│           ├── endpoint-editor.js   # 连接端点编辑器
+│           ├── file-preview.js      # 文件预览/下载/拖拽上传侧栏
+│           ├── preview-image.js / preview-resize.js  # 图片查看与侧栏拖拽
+│           ├── log-panel.js         # 运行日志面板
+│           └── form-draft.js        # 表单草稿存取（跨 SSE 重建保活）
 ├── scripts/                     # 远程 dsh web 冷启动/缓存/隧道运维脚本
 ├── dsh-remote-index/            # 多实例会话索引（独立工具）
 ├── dsh-static-cache/            # dsh 前端静态缓存插件
+├── docs/topology.md             # 拓扑可视化附录（README/设计文档的可视化补充）
 ├── tests/                       # 单元测试 + mock-home 夹具
+├── images/                      # README 头图
 └── DSH_Workbench_Fusion_Architecture.md   # 设计文档（三平面/数据模型/里程碑）
 ```
+
+> 完整文件清单以 `git ls-files` 为准（上面只列主线，测试文件未逐个展开）。
 
 ---
 
@@ -338,10 +488,17 @@ hwb/
 npm test        # node --test tests/*.test.js
 ```
 
-当前 **62 个用例全绿**，交叉覆盖：schema 校验 / normalize 纯函数 / read-home 读取 /
+当前**全套用例全绿**。确切条数与文件数以 `npm test` 的输出为准 —— 这里刻意不写死任何数字，
+因为那种数字每加一个用例/文件就会过期一次（历史上它从 62 漂到 359 再到 419 都没人发现）。
+`tests/docs-consistency.test.js` 会守住这条「文档不自带会过期的计数」的约定。交叉覆盖：schema 校验 / normalize 纯函数 / read-home 读取 /
 credentials 解析 / status 推导 / quota 适配器与 TTL 缓存 / store 查询与用量聚合 /
-monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深链探测。
+monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深链探测 /
+API 层（跨站写保护、DNS rebinding、请求体上限、UTF-8 分片解码）/ multipart 解析与上传 /
+SSH 重连与恢复 / 前端渲染转义与表单草稿 / Node 版本门槛与时间戳边界。
 `tests/mock-home/` 是真实 `~/.dsh` 形状的夹具（由 `tests/init-mock.js` 生成）。
+
+部分测试直接打真实 socket / 真 bash / 真 HTTP 服务（而不是只喂假对象），
+因为有些行为只有在真实分片、真实 shell 引号语义下才暴露得出来。
 
 ---
 
@@ -349,6 +506,10 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
 
 > 这些是 v0.1.1 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
 
+- **上传的内存占用有界但不为零**：multipart 解析器是流式的，但上传路由目前会把整份文件先攒在内存
+  再落盘（解析器的 `write` 回调是同步契约，而落盘写入是异步的）。单文件上限 256 MiB，
+  因此峰值是同量级的一次性开销，不会随并发累积（上传是串行处理的）。改成真流式需要让解析器
+  支持异步写入端。
 - **额度卡片未接通仪表盘**：`src/web/components/quota-card.js` 的 `renderQuotaCards` 已实现，
   后端 `/api/quota` ✓、`/api/events` 的 `quota:updated` ✓、`QuotaService` + 各 provider 适配器 ✓、
   单测 ✓ —— 但仪表盘**尚未**把它渲染出来（前端目前用量卡里没有额度区块）。如需启用，把
@@ -373,8 +534,38 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
 ## 安全边界
 
 - hwb 仅监听 **127.0.0.1**，无鉴权，不暴露公网。
+- **跨站写保护**：因为无鉴权，浏览器里的任意页面理论上都能向本机端口发请求，所以所有改变状态的
+  方法（`POST`/`PUT`/`PATCH`/`DELETE`）统一要求同站来源——`Sec-Fetch-Site: cross-site` 或
+  `Origin` 与本机 `Host` 不一致的请求一律 403。这不能只依赖 CORS：`Content-Type: text/plain`
+  之类的请求属于 **CORS 简单请求**，不触发预检，浏览器不会替你拦。非浏览器客户端（curl 等）不带
+  这两个头，照常可用。
+- **DNS rebinding 防护**：`/api/*` 只接受回环 Host（`127.0.0.1` / `localhost` / `::1`）。
+  只靠 Origin/Host 比较挡不住 rebinding——那两个值在攻击场景下都由攻击者控制；
+  Host 是否指向回环地址才是唯一能区分「本机页面」与「rebinding 页面」的信号。
+  **逃生口**：如果你通过 `/etc/hosts` 别名、devcontainer/Codespaces 的转发域名、或保留
+  浏览器 authority 的反代访问，把该主机名加进 `HWB_ALLOWED_HOSTS`（逗号分隔）即可，
+  例如 `HWB_ALLOWED_HOSTS=hwb.local hwb start`。放行等于允许该来源的页面访问本地 API，
+  请只填自己控制的名字。
 - **API key 永不越界**：`.credentials.yaml` 的 key 只用于服务端查余额，浏览器只收到
   `{ provider, remaining, currency }`（单测专门断言 key 不出现在列表里）。
+- **无鉴权 ≠ 只有你自己能用**：端口绑在回环上，但**同机的其他用户也能连**（回环不是访问控制）。
+  凡是能读到 `/api/*` 的人都能看到实例元数据与会话标题，非浏览器客户端（curl）还带着写权限
+  （见上面「跨站写保护」：那两个头本来就不是给 curl 用的）。它是单人本机工具——不要把端口暴露到
+  回环之外；同机有不受信任的用户时，请用独立用户或容器运行。
+- **dsh token 的暴露面**：读接口（`GET /api/homes`、更新响应）**不再回传 token** —— 实例级与
+  连接端点级都不回传，端点只给 `tokenSet: true` 表示「已配置」。因此端点编辑器把输入框留空显示为
+  「已配置，留空保持不变」：留空 = 不传该字段 = 沿用已存的值，要清除必须点「清除 token」
+  （服务端按端点 id 合并，留空绝不会静默清除）。
+  唯一的例外是打开实例必经的 `POST /homes/{id}/open`：它返回**带 token 的 iframe 入口 URL**
+  （dsh 的入口就是靠它认证的）。也就是说 token 迟早要交给浏览器，这一条的边界是
+  **「谁能访问这个端口」**，而不是「响应里有没有这个字段」。
+- **落盘文件的权限**（同机其它用户能读日志/库就等于能读走 dsh token）：
+  `hwb.log`（及 `.1/.2`）**0600**、`service.log` **0600**、状态目录 `~/.hwb` **0700**、
+  控制套接字 **0600**、`hwb.db` **0600**（SQLite 按 umask 建文件，所以服务启动时显式收一次 ——
+  库里存着实例与端点的 token）。日志目录的 chmod **不会**碰当前目录及其祖先
+  （日志路径可以是相对的），也不会碰 `HWB_DIR` 被误设成的共享位置（`/tmp`、`$HOME`、`/`）。
+- **`/api/*` 一律 `Cache-Control: no-store`**：这些 JSON 里有实例元数据、会话标题与错误上下文，
+  不该留在浏览器缓存或中间反代里；同时带 `X-Content-Type-Options: nosniff`。
 - **远程读取只读**：SSH 单条命令只提取元数据，不注入密钥、不修改远端文件。
 - **进程指纹**：`guard.js` 在 kill 前确认目标是我们拉起且仍存活的子进程，避免 pid 复用误杀。
 
@@ -401,3 +592,16 @@ monitor 状态机 / proxy 反代与 WebSocket / launcher 的 token 抓取与深�
 ## 许可
 
 [MIT](LICENSE)
+
+
+### 一个实例配置多个连接端点
+
+实例使用固定的 `homeId`，连接地址和端口属于实例下的 `endpoints`，不再用端口来区分它的身份。每个端点包含 SSH 主机（远程实例）、dsh web 端口和可选 token，以主机和端口区分，不单独设置别名；`activeEndpointId` 记录当前选用的端点。不同 token 可分别保存在各端点中。本机实例也支持多个直连端口。
+
+在实例卡片的「设置 → 连接端点」中添加端点并保存，在设置内选择目标并点击「切换连接」。多 IP／端口在设置中维护；配置多个端点后，实例卡片会增加「切换」按钮，点击后选择通道。可以在连接中添加或编辑备用端点；修改正在使用的端点前需先切换或断开。切换会先连接并验证新端点，成功后释放旧接入，失败保留原连接。远程切换不会启动、重启或停止 dsh web；目标服务需已运行。hwb 自己启动的本机进程需先停止，才能改用其他直连端口。
+
+首次升级会将同一服务器标识、同一远端 home 的旧通道配置合并为一个实例的多个端点（相对 home 还区分显式 SSH 用户）。已确认的 `cms.lo` / `cms.tun` 包括 `bot@` 前缀会归到 `cms`。保留首个实例 ID，合并唯一的索引记录并消除重复记录。以后请直接在一个实例中维护端点列表，界面只保留「实例名称」用于显示，不会因改名或切换端口生成新的实例。
+
+Instances 直接显示全部实例卡片，没有折叠层：未连接时显示「连接」，连接后显示「断开」，仅配置多个通道时增加「切换」按钮，用于选择连接通道。「连接」留在工作台；点击顶部选项卡进入实例页面。仅 Instances 区域的实例卡片显示当前连接通道，不默认展开其他通道列表；顶部导航栏只显示实例名称。连接状态每 30 秒检查。Projects 和 Sessions 仅查询已连接且可达的实例，过滤发生在汇总、跳转目标选择和分页之前；断开后隐藏其数据，保留索引供重新连接后展示。
+
+API：`PUT /api/homes/:homeId` 支持 `endpoints` 数组；`POST /api/homes/:homeId/switch` 接收 `{ "endpointId": "目标端点 ID" }`。切换成功后 `homeId`、会话及项目索引不变。旧的单主机／端口配置仍兼容。后端更改需重启 hwb 生效。

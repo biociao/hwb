@@ -44,7 +44,7 @@ scripts/dsh-remote-web.sh --kill-tunnel
 | `--open` | 打印后调用默认浏览器打开(macOS) | 关 |
 | `--no-restart` | 不重启,只抓当前实例已写入日志的 token | 关 |
 | `--token-only` | 只抓 token,不打隧道(隐含 `--no-restart`) | 关 |
-| `--kill-tunnel` | 结束已建隧道(读 `/tmp/.dsh-remote-web.tunnel`) | 关 |
+| `--kill-tunnel` | 结束已建隧道(读 `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/tunnel.pid`) | 关 |
 | `--dry-run` | 只打印将执行的远端命令,不实际执行 | 关 |
 | `--verbose` | 打印调试信息 | 关 |
 | `-h/--help` | 帮助 | — |
@@ -57,7 +57,7 @@ scripts/dsh-remote-web.sh --kill-tunnel
    - `--no-restart` / `--token-only`:直接 grep 整个日志里最新一条 `?token=...`。
    - 40s 内抓不到就报错并回显日志尾部。
 2. **建 SSH 隧道**：`ssh -N -L <local>:<host>:<remote>` 后台运行,PID 存到
-   `/tmp/.dsh-remote-web.tunnel`。本地绑定 `127.0.0.1`,避免跨机再触发 `/api` 信任围栏。
+   `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/tunnel.pid`。本地绑定 `127.0.0.1`,避免跨机再触发 `/api` 信任围栏。
 3. **拼 URL**：`http://127.0.0.1:<local>/?token=<token>`,打印(可选 `--open` 打开)。
 
 > token 只在远端进程里,所以"本地注入启动命令→远端抓 token→本地建隧道访问"是**唯一可靠**的
@@ -118,3 +118,28 @@ scripts/dsh-remote-web.sh --kill-tunnel
 > 若 `nohup: failed to run command 'dsh'`,说明 PATH 没带上(见第 1 条)。
 > `~/.dsh/web.log` 里最新一条 `dsh web: http://127.0.0.1:<port>/?token=...` 就是当前 token
 > (存在多条也不会混淆——脚本只抓该次启动【新增】的那条)。
+
+## 状态文件位置（已从 `/tmp` 迁到用户私有目录）
+
+隧道 PID 与 ssh 的输出原先放在 `/tmp/.dsh-remote-web.*`。那是一组**全局可写的固定路径**：
+
+- 任何本地用户都能在文件不存在时抢先创建它（`/tmp` 的 sticky 位只保护已存在的条目）；
+- 旧实现把文件内容当 PID 直接 `kill` —— 内容写成 `0` 就等于让调用者 `kill 0`（SIGTERM 掉整个
+  进程组），而一个过期的 PID（隧道早已退出、PID 被系统复用）会打死一个毫不相干的进程；
+- 隧道输出用的是固定路径且**不先删除**，谁提前放一个指向 `~/.ssh/authorized_keys` 的符号链接，
+  重定向就会把那个文件截成 0 字节。
+
+现在统一放在用户私有运行目录，默认 `${XDG_RUNTIME_DIR:-$HOME/.dsh}/dsh-remote-web/`（权限 `0700`），
+可用环境变量 `DSH_REMOTE_WEB_DIR` 覆盖。`--kill-tunnel` 会先校验：PID 必须是数字且非 `0`，
+再用 `ps` 确认它确实是一条 `ssh -N -L` 隧道 —— 对不上就**拒绝 kill 并说明原因**，
+而不是"照着文件里的数字杀"。
+
+另外修掉了两处会让脚本"看起来成功、实际什么都没做成"的问题：
+
+- **远端参数引用**：ssh 会把 host 之后的 argv 用空格拼成一个字符串交给远端 shell 重新切分。
+  原先没有逐个引用，默认的 `remoteCmd`（含空格）会把后面每个参数整体错位一格 ——
+  实测远端拿到 `cmd=[bash]`、`port=[$HOME/scripts/...]`、`killp=[web]`：远端跑了一个裸 `bash`
+  （永远等不到 token），而 `pkill -f web` 会把远端**任何**命令行含 "web" 的进程杀掉。
+  现在用 `printf '%q'` 逐参引用（远端就是 `bash -s`）。
+- **隧道没起来也报成功**：原先不检查端口就绪就打印 URL 并 `exit 0`，真正的错误（ssh 的 stderr）
+  丢在临时文件里没人看。现在端口没起来会打印 ssh 的 stderr 并 `exit 1`。

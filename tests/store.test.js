@@ -72,11 +72,31 @@ test('store re-upsert replaces child rows wholesale', () => {
     homeId, homePath: '/mock/home', generatedAt: new Date().toISOString(),
     wsVersion: 2, pcVersion: 3,
     workspaces: [], sessions: [], modelTier: null,
-    providers: [], degraded: [{ domain: 'workspace', error: 'gone', degraded: true }],
+    providers: [], degraded: [],
   });
   store.upsertRows(rows);
   assert.equal(store.recentSessions({}).length, 0);
   assert.equal(store.listWorkspaces().length, 0);
+  assert.equal(store.listHomes()[0].status, 'ok');
+  store.close();
+});
+
+// 降级域是「整表替换」的例外：它对应的表必须保留上一次成功索引的行。
+// 否则一次 dsh 升级（unit.version 不再被识别）就会把该实例的会话/项目静默删空
+// —— 界面上没有任何地方显示 degraded，用户只会看到实例「变空了」。
+// 完整覆盖见 tests/store-degraded.test.js。
+test('store re-upsert keeps rows of degraded domains only', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  const rows = normalize({
+    homeId, homePath: '/mock/home', generatedAt: new Date().toISOString(),
+    wsVersion: 999, pcVersion: 3,
+    workspaces: [], sessions: [], modelTier: null,
+    providers: [], degraded: [{ domain: 'workspace', error: 'gone', degraded: true }],
+  });
+  store.upsertRows(rows);
+  assert.equal(store.listWorkspaces().length, 2, 'workspace 降级 → 保留旧行（seed 建了 2 个工作区）');
+  assert.equal(store.recentSessions({}).length, 0, 'projcache 未降级 → 照常按快照替换');
   assert.equal(store.listHomes()[0].status, 'degraded');
   store.close();
 });
@@ -278,7 +298,10 @@ test('store usageTrendGrouped buckets by dimension (total/project/instance/provi
 
   const model = store.usageTrendGrouped({ dimension: 'model', hours: 24 });
   const mg = groupsOf(model);
-  assert.ok(mg.has('m'), 'model groups include the home default-tier model (m)');
+  // Model 维度的取值来源只有**当前档位配置**（会话真实模型在 .zstd 日志里，而本项目硬性规则
+  // 是永不碰它）。所以标签必须自带「（档位推定）」后缀，与事实区分开：
+  // 它既不是该会话真实用过的模型，还会随用户改默认模型而改写历史。
+  assert.ok(mg.has('m（档位推定）'), `model groups 必须标注档位推定，got ${[...mg].join('/')}`);
 
   const instance = store.usageTrendGrouped({ dimension: 'instance', hours: 24 });
   const ig = groupsOf(instance);
@@ -356,5 +379,115 @@ test('store localPort: 本机直连端口 round-trip（register/list/update/clea
   // 清空（null）→ 回到「新拉起」语义
   store.updateHomeConfig(homeId, { localPort: null });
   assert.equal(store.getHome(homeId).localPort, null);
+  store.close();
+});
+
+// getHome 必须是**点查**，不能实现成 listHomes().find(...)。
+// listHomes 对每个实例都要跑 providers / activeTier / currentSession 三条语句加两次 JSON.parse，
+// 而 live-poller 每约 3s 就会对每个实例多次调用 getHome：十几个实例时就是每轮十几毫秒的同步阻塞
+// （node:sqlite 是同步 API，直接卡住事件循环 —— SSE、HTTP、监控心跳一起等）。
+// 这里用「把 listHomes 换成一调用就抛」来结构性地钉住这一点，不依赖计时（避免慢机器误报）。
+test('getHome is a point query and never goes through listHomes', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  const original = store.listHomes;
+  store.listHomes = () => { throw new Error('getHome must not call listHomes'); };
+  try {
+    const home = store.getHome(homeId);
+    assert.equal(home.homeId, homeId);
+    assert.equal(home.sessionCount, 2, '点查也必须带上同一套派生字段');
+    // node:sqlite 返回 null-prototype 行，先摊平成普通对象再比较
+    assert.deepEqual(home.providers.map((p) => ({ ...p })), [{ homeId, ref: 'DEEPSEEK_API_KEY', provider: 'deepseek' }]);
+    assert.equal(home.activeTier.tierId, 'std');
+    assert.equal(store.getHome('does-not-exist'), null);
+    assert.equal(store.getHome(''), null, '空 id 直接返回 null，不查库');
+  } finally {
+    store.listHomes = original;
+  }
+  store.close();
+});
+
+test('getHome and listHomes agree on the enriched shape', () => {
+  const store = new IndexStore(':memory:');
+  const homeId = seed(store);
+  const fromList = store.listHomes().find((h) => h.homeId === homeId);
+  const fromPoint = store.getHome(homeId);
+  assert.deepEqual(JSON.parse(JSON.stringify(fromPoint)), JSON.parse(JSON.stringify(fromList)),
+    '两条路径必须返回完全一致的实例视图');
+  store.close();
+});
+
+// 实例维度按 `basename(homePath)` 打标签，而 dsh 的默认 home 目录就叫 `.dsh` ——
+// 两个实例（不同用户/项目下的 .dsh）会得到同一个标签，图例上被**合并成一条**（实测 1000+7000
+// 画成一条 `.dsh: 8000`）。撞名时必须补一段标识，而不是让数字悄悄合到一起。
+test('usageTrendGrouped: instance 维度不会把同名实例合并成一条', () => {
+  const store = new IndexStore(':memory:');
+  const now = new Date().toISOString();
+  const a = store.registerHome({ homePath: '/Users/alice/.dsh', hostType: 'local' });
+  const b = store.registerHome({ homePath: '/Users/bob/proj/.dsh', hostType: 'local' });
+  const row = (homeId, sessionId, tok) => ({ type: 'session', homeId, sessionId, project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: tok }), contextPressure: null,
+    status: JSON.stringify({ kind: 'idle' }), lastActivity: now, generatedAt: now, liveOnly: 0 });
+  store.upsertRows([row(a, 's1', 1000), row(b, 's2', 7000)]);
+  const g = store.usageTrendGrouped({ dimension: 'instance', hours: 24 });
+  const labels = [...new Set(g.buckets.flatMap((x) => Object.keys(x.groups)))];
+  assert.equal(labels.length, 2, `两个实例应是两条序列，实际 ${JSON.stringify(labels)}`);
+  const total = g.buckets.reduce((acc, x) => acc + x.total, 0);
+  assert.equal(total, 8000, '总量不变（只是拆成两条）');
+  store.close();
+});
+
+// lastActivity 在**未来**（远端实例时钟偏、或 dsh 写了将来时间戳）时，桶号会超出
+// [startHour, endHour]：用量汇总把它算进去了、趋势图却整条丢掉（实测 summary 6000 / trend 0）。
+test('usageTrend/usageTrendGrouped: 未来时间戳不再被趋势图丢掉（与 summary 口径一致）', () => {
+  const store = new IndexStore(':memory:');
+  const h = store.registerHome({ homePath: '/x', hostType: 'local' });
+  const future = new Date(Date.now() + 6 * 3_600_000).toISOString();   // 时钟偏 6 小时
+  store.upsertRows([{ type: 'session', homeId: h, sessionId: 'fut', project: 'p', title: null,
+    tokenUsage: JSON.stringify({ uncachedInputTokens: 6000 }), contextPressure: null,
+    status: JSON.stringify({ kind: 'idle' }), lastActivity: future, generatedAt: future, liveOnly: 0 }]);
+  const sum = store.usageSummary({ days: 30 }).totalTokens;
+  const trend = store.usageTrend({ hours: 24 }).reduce((a, r) => a + r.input + r.output + r.cacheRead + r.cacheWrite, 0);
+  const grouped = store.usageTrendGrouped({ dimension: 'total', hours: 24 }).buckets.reduce((a, x) => a + x.total, 0);
+  assert.equal(sum, 6000);
+  assert.equal(trend, sum, `趋势应与汇总一致，实际 trend=${trend} summary=${sum}`);
+  assert.equal(grouped, sum, `分组趋势应与汇总一致，实际 grouped=${grouped}`);
+  store.close();
+});
+
+// `recentProjects` 的「孤立 workspace」那一半需要 `sessions(homeId, workspaceId)`：
+// 没有它时 SQLite 只能 SCAN 整张 workspaces 表逐行关联。规模审查实测（400k 会话 / 50k workspace）：
+// 那一半本身 **35,340ms** 却产出 0 行，整个查询 44,311ms，期间整个服务停住（并发探针最大停顿 9,758ms）；
+// 加上索引后 35,340ms → 43ms。
+// 这条测试用**自校准 A/B**（同一份数据、同一台机器，只差这个索引）而不是绝对时间阈值 ——
+// 后者在慢机器/负载下会变成假失败。实测对照（20k 会话 / 4k workspace）：368ms → 6ms。
+test('store: recentProjects 的孤立 workspace 查询依赖 idx_sessions_home_ws（自校准 A/B）', () => {
+  const store = new IndexStore(':memory:');
+  const now = new Date().toISOString();
+  for (let h = 0; h < 4; h++) {
+    const homeId = store.registerHome({ homePath: `/p${h}` });
+    const rows = [{ type: 'home', homeId, homePath: `/p${h}`, generatedAt: now, degraded: [] }];
+    for (let w = 0; w < 500; w++) rows.push({ type: 'workspace', homeId, workspaceId: `w${h}-${w}`, title: `W${w}`, path: `/r/p${w}`, project: `p${w}`, archived: 0, sessionCount: 0 });
+    // 只给一半 workspace 造会话：另一半是「孤儿」（recentProjects 仍要按项目聚合出来）
+    for (let s = 0; s < 2500; s++) {
+      rows.push({ type: 'session', homeId, sessionId: `s${h}-${s}`, workspaceId: `w${h}-${s % 250}`, workspaceTitle: 'T',
+        project: `p${s % 250}`, title: `t${s}`, tokenUsage: null, contextPressure: null, status: null,
+        lastActivity: now, generatedAt: now, liveOnly: 0 });
+    }
+    store.upsertRows(rows);
+  }
+  // SCHEMA 里必须带这个索引（新库一建就有）
+  const idx = store.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sessions_home_ws'").get();
+  assert.ok(idx, 'SCHEMA 必须建 idx_sessions_home_ws（否则大库上 recentProjects 会整表扫）');
+
+  const timed = () => { const t = process.hrtime.bigint(); const rows = store.recentProjects({ days: 3650, limit: 50 }); return { ms: Number(process.hrtime.bigint() - t) / 1e6, rows }; };
+  const withIndex = timed();
+  store.db.exec('DROP INDEX idx_sessions_home_ws');
+  const without = timed();
+
+  assert.ok(withIndex.rows.length > 0 && without.rows.length === withIndex.rows.length,
+    `两种情况下结果必须一致（${withIndex.rows.length} vs ${without.rows.length}）`);
+  assert.ok(without.ms > withIndex.ms * 3,
+    `去掉索引后必须明显更慢（有索引 ${withIndex.ms.toFixed(1)}ms、无索引 ${without.ms.toFixed(1)}ms）—— 这条断言就是在守那个索引`);
   store.close();
 });

@@ -41,6 +41,11 @@ systemctl enable --now caddy
 # 浏览器改访问  http://<服务器IP>:3081
 ```
 
+**nginx 版注意**: 该文件里包含一个 `map` 块(用请求里有没有 `Upgrade` 来按需决定
+`Connection` 头),`map` 是 **http 上下文**指令。`conf.d/*.conf` 通常被 include 在 `http{}` 内,
+所以整体拷进去可以;若你的 nginx.conf 把 conf.d 放在别处而报 `"map" directive is not allowed here`,
+就把那个 `map` 块挪到 `nginx.conf` 的 `http{}` 里。改了 `map`/`server` 之后 `nginx -t` 验一下再 reload。
+
 > 资源文件名为 hash 后缀(内容寻址、不可变),所以强缓存安全;
 > 浏览器「本地命中缓存」后,再次打开本页/本实例直接从浏览器缓读取,不用再连服务器。
 
