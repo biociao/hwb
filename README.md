@@ -2,9 +2,6 @@
 
 # hwb — harness workbench
 
-> 版本：**v0.1.1** ｜ Node.js 22.5+ ｜ 原生 ESM ｜ **零 npm 依赖**（用 `node:sqlite`）
-
-
 [![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
 [![version](https://img.shields.io/badge/version-v0.1.1-blue)](CHANGELOG.md)
 [![milestones](https://img.shields.io/badge/milestones-M1%E2%80%93M7-brightgreen)](DSH_Workbench_Fusion_Architecture.md)
@@ -12,12 +9,11 @@
 [![npm deps](https://img.shields.io/badge/npm_deps-0-blue)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-`hwb`（harness workbench）是一个面向 harness工具（目前主要支持的是DeepSeek Harness，即dsh）的**本地工作台**，用于应付需要开启多个dsh实例：它会构建一份本地 SQLite 索引，
-在一个纯元数据仪表盘里跨实例展示**最近项目 / 会话 / 实例状态 / Token 用量**，并通过一个
-**控制平面**去启动、停止、重启 dsh web 进程（本机），或经 SSH 隧道接入**远端** dsh 实例。
+`hwb`（harness workbench）是一个面向 harness工具（目前主要支持的是DeepSeek Harness，即dsh）的**本地工作台**，用于应付需要开启多个dsh实例的情况——当前dsh在项目和任务数增多后会变得难以管理和跟踪。
+`hwb`会构建一份本地 SQLite 索引，在一个纯元数据仪表盘里跨实例展示**最近项目 / 会话 / 实例状态 / Token 用量**，并通过一个**控制平面**去启动、停止、重启 dsh web 进程（本机），或经 SSH 隧道接入**远端** dsh 实例。
 
-它**只读** dsh 的元数据文件，**绝不修改**任何 dsh 文件，也**永不阅读** `.zstd` 会话正文。
-它也不替代 dsh web——只托管它、显示它，让你在一处看全所有实例。
+它**只读** dsh 的元数据文件，保持dsh独立运行，也**不会读取** `.zstd` 会话正文。
+它也不会替代 dsh web——只一站式托管它、快速找到它、直达会话，让你在一处总揽所有实例的工作状态。
 
 > 设计文档（三平面架构、数据模型、控制状态机、里程碑）见
 > [`DSH_Workbench_Fusion_Architecture.md`](DSH_Workbench_Fusion_Architecture.md)；
