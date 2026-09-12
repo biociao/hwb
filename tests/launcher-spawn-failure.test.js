@@ -79,7 +79,27 @@ test('launcher: 子进程被杀后注册表立刻变成 stopped（不再谎报�
   const dir = await mkdtemp(path.join(tmpdir(), 'hwb-launch-exit-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const bin = path.join(dir, 'dsh');
-  await writeFile(bin, '#!/bin/bash\nsleep 30\n');
+  // 假 dsh 必须**自己把真 dsh 启动时会做的两件事做掉**，否则这条用例根本走不到「被杀」那一步：
+  //   ① 往 stdout 打印 `dsh web: <url>?token=…` —— 启动路径的 captureDshToken 就是在等这一行；
+  //   ② 真的在 --port 上监听 HTTP —— 启动路径会 waitForHttp 探测这个地址，成功后再做
+  //      #assertAuthorized（任何 <400 都算通过）与 probeDeeplink（正文里要出现 session-deeplink）。
+  // 这条夹具以前只是 `sleep 30`，却一直"绿"：Launcher 忽略了注入的 env，spawn 用的是**本机
+  // PATH 里的真 dsh**，上面两件事都是真 dsh 做的，用例其实在"借"本机装好的 dsh 跑。
+  // CI 上没有 dsh，于是 `spawn dsh ENOENT` 变红（2026-09-13 定位并修好 env 注入 + 本夹具）。
+  // 用 process.execPath 做 shebang：不依赖 PATH 里有 node（复现 CI 时会把 PATH 清空到只有 /usr/bin）。
+  await writeFile(bin, `#!${process.execPath}
+const http = require('node:http');
+const argv = process.argv.slice(2);
+const i = argv.indexOf('--port');
+const port = i >= 0 ? Number(argv[i + 1]) : 0;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html' });
+  res.end('<!doctype html><title>fake dsh web</title><div id="session-deeplink"></div>');
+});
+server.listen(port, '127.0.0.1', () => {
+  console.log('dsh web: http://127.0.0.1:' + port + '/?token=fake-token-for-test');
+});
+`);
   await chmod(bin, 0o755);
   const registry = new InstanceRegistry();
   const store = new IndexStore(':memory:');

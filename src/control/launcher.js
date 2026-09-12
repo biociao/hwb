@@ -21,7 +21,7 @@ const STOP_KILL_MS = 2000;
 // 进程句柄存 this.procs；控制状态（phase/url/port/pid）写入共享 registry，
 // 由 Monitor 推进状态机。stop 前经 guard 指纹校验，防误杀。
 export class Launcher {
-  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy, stopTermMs = STOP_TERM_MS, stopKillMs = STOP_KILL_MS } = {}) {
+  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy, stopTermMs = STOP_TERM_MS, stopKillMs = STOP_KILL_MS, env = null } = {}) {
     this.registry = registry;
     this.tunnelFactory = tunnelFactory;
     this.remotePathExists = remotePathExists;
@@ -34,6 +34,14 @@ export class Launcher {
     this.proxyFactory = proxyFactory; // 可注入：预览代理的建立是异步的，竞态需要能被测试复现
     this.stopTermMs = stopTermMs;     // 可注入：测试不该为「忽略信号的子进程」真的等 5 秒
     this.stopKillMs = stopKillMs;
+    // 子进程环境**可注入**：spawn 读的是下面 #spawnLocalDsh 里那份 env，而它一直写死
+    // `{...process.env, DSH_HOME}`，于是测试传进来的 `env: {PATH: '<假 dsh 目录>:…'}`
+    // 被**静默忽略**（对象里多一个键不会报错）。
+    // 后果不是「测试少覆盖一点」，而是测试在有的机器上**根本没在测它要测的东西**：
+    // 夹具的假 dsh 没人用，spawn 走的是本机 PATH 里的**真 dsh** —— 本机有 dsh 就绿、
+    // CI 上没有 dsh 就 `spawn dsh ENOENT` 变红（实测：同一份代码本机 660 例全绿、
+    // GitHub runner 上 launcher-spawn-failure 的第三条失败）。所以这里把它做成真的开关。
+    this.env = env;
     this.procs = new Map(); // homeId -> { pid, port, url, proc, deeplink, kind }
     process.on('exit', () => {
       for (const inst of this.procs.values()) {
@@ -379,7 +387,8 @@ export class Launcher {
     // 本机默认带 `--no-open`，避免 hwb 之外再弹一个浏览器标签。
     const args = ['web', '--port', String(port), ...(noOpen ? ['--no-open'] : [])];
     const proc = spawn('dsh', args, {
-      env: { ...process.env, DSH_HOME: home.homePath },
+      // 注入的 env 覆盖 process.env；DSH_HOME 放最后 —— 它是这个实例的身份，不许被覆盖。
+      env: { ...process.env, ...(this.env ?? {}), DSH_HOME: home.homePath },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stderr = '';
