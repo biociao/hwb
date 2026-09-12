@@ -40,6 +40,17 @@ const DIM_LABELS = { total: '总 Tokens', project: '项目', provider: 'LLM prov
 // 稳定的曲线/点颜色：按分组标签记色，跨重渲染同色（复用实例/项目 chip 配色）。
 const colorOf = (label) => chipColor(label).fg;
 
+// 图例/悬停用的**显示名**：分组键要保持原样（它是 SQL 聚合出来的、用于跨维度稳定配色的标识），
+// 只在展示时替换成人能读懂的说明。
+// unknown 不是一个模型名：它表示这个实例没有 model-tier.json（读不到档位配置），
+// 而「按 Model」这一维的取值来源本来就只有档位配置 —— 把它当一个模型列进图例，
+// 用户只会以为工作台把某个模型叫成了 unknown。
+// 另外：标签里的「（档位推定）」后缀来自后端，那是当前 default 档的模型名，
+// **不是**该会话真实用过的模型，别当成事实读（为什么不去读会话日志取真实模型，见 store.js
+// usageTrendGrouped 与 CHANGELOG 里那条被否决的方案）。
+const GROUP_LABELS = { unknown: '未识别（该实例未配置模型档位）' };
+const labelOf = (g) => GROUP_LABELS[g] ?? g;
+
 
 // 统计周期：过去 24h / 3天 / 7天 / 14天 / 30天。
 // hours 驱动「用量趋势」点图，days 驱动「汇总 + 按项目」统计，两者统一切换保持一致。
@@ -169,7 +180,7 @@ export function usageTrendHtml(usage, dim = 'total') {
     const pct = max > 0 ? (v / max) * 100 : 0;
     // 数据点悬停显示详细信息：时间 · 分组 · 用量 · 占峰值百分比（交由前端 tooltip 渲染）。
     return `<i class="trend-dot" style="left:${p.x}%;bottom:${bottomOf(v)}%;background:${colorOf(s.g)}"
-        data-name="${axisLabel(data[i].ts, stepMs)} · ${esc(s.g)}" data-tok="${esc(fmtTokens(v))}" data-pct="${pct.toFixed(1)}"></i>`;
+        data-name="${axisLabel(data[i].ts, stepMs)} · ${esc(labelOf(s.g))}" data-tok="${esc(fmtTokens(v))}" data-pct="${pct.toFixed(1)}"></i>`;
   })).join('');
 
   // X 轴标签：**必须与散点用同一个 x 函数**（pxAt）。散点按时间定位，而标签原先只是 n 个 flex:1
@@ -196,7 +207,7 @@ export function usageTrendHtml(usage, dim = 'total') {
     (f) => `<i class="trend-gridline" style="bottom:${f * 100}%"></i>`
   ).join('');
   const legend = groups.map(
-    (g) => `<span class="trend-legend-item"><i style="background:${colorOf(g)}"></i>${esc(g)}</span>`
+    (g) => `<span class="trend-legend-item"><i style="background:${colorOf(g)}"></i>${esc(labelOf(g))}</span>`
   ).join('');
   const isStacked = dim !== 'total';
   // 空桶（按 0 连线）必须配一行口径说明：否则「曲线掉到 0」会被读成「那段时间没用」，

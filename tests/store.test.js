@@ -298,7 +298,10 @@ test('store usageTrendGrouped buckets by dimension (total/project/instance/provi
 
   const model = store.usageTrendGrouped({ dimension: 'model', hours: 24 });
   const mg = groupsOf(model);
-  assert.ok(mg.has('m'), 'model groups include the home default-tier model (m)');
+  // Model 维度的取值来源只有**当前档位配置**（会话真实模型在 .zstd 日志里，而本项目硬性规则
+  // 是永不碰它）。所以标签必须自带「（档位推定）」后缀，与事实区分开：
+  // 它既不是该会话真实用过的模型，还会随用户改默认模型而改写历史。
+  assert.ok(mg.has('m（档位推定）'), `model groups 必须标注档位推定，got ${[...mg].join('/')}`);
 
   const instance = store.usageTrendGrouped({ dimension: 'instance', hours: 24 });
   const ig = groupsOf(instance);

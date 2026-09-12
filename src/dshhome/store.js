@@ -1103,6 +1103,24 @@ export class IndexStore {
     const endBucket = Math.floor(now / stepMs);      // 当前桶索引（对齐 UTC 纪元）
     const startBucket = endBucket - bucketCount + 1;
     const startIso = new Date(startBucket * stepMs).toISOString();
+    // 「按 Model」只能拿到**当前档位配置**，不是会话真实用的模型 —— 这一点必须让用户看得见。
+    //
+    // 会话真实用过的模型只在会话日志（`sessions/<项目>/<会话>/session.jsonl.zstd`）里，
+    // 而本项目的硬性规则是**永不碰 `*.zstd`**（README「Reader 只读取以下 4 个文件」/ docs/topology /
+    // 架构文档 §数据源，共 8 处）：工作台活在投影缓存（projection cache）第一层，绝不下探日志。
+    // 这条规则不是洁癖 —— 日志格式是 dsh 的内部细节（多帧拼接的 zstd，node 的
+    // zstdDecompressSync 只解第一帧就静默返回），下探它等于把仪表盘绑在一个随时会变的实现上。
+    // 2026-09-13 曾实现过「解压日志取真实模型」并实测有效（Model 维度 2 项 → 7 项），
+    // 因为它与这条规则直接冲突而**整体回退**（详见 CHANGELOG 该条）。
+    //
+    // 所以这里改为**如实标注来源**：model_tiers 是当前 model-tier.json 的 default 档，标成
+    // 「<模型>（档位推定）」；读不到档位配置的实例标成 'unknown'（前端显示为
+    // 「未识别（该实例读不到会话日志）」，而不是把它当成一个模型名列进图例）。
+    // 为什么不用「看起来更干净」的裸模型名：那会让读者以为这是事实，而它还会随用户改默认模型
+    // 而**改写历史**（model_tiers 每次索引整表重建）。
+    const tierModel = `(SELECT NULLIF(model, '') FROM model_tiers t
+               WHERE t.homeId = s.homeId AND t.active = 1
+               ORDER BY CASE WHEN t.tierId = 'default' THEN 0 ELSE 1 END LIMIT 1)`;
     const groupExpr = dimension === 'instance'
       ? 's.homeId'
       : dimension === 'provider'
@@ -1114,9 +1132,7 @@ export class IndexStore {
              'unknown')`
         : dimension === 'model'
           ? `COALESCE(
-               (SELECT NULLIF(model, '') FROM model_tiers t
-                 WHERE t.homeId = s.homeId AND t.active = 1
-                 ORDER BY CASE WHEN t.tierId = 'default' THEN 0 ELSE 1 END LIMIT 1),
+               CASE WHEN ${tierModel} IS NULL THEN NULL ELSE ${tierModel} || '（档位推定）' END,
                'unknown')`
           : dimension === 'total'
             ? "'合计'"
