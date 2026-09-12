@@ -13,6 +13,7 @@ import { logInit, logRefresh, appendLog, setLogFilter, toggleLogFollow, clearLog
 import { captureFormDraft, restoreFormDraft } from './components/form-draft.js';
 import { createUsageCache } from './components/usage-cache.js';
 import { createNote } from './components/note.js';
+import { planFrameEviction, touchFrameOrder, resolveMaxLiveFrames } from './frame-budget.js';
 
 const main = document.getElementById('main');
 const dashboardEl = document.getElementById('dashboard');
@@ -57,10 +58,15 @@ function fetchUsage({ force = false } = {}) {
 let usageDim = 'total';
 // 当前统计周期（过去 24h / 3天 / 7天 / 14天 / 30天）。hours 驱动趋势图，days 驱动汇总/按项目。
 let usagePeriod = USAGE_PERIODS[0];
-// 视图：工作台（纯元数据，零 iframe）或某个实例（持久 iframe，切走只隐藏不销毁）
+// 视图：工作台（纯元数据，零 iframe）或某个实例（热 iframe，切走只隐藏；超出预算才释放）
 let view = { kind: 'dashboard' };
 // 每个已打开实例一个持久 iframe 面板：homeId -> { el, iframe, url, sessionId }
 const panes = new Map();
+// 活跃 iframe 的 LRU 顺序（最旧 → 最新）与预算。见 frame-budget.js：每个 iframe 都是一整个
+// dsh web SPA，无上限地留着会把浏览器内存拖爆（Safari 会直接重载页面）。
+const MAX_LIVE_FRAMES = resolveMaxLiveFrames(window.location.search);
+let frameOrder = [];
+let frameReleased = 0; // 累计释放次数（只被 __hwbFrameBudget 读出用于排查/测量，不参与逻辑）
 window.addEventListener('message', (event) => {
   const type = event.data?.type;
   if (!['hwb:file-preview', 'hwb:preview-context', 'hwb:open-workspace'].includes(type)) return;
@@ -150,7 +156,7 @@ function renderTabs() {
     const externalUrl = active && (pane?.externalUrl || pane?.url);
     return `<button class="tab ${active ? 'active' : ''}" draggable="true"
                     data-action="nav-instance" data-home-id="${esc(h.homeId)}"
-                    title="${esc(h.homePath)}${rt === 'unreachable' ? ' · 连接暂时无响应，等待恢复' : ''}">
+                    title="${esc(h.homePath)}${rt === 'unreachable' ? ' · 连接暂时无响应，等待恢复' : ''}${pane?.released ? ' · 已释放内存（重新进入时重新加载）' : ''}">
       <span class="dot ${esc(rt)}"></span>
       <span class="label">${tabLabel(h)}</span>
     </button>${externalUrl ? `<button class="tab tab-popout" data-action="popout"
@@ -159,13 +165,18 @@ function renderTabs() {
   tabs.innerHTML = dashboard + inst;
 }
 
-// 切换视图：只显示/隐藏面板，绝不销毁 iframe（持久化，不重载）
+// 切换视图：只显示/隐藏面板，不销毁**热** iframe（持久化，不重载）。
+// 但「热」是有预算的：进入某个实例即把它标成最近使用，超预算的按 LRU 释放 iframe
+// （releasePaneFrame）—— 保留标签页与会话 id，重新进入时重新挂载。
 function showView() {
   dashboardEl.hidden = view.kind !== 'dashboard';
+  const activeId = view.kind === 'instance' ? view.homeId : null;
+  if (activeId) frameOrder = touchFrameOrder(frameOrder, activeId);
   for (const [homeId, pane] of panes) {
-    pane.el.hidden = !(view.kind === 'instance' && view.homeId === homeId);
-    pane.preview.toggle.hidden = pane.el.hidden;
+    pane.el.hidden = homeId !== activeId;
+    if (pane.preview) pane.preview.toggle.hidden = pane.el.hidden;
   }
+  enforceFrameBudget();
 }
 
 async function refresh() {
@@ -402,7 +413,53 @@ function destroyPane(homeId) {
   pane.preview?.dispose();
   pane.el.remove();
   panes.delete(homeId);
+  frameOrder = frameOrder.filter((id) => id !== homeId);
 }
+
+// 释放一个面板的 iframe：**只拆 iframe 与预览侧栏**，标签页、入口 URL、会话 id 全部保留。
+// 这是超预算时的动作（见 frame-budget.js 与 enforceFrameBudget）——留着 iframe 的代价是一整个
+// dsh web SPA 常驻内存（实测单个可达数百 MB），而重新进入的代价只是一次重载（有 session 深链时
+// 还回到同一个会话）。故意不复位 _cookieReady：cookie 属于浏览器不属于 iframe，重新挂载时
+// 仍然是「已认证」状态，深链可以一次直达（见 instance-navigation.planPaneNavigation）。
+function releasePaneFrame(homeId) {
+  const pane = panes.get(homeId);
+  if (!pane?.iframe) return;
+  pane.iframe.remove();        // 真正的回收点：iframe 一离开文档，它的 SPA/文档/JSScript 都能被回收
+  pane.iframe = null;
+  pane.preview?.dispose();     // 释放预览侧栏持有的图片 objectURL / 拖拽监听
+  pane.preview = null;
+  pane.el.querySelector('.file-preview')?.remove();
+  pane.el.classList.remove('has-preview');
+  pane._iframed = false;
+  pane._navTarget = null;
+  pane._navStep = 0;
+  pane.released = true;        // 供标签页提示与排查用（重新挂载时清掉）
+  const cover = pane.el.querySelector('.frame-cover');
+  if (cover) cover.hidden = true;
+  // 占位文案复位：mountPane 会把它移除后再挂 iframe，于是「重新进入」看见的是加载态而不是白板。
+  if (!pane.el.querySelector('.frame-loading')) {
+    pane.el.insertAdjacentHTML('afterbegin', '<div class="frame-loading">连接 dsh web…（已释放内存，重新加载中）</div>');
+  }
+  frameOrder = frameOrder.filter((id) => id !== homeId);
+  frameReleased++;
+}
+
+// 预算执行：只保留最近使用的 MAX_LIVE_FRAMES 个 iframe，其余释放。
+// 正在看的那个永不释放（否则当前页面会白屏），因此 keep 由 view 决定。
+function enforceFrameBudget() {
+  const live = frameOrder.filter((id) => panes.get(id)?.iframe);
+  const activeId = view.kind === 'instance' ? view.homeId : null;
+  for (const id of planFrameEviction(live, { limit: MAX_LIVE_FRAMES, keep: [activeId] })) releasePaneFrame(id);
+}
+
+// 排查/测量钩子：控制台里 `__hwbFrameBudget()` 直接看到当前预算与活跃 iframe 数
+// （scripts/memory-check.mjs 也读它做断言）。只读，不暴露任何可变状态。
+window.__hwbFrameBudget = () => ({
+  limit: MAX_LIVE_FRAMES,
+  live: frameOrder.filter((id) => panes.get(id)?.iframe).length,
+  order: [...frameOrder],
+  released: frameReleased,
+});
 
 function mountPane(homeId, url, sessionId, pane, force = false) {
   const navigation = planPaneNavigation(pane, url, sessionId, force);
@@ -417,6 +474,13 @@ function mountPane(homeId, url, sessionId, pane, force = false) {
     pane.el.appendChild(iframe);
     pane.iframe = iframe;
     iframe.addEventListener('load', () => onFrameLoad(pane));
+    pane.released = false;
+    // 面板的预览侧栏是随 iframe 一起被 releasePaneFrame 拆掉的（它持有图片 objectURL 与
+    // 拖拽监听），重新挂载时必须重建 —— 否则「重新进入」后点会话里的文件路径会毫无反应。
+    if (!pane.preview) {
+      pane.preview = attachFilePreview(pane, homeId);
+      pane.preview.toggle.hidden = pane.el.hidden;
+    }
   }
 
   pane.url = url;
@@ -434,6 +498,9 @@ function mountPane(homeId, url, sessionId, pane, force = false) {
     if (force || pane.iframe.src !== firstTarget) pane.iframe.src = firstTarget;
   }
 
+  // 这个面板是「刚用过」的：记账 + 立刻执行预算（挂载本身就把活跃数推高了一个）。
+  frameOrder = touchFrameOrder(frameOrder, homeId);
+  enforceFrameBudget();
 }
 
 async function enterInstance(homeId, extra = {}) {
