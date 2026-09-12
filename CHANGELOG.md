@@ -167,6 +167,45 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
 
 细节见下面各条（每条都写了现象、根因、修复与回归测试）。
 
+### Fixed
+#### 前端内存：实例 iframe 无上限常驻，Safari 直接以「占用过多内存」重载页面
+- **现象**：Safari 弹出「此网页使用了大量内存，已重新载入」。实测定位到一个
+  `com.apple.WebKit.WebContent` 进程 **RSS 2.3 GB / 26% CPU 常驻 7 小时**
+  （`ps -Ao pid,rss,pcpu,etime,command`），同时 `dsh web` 服务端进程 1.2 GB。
+- **根因**：每个实例面板的 iframe 都是一整个 dsh web SPA（自带实时通道、会话 DOM、插件脚本），
+  而前端对它的策略是「切走只 hidden、**永不销毁**」——隐藏的 iframe 不是冻结快照，照旧跑定时器；
+  于是浏览器内存随**访问过的实例数**单调增长、且永不归还。5 个实例全部访问过之后，
+  单个 WebContent 进程就被推到了 2 GB 量级。
+- **修复**：新增 `src/web/frame-budget.js`（纯函数策略）+ `app.js` 的记账与释放路径。
+  活跃 iframe 数有预算（默认 3 = 当前 + 2 个热的），超出的按 **LRU** 释放：
+  只拆 iframe 与预览侧栏（`releasePaneFrame`），标签页、入口 URL、会话 id 全部保留，
+  重新进入时按 `pane.sessionId` 重新挂载（dsh 支持会话深链时回到同一会话）；
+  **正在看的面板永不释放**（否则当前页面白屏），cookie 状态故意不复位（重新进入时少一次重定向）。
+  释放过的标签在悬停提示里标出「已释放内存（重新进入时重新加载）」。
+  `?frames=N` 可临时调整预算（同时作为内存对照实验的开关）；`window.__hwbFrameBudget()`
+  暴露只读的预算/活跃数/已释放数。
+- **回归**：
+  - 单元测试 `tests/frame-budget.test.js`（7 例）覆盖预算解析（0/负数/小数/NaN 一律回退默认，
+    且上限 64 防呆）、LRU 记账、超预算淘汰顺序、keep 保护与非法预算不误伤；
+  - 真浏览器对照检查 `scripts/memory-check.mjs`（13 项断言）：隔离 hwb + PATH 里的假 dsh +
+    headless Chrome，同一批实例分别用「默认预算」与「预算 64（≈旧的无上限行为）」跑，
+    依次点开每个实例标签。**5 实例 × 96MB/SPA 的实测**：默认预算 3 时活跃 iframe 3 个、
+    活着的实例页面 3 个、Chrome 进程树 RSS **+214 MB**；预算 64 时 5 个全部常驻、
+    RSS **+386 MB**（并以 4/2 预算的组合复验过一次：+422 vs +210）；
+  - 同一条检查还验证了「释放之后那个 SPA 真的卸载了」（假 SPA 每 2s 打心跳、卸载时
+    `sendBeacon` 注销，由**服务端**观测，不靠 DOM 推断），以及**回访被释放的实例能重新挂载并重新加载**。
+
+#### SSH 隧道必须独占连接：复用 master 会让 ssh 立即退出，hwb 自己判自己失败（src/control/tunnel.js）
+- **现象**：远端实例连不上，报 `ssh exited early`——**而端口其实已经在转发**（是 hwb 自己把自己判失败的）。
+- **根因**：上一节「SSH 连接层统一」加的复用（`ControlMaster=auto` + `ControlPersist=300`）对**短命令**是对
+  （省掉每次 12–25s 握手），但对「必须常驻的隧道所有者进程」是错的：一旦 master 已存在
+  （抓 token / 探活会先建一条并保活 5 分钟），`ssh -o ControlMaster=auto -N -L …` 就退化成**从连接**——
+  把 `-L` 请求交给 master 后**立即以 code 0 退出、stderr 为空**；launcher 的 `assertCurrent()`
+  见到 `proc.exitCode !== null` 就抛 `ssh exited early`。
+  复现：master 存在时该命令 exit 0，不存在时才常驻（`2026-09-12` 实测）。
+- **修复**：隧道显式 `sshOpts({ host, mux: false })`——永远自建连接并持有它，配合 `ConnectTimeout=30`
+  承受高延迟链路的握手。即「复用只给短命令，隧道不参与复用」。
+
 ### Added
 #### 统一管理命令 `hwb`
 - `hwb start | stop | restart | status | logs | config | doctor | upgrade | test`，以及 `hwb serve`
@@ -244,6 +283,22 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
   副本：原 buffer → base64 字符串（1.33×）→ `JSON.stringify` 的结果（又一份）→ 调用方再解一遍，
   实测 64 MiB 文件额外堆占用约 170 MiB（合计约 235 MB 峰值）。远端仍用 base64（ssh 传输需要），
   调用方按类型分别处理。实测本机 64 MiB 下载的 RSS 增量从 ~235 MB 降到 64 MB。
+
+### Added
+
+#### 文件预览支持 HTML 渲染显示（src/lib/file-preview.js + src/api/routes.js + src/web/components/preview-html.js）
+- **问题**：HTML 之前落进纯文本分支，只能看到前 24 KiB 的 raw content（实测的 ver17 评估报告有 8.6 MB），
+  想看渲染结果只能先下载再用浏览器打开。
+- **修复**：新增 `kind: 'html'`（`.html` / `.htm` / `.xhtml`，上限 32 MiB）：预览时只回「是 HTML + 大小 + MIME」，
+  正文交给新增的 `GET /api/homes/{homeId}/asset` 按真实 MIME 原字节返回，前端用 `<iframe>` 渲染；
+  工具栏提供「渲染 / 源码（前 24 KiB，带行号）/ 在浏览器打开 / 下载完整文件」，源码按需再取一次
+  （`text=1` 显式请求文本，否则 `.html` 只会返回没有正文的元数据）。
+- **安全**：`/asset` 仍是只读 + 只限工作区内 + 强制同源，并带
+  `Content-Security-Policy: sandbox ... allow-popups`（脚本不执行、不能导航顶层窗口）；
+  前端 iframe 也加 `sandbox="allow-popups allow-popups-to-escape-sandbox"`。
+  因此预览外部来源的 HTML 不会拿到 hwb 的 API；`X-Content-Type-Options: nosniff` / `X-Frame-Options: SAMEORIGIN` 同时下发。
+- **测试**：`tests/html-preview.test.js`（本机 + 远端各 3 例：识别成 html、raw 回完整字节、超限拒绝；
+  以及 `/asset` 的 MIME/安全头/越界/跨站/目录拒绝）。远端路径复用同一套 Python 脚本，raw 与 download 同源取全量字节。
 
 ### Notes
 - 远程实例的上传**内容经命令行参数按 512 KiB 分片传输**（远端先分片落盘到临时目录再合并）。
@@ -2124,6 +2179,26 @@ web+dshhome / 前端与 SSE ×2 / 文档一致性 / 服务生命周期 / 预览�
 - **回归测试**：`tests/file-preview-ui.test.js`（最小假 DOM + 假 fetch）覆盖三种情形：
   未上报会话时按工作区兜底、上报会话时优先跟随会话、实例没有任何工作区时给明确提示而不崩。
 
+
+#### 文件路径点击不再漏给 dsh 的原生「用系统应用打开」（src/web/preview-bridge.js）
+- **现象**：在远端实例里点会话中的文件路径，弹出
+  `path open failed: … xdg-open: 882: www-browser: not found …`，文件打不开。
+  这是 dsh 自己调用**宿主操作系统**的打开方式（`host.openPath` → `xdg-open`）——
+  而无 GUI 的远端 Linux 上 `xdg-open` 必然失败，所以只能拿到这句英文报错。
+- **根因**：桥接脚本此前只在 `window` 上挂了一个 capture 的 click 监听，并且只认
+  `aria-label === '打开 ' + title` / `Open ` + title 这一种精确文案。实测（真实 Chrome +
+  经 hwb 代理的 dsh 页面）：在同一份代码里 **`document` 上的 capture 监听能拦到点击，
+  而 `window` 上的那次没有生效**；文案一旦不是精确匹配（不同入口/版本的按钮文字不同），
+  点击就会漏给 dsh 的原生处理，于是出现上面的 xdg-open 报错。
+- **修复**：① 把「点击 → 上报」抽成 `handleFileClick`，**`window` 与 `document` 各挂一次**
+  capture 监听（后者看到 `defaultPrevented` 就退出，不会重复上报）；
+  ② 识别放宽为「产物行 chip / aria 文案是『打开 <路径>』/ 按钮显示的名字就是该路径」三者之一，
+  同时仍排除 `http(s)://` 链接与「打开侧边栏」这类无关按钮；
+  ③ 新增失败提示兜底：dsh 弹出 `path open failed` 时，就地补一个「用 hwb 文件预览打开」按钮，
+  把提示里的绝对路径直接送进侧栏预览——即使某个入口的点击识别没覆盖到，用户也打不开不了文件。
+- **测试**：`tests/preview-bridge.test.js` 重写为 8 例（假 DOM），覆盖 mention 的
+  `code>button` 形态、产物 chip、data-path / a[href] / 裸 code 文本、带行号路径、
+  不误伤「打开侧边栏」与 Cmd+点击、失败弹窗兜底（含点击兜底按钮会发出预览请求）。
 
 #### 根因记录：「跟随 dsh 会话」为何会失效（证据）
 该 dsh 客户端的全部客户端 bundle（主 bundle + 40 余个 `plugins/@deepseek-ai/*/client.js`）里
