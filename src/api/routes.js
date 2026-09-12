@@ -48,6 +48,20 @@ function mergeEndpointTokens(input, existing = []) {
   });
 }
 
+// 预览资源（/asset）按扩展名给 Content-Type：HTML 必须是 text/html 浏览器才会渲染，
+// 其余按常见文本/图片类型；未知类型一律 application/octet-stream（配合 nosniff 不会被执行）。
+const PREVIEW_MIME = {
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8', '.xhtml': 'application/xhtml+xml',
+  '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8', '.csv': 'text/plain; charset=utf-8', '.xml': 'application/xml; charset=utf-8',
+  '.pdf': 'application/pdf', '.woff': 'font/woff', '.woff2': 'font/woff2',
+};
+function mimeFor(file) {
+  return PREVIEW_MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
+}
+
 function send(res, status, body) {
   const json = JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -153,6 +167,15 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
   // 上传并发上限（见 upload 路由里的说明）。默认 1：最坏内存 ≈ 单次上限（256 MiB → ~1.1 GiB）。
   const MAX_CONCURRENT_UPLOADS = maxConcurrentUploads;
   let uploadsInFlight = 0;
+  // 预览族接口（preview/download/asset/upload）共用的「解析目标工作区」：
+  // 优先按会话（sessionId）解析它所属的 project 工作区，否则按显式 workspaceId 解析。
+  function resolveWorkspace(home, searchParams) {
+    const workspaces = store.listWorkspaces({ homeId: home.homeId });
+    const sessionId = searchParams.get('sessionId');
+    return sessionId
+      ? sessionWorkspace(workspaces, store.getSession(home.homeId, sessionId))
+      : workspaces.find((w) => w.workspaceId === searchParams.get('workspaceId'));
+  }
   // 定向重索引常常是 fire-and-forget（远程要等 SSH 超时，不能阻塞响应）。
   // 但「不 await」不等于「不管」：返回的 promise 一旦拒绝就是未处理拒绝，
   // 会被 crash handler 记成 fatal 并掩盖真正的失败原因。这里统一吞掉——
@@ -228,7 +251,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
 
-    const preview = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(preview|download)$/);
+    const preview = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(preview|download|asset)$/);
     if (req.method === 'GET' && preview) {
       res.setHeader('Cache-Control', 'no-store');
       if (req.headers['sec-fetch-site'] === 'cross-site') {
@@ -236,13 +259,22 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       const home = store.getHome(preview[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
-      const workspaces = store.listWorkspaces({ homeId: home.homeId });
-      const sessionId = searchParams.get('sessionId');
-      const workspace = sessionId
-        ? sessionWorkspace(workspaces, store.getSession(home.homeId, sessionId))
-        : workspaces.find((w) => w.workspaceId === searchParams.get('workspaceId'));
-      if (!workspace?.path) { send(res, 400, { error: '当前会话尚未关联可用的 project 工作区，请先在 dsh 中打开项目会话' }); return; }
+      const workspace = resolveWorkspace(home, searchParams);
+      if (!workspace?.path) { send(res, 400, { error: '尚未绑定可用的 project 工作区：请先在 dsh 中打开项目会话，或在上方选择工作区' }); return; }
       try {
+        if (preview[2] === 'asset') {
+          // HTML 渲染预览的「原字节」通道：按真实 MIME 返回，供 <iframe> 直接渲染。
+          // 仍是只读 + 工作区内 + 强制同源；并且 CSP sandbox 会禁掉脚本，
+          // 所以即使预览的是外部给的可疑 HTML，也拿不到 hwb 自己的 API。
+          const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { raw: true });
+          const bytes = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data, 'base64');
+          res.writeHead(200, { 'Content-Type': mimeFor(result.path), 'Content-Length': bytes.length,
+            'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none'; img-src data: blob: 'self'; style-src 'unsafe-inline' 'self'; font-src data: 'self'",
+            'X-Frame-Options': 'SAMEORIGIN' });
+          res.end(bytes);
+          return;
+        }
         if (preview[2] === 'download') {
           const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { download: true });
           const name = encodeURIComponent(path.basename(result.path)).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16));
@@ -254,7 +286,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
           res.end(bytes);
           return;
         }
-        send(res, 200, { ...await readFilePreview(home, workspace.path, searchParams.get('path') || '.'),
+        // text=1：显式要文本（HTML 的「源码」视图），否则 .html 会走渲染预览那条路。
+        send(res, 200, { ...await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined,
+            { text: searchParams.get('text') === '1' }),
           workspace: { workspaceId: workspace.workspaceId, title: workspace.title, path: workspace.path } });
       } catch (e) { send(res, 400, { error: e.message }); }
       return;

@@ -1,6 +1,7 @@
 import { api, esc } from '../store.js';
 import { attachPreviewResize } from './preview-resize.js';
 import { renderPreviewImage } from './preview-image.js';
+import { renderPreviewHtml } from './preview-html.js';
 
 // 与后端 src/lib/file-preview.js 的 UPLOAD_BYTES 保持一致：拖入超限文件时在本地就给提示，
 // 不必先把几百 MiB 发给服务端再被拒。服务端仍是唯一权威（它自己也会挡）。
@@ -223,6 +224,16 @@ export function attachFilePreview(pane, homeId) {
       } else if (result.kind === 'image') {
         content.innerHTML = `<p class="preview-meta">${result.size.toLocaleString()} 字节</p>`;
         disposeImage = renderPreviewImage(content, result);
+      } else if (result.kind === 'html') {
+        // 默认渲染（iframe 取 /asset 的原字节），并保留「源码 / 在浏览器打开」出口。
+        // 源码按需再取一次（服务端只回前 24 KiB），避免为了一个可选视图多传一遍元数据。
+        const assetUrl = `/api/homes/${homeId}/asset?` + new URLSearchParams({ ...boundQuery(), path: result.path });
+        const loadSource = () => api(`/api/homes/${homeId}/preview?` + new URLSearchParams({ ...boundQuery(), path: result.path, text: '1' }))
+          .then((response) => (typeof response.content === 'string' ? response.content : ''))
+          .catch((error) => { throw new Error(error.message); });
+        content.innerHTML = '';
+        disposeImage = renderPreviewHtml(content, result, { assetUrl, line, loadSource,
+          onDownload: () => downloadFile(result.path) });
       } else if (result.binary) {
         content.textContent = `二进制文件，暂不支持内容预览（${result.size.toLocaleString()} 字节）。`;
       } else {
@@ -249,8 +260,8 @@ export function attachFilePreview(pane, homeId) {
   up.onclick = () => current?.parent && open(current.parent);
   aside.querySelector('[data-root]').onclick = () => open('.');
   aside.querySelector('[data-refresh]').onclick = () => open(input.value || '.');
-  download.onclick = async () => {
-    const file = current?.path || input.value;
+  download.onclick = () => downloadFile(current?.path || input.value);
+  async function downloadFile(file) {
     if (!bound || !file || downloading) return;
     const request = sequence;
     downloading = true;
@@ -278,7 +289,7 @@ export function attachFilePreview(pane, homeId) {
       downloading = false;
       download.disabled = !bound || current?.kind === 'directory';
     }
-  };
+  }
   content.onclick = (e) => {
     const button = e.target.closest('[data-entry]');
     if (button && current?.kind === 'directory') open(`${current.path.replace(/\/$/, '')}/${current.entries[Number(button.dataset.entry)].name}`);

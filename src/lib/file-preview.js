@@ -6,8 +6,12 @@ import { sshBash } from '../control/remote.js';
 export const PREVIEW_BYTES = 24 * 1024;
 export const IMAGE_BYTES = 2 * 1024 * 1024;
 export const DOWNLOAD_BYTES = 64 * 1024 * 1024;
+// HTML 走「渲染预览」：文件本体交给 <iframe> 按浏览器方式渲染，因此比纯文本预览能大得多
+// （实测的 ver17 评估报告就有 8.6 MB，里面是全内联的图表）。
+export const HTML_BYTES = 32 * 1024 * 1024;
 export const UPLOAD_BYTES = 256 * 1024 * 1024;
 const IMAGE_TYPES = { '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+const HTML_TYPES = { '.html': 'text/html', '.htm': 'text/html', '.xhtml': 'application/xhtml+xml' };
 export function sessionWorkspace(workspaces, session) {
   if (!session) return null;
   const exact = workspaces.find((w) => w.workspaceId === session.workspaceId);
@@ -21,7 +25,7 @@ function inside(root, target) {
   return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
-export async function readLocalPreview(root, requested = '.', download = false) {
+export async function readLocalPreview(root, requested = '.', download = false, { raw = false, text = false } = {}) {
   // 与 mapUploadError 同源：把 Node 的裸 errno 翻成用户能看懂的话。
   // 之前文件被删掉后点预览，界面上显示的是 `ENOENT: no such file or directory, realpath '/...'`
   // —— 一句英文系统错误，既没说是哪个文件、也没说该怎么办。
@@ -68,8 +72,10 @@ export async function readLocalPreview(root, requested = '.', download = false) 
       return { ...base, kind: 'directory', entries, truncated };
     }
     if (!st.isFile()) throw new Error('不支持预览此文件类型');
-    if (download) {
-      if (st.size > DOWNLOAD_BYTES) throw new Error('文件超过 64 MiB 下载上限');
+    if (download || raw) {
+      // raw：按原字节取回（HTML 渲染预览、静态资源转发用）。与 download 同一个上限，
+      // 区别只是调用方怎么用：download 走附件下载，raw 按真实 MIME 交给浏览器渲染。
+      if (st.size > DOWNLOAD_BYTES) throw new Error(raw ? '文件超过 64 MiB 预览上限' : '文件超过 64 MiB 下载上限');
       const buffer = Buffer.alloc(Math.min(st.size + 1, DOWNLOAD_BYTES + 1));
       let length = 0;
       while (length < buffer.length) {
@@ -85,8 +91,18 @@ export async function readLocalPreview(root, requested = '.', download = false) 
       // 调用方按类型分别处理（Buffer 直接写出，字符串才解码）。
       return { ...base, kind: 'download', size: length, data: buffer.subarray(0, length) };
     }
-    const mime = IMAGE_TYPES[path.extname(target).toLowerCase()];
+    const extension = path.extname(target).toLowerCase();
+    const mime = IMAGE_TYPES[extension];
     if (mime && st.size > IMAGE_BYTES) throw new Error('图片超过 2 MiB 预览上限');
+    // HTML 只报「是 HTML + 大小 + 真实 MIME」，正文由前端用 <iframe> 去取
+    // （走 /api/homes/:id/asset 流式转发），这样 8 MB 的报告也不用塞进 JSON。
+    // text=true：显式要文本（侧栏的「源码」视图）。即使扩展名是 .html 也走普通文本分支，
+    // 否则会返回只有元数据的 html kind，源码视图拿不到任何正文。
+    const htmlMime = text ? null : HTML_TYPES[extension];
+    if (htmlMime) {
+      if (st.size > HTML_BYTES) throw new Error(`网页超过 ${Math.floor(HTML_BYTES / (1024 * 1024))} MiB 预览上限，可下载后用浏览器打开`);
+      return { ...base, kind: 'html', size: st.size, mime: htmlMime };
+    }
     const buffer = Buffer.alloc(mime ? IMAGE_BYTES + 1 : PREVIEW_BYTES);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     const data = buffer.subarray(0, bytesRead);
@@ -114,8 +130,8 @@ try:
     try:
         info = os.fstat(fd)
         if stat.S_ISDIR(info.st_mode):
-            if args.get('download'):
-                raise Exception('请选择文件下载，暂不支持目录打包')
+            if args.get('download') or args.get('raw'):
+                raise Exception('这里只能预览文件，暂不支持目录打包/转发')
             entries = []
             truncated = False
             with os.scandir(target) as items:
@@ -128,19 +144,27 @@ try:
             out.update(kind='directory', entries=entries, truncated=truncated)
         elif stat.S_ISREG(info.st_mode):
             download = args.get('download', False)
-            if download and info.st_size > ${DOWNLOAD_BYTES}:
-                raise Exception('文件超过 64 MiB 下载上限')
-            mime = None if download else ${JSON.stringify(IMAGE_TYPES)}.get(os.path.splitext(target)[1].lower())
+            # raw：HTML 渲染预览/静态资源转发，需取回完整字节（与 download 同源，只是用途不同）。
+            full = download or args.get('raw', False)
+            if full and info.st_size > ${DOWNLOAD_BYTES}:
+                raise Exception('文件超过 64 MiB 上限')
+            extension = os.path.splitext(target)[1].lower()
+            mime = None if full else ${JSON.stringify(IMAGE_TYPES)}.get(extension)
+            html_mime = None if full or args.get('text') else ${JSON.stringify(HTML_TYPES)}.get(extension)
             if mime and info.st_size > ${IMAGE_BYTES}:
                 raise Exception('图片超过 2 MiB 预览上限')
-            if download:
+            if full:
                 with os.fdopen(os.dup(fd), 'rb') as file:
                     data = file.read(info.st_size + 1)
                 if len(data) != info.st_size:
                     raise Exception('文件在读取时发生变化，请重试')
             else:
                 data = os.read(fd, ${IMAGE_BYTES + 1} if mime else 24576)
-            if download:
+            if html_mime:
+                if info.st_size > ${HTML_BYTES}:
+                    raise Exception('网页超过 32 MiB 预览上限，可下载后用浏览器打开')
+                out.update(kind='html', size=info.st_size, mime=html_mime)
+            elif full:
                 out.update(kind='download', size=len(data), data=base64.b64encode(data).decode('ascii'))
             elif mime:
                 if len(data) > ${IMAGE_BYTES}:
@@ -158,12 +182,13 @@ except Exception as e:
     print(json.dumps(dict(error=str(e)), ensure_ascii=False))
 PY`;
 
-export async function readFilePreview(home, root, requested = '.', exec = sshBash, { download = false } = {}) {
+export async function readFilePreview(home, root, requested = '.', exec = sshBash, { download = false, raw = false, text = false } = {}) {
   if (typeof requested !== 'string' || requested.length > 4096 || requested.includes('\0')) throw new Error('文件路径无效');
-  if (home.hostType !== 'remote') return readLocalPreview(root, requested, download);
-  const payload = Buffer.from(JSON.stringify({ root, path: requested, download })).toString('base64');
-  const result = await exec(home.host, REMOTE_PREVIEW_SCRIPT, [payload], download ? 120000 : 15000,
-    { maxStdoutBytes: download ? Math.ceil(DOWNLOAD_BYTES * 4 / 3) + 65536 : 3 * 1024 * 1024 });
+  if (home.hostType !== 'remote') return readLocalPreview(root, requested, download, { raw, text });
+  const payload = Buffer.from(JSON.stringify({ root, path: requested, download, raw, text })).toString('base64');
+  const full = download || raw;
+  const result = await exec(home.host, REMOTE_PREVIEW_SCRIPT, [payload], full ? 120000 : 15000,
+    { maxStdoutBytes: full ? Math.ceil(DOWNLOAD_BYTES * 4 / 3) + 65536 : 3 * 1024 * 1024 });
   if (result.code !== 0) throw new Error('远端文件读取失败，请检查 SSH 连接和 Python 3');
   let data;
   try { data = JSON.parse(result.stdout); } catch { throw new Error('远端预览响应无效或过大'); }
