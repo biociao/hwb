@@ -11,7 +11,7 @@
   // 「打开侧边栏」「打开目录」这类与本功能无关的按钮。
   function looksLikeFile(title) {
     if (typeof title !== 'string' || !title || title.length > 4096) return false;
-    if (/^[a-z][a-z\d+.-]*:\/\//i.test(title)) return false; // http(s):// 等 URL 不是本地路径
+    if (/^[a-z][a-z\d+.-]*:/i.test(title) && !/^[A-Za-z]:[\\/]/.test(title)) return false; // 带协议的都不是本地路径（含 app://、http://）
     if (title.includes('/') || title.includes('\\')) return true;
     return /^[\w.@+-]+\.[A-Za-z0-9]{1,12}$/.test(title);
   }
@@ -109,51 +109,66 @@
     window.parent.postMessage({ type: 'hwb:file-preview', path: file, line,
       sessionId: new URL(location.href).searchParams.get('session') }, parentOrigin);
   }
-  // 挂两次：window 与 document 各一个 capture 监听。过去只挂 window —— 一旦某个环境下
-  // window 上的 capture 监听没有生效（实测 headless Chrome 里出现过，同一份代码在
-  // document 上正常），文件点击就会漏给 dsh 的原生「用系统应用打开」，在远端 Linux 上
-  // 只能得到 `xdg-open: no method available`。两个都挂，谁先到手都行（后者看到
-  // defaultPrevented 就退出，不会重复上报）。
+  // 挂三个 capture 监听：window、document（拦截），以及一个「没拦住时才提示」的 document 监听。
+  // 过去只挂 window —— 实测同一份代码在 document 上能拦到、window 上那次没有，一旦漏拦，
+  // 事件就交给 dsh 的原生「用系统应用打开」，在远端 Linux 上只能得到 xdg-open 报错。
+  // 三个监听都在同一节点上的捕获阶段，顺序确定：前两个先处理，第三个只在 defaultPrevented
+  // 仍为 false（= 确实要交给原生打开）时才提示。
+
+  // 兜底：万一某个入口的点击仍漏给了 dsh 的原生「用宿主系统应用打开」（远端 Linux 上必然
+  // 失败 → `xdg-open: no method available`），不要往会话正文里插任何控件（那会污染对话）；
+  // 只在 iframe 角落浮一条自己会消失的小提示，给一个「在 hwb 预览里打开」的动作。
+  let toastTimer = null;
+  function showOpenNotice(path) {
+    if (!parentOrigin) return;
+    let toast = document.getElementById('hwb-preview-notice');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'hwb-preview-notice';
+      toast.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483000;display:flex;gap:10px;'
+        + 'align-items:center;max-width:420px;padding:10px 12px;border-radius:8px;background:#1f2430;color:#e8ecf3;'
+        + 'font:13px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 6px 24px #0006';
+      document.body.appendChild(toast);
+    }
+    toast.replaceChildren();
+    const text = document.createElement('span');
+    text.textContent = '本机没有可用的打开方式（远端 xdg-open 失败）。';
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.textContent = '在 hwb 文件预览里打开';
+    action.style.cssText = 'flex:none;padding:4px 10px;font:inherit;cursor:pointer';
+    action.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      window.parent.postMessage({ type: 'hwb:file-preview', path, line: null,
+        sessionId: new URL(location.href).searchParams.get('session') }, parentOrigin);
+      toast.remove();
+    }, true);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '×';
+    close.setAttribute('aria-label', '关闭提示');
+    close.style.cssText = 'flex:none;padding:0 6px;font:inherit;cursor:pointer;background:transparent;color:inherit;border:0';
+    close.addEventListener('click', () => toast.remove());
+    toast.append(text, action, close);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.remove(), 20000);
+  }
   window.addEventListener('click', handleFileClick, true);
   document.addEventListener('click', handleFileClick, true);
+  document.addEventListener('click', handleNativeOpen, true);
 
-  // 兜底：dsh 的「用宿主系统应用打开」在无 GUI 的远端必然失败（xdg-open: no method available），
-  // 界面上只会弹一句英文报错。这里把它的路径取出来，就地补一个走 hwb 预览的按钮。
-  // 触发点是**应用内新增的节点**，与用户点击的是哪个元素无关，因此即使上面的点击识别
-  // 没覆盖到某个入口（不同 dsh 版本/不同产物面板），这条兜底也能让用户把文件打开。
-  function decorateOpenFailure(root) {
-    if (!parentOrigin || typeof root?.querySelectorAll !== 'function') return;
-    const candidates = [root];
-    if (typeof root.matches !== 'function' || root.matches('div, section, dialog, [role="alert"], [role="dialog"]')) {
-      candidates.push(...root.querySelectorAll('div, section, dialog, [role="alert"], [role="dialog"]'));
-    }
-    for (const node of candidates) {
-      const text = node.textContent || '';
-      if (!text.includes('path open failed') || text.length > 4000) continue;
-      if (node.querySelector('[data-hwb-preview-open]')) continue;
-      const paths = text.match(DISK_PATH);
-      const path = paths?.find((item) => /\.[A-Za-z0-9]{1,12}$/.test(item));
-      if (!path) continue;
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.setAttribute('data-hwb-preview-open', path);
-      button.textContent = '用 hwb 文件预览打开';
-      button.style.cssText = 'margin-top:8px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer';
-      button.addEventListener('click', (clickEvent) => {
-        clickEvent.preventDefault();
-        clickEvent.stopImmediatePropagation();
-        window.parent.postMessage({ type: 'hwb:file-preview', path, line: null,
-          sessionId: new URL(location.href).searchParams.get('session') }, parentOrigin);
-      }, true);
-      node.appendChild(button);
-    }
+  // 走到这里说明这次点击**没被**上面拦下、即将交给 dsh 的原生打开。此时用一个更宽的判据
+  // 把路径找出来即可（宽松不会有副作用：只是多浮一条提示，而且提示本身也是可关闭的）。
+  function handleNativeOpen(event) {
+    if (!parentOrigin || event.defaultPrevented) return;
+    const target = event.target;
+    if (typeof target?.closest !== 'function') return;
+    if (target.closest('textarea, input, [contenteditable="true"]')) return;
+    const holder = typeof target.closest === 'function' ? (target.closest('[title]') || target) : target;
+    const title = holder?.getAttribute?.('title');
+    if (typeof title === 'string' && looksLikeFile(title)) { showOpenNotice(title); return; }
+    const path = pathFromEvent(event);
+    if (path && path.length <= 4096) showOpenNotice(path);
   }
-  new MutationObserver((records) => {
-    if (!Array.isArray(records)) { decorateOpenFailure(document); return; }
-    for (const record of records) {
-      for (const node of record?.addedNodes || []) {
-        if (node?.nodeType === 1) decorateOpenFailure(node);
-      }
-    }
-  }).observe(document, { childList: true, subtree: true });
 })();

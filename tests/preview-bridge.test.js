@@ -17,7 +17,6 @@ function fakeElement({ tag = 'DIV', title = null, label = null, dataPath = null,
     nodeType: 1, // 元素节点：桥接的兜底逻辑只处理 nodeType === 1 的新增节点
     style: {},
     dataset: { ...(dataPath ? { path: dataPath } : {}), ...(dataFilePath ? { filePath: dataFilePath } : {}) },
-    textContent: text,
     children: [],
     handlers: {},
     getAttribute(name) {
@@ -57,6 +56,9 @@ function fakeElement({ tag = 'DIV', title = null, label = null, dataPath = null,
       return found;
     },
     addEventListener(type, handler) { element.handlers[type] = handler; },
+    replaceChildren(...nodes) { element.children = [...nodes]; },
+    append(...nodes) { element.children.push(...nodes); },
+    remove() { element.removed = true; },
     querySelector(selector) {
       return element.children.find((child) => {
         if (selector.includes('[data-hwb-preview-open]')) return child.getAttribute('data-hwb-preview-open') != null;
@@ -64,7 +66,11 @@ function fakeElement({ tag = 'DIV', title = null, label = null, dataPath = null,
       }) ?? null;
     },
     appendChild(child) { element.children.push(child); return child; },
+    // 放在最后：对象字面量里后定义的同名访问器才会生效（上面的 text 参数走这里）。
+    get textContent() { return element.children.map((child) => child.textContent || '').join(''); },
+    set textContent(value) { element.children = value === '' ? [] : [{ nodeType: 3, textContent: String(value) }]; },
   };
+  if (text) element.textContent = text;
   return element;
 }
 
@@ -78,6 +84,7 @@ function mount({ dialogRoots = [] } = {}) {
     addEventListener: (type, fn) => { listeners[type] = fn; },
   };
   const docListeners = {};
+  const toasts = {};
   const observers = [];
   let observed = false;
   runInNewContext(source, {
@@ -86,9 +93,21 @@ function mount({ dialogRoots = [] } = {}) {
       referrer: '',
       querySelectorAll: () => dialogRoots,
       createElement: (tag) => fakeElement({ tag: tag.toUpperCase() }),
-      addEventListener: (type, fn) => { docListeners[type] = fn; },
+      getElementById: (id) => toasts.byId?.[id] || null,
+      addEventListener: (type, fn) => { (docListeners[type] ||= []).push(fn); },
+      body: {
+        children: [],
+        appendChild(child) {
+          this.children.push(child);
+          if (child.id) { toasts.byId ||= {}; toasts.byId[child.id] = child; toasts[child.id] = child; }
+          return child;
+        },
+      },
     },
     URL,
+    // 角落提示会用一个自动消失的定时器；沙箱里补上（不真的等待）
+    setTimeout: () => 0,
+    clearTimeout: () => {},
     MutationObserver: class {
       constructor(callback) { mutationCallback = callback; observers.push(callback); }
       observe() { observed = true; }
@@ -116,6 +135,8 @@ function mount({ dialogRoots = [] } = {}) {
       void mutationCallback;
       for (const callback of observers) callback([{ addedNodes: [addedNode] }]);
     },
+    toasts,
+    // 按真实顺序跑 document 上的 capture 监听（拦截 → 未拦住时提示）
     clickOnDocument(target, options = {}) {
       const event = {
         button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, target,
@@ -124,7 +145,7 @@ function mount({ dialogRoots = [] } = {}) {
         stopImmediatePropagation() { this.stopped = true; },
         ...options,
       };
-      docListeners.click(event);
+      for (const listener of docListeners.click || []) listener(event);
       return event;
     },
   };
@@ -184,34 +205,32 @@ test('bridge: 不误伤无关按钮与组合键点击', () => {
   assert.equal(modified.messages.filter((m) => m.data.type === 'hwb:file-preview').length, 0);
 });
 
-test('bridge: path open failed 弹窗 → 补「用 hwb 文件预览打开」入口', () => {
-  const alert = fakeElement({
-    tag: 'DIV',
-    text: '无法打开文件 path open failed: Command failed: xdg-open /home/bot/PMAID/analyses/ver18_1_review/REVIEW.md /usr/bin/xdg-open: 882: www-browser: not found',
-  });
-  const rig = mount({ dialogRoots: [alert] });
-  rig.fireMutation(alert);
-  const added = alert.children.find((child) => child.getAttribute('data-hwb-preview-open'));
-  assert.ok(added, '未在失败提示里插入预览入口');
-  assert.equal(added.getAttribute('data-hwb-preview-open'), '/home/bot/PMAID/analyses/ver18_1_review/REVIEW.md');
-  assert.match(added.textContent, /hwb/);
-  // 点这个按钮应当发出一条预览请求（父页据此打开侧栏预览）
-  const clickEvent = { prevented: false, stopped: false, preventDefault() { this.prevented = true; }, stopImmediatePropagation() { this.stopped = true; } };
-  added.handlers.click(clickEvent);
-  assert.equal(clickEvent.prevented, true);
-  assert.equal(last(rig.messages).type, 'hwb:file-preview');
-  assert.equal(last(rig.messages).path, '/home/bot/PMAID/analyses/ver18_1_review/REVIEW.md');
-  // 重复触发不重复插
-  rig.fireMutation(alert);
-  assert.equal(alert.children.filter((child) => child.getAttribute('data-hwb-preview-open')).length, 1);
+test('bridge: 会话正文里不会插任何控件；漏给原生打开时才浮一条角落提示', () => {
+  // ① 被拦截的点击（mention）：不产生任何提示
+  const intercepted = mount();
+  const file = '/home/bot/PMAID/analyses/ver18_1_review/REVIEW.md';
+  intercepted.clickOn(fakeElement({ tag: 'BUTTON', title: file, label: '打开 ' + file }));
+  assert.equal(Object.keys(intercepted.toasts).length, 0, '拦截成功的点击不该再浮提示');
+  assert.equal(intercepted.messages.filter((m) => m.data.type === 'hwb:file-preview').length, 1);
+
+  // ② 没拦住的点击（data-path 挂在非 mention 元素上、且不是文件按钮）：浮提示，并且提示里
+  //    只有一个动作按钮，会话正文本身不被修改。
+  const missed = mount();
+  const paragraph = fakeElement({ tag: 'DIV', text: '详见 analyses/ver18_1_review/REVIEW.md' });
+  // 这种入口（有 title=路径，但既不是 mention 也不是产物 chip）会被漏给 dsh 的原生打开
+  const pathish = fakeElement({ tag: 'SPAN', title: file });
+  missed.clickOnDocument(pathish);
+  const toast = Object.values(missed.toasts.byId || {})[0];
+  assert.ok(toast, '未拦住原生打开时应浮一条提示');
+  assert.equal(Object.keys(missed.toasts.byId || {}).length, 1, '同一实例只应有一个提示节点');
+  assert.match(toast.children.map((c) => c.textContent).join(' '), /hwb 文件预览/);
 });
 
-test('bridge: 与打开文件无关的弹窗不插按钮', () => {
-  const other = fakeElement({ tag: 'DIV', text: '网络连接失败，请重试。' });
-  const rig = mount({ dialogRoots: [other] });
-  rig.fireMutation(other);
-  assert.equal(other.children.length, 0);
-  assert.equal(rig.messages.some((m) => m.data.type === 'hwb:file-preview'), false);
+test('bridge: 与文件无关的点击不提示', () => {
+  const rig = mount();
+  rig.clickOnDocument(fakeElement({ tag: 'BUTTON', title: '侧边栏', label: '打开侧边栏' }));
+  rig.clickOnDocument(fakeElement({ tag: 'DIV', text: '随便一段普通文字' }));
+  assert.equal(Object.keys(rig.toasts).length, 0);
 });
 
 test('bridge: publishes context initially and after SPA session changes, including clearing it', () => {
