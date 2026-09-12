@@ -39,11 +39,19 @@ export async function openTunnel({ host, remotePort }) {
       '-o', 'ClearAllForwardings=no',
       // dsh serves large JavaScript bundles; compress them across remote links.
       '-C',
-      // 连接策略（ConnectTimeout/保活/复用）统一来自 ssh-opts。原实现锁死
-      // `ControlPath=none` 从而每次都新建连接——在高延迟链路上隧道与探测都要等 12s 握手，
-      // 且因 ConnectTimeout=10 直接失败。现在复用常驻 master：隧道建立走已保活的连接，
-      // 同时保留 ExitOnForwardFailure=yes 语义（复用连接上建 -L 转发失败仍会立即退出）。
-      ...sshOpts({ host }),
+      // 连接策略（ConnectTimeout/保活）来自 ssh-opts；**但隧道必须独占连接，不得复用**。
+      //
+      // 原实现锁死 `ControlPath=none`（每次新建连接），在高延迟链路上因 ConnectTimeout=10
+      // 直接失败，故一度改成复用常驻 master。实测（2026-09-12）复用对隧道是错的：
+      // 一旦 master 已存在（remote.js 的 sshBash 抓 token / 探活会先建一条，ControlPersist=300
+      // 保活 5 分钟），本命令就退化成从连接——它把 -L 请求交给 master 后【立即以 code 0 退出、
+      // stderr 为空】，而 launcher 的 assertCurrent() 见到 proc.exitCode !== null 就抛
+      // 'ssh exited early'，实例连接因此失败（端口实际还在转发，是 hwb 自己判自己失败）。
+      // 复现：master 存在时 `ssh -o ControlMaster=auto -N -L …` → exit 0；不存在时则常驻。
+      //
+      // 复用只对「短命令」有益（sshBash/探活），对「必须常驻的隧道所有者进程」有害。
+      // 故此处显式 mux:false：隧道永远自己建连并持有它，配合 ConnectTimeout=30 承受 12–25s 握手。
+      ...sshOpts({ host, mux: false }),
       '-o', 'ExitOnForwardFailure=yes',
       '-N',
       '-L', `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`,
