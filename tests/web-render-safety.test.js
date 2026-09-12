@@ -225,15 +225,17 @@ test('log-panel: 去重键包含 scope 与 fields，不同上下文的同文案�
   assert.notEqual(a, logEntryKey({ ...base, scope: 'other', fields: { homeId: 'A' } }), 'scope 不同也要区分');
 });
 
-// 趋势图的 x 轴原先按「第几个非空桶」定位：空桶被过滤掉之后，23 小时的空白与相邻两小时
-// 在图上完全一样（实测：数据只在第 1 与第 24 个桶时，两个点画在 0% 与 100%，曲线还平滑连过去，
-// 读者会以为中间是逐步衰减）。修好后：x 按时间插值，跨空桶处断开折线。
-test('usage-card: 趋势图按时间定位 x，且跨空桶处断线', async () => {
+// 趋势图的两条不变量（2026-09-13 变更口径后重新表述）：
+// ① x 一律按**时间**插值定位，不能按「第几个桶」—— 否则 21 小时的空白与相邻两小时在图上一样宽；
+// ② 空桶**按 0 连线**（全窗口每一格都画，缺数据处落在基线上），一个分组只有一条 path。
+// 旧口径是「只画非空桶 + 跨空格断线」，它把「该格没有会话结束」画成了「曲线到此为止」——
+// 用户实测反馈就是「线怎么不连续了」。代价由图注的口径说明接手（0 ≠ 无用量）。
+test('usage-card: 趋势图按时间定位 x，空桶按 0 连线（不再断线）', async () => {
   const { usageTrendHtml } = await import('../src/web/components/usage-card.js');
   const H = 3_600_000, t0 = Date.parse('2026-09-12T00:00:00.000Z');
   const mk = (i, total) => ({ ts: new Date(t0 + i * H).toISOString(), groups: total ? { '合计': total } : {}, total });
   const buckets = Array.from({ length: 24 }, (_, i) => mk(i, 0));
-  // 0 与 1 相邻（同一桶宽），1 与 23 之间隔了 21 个空桶 → 应断成两段
+  // 0 与 1 相邻（同一桶宽），1 与 23 之间隔了 21 个空桶
   buckets[0].total = 1000; buckets[0].groups = { '合计': 1000 };
   buckets[1].total = 500; buckets[1].groups = { '合计': 500 };
   buckets[23].total = 300; buckets[23].groups = { '合计': 300 };
@@ -241,14 +243,22 @@ test('usage-card: 趋势图按时间定位 x，且跨空桶处断线', async () 
   const html = usageTrendHtml(usage, 'total');
 
   const lefts = [...html.matchAll(/class="trend-dot" style="left:([\d.]+)%/g)].map((m) => Number(m[1]));
-  assert.equal(lefts.length, 3, `应有 3 个数据点，实际 ${lefts.length}`);
-  // 第 2 个桶（1/23 ≈ 4.3%）不该被画在中间（按序号会是 50%，那样 21 小时空白就被压缩掉了）
+  assert.equal(lefts.length, 3, `0 值不画散点，应有 3 个数据点，实际 ${lefts.length}`);
+  // 第 2 个桶（1/23 ≈ 4.3%）不该被画在中间（按非空序号会是 50%，那样 21 小时空白就被压缩掉了）
   assert.ok(Math.abs(lefts[0] - 0) < 0.01, `第一个点应在 0%，实际 ${lefts[0]}`);
   assert.ok(Math.abs(lefts[1] - (1 / 23) * 100) < 1, `第 2 小时的桶应画在约 4.3%，实际 ${lefts[1]}`);
   assert.ok(Math.abs(lefts[2] - 100) < 0.01, `最后一个点应在 100%，实际 ${lefts[2]}`);
-  // 0→1h 相邻（同一个桶宽内），1h→23h 跨了 21 个空桶 → 必须断成两条路径
+
   const paths = (html.match(/<path /g) || []).length;
-  assert.equal(paths, 2, `跨空桶应断开折线（应为 2 条 path），实际 ${paths}`);
+  assert.equal(paths, 1, `合计只有一条连续曲线，应为 1 条 path，实际 ${paths}`);
+  // 空桶是值为 0 的真实数据点：曲线必须落到基线（y=100），第 3 个桶（i=2）就是其中之一
+  const d = /<path d="([^"]+)"/.exec(html)[1];
+  const x2 = ((2 / 23) * 100).toFixed(2);
+  assert.ok(d.includes(`${x2} 100.00`), `空桶应落在基线 y=100（x=${x2}），路径：${d.slice(0, 160)}…`);
+  assert.ok(d.split(' 100.00').length - 1 >= 21, `21 个空桶都应落在基线上，实际 ${d.split(' 100.00').length - 1} 个`);
+  // 口径说明必须跟着出现 —— 否则「掉到 0」会被读成「那段时间没用」
+  assert.match(html, /21 格无数据/, '空桶数应写进图注');
+  assert.match(html, /不等于该时段没有用量/, '图注要讲清 0 的含义');
 });
 
 // 「空状态」曾经是一个死胡同：renderUsageCard 在 summary.sessionCount === 0 时直接 return 一句
@@ -274,11 +284,16 @@ test('renderUsageCard: 空窗口也必须给出周期切换按钮（否则用户
 // x 轴标签曾经是 n 个 flex:1 的等分单元格，而散点按时间定位 —— 有空桶时两者必然错位。
 // 独立审查用真浏览器实测（30 天周期、60 桶里 5 个非空）：标签中心 9.9/29.9/50.0/70.1/90.1%，
 // 对应的散点却在 72.9/86.4/96.6/98.3/100.0% —— 所有数据都堆在最后一个标签底下，读者会看错日期。
-test('usage-card: x 轴标签与散点用同一个定位函数（不随空桶错位）', async () => {
+// x 轴标签曾经是 n 个 flex:1 的等分单元格，而散点按时间定位 —— 有空桶时两者必然错位。
+// 独立审查用真浏览器实测（30 天周期、60 桶里 5 个非空）：标签中心 9.9/29.9/50.0/70.1/90.1%，
+// 对应的散点却在 72.9/86.4/96.6/98.3/100.0% —— 所有数据都堆在最后一个标签底下，读者会看错日期。
+// 变更口径后（空桶也画、也连线）标签改在**全量桶网格**上取点，判据相应变为：
+// 标签与散点必须共用同一个「时间 → x%」映射，即桶序号 i 的位置恰好是 i/(n-1)。
+test('usage-card: x 轴标签与散点用同一个时间定位函数（不随空桶错位）', async () => {
   const { usageTrendHtml } = await import('../src/web/components/usage-card.js');
   const H = 3_600_000, t0 = Date.parse('2026-09-01T00:00:00.000Z');
   const mk = (i, total) => ({ ts: new Date(t0 + i * H).toISOString(), groups: total ? { '合计': total } : {}, total });
-  // 审查实测的那个窗口：60 个桶里只有 5 个非空，位置在 72.9/86.4/96.6/98.3/100%（桶序号 43/51/57/58/59）
+  // 审查实测的那个窗口：60 个桶里只有 5 个非空，桶序号 43/51/57/58/59
   const buckets = Array.from({ length: 60 }, (_, i) => mk(i, 0));
   for (const i of [43, 51, 57, 58, 59]) buckets[i] = mk(i, 100 + i);
   const html = usageTrendHtml({ trendBy: { total: { buckets, hours: 24, stepMs: H } } }, 'total');
@@ -287,12 +302,18 @@ test('usage-card: x 轴标签与散点用同一个定位函数（不随空桶错
   const labelLefts = [...html.matchAll(/class="trend-xlabel[^"]*" style="left:([\d.]+)%"/g)].map((m) => Number(m[1]));
   assert.equal(dotLefts.length, 5);
   assert.ok(labelLefts.length >= 2, `应至少渲染 2 个标签，实际 ${labelLefts.length}`);
-  // 每个标签的 left 必须是某个散点的 left（同一个 pxAt），而不是等分位置
+  const at = (i) => (i / 59) * 100;
+  // 散点按时间落在自己的桶号上（若按「第几个非空桶」定位，这里会是 0/25/50/75/100）
+  [43, 51, 57, 58, 59].forEach((bucketIndex, k) => {
+    assert.ok(Math.abs(dotLefts[k] - at(bucketIndex)) < 0.01,
+      `桶 ${bucketIndex} 的散点应在 ${at(bucketIndex).toFixed(2)}%，实际 ${dotLefts[k]}%`);
+  });
+  // 标签同样落在桶网格上（同一套 pxAt），不是等分的单元格
   for (const l of labelLefts) {
-    assert.ok(dotLefts.some((d) => Math.abs(d - l) < 0.01), `标签 ${l}% 必须落在某个数据点上，散点在 ${dotLefts.join('/')}%`);
+    const onGrid = Array.from({ length: 60 }, (_, i) => at(i)).some((x) => Math.abs(x - l) < 0.01);
+    assert.ok(onGrid, `标签 ${l}% 必须落在桶网格上`);
   }
-  // 等分位置（i/(n-1)）不该再出现：数据都在窗口后段，第一个标签就该在 72.9% 附近，而不是 0%
-  assert.ok(labelLefts[0] > 60, `稀疏窗口下第一个标签应贴近真实数据位置，实际 ${labelLefts[0]}%`);
+  assert.ok(Math.abs(labelLefts[labelLefts.length - 1] - 100) < 0.01, '最后一个标签就是「现在」，必须在 100%');
   assert.doesNotMatch(html, /trend-xcell/, '等分单元格已废弃');
 });
 

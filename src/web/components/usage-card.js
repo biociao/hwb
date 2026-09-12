@@ -82,25 +82,38 @@ function axisLabel(ts, stepMs) {
 // 每条时间序列对应一条 Catmull-Rom→三次贝塞尔平滑曲线，数据点以圆形散点标出；
 // 悬停散点显示详细信息（时间 · 分组 · 用量 · 占峰值百分比，data-name/tok/pct 交前端 tooltip 渲染）。
 // 粒度由后端按周期自适应调整。
+// 空桶怎么画：**照画，并按 0 连线**（2026-09-13 按用户口径变更）。
+//
+// 本函数以前是「只画非空桶 + 跨空格断线」，理由是跨空白连一条平滑曲线等于替用户编一段
+// 「逐步衰减」。但那个做法在真实数据上的效果是：14 天窗口 56 格里有 19 格是空的、折线被切成
+// 12 段，用户看到的是「线怎么不连续了、像是少了一段」。现在整段窗口每一格都画，
+// 没有数据的格子落在基线上、折线一路连着。
+//
+// 代价必须由**图注**接手，不能悄悄消失：这一层的 0 表示「该时段没有会话结束」，
+// 不等于「该时段没有用量」—— token 是按会话**累计**、整段落在会话 lastActivity 所在那一格里的
+// （见 store.js usageTrendGrouped）。所以有空桶时额外输出一行口径说明。
+//
+// 另一条不变量保持不变：**0 不画散点**。按维度拆分时大部分分组在大部分格子里都是 0，
+// 画出来是一排 8px 圆点全叠在基线上，且 tooltip 各不相同（同一位置只能命中最后那个）。
 export function usageTrendHtml(usage, dim = 'total') {
   const source = usage?.trendBy?.[dim] || null;
   const buckets = Array.isArray(source?.buckets) ? source.buckets : [];
   const hours = source?.hours ?? 24;
   const stepMs = source?.stepMs ?? 3_600_000;
-  // 只**画**有数据的桶（空桶会把曲线压扁），但**定位必须按时间**，不能按「第几个非空桶」：
-  // 过滤掉空桶之后，23 小时的空白与相邻的两个小时在图上长得一模一样 —— 独立审查实测：
-  // 数据只在第 1 与第 24 个桶时，两个点被画在 0% 与 100%，曲线还平滑连过去，
-  // 读者会以为中间是逐步衰减。这里保留全量桶用于时间轴（t0..t1），只跳过错点的绘制。
-  const data = buckets.filter((b) => b.total > 0);
-  if (data.length === 0) {
+  // 全量桶都进 data（空桶是值为 0 的真实数据点），**定位按时间**而不是按「第几个桶」：
+  // 整段窗口的首尾桶时间戳为端点、其余按时间插值。这一点必须保住 —— 只按序号等分的话，
+  // 边界上多出来的半格会让所有点整体偏移（历史上"标签与散点对不上"就是这类错位）。
+  const data = buckets;
+  if (!buckets.length || !buckets.some((b) => b.total > 0)) {
     return '<div class="empty">暂无 token 趋势数据（需先有被索引的活跃会话）</div>';
   }
-  const max = Math.max(...data.map((b) => b.total), 1);
+  const max = Math.max(...buckets.map((b) => b.total), 1);
   // 收集本维度出现过的分组，按名排序并分配稳定颜色。
   const groupSet = new Set();
-  for (const b of data) for (const k of Object.keys(b.groups)) groupSet.add(k);
+  for (const b of buckets) for (const k of Object.keys(b.groups)) groupSet.add(k);
   const groups = [...groupSet].sort((a, b) => a.localeCompare(b));
   const n = data.length;
+  const emptyBuckets = buckets.filter((b) => !(b.total > 0)).length;
 
   // 点图坐标（SVG viewBox 0..100；preserveAspectRatio=none，随容器横向拉伸）。
   // x：0..100 左→右；y：0..100 顶→底。数据点用 HTML 圆形散点（left%/bottom%）定位，不受拉伸变形。
@@ -137,29 +150,21 @@ export function usageTrendHtml(usage, dim = 'total') {
     return d;
   }
 
-  // 相邻两个非空桶之间若隔了空桶（时间跨度超过 1.5 个桶宽），就**断开**折线：
-  // 跨空白区连一条平滑曲线等于替用户编了一段「逐步衰减」的假数据。
-  const contiguous = (a, b) => Date.parse(b.ts) - Date.parse(a.ts) <= stepMs * 1.5;
+  // 一条分组 = 一条**连续**曲线：空桶（值 0）就是曲线上的一个点，落在基线上。
+  // 不再有「跨空格断线」分支 —— 那是旧口径，见函数头的说明。
   const series = groups.map((g) => {
     const pts = data.map((b, i) => ({ x: px(i), y: py(b.groups[g] || 0) }));
-    const paths = [];
-    let run = [];
-    for (let i = 0; i < pts.length; i++) {
-      if (run.length && !contiguous(data[i - 1], data[i])) { paths.push(smoothPath(run)); run = []; }
-      run.push(pts[i]);
-    }
-    if (run.length) paths.push(smoothPath(run));
-    return { g, paths, pts };
+    return { g, path: smoothPath(pts), pts };
   });
   const lineSvg = `<svg class="trend-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${
-    series.flatMap((s) => s.paths.map((d) => `<path d="${d}" fill="none" stroke="${colorOf(s.g)}"
-        stroke-width="${s.g === '合计' ? 2 : 1.6}" vector-effect="non-scaling-stroke"/>`)).join('')
+    series.map((s) => `<path d="${s.path}" fill="none" stroke="${colorOf(s.g)}"
+        stroke-width="${s.g === '合计' ? 2 : 1.6}" vector-effect="non-scaling-stroke"/>`).join('')
   }</svg>`;
   const dots = series.flatMap((s) => s.pts.map((p, i) => {
     const v = data[i].groups[s.g] || 0;
     // 0 不画点：按维度拆分时，大部分分组在大部分桶里都是 0，画出来是一排 8px 圆点全叠在 0% 基线上，
     // 且各自的 tooltip 不同（同一位置悬停只能命中 DOM 里最后那个）。独立审查实测 24h + 按项目：
-    // 12 个点里 8 个 data-tok="0"，两两完全重叠。曲线路径（含断线逻辑）不受影响。
+    // 12 个点里 8 个 data-tok="0"，两两完全重叠。曲线本身照画（含 0 值点）。
     if (!(v > 0)) return '';
     const pct = max > 0 ? (v / max) * 100 : 0;
     // 数据点悬停显示详细信息：时间 · 分组 · 用量 · 占峰值百分比（交由前端 tooltip 渲染）。
@@ -194,6 +199,11 @@ export function usageTrendHtml(usage, dim = 'total') {
     (g) => `<span class="trend-legend-item"><i style="background:${colorOf(g)}"></i>${esc(g)}</span>`
   ).join('');
   const isStacked = dim !== 'total';
+  // 空桶（按 0 连线）必须配一行口径说明：否则「曲线掉到 0」会被读成「那段时间没用」，
+  // 而真相是 token 按会话累计落格，那一格没有会话结束而已。
+  const zeroNote = emptyBuckets > 0
+    ? `<div class="trend-caption">其中 ${emptyBuckets} 格无数据，按 0 计入并连线 —— 0 表示该时段没有会话结束，不等于该时段没有用量</div>`
+    : '';
   return `
     <div class="trend-chart">
       <div class="trend-y">${yhtml}</div>
@@ -203,6 +213,7 @@ export function usageTrendHtml(usage, dim = 'total') {
       </div>
     </div>
     <div class="trend-caption">${rangeLabel(hours)} · 每 ${granLabel(stepMs)} 一个数据点${isStacked ? ` · 按${DIM_LABELS[dim]}拆分` : ''}</div>
+    ${zeroNote}
     ${isStacked ? `<div class="trend-legend">${legend}</div>` : ''}`;
 }
 
