@@ -33,7 +33,10 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js tests/compat/*.test.js",
+    "test:unit": "node --test tests/*.test.js",
+    "test:compat": "node --test tests/compat/*.test.js",
+    "compat": "node scripts/compat-check.mjs"
   },
   "author": "hwb contributors",
   "license": "MIT"

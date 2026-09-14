@@ -77,10 +77,15 @@ test('锚点缺失时 fail-closed（原样返回，不产出半截注入）', ()
 });
 
 test('针对真实安装的 dsh bundle 注入（存在时；验证锚点仍然匹配）', async (t) => {
-  const candidates = [
-    process.env.HWB_DSH_CLIENT_BUNDLE,
-    '/Users/ciao/.nvm/versions/node/v22.21.1/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-workspace/lib/client.js',
-  ].filter(Boolean);
+  // 用 tests/compat 的 dsh 定位器，而不是写死本机的 nvm 路径 —— 否则这条用例在
+  // 别人的机器 / CI 上永远 skip（「看起来绿，其实没测」）。显式 env 仍可覆盖。
+  const { locateDsh, findDshPackage } = await import('./compat/dsh-contract.mjs');
+  const candidates = [process.env.HWB_DSH_CLIENT_BUNDLE].filter(Boolean);
+  const loc = locateDsh();
+  if (loc.root) {
+    const pkg = findDshPackage(loc.root, 'dsh-client-ui-workspace');
+    if (pkg) candidates.push(path.join(pkg, 'lib', 'client.js'));
+  }
   const real = candidates.find((p) => existsSync(p));
   if (!real) { t.skip('本机没有安装 dsh 客户端 bundle'); return; }
 
