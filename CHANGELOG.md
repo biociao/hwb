@@ -6,6 +6,315 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+#### dsh 升级到 0.1.5-rc.1：修掉「只显示 179 个会话，实际有 476 个」的静默漏读
+
+- **现象**：换上 dsh 0.1.5-rc.1 后，仪表盘上的会话数只有磁盘真值的 **38%**，而且
+  **`degraded` 是空的** —— 界面上没有任何异常提示，看起来只是「这个实例数据少」。
+- **实测数据**（本机真实 home）：
+
+  | | 数量 |
+  |---|---|
+  | hwb 读到 | 179 |
+  | 磁盘上实际（per-record 文件数） | 476 |
+  | **漏掉** | **297（62%）** |
+
+- **根因有两个，叠在一起**：
+
+  1. **版本白名单过窄**。dsh 声明 `session_projcache` 域
+     `version: 7, compatibleVersions: [3,4,5,6]`，而 hwb 只认 `[3,4,5]`。
+     一旦某个 home 的 `unit.version` 被写成 6 或 7，整个域被判 `degraded`、**整块停止更新**。
+  2. **磁盘布局早已迁移**。dsh 从「单文件聚合」迁到 **per-record**
+     （`storages/session_projcache/sessions/<id>.json`，信封 `{version, record}`），
+     而 hwb 只读那个**已被冻结**的聚合文件 `storages/session_projcache.json`
+     （信封 `{unit, global, tables}`）。实测聚合文件停在 9-5，per-record 目录每天在写 ——
+     也就是说 hwb 一直在展示 10 天前的快照。
+
+- **修复**：
+  - `SUPPORTED_VERSIONS.projcache` 放宽到 `[3,4,5,6,7]`，与 dsh 的 `acceptedStamps` 对齐；
+  - `read-home.js` 改为**布局感知**：以 per-record 为准、聚合文件为补充
+    （补齐 bootstrap 期的老会话），同 id 冲突以 per-record 为准；新增 `listMetadataDir` 原语；
+  - `remote-reader.js` 同步支持：cat 脚本增加 per-record 目录抓取（`DIR_BEGIN/END` 标记），
+    并区分「目录不存在」（退回聚合）与「目录存在但空」；
+  - 抽出 `projcacheRecordToSession`，保证两条读取路径产出**同一组字段**（否则会出现
+    「有些会话没有状态」这类只在部分数据上复现的分歧）；
+  - **语义修正**：文件缺失**不再**判 degraded —— 缺失 = 这个 home 没有该数据（新 home /
+    旧版没有该布局），不是版本不兼容。真正读不出（版本不认识）才 degraded。
+  - 效果：会话读取 **179 → 476（100%）**，degraded 为空；
+    用量聚合从 179 个会话扩到 476 个（52.9M input / 19.9M output / 4.4B cache-read tokens）。
+    性能：476 个会话 73ms、5000 个 96ms，远低于 60s 索引周期。
+
+#### 新增 dsh 版本兼容性测试模块（`tests/compat/`）
+
+dsh 没有承诺稳定的存储/CLI 契约，而漂移的**失败方式是静默的**（上面那件事）。
+所以把契约**从实际安装的 dsh 里提取**出来比对，而不是手抄进常量：
+
+- `dsh-contract.mjs`：定位 dsh 安装（兼容 flat/nested 布局），括号配平提取
+  `defineDomain({...})` 字面量（跳过字符串与注释里的假调用），**不 eval / 不 import**；
+- 契约测试（分 A–G 七组）：**A** 存储域版本、**B** 磁盘布局、**C** CLI（`dsh web: ` 打印行 /
+  token query / `printUrl` 默认值）、**D** 真实 home 端到端（唯一能抓「读了但读少了」的一组）、
+  **E** 域发现（dsh 新增了 hwb 还不认识的域吗）、**F** UI 注入锚点、**G** 路径一致性；
+- 找不到 dsh 时 `skip` 并说明原因（**不假装通过**）；失败信息直接给出
+  「需要改哪个文件的哪一行」；真常量来自 `import` 源码，不复制；
+- `npm run test:compat` / `npm test`，详见 `tests/compat/README.md`
+  （含升级 dsh 后的操作流程与「故意不测什么」的边界说明）。
+
+> 后续补强（同一批工作）：
+>
+> - 新增 **C2**（RPC 端点首选写法是否仍与 dsh 现状一致）、**F**（真实 dsh bundle 的注入锚点）、
+>   **G**（本地 reader 与远程 cat 脚本的路径一致性）、**G2**（远端投影的保留清单必须覆盖
+>   schema 实际读取的字段）四组；
+> - 提取器不再依赖固定包名/文件名（dsh 重构后仍能定位域）；
+> - 新增「升级闭环」测试（按提示补版本后必须转绿）；
+> - 修掉 `hwb test` 与 `npm test` **静默跳过 `tests/compat` 整个子目录**的问题；
+> - 修掉一条**假绿**测试（`DEFAULT_ENDPOINTS` 未导出 → 断言整段被跳过）；
+> - 补齐合并语义（per-record 优先于聚合）、目录列举语义（null vs `[]`、不跟随符号链接、
+>   `.bak` 不计入 skipped）等边界测试。当前 **853 条用例、0 跳过**。
+
+#### per-record 布局带来的传输量：远端投影省 69–97%
+
+dsh 迁到 per-record 后，远程索引要抓**每个会话一个文件**，全量远大于旧的聚合文件
+（本机 476 个会话：4.07 MiB vs 635 KB，6.4×）——在 25–30 KB/s 的链路上约 160 s，
+而 ssh 脚本超时 90 s。
+
+hwb 其实只用每条记录 21 个 projection 里的约 10 个，所以让**远端先投影**再传
+（python3 读 JSON、只留白名单 rows、紧凑序列化；`identity`/`version` 原样保留）：
+
+| | 传输量 |
+|---|---|
+| 本机真实 home（476 会话） | 4.07 MiB → **1.28 MiB（省 69%）** |
+| 合成夹具（含大 projection） | 604 KB → **18 KB（省 97%）** |
+
+投影任一步失败（远端没有 python3 / JSON 损坏 / 结构不符）都**原文回退** ——
+宁可多传也不少读。另加传输体积观测：超 2 MiB 记一条 warn（低带宽链路的超时风险）。
+
+#### 观察性：让「静默漏读」变成可断言的信号
+
+事故里快照**没有任何字段**能反映「磁盘上是 per-record、我们走的却是聚合」——
+聚合文件合法，所以连 `degraded` 都是空的。新增：
+
+- `pcLayout`：`{ perRecord, aggregate, versions, skipped, skippedSample }` ——
+  实际用到的布局、版本分布、以及**部分文件读失败时的计数与样例原因**
+  （原先这些错误只在「一个都读不出」时才被用上，部分失败被静默丢弃）；
+- `pcVersion` 改取**最高**版本（原先取「第一个读到的」，取决于 readdir 顺序，是假信号）；
+- 索引载荷与 debug 日志带上这两项；`hwb doctor` 输出 dsh 兼容性结论。
+
+#### `hwb doctor` 增加 dsh 兼容性自检
+
+上面那类问题用户**看不到**（静默降级），而「实例数据怎么变少了」正是跑 `doctor` 的典型场景。
+新增 `src/lib/dsh-compat.js`：只读地提取本机 dsh 的域契约与 hwb 的假设比对，
+不兼容时打印「要改哪里」。找不到 dsh 不算错；**提取失败单独归为「无法判定」**，
+不与「兼容」混为一谈（否则「兼容 ✓」会把「我们没读到」说成好事）。
+生产侧与测试侧是两份独立实现，另有一条测试固定「两者对真实 dsh 结论一致」，防止漂移。
+
+#### 远程实例「每次打开都要重新下载」的真正大头：dsh 的读取**没法被浏览器缓存** —— hwb 代理层补一层本地缓存
+
+- **现象**：dgx21.tun 的 dsh 页面每次打开都要重下几 MB（用户原话「每次都要下载！太慢」），
+  打开一次要 1–2 分钟，还经常以 `Failed to load plugins` 收场。
+- **根因**（2026-09-14 无头 Chrome + CDP 抓包；两次页面加载 = 178 个请求 / 8.26 MiB）：
+
+  | 载荷 | 每次加载的行为 | 为什么 |
+  |---|---|---|
+  | 47 个插件 bundle（**3.33 MiB**） | **每次都要重下** | 远端 dsh 0.1.1-rc.2 对 `/plugins/*/client.js` 回 `cache-control: no-cache` **且不带 ETag/Last-Modified** —— 浏览器没有任何校验依据，只能整包重取 |
+  | 会话列表 `session.list`（52–61 KB） | 每次 1–4 次 | 走 POST RPC，HTTP 语义上不可缓存 |
+  | `/assets/*`（1.21 MiB） | 只有第一次 | hwb 早已注入 immutable，浏览器缓存生效（这部分一直是好的） |
+
+  实测同一份 448 KB 的 `dsh-client-ui-conversation` bundle 在一次会话里被完整下载两次；
+  最慢的单个 bundle 请求 34 s；一次页面加载里插件部分的总跨度 **61.8 s**。
+- **修复**：在 hwb 的代理层加一层**本地读取缓存**（新增 `src/control/proxy-cache.js`）——
+  代理本来就是每条链路的唯一咽喉，缓存只能坐在这里（远端 dsh 不动，也不重启）：
+  - **静态（内容寻址）**：`/assets/<name>-<hash8>.<ext>`、`/plugins/**/client.js[.map]?rev=<hash>`、
+    `/plugins/??…&rev=<hash>` 组合脚本 → 命中直接本地回；**补一个 ETag**（不改写上游策略），
+    浏览器下次只发一次条件请求、拿 304；
+  - **只读 RPC**：`POST /api/<method>` 按「命名空间 + 只读动词后缀」形态判定，并**先否决**写动词
+    （prompt/create/cancel/updateQueue/respond/upload…）；键 = 路径 + 方法 + 规范化 payload（不含 rpcId）。
+    回放时**把响应信封里的 rpcId 改写成本次请求的** —— 否则客户端会因为对不上号而丢弃响应；
+  - **新鲜度**：TTL 内直接命中；TTL 外但仍在宽限窗口内 → **先回本地副本、后台再刷新**
+    （stale-while-revalidate：慢链路上用户永远不等第二次），刷新按缓存键**单飞**，
+    重复命中不会堆出一串上游请求；
+  - **落盘**：`<HWB_DIR>/proxy-cache`（默认 `~/.hwb/proxy-cache`，目录 0700、文件 0600），
+    hwb 重启后仍然命中（开发期反复重启等于每次清空的话，这层缓存就没意义了）；
+  - **边界（一律不缓存）**：`set-cookie`、非 200、`vary: *`、`no-store`、带 token 的 URL、
+    没有内容指纹的 `/plugins/**`、被 preview 注入改造过的 index / workspace bundle；
+    请求体超过上限（默认 64 KiB，例如附件上传）也不缓存。
+- **验证**（真实 dgx21.tun，同一接入端口 49670）：
+  - 单个 bundle：首次 447 932 B / **10.66 s** → 第二次 **0.0008 s**（`x-hwb-cache: hit`），字节逐字节一致；
+  - 新增 `scripts/warm-cache.mjs` 预热索引里 50 个资源：首次 4.05 MiB / 64.4 s →
+    再跑一次 **0.00 MiB / 0.0 s（50/50 命中）**；
+  - CDP 复测两次页面加载：插件部分 3.33 MiB / 61.8 s（冷）+ 3.33 MiB / 39.5 s（热）
+    → **3.34 MiB / 0.1 s（冷）+ 0.12 MiB / 0.1 s（热，全部 304）**；
+    响应里的缓存标记：静态 `hit` 100 次、`rpc-hit` 16 次、`rpc-stale` 10 次；
+  - `session.list`（61 KB）：上游 9–10 s → 本地 **0.001–0.002 s**；
+  - `node --test tests/*.test.js` 全量 713 例（712 通过 / 1 skip / 0 失败）；新增
+    `tests/proxy-cache.test.js` 11 例：命中与 304、写类 RPC 不缓存、实例（cacheScope）隔离、
+    TTL 陈旧回放 + 后台刷新、刷新单飞、大请求体不进缓存、dgx21 的点号命名（`session.history` 等）。
+- **行为变更**：代理此前「只给浏览器缓存策略、从不复用响应体」（`tests/proxy.test.js` 里曾以此断言）。
+  内容寻址的静态资源现在会被复用 —— 这正是本次修复的核心。鉴权响应（`set-cookie`）仍然绝不进缓存。
+- **旋钮**：`HWB_PROXY_CACHE=0` 关闭；`HWB_PROXY_CACHE_DIR` 改落盘位置；
+  `HWB_PROXY_CACHE_STATIC_TTL_MS`（默认 600000）、`HWB_PROXY_CACHE_RPC_TTL_MS`（默认 3000）、
+  `HWB_PROXY_CACHE_RPC_STALE_MS`（默认 60000）、`HWB_PROXY_CACHE_MAX_BYTES`（默认 256 MiB）、
+  `HWB_PROXY_CACHE_MAX_ENTRY_BYTES`（默认 16 MiB）、`HWB_PROXY_CACHE_RPC_BODY_CAP`（默认 64 KiB）。
+  预热工具：`node scripts/warm-cache.mjs --url http://127.0.0.1:<接入端口>/`。
+
+#### 历史会话载入：长 TTL + 修掉「大历史被打成 504」+ 预热
+
+- **现象**：用户明确指出的真问题 —— 在 dgx21 上**打开一个历史会话**要等很久（甚至拿不到）。
+- **实测**（远端本机 curl + 经 hwb 入口，2026-09-14）：
+  | 会话 | `session.history` 原始大小 | gzip 后 | 经隧道首次 | 缓存后 |
+  |---|---|---|---|---|
+  | 小会话（23 条事件） | 43 KB | — | **19.1 s** | 0.0018 s |
+  | 大会话（42 088 条事件） | **8.33 MiB** | 0.69 MiB | **43.4 s** | **0.135 s** |
+  | 另一个大会话 | 9.83 MiB | — | — | — |
+
+  两个独立缺陷叠在一起：
+  1. **`session.history` 是原始事件日志**（50 条消息的窗口 = 几万条 chunk 事件、8–10 MiB），
+     而且走 POST RPC —— 浏览器侧完全不可缓存，每次打开都从远端重来一遍；
+  2. **大历史会被代理打成 504**：代理原先「先攒完整个响应再写响应头」，而 30 s 的
+     `upstream response timeout` 在 8 MiB 的正文上先到 —— 实测返回
+     `proxy: upstream error — upstream response timeout`，用户**根本拿不到历史**。
+- **修复**（`src/control/proxy-cache.js` + `src/control/proxy.js`）：
+  - **只读 RPC 立刻发头、边流边攒**：响应头不再等正文，504 那条路径消失（正文超上限就只放弃缓存，
+    转发一个字节都不少）；
+  - **历史类条目按会话状态分档**：`session.history` / `session.page` / `session.getSnapshot`
+    在会话**已结束**时用长 TTL（默认 30 分钟新鲜 / 7 天宽限，历史不可变），
+    **正在跑**时仍用短窗口（3 s / 60 s）——否则界面会停在旧快照上；
+  - **运行状态索引**：由流经代理的 `session.list` 响应（页面每次加载都会拉）喂入
+    `sessionId → running`；命中缓存时也照样喂，避免索引停在旧值上；会话一旦在跑，
+    已写下的「长 TTL」副本会在读取时被降级到短窗口；
+  - 单条目上限从 16 MiB 提到 32 MiB（8–10 MiB 的历史要能装下）。
+- **预热**：`node scripts/warm-cache.mjs --url <入口> --history 5` —— 把最近 N 个**已结束**会话的历史
+  也灌进缓存（正在跑的不预热）。实测 5 个会话 1.2–1.8 s 各，之后打开这些会话是本地回。
+- **验证**：大会话 8 732 646 B / 42 088 事件，首次 43.36 s（HTTP 200）→ 第二次 **0.135 s**
+  （`x-hwb-cache: rpc-hit`，事件数、`asOfSeq` 与首次逐字节一致，`rpcId` 正确改写）；
+  小会话 19.06 s → 0.0018 s。新增用例：已结束会话长 TTL 命中、会话转运行时长副本立即失效、
+  大 RPC 必须先发头（用 150 ms 正文间隙 + 400 ms 超时证明头不是等正文攒完才发的）。
+- **为什么不能「旧副本 + 让流补差」（协议事实，2026-09-14 读远端 0.1.1-rc.2 源码确认）**：
+  `session.history` 只接受 `{sessionId, beforeSeq, maxMessages}` —— `beforeSeq` 是**往回翻**更早的
+  内容，不给就是切「最新尾部窗口」（`historyCutOf` 取整条事件日志再 `paginate`），
+  **没有 sinceSeq/afterSeq**；而事件流 `/api/events.host` 开流时 payload 是 `{}`（**没有游标**），
+  只推订阅之后的新事件。于是「陈旧历史窗口 + 实时流」中间的**那段事件永远补不回来** ——
+  界面会出现静默空洞。因此策略收紧为：
+  · **运行中的会话，连陈旧副本也不供**（`HWB_PROXY_CACHE_RUNNING_STALE_MS` 默认 0，可调但风险自负）；
+  · **运行状态未知**（没观测到，或观测超过 `HWB_PROXY_CACHE_RUNNING_TRUST_MS`，默认 5 分钟）
+    一律按保守档处理 —— 磁盘缓存可能带着几天前的条目跨 hwb 重启，不能拿过期观测批准长 TTL；
+  · 陈旧命中**不刷新**「是否在跑」的观测时间（新的 `noteSessionList(..., { fresh:false })`），
+    否则旧状态会冒充「刚确认过」。
+  上游若给 `session.history` 加 `afterSeq`（或给事件流加 `since` 游标），这条限制就能解除 ——
+  那时「每次打开重拉 8 MiB」可以变成「只补尾巴」。
+- **旋钮**：`HWB_PROXY_CACHE_HISTORY_TTL_MS`（默认 1800000）、
+  `HWB_PROXY_CACHE_HISTORY_STALE_MS`（默认 604800000）、
+  `HWB_PROXY_CACHE_MAX_ENTRY_BYTES`（默认改为 32 MiB）。
+
+#### 实时会话同步：兼容 dsh v0.1.1 的端点命名（`session.list` vs `session/list`）
+
+- **现象**：工作台里 dgx21 的会话状态一直是冻结的（回退到文件索引），日志里每 3 秒一条
+  `实时会话同步失败 … reason=rpc http 404`。
+- **根因**：dsh 的 RPC 端点有两代命名 —— 0.1.2 是 `/api/session/list`，**0.1.1-rc.2（dgx21）是
+  `/api/session.list`**。hwb 写死了前者，于是对旧版远端**实时通道从来没生效过**，还白发一条
+  注定 404 的请求（这条链路每 3 秒一次也不是免费的）。
+- **修复**（`src/dshhome/live-status.js`）：候选端点 `['session/list', 'session.list']`，
+  **只在 404 时**换下一种写法（超时/鉴权/超限换写法也一样失败，不再多打一轮），
+  成功一次就按 home 记住；远端换版本（记住的写法又开始 404）时忘掉重试。
+- **验证**：真实 dgx21 上日志从 `rpc http 404` 变为 `实时会话读取成功`；
+  新增两例：404 → 换用另一种命名并记住（第二轮只发一条请求）、401 不做第二次尝试。
+
+#### 远程隧道：上游瞬时失败重试 + 上游并发上限（真凶：远端 MaxSessions 10）
+
+- **现象**：稳定入口已修好、实例也不再永久卡死，但浏览器打开 dgx21 的 dsh 页面依旧「打不开」：
+  无头 Chrome（CDP）实测首屏文本停在 `Failed to load plugins`，一次抓包有 4~10 个
+  `502 Bad Gateway`（插件 bundle、`/api/*`、WebSocket 都有）。
+- **根因**：远端 sshd 的 `MaxSessions` 默认 10 —— 复用 master 时开第 11 条会话即被拒
+  （实测：`mux_client_request_session: session request failed: Session open refused by peer`，
+  1~10 成功、11~15 全拒）。而 hwb 把**全部**流量复用同一条 master：浏览器打开一个 dsh 页面
+  就要并发 6 条 HTTP 连接 + WebSocket，再叠上 hwb 自己的实时轮询/索引，稳定越过 10。
+  被拒的 channel 在代理侧表现为 `socket hang up` → 502 → 插件加载器对任何一次失败都整体报错
+  → 整个 UI 起不来（浏览器自己不会重试）。远端 sshd 用户明确不让改（怕改坏连不上服务器），
+  故只能在本侧解决。
+- **修复**（`src/control/proxy.js`）：
+  1. **上游瞬时失败重试一次**：仅 GET/HEAD、仅在上游连接阶段失败且还没向客户端写出任何字节时，
+     间隔 150ms 重试；POST（`/api/rpc` 等）绝不重放。判据用**响应**侧（`res.destroyed`）而不是
+     `req.destroyed` —— GET 的请求体读完会被 Node 自动销毁，拿它当「客户端已断开」会让重试永不触发。
+  2. **上游连接池上限**：每个代理自带 keep-alive Agent，HTTP 至多 `HWB_PROXY_MAX_SOCKETS`（默认 3）
+     条上游连接、升级单独一池（默认 2）；多余请求在 Agent 里本地排队。因为「每条转发 = 一个 ssh
+     channel」，这就把隧道占用的 channel 数**钉死**在 5 个以内，给 hwb 自身的 ssh 命令通道留出余量，
+     不再撞 MaxSessions。`close()` 时一并 `destroy()` 空闲上游连接，避免白占远端名额。
+- **验证**：同一页面 CDP 复测 —— 首屏请求 **10 个、非 2xx 0 个、失败请求 0、控制台异常 0**
+  （修复前是 4~10 个 502 + `Failed to load plugins`）。`node --test tests/*.test.js` 全量
+  672 例（671 通过 / 1 skip / 0 失败），新增 5 例：GET 重试成功、POST 不重试、持续失败只重试一次、
+  并发共用有限上游连接（峰值 = 3）、close 释放空闲上游连接。
+
+#### 链路本身：VPN 路径丢包随包长上升，瓶颈 ~25-30 KB/s（无法在 hwb 侧解决）
+
+- 同一时刻实测（本机 → 10.8.0.21）：
+  | 载荷 | 丢包 | RTT 均值 |
+  |---|---|---|
+  | 100 B | 0 % | 112 ms |
+  | 600 B | 3.3 % | 124 ms |
+  | 1200 B | 12–20 % | 467 ms |
+  | 1400 B | 33–38 % | 388 ms |
+  | 1472 B（DF） | **100 %**（黑洞） | — |
+- 本机 VPN 口 `utun8` 的 MTU 是 **1500**，而路径 MTU 只有 ~1428：满尺寸 TCP 段（1448）全被丢，
+  TCP 只能靠重传爬。三台 `.tun` 主机一致：dgx21 25 KB/s、c4g 30 KB/s、cms 37 KB/s。
+- hwb 侧已无进一步空间：能压的只有并发与重试（见上一条）。**链路要快必须动网络**——
+  最低成本是 `sudo ifconfig utun8 mtu 1400`（可回滚），彻底解决则需要网关做 MSS clamping。
+
+#### 代理长连接阻塞与 HTTP 失败恢复
+
+- SSE 收到响应头后从普通 HTTP 连接池移出，避免三个实时订阅占满连接池、页面和鉴权请求永久排队；流仍在浏览器断开、代理关闭或切换时释放。
+- 插件下载与普通请求分池，避免大文件挡住页面和鉴权；非注入响应立即发送响应头，支持无正文的 SSE。
+- 普通请求增加包含排队时间的响应头超时和响应体空闲超时，默认 30 秒（`HWB_PROXY_REQUEST_TIMEOUT_MS`）；静态资源至少保留 120 秒等待窗口；SSE 正常建立后不套用空闲超时。保留 GET/HEAD 一次重试，POST 不重放；重试等待随客户端断开取消。
+- 远程入口连续三次 HTTP 探测失败后实际重建隧道与代理，保留固定浏览器端口；重建复用既有取消和退避机制，不启动或停止远端 DSH。
+- 修正连接池注释：SSH `MaxSessions` 限制 shell/subsystem 会话，不能把 HTTP 转发通道数量直接与它等同。
+- 新增回归覆盖双层代理的 SSE 饥饿、超时释放、空闲 SSE 与切换，以及 SSH 仍存活时的 HTTP 故障恢复和断开取消。
+
+
+#### 隧道巡检：`ssh -O check` 说 master 活着 ≠ `-L` 还在（实例永久卡在 unreachable）
+
+- **现象**：2026-09-14 00:02 起 `dgx21.tun` 一直 `unreachable`，而 `ssh -O check` 回
+  `Master running (pid=71088)`；同一个窗口里 `lsof -nP -iTCP -sTCP:LISTEN` 中**没有一个 ssh 监听**
+  （实测计数 0）。稳定入口只回 `proxy: upstream error — connect ECONNREFUSED 127.0.0.1:52594`。
+- **根因**：复用 master 的隧道把「存活」定义成「master 进程还在」——旧 master 崩溃后，
+  新连接用同一 `ControlPath` 复用了套接字文件，`-O check` 继续报 Master running，
+  而依附其上的 `-L` 早已消失。于是合成句柄永不 `exit`：launcher 不重建、monitor 不安排重连，
+  实例永久停在不可用状态。属「长命 master 会退化」的严重变体（不是变慢，而是不再自愈）。
+- **修复**：`masterTunnel` 的巡检改为 `liveness = master 存活 && 本地转发口可建立 TCP 连接`
+  （新增 `forwardListening()`，超时走 `HWB_TUNNEL_FORWARD_PROBE_MS`，默认 2s）。任一不成立即
+  `finish(255)` 并写清是哪个转发口丢了，交回 launcher 既有恢复流程重建。
+  该探测只测 ssh 监听口自身（不经过远端），远端慢不会造成误判。
+- **验证**：`node --test tests/*.test.js` 全量 667 例（666 通过 / 1 skip / 0 失败）。
+  测试夹具升级：假 ssh 在 `-O forward` 时用 node 真起一个本地监听（cancel 时杀掉），
+  使「master 活着但转发已丢」这一真实故障可复现；新增两例——转发口丢失 → 判定死亡、
+  `-O forward` 假装成功但端口没监听 → 判定死亡。修复后线上实测：实例 2 分钟内
+  10 次连续探测全为 `http=200`、0.091–0.188s（此前 12.4s / 21.0s / 30s 超时 / 502）。
+
+#### 远程实例「在外部浏览器打开」改用配置的本地接入端口（不再给每次随机端口）
+
+- **现象**：`dgx21.tun` 的本地接入端口配成 49670，但标签上 ↗ 给出的地址是
+  `http://127.0.0.1:57686`，而且经常打不开。
+- **根因**：远程实例上 hwb 同时存在**两个**入口，前端却把它们混用成一个字段：
+  - `iframeUrl` —— 预览代理，监听口来自已保存的 `accessPort`（49670），跨重连 `retarget`
+    复用同一监听口，**这才是稳定的接入端口**；
+  - `inst.url` —— `#connectRemote` 为**本次连接**现建的第二个反代，端口由 `tunnel.js` 的
+    `freePort()` 让内核随机分配（实测 57686，隧道口 57679），重连即换。
+  `renderTabs` 的 ↗ 按钮此前用 `pane.externalUrl = inst.url`，于是把「短命的运行地址」
+  交给了用户：复制/收藏后随隧道重建立刻失效（实测 curl 该端口时好时坏：
+  一次 200/12.4s、一次 `proxy: upstream error — socket hang up` 502、一次 25s 超时）。
+- **修复**：
+  - `launcher`：远程实例新增 `externalUrl` = 预览代理地址（= `iframeUrl`，绑在 `accessPort` 上），
+    随 `status()`、`registry.set`、`#withPreview`/`#transferPreview`/`#connectRemote`/`switchEndpoint`
+    的结果一并返回；断开/停止时与 `iframeUrl` 一起清空。
+  - `monitor`：`externalUrl` 进入前端 runtime 形状、探测 patch、状态广播与变更判定
+    （`status()` 不带该字段会把注册表里的值抹掉，故二者必须同步改）。
+  - 前端：新增 `pane.popoutUrl`（仅用于「在外部浏览器打开」），↗ 优先用它；
+    `pane.externalUrl` 保留「本次连接地址」语义，专供入口变更判定（`planPaneRecovery` 的
+    `force`）——隧道换端口仍会强制重新认证一次，因为 `retarget` 会掐断 iframe 里的实时通道。
+- **效果**：外链与 iframe 同一个 origin（`http://127.0.0.1:49670`），token→cookie 只握一次手，
+  地址不再随隧道重建漂移；本机实例行为不变（其 `inst.url` 就是 dsh web 真实端口）。
+- **已知残留**：外链因此也走**预览代理**，它会给 dsh 的 workspace 插件注入「在 Finder 中打开工作区」
+  菜单项；在非 iframe 窗口里该项点了没反应（`preview-bridge.js` 顶层直接 return）。属外观瑕疵，非功能故障。
+- **验证**：`node --test tests/*.test.js` 全量 665 例（664 通过 / 1 skip / 0 失败）；
+  新增 `access-port.test.js`「remote 外链拿到的就是配置的接入端口，且跨重连不变」与
+  `instance-navigation.test.js`「外链走稳定入口，而入口变更判定仍看本次连接的运行地址」。
+
 > 本节原先只记了「文件预览上传」一件事，而 v0.1.1 之后其实落了 6 个功能性提交。
 > 下面先把它们补记齐（按主题合并，不逐条 commit 罗列），再是后续的修复记录。
 

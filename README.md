@@ -35,6 +35,7 @@
 - [辅助工具包](#辅助工具包)
 - [项目结构](#项目结构)
 - [测试](#测试)
+- [dsh 版本兼容性](#dsh-版本兼容性)
 - [已知限制](#已知限制)
 - [安全边界](#安全边界)
 - [路线图](#路线图)
@@ -125,7 +126,7 @@ hwb config set verbose true
 hwb config set homes '["~/.dsh"]'
 hwb config update ./hwb.json # 合并 JSON 文件；校验成功后原子保存
 hwb restart                # 更新配置后执行
-hwb doctor                 # Node、配置与运行服务 HTTP 检查
+hwb doctor                 # Node、配置、运行服务 HTTP 检查 + dsh 版本兼容性自检
 hwb test                   # 全部测试
 hwb test --test-name-pattern=CLI
 hwb upgrade                # Git 快进更新 → 测试 → 原在运行则重启
@@ -163,7 +164,7 @@ npm 安装可使用 `npm install -g hwb@latest` 后执行 `hwb restart`。
 
 ```bash
 npm start          # node src/server.js
-npm test           # node --test tests/*.test.js
+npm test           # 全量（含 tests/compat 版本兼容性契约）
 ```
 
 命令行选项：
@@ -286,18 +287,29 @@ SSH 意外退出后按 1/2/4/8/16 秒退避，最多重连 5 次，只重建到�
 
 ## 读取的 dsh home 文件
 
-Reader 只读取以下 **4 个文件**，均为 schema-versioned：
+Reader 读取以下文件，均为 schema-versioned：
 
 | 文件 | 内容 | 版本 | 关键规则 |
 |------|------|------|---------|
 | `storages/workspace.json` | 工作区列表、会话 ID 映射、归档状态 | 2 | 轻量，可频繁读 |
-| `storages/session_projcache.json` | 会话投影缓存：tokenUsage、contextPressure、status | 3 | **零 I/O 读取层** |
+| `storages/session_projcache/sessions/*.json` | 会话投影缓存（**per-record 布局**）：tokenUsage、contextPressure、status | 3–7 | **当前 dsh 的权威来源**；每个会话一个文件 |
+| `storages/session_projcache.json` | 同上，但是**单文件聚合**（遗留布局） | 3–7 | 只用于补齐 per-record 尚未覆盖的会话；dsh 已不再更新它 |
 | `model-tier.json` | 订阅方案、模型路由 tiers | 2 | 可选；缺失不判定 degraded |
 | `.credentials.yaml` | provider 引用（只读 provider 名，**不读 key 值**） | — | 可选；缺失不判定 degraded |
 
+**projcache 有两种磁盘布局，必须都认。** dsh 声明该域 `layout: 'per-record'`，把会话写进
+`storages/session_projcache/sessions/<id>.json`（信封 `{version, record}`）；早期版本写单个聚合文件
+`storages/session_projcache.json`（信封 `{unit, global, tables}`），新版只在首次发现时用它做一次
+bootstrap，之后**不再更新**。hwb 以 **per-record 为准、聚合为补充**（同 id 冲突以 per-record 为准）。
+
+> 这里踩过一次真实的坑（2026-09，dsh 0.1.5-rc.1）：hwb 只读聚合文件 → 真实 home 上
+> **476 个会话只看到 179 个（漏 62%），且 `degraded` 为空**（聚合文件本身合法，只是过期）。
+> 修复后覆盖 100%。回归测试见 `tests/compat/`。
+
 **硬性规则：永不碰 `*.zstd`。** 工作台活在投影缓存（`projection cache`）第一层，绝不下探日志。
-远程实例读取同样的 4 个文件，只是经一次 `ssh host bash -s`（`remote-reader`）在远端 `cat` 抓回再解析——**只读**，
-且与本地共用同一套 schema 验证与域降级，因此远程实例的「当前项目/当前会话」与本地同构。
+远程实例读取同样的文件（外加 per-record 目录），只是经一次 `ssh host bash -s`（`remote-reader`）
+在远端 `cat` 抓回再解析——**只读**，且与本地共用同一套 schema 验证与域降级，
+因此远程实例的「当前项目/当前会话」与本地同构。
 
 > 某个文件升级到未支持的主版本时，只把**该域**标记为 `degraded`，其余域照常索引，
 > 前端显示「dsh 已升级 — 索引待适配」提示，而不是白屏。
@@ -387,6 +399,7 @@ Reader 只读取以下 **4 个文件**，均为 schema-versioned：
 | `dsh-remote-web.sh` | 本地一键：SSH 到远端拉 dsh web、抓回流 token、建隧道、打 URL |
 | `dsh-http-cache.Caddyfile` | 给 dsh web 前端静态资源加不可变缓存头的反代配置（Caddy） |
 | `dsh-http-cache.nginx.conf` | 同上（nginx 版） |
+| `warm-cache.mjs` | 预热 hwb 代理缓存：按 dsh 索引里的清单把插件 bundle / 前端资源灌进本地缓存（`--history N` 还会预热最近 N 个已结束会话的历史），之后打开页面/历史会话就是本地回 |
 
 详见 `scripts/README.md`、`scripts/README-dsh-remote-web.md`、`scripts/README-http-cache.md`。
 
@@ -422,6 +435,7 @@ hwb/
 │   │   ├── status.js            # 会话工作状态推导（纯函数）
 │   │   ├── time.js              # 毫秒时间戳 → ISO（越界降级为 null）
 │   │   ├── node-version.js      # Node 版本门槛（engines / doctor / 启动预检 同源）
+│   │   ├── dsh-compat.js        # dsh 存储契约自检（doctor 用；从安装的 dsh 提取域版本）
 │   │   ├── file-preview.js      # 预览/下载/上传（本机 fs + 远端 python，含路径围栏）
 │   │   ├── multipart.js         # 流式 multipart 解析（线性扫描 + 边界保持）
 │   │   ├── endpoints.js         # 连接端点规范化（host/port/唯一 id）
@@ -430,7 +444,7 @@ hwb/
 │   │   └── service-config.js    # ~/.hwb/config.json 的读写与校验
 │   ├── dshhome/                 # 数据平面
 │   │   ├── reader.js            # 编排 read + normalize + store
-│   │   ├── remote-reader.js     # 远端只读索引（一次 ssh bash -s cat 4 个元数据文件）
+│   │   ├── remote-reader.js     # 远端只读索引（一次 ssh bash -s cat 元数据文件 + per-record 目录）
 │   │   ├── indexer.js           # 后台索引循环（60s debounce + 按实例退避）
 │   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC）
 │   │   ├── live-poller.js       # 实时状态轮询（3s，仅运行中的本机实例）
@@ -485,7 +499,9 @@ hwb/
 ## 测试
 
 ```bash
-npm test        # node --test tests/*.test.js
+npm test            # 全量：功能测试 + dsh 版本兼容性契约（tests/compat）
+npm run test:unit   # 只跑功能测试
+npm run test:compat # 只跑兼容性契约（升级 dsh 后先跑这个）
 ```
 
 当前**全套用例全绿**。确切条数与文件数以 `npm test` 的输出为准 —— 这里刻意不写死任何数字，
@@ -502,6 +518,57 @@ SSH 重连与恢复 / 前端渲染转义与表单草稿 / Node 版本门槛与�
 
 ---
 
+## dsh 版本兼容性
+
+hwb 消费 dsh 的**磁盘格式**与 **CLI 表面**，而这些都不是 dsh 承诺稳定的公开 API，
+dsh 的版本号也不遵循 semver 承诺（0.1.x → 0.1.5 之间就改过存储布局）。
+**漂移的失败方式通常是静默的**：整块域被判 degraded，或只读到一部分数据而界面毫无提示。
+
+**已验证**：dsh **0.1.5-rc.1**（本机实测）。契约：
+
+| 契约 | dsh 声明 | hwb 的处理 |
+|---|---|---|
+| `workspace` 域 | `version: 2`，single 布局，`global.workspaceIds` | 接受 2 |
+| `session_projcache` 域 | `version: 7`，`compatibleVersions: [3,4,5,6]`，**per-record** 布局 | 接受 3–7；**两种布局都读**（per-record 为准、聚合为补充） |
+| `dsh web` 启动打印 | `dsh web: http://127.0.0.1:<port>/?token=<t>` | 抓 `?token=`（抓不到则退回裸 URL） |
+| RPC 端点 | `POST /api/session/list`（slash 形） | 先试 slash，404 回退 dot 形 |
+
+**升级 dsh 后怎么办**：
+
+```sh
+npm run compat          # 一键结论：兼容 / 不兼容 + 改哪里（不兼容时退出码 1，可进 CI）
+npm run test:compat     # 完整契约测试：逐条检查与「改哪一行」的指引
+hwb doctor              # 运行时体检：Node / 配置 / 服务 / 契约 / 本机 home 可读性
+```
+
+契约测试在**没装 dsh 的 CI 上也能跑**：整组按「无法判定」跳过（跳过项名字里写明原因），
+不会假装通过、也不会让构建失败。
+
+`hwb doctor` 会同时报告**两个互相独立**的检查 —— 只做其中一个会漏掉另一半
+（dsh 二进制可以很新而 home 是旧格式，反之亦然）：
+
+```
+dsh 0.1.5-rc.1 兼容 ✓
+本机 home（2 个）：
+  · MBP：476 会话 / 28 工作区 | 布局 per-record=476 | 版本 7
+  · bee：8 会话 / 2 工作区 | 布局 per-record=8 | 版本 5
+```
+
+契约测试是**从实际安装的 dsh 里提取**契约再比对的（不是抄进常量），
+所以 dsh 一升级它就报「dsh 现在声明了什么」。完整说明见
+[`tests/compat/README.md`](tests/compat/README.md)。
+
+**已知的兼容性风险**（有意保留的边界）：
+
+- 远程 dsh 的两个可选插件（`dsh-static-cache` / `dsh-history-delta`）依赖 dsh 内部服务名
+  （`webServer` / `connection` / `apiProxy`）。这些是运行时字符串，无法自动做契约测试。
+  实测 dsh 0.1.5-rc.1 里 `webServer` 存在、而 **`apiProxy` 不存在** ——
+  即 `dsh-history-delta`（低带宽增量历史，**默认关闭**）在当前版本会走「不打补丁」分支。
+  后果仅性能（代理层整段回退读取），不会错也不会崩。
+- **前端 bundle 注入锚点**（`workspace-menu.js` 给 dsh 的 workspace 菜单打补丁）
+  依赖压缩后的字面量子串。已纳入契约测试 F 组（拿真实 bundle 验证），但注入后的**浏览器行为**
+  无法在无浏览器环境断言。
+
 ## 已知限制
 
 > 这些是 v0.1.1 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
@@ -515,8 +582,36 @@ SSH 重连与恢复 / 前端渲染转义与表单草稿 / Node 版本门槛与�
   单测 ✓ —— 但仪表盘**尚未**把它渲染出来（前端目前用量卡里没有额度区块）。如需启用，把
   `renderQuotaCards` 挂到工作台即可；属**剩余 5% 接线**工作，不影响其余功能。
 - **远程索引读整份 projcache 走 SSH**：远程实例每次索引周期（60s 基线）经一次 `ssh cat` 抓回
-  `session_projcache.json`（可能数百 KB）+ 其余元数据。这是为拿到「当前项目/会话」所必需的只读读；
+  元数据文件 + **per-record projcache 目录**（每个会话一个文件）。
+  per-record 是全量文件，所以远端会先做一次**投影**：只保留 hwb 用到的
+  ~10 个 projection（`title` / `tokenUsage` / `contextPressure` / `sessionStats` /
+  `goal` / `todos` / `subagent` / `plan` / `permissions` / `sessionListMetadata`），
+  丢掉 `titleInput` / `turnOutline` / `contextBreakdown` 等大头 ——
+  实测本机 476 个会话 **4.07 MiB → 1.28 MiB（省 69%）**。
+  投影任一步失败（远端没有 python3、JSON 坏了）都**原文回退**，宁可多传也不少读；
+  传输体积超过 2 MiB 时记一条 warn（低带宽链路上有 90 s ssh 超时风险）。
   远程不可达时该实例降级（`markHomeError`），**不会**阻塞其它实例索引，也不会去重启/杀实例。
+- **代理层本地缓存（`src/control/proxy-cache.js`）有 TTL，不是「永远最新」**：远程实例的插件 bundle、
+  前端资源、以及只读 RPC（会话列表/历史/描述类）会缓存在 `<HWB_DIR>/proxy-cache`，命中直接本地回。
+  实测依据：远端 dsh 对插件 bundle 回 `no-cache` 且无校验器、会话列表走 POST RPC，浏览器侧**根本无法缓存**，
+  于是每次打开页面都要在 25–30 KB/s 的链路上重下 3.3 MiB（≈2 分钟）。
+  代价是「上游在同一 URL 下改了内容」时最多陈旧一个 TTL（默认静态 600 s、只读 RPC 3 s / 宽限 60 s）；
+  内容寻址的 URL（`?rev=<hash>`、`-<hash8>.js`）本身不会原地变，所以这个窗口在实践中是空的。
+  写/控制类 RPC（prompt/create/cancel/updateQueue/respond/upload…）、带 `set-cookie` 的响应、
+  带 token 的 URL 一律不缓存。要关掉：`HWB_PROXY_CACHE=0`；换落盘位置：`HWB_PROXY_CACHE_DIR`。
+- **会话历史（`session.history`）按「会话是否在跑」分档**：它是**原始事件日志**，实测一个大会话
+  50 条消息的窗口就有 8–10 MiB（经隧道首次 43 s）。已结束的会话历史不可变 → 长 TTL
+  （默认 30 分钟新鲜 / 7 天宽限）；正在跑的会话仍用短窗口（3 s / 60 s），
+  且已写下的长副本会在读取时被降级 —— 界面不会停在旧快照上。
+  旋钮：`HWB_PROXY_CACHE_HISTORY_TTL_MS`、`HWB_PROXY_CACHE_HISTORY_STALE_MS`。
+  想连「第一次打开」都不等：`node scripts/warm-cache.mjs --url <入口> --history 5`。
+  **运行中的会话连陈旧副本也不供**（默认 `HWB_PROXY_CACHE_RUNNING_STALE_MS=0`）：dsh 的
+  `session.history` 只有 `beforeSeq`（往回翻）而没有 `afterSeq`（向前增量），事件流订阅也不带游标，
+  所以一份陈旧窗口中间缺的那段事件补不回来。运行状态未知（没观测到 / 观测超过
+  `HWB_PROXY_CACHE_RUNNING_TRUST_MS`，默认 5 分钟）同样按保守档处理。
+- **dsh 的 RPC 端点有两代命名**：0.1.2 是 `session/list`，0.1.1-rc.2 是 `session.list`。
+  实时会话同步（`src/dshhome/live-status.js`）与代理缓存都按形态/候选两种写法兼容；
+  只写死一种时，旧版远端的表现是「实时状态从未生效」（每 3 秒一条 `rpc http 404`）。
 - **仅 `deepseek`/`kimi` 有公开余额 API**：`zai`/`minimax` 无公开 balance endpoint，
   API 显式降级为「余额不可用」，不会静默失败。
 - **会话 deep-link 依赖客户端插件**：`dsh-session-deeplink` 需经
