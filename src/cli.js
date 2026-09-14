@@ -7,6 +7,36 @@ import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { serviceDir, socketFile, configFile, readConfig, saveConfig, serverArgs } from './lib/service-config.js';
 import { isNodeSupported, nodeRequirementMessage, MIN_NODE } from './lib/node-version.js';
+import { checkDshCompat, formatDshCompat } from './lib/dsh-compat.js';
+
+// node:sqlite 自 Node 22.5 起提供；更早的版本在启动时就被 isNodeSupported 拦下，
+// 因此这里的 import 不会在支持的平台上失败。doctor 读索引库要用它。
+//
+// **必须是动态 import**：ESM 的静态 import 会被提升到模块体之前求值，那时
+// `process.emitWarning` 还没被替换 —— 结果就是那行 ExperimentalWarning 照样打出来
+// （实测踩过）。动态 import 在 main() 里、覆盖之后才求值。
+let sqliteModule = null;
+async function sqlite() {
+  if (!sqliteModule) {
+    // Node 把 node:sqlite 标为实验特性，首次加载会往 stderr 打一行
+    // `ExperimentalWarning: SQLite is an experimental feature…`。服务端进程里它混在日志中无所谓，
+    // 但 `hwb doctor` / `hwb test` 是**给人看的终端输出**，多这一行会让人以为出了问题。
+    // 只屏蔽这一条（按名字+内容匹配），其它警告照常抛出。
+    const original = process.emitWarning;
+    process.emitWarning = (warning, ...rest) => {
+      const name = typeof warning === 'object' ? warning?.name : rest[0];
+      const text = String(typeof warning === 'object' ? warning?.message ?? '' : warning);
+      if (name === 'ExperimentalWarning' && /SQLite/i.test(text)) return;
+      return original.call(process, warning, ...rest);
+    };
+    try {
+      sqliteModule = await import('node:sqlite');
+    } finally {
+      process.emitWarning = original;
+    }
+  }
+  return sqliteModule;
+}
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const help = `hwb — 服务管理（macOS / Linux，Node.js ${MIN_NODE}+）
@@ -239,8 +269,89 @@ function run(command, args, capture = false) {
   return result.stdout?.trim();
 }
 function test(args = []) {
-  const files = fs.readdirSync(path.join(root, 'tests')).filter(f => f.endsWith('.test.js')).sort().map(f => path.join(root, 'tests', f));
+  const files = collectTestFiles();
   run(process.execPath, ['--test', ...args, ...files]);
+}
+
+/**
+ * `doctor` 的「本机 home 健康」检查：实际读一遍每个**本地** home 的元数据并报告结果。
+ *
+ * 与 `checkDshCompat()` 的分工：那个查「本机装的 dsh 声明了什么」，本函数查
+ * 「配置里的 home 实际能不能读」。两者独立且都必要 —— dsh 二进制可以很新而某个 home
+ * 的元数据仍是 hwb 不认的版本，也可能反过来。只查一边会漏掉另一半。
+ *
+ * 只查**本地** home：远程要走 SSH（可能几十秒、可能不可达），不该拖住一个诊断命令；
+ * 远程实例的状态看仪表盘即可。读失败按「读不了」如实报告，不抛错（doctor 是诊断命令）。
+ */
+async function formatHomeHealth() {
+  let homes;
+  try {
+    homes = await localHomesFromDb();
+  } catch (e) {
+    return `本机 home 检查：跳过（读不到配置库：${e.message}）`;
+  }
+  if (!homes.length) return '本机 home 检查：配置里没有本地 home';
+
+  const { readHome } = await import('./lib/read-home.js');
+  const lines = [`本机 home（${homes.length} 个）：`];
+  for (const h of homes) {
+    let snap;
+    try {
+      snap = readHome(h.homePath);
+    } catch (e) {
+      lines.push(`  ✗ ${h.alias || h.homePath}：读取失败（${e.message}）`);
+      continue;
+    }
+    const lay = snap.pcLayout ?? {};
+    const deg = Array.isArray(snap.degraded) && snap.degraded.length
+      ? ` | ⚠ 降级 ${snap.degraded.map((d) => d.domain).join('/')}`
+      : '';
+    const skipped = lay.skipped ? ` | 跳过 ${lay.skipped} 个会话文件` : '';
+    // 「perRecord=0 且 aggregate=true」= 还在旧布局上（正常，dsh 未升级）；
+    // 「perRecord=0 且 aggregate=false 且 sessions=0」= 没有数据（新 home）。
+    lines.push(
+      `  · ${h.alias || h.homePath}：${snap.sessions.length} 会话 / ${snap.workspaces.length} 工作区`
+      + ` | 布局 per-record=${lay.perRecord ?? 0}${lay.aggregate ? ' +聚合' : ''}`
+      + ` | 版本 ${snap.pcVersion ?? '—'}${skipped}${deg}`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/** 从索引库读本地 home（仅 hostType=local）。库不存在/读不了时抛错，由调用方处理。 */
+async function localHomesFromDb() {
+  const { db } = readConfig();
+  if (!fs.existsSync(db)) return [];
+  const { DatabaseSync } = await sqlite();
+  const conn = new DatabaseSync(db, { readOnly: true });
+  try {
+    return conn.prepare("SELECT homePath, alias FROM homes WHERE hostType = 'local'").all()
+      .map((r) => ({ homePath: r.homePath, alias: r.alias }));
+  } finally {
+    try { conn.close(); } catch { /* 已关闭 */ }
+  }
+}
+
+/**
+ * 收集要跑的测试文件：`tests/*.test.js` **加上** `tests/compat/*.test.js`。
+ *
+ * 为什么必须显式带上 compat 子目录：`readdirSync(tests)` 不递归，所以
+ * `hwb test` 原先**静默漏掉**整个兼容性测试模块 —— 而 `hwb test` 正是升级 dsh 后
+ * 最自然要跑的命令（README 与 doctor 的提示都指向它）。漏掉它等于「以为测了其实没测」。
+ */
+function collectTestFiles() {
+  const testsDir = path.join(root, 'tests');
+  const out = fs.readdirSync(testsDir)
+    .filter((f) => f.endsWith('.test.js'))
+    .sort()
+    .map((f) => path.join(testsDir, f));
+  const compatDir = path.join(testsDir, 'compat');
+  if (fs.existsSync(compatDir)) {
+    for (const f of fs.readdirSync(compatDir).filter((f) => f.endsWith('.test.js')).sort()) {
+      out.push(path.join(compatDir, f));
+    }
+  }
+  return out;
 }
 async function main() {
   let [command, ...args] = process.argv.slice(2);
@@ -343,7 +454,17 @@ async function main() {
         if (!res.ok) throw Error(`HTTP ${res.status}`);
       }
       const how = state?.ready ? '' : '（前台 serve，无控制 socket）';
-      console.log(`Node ${process.version} ✓ 配置 ✓ 服务 ${up ? `HTTP 正常 ✓${how}` : '未运行'}`); return;
+      console.log(`Node ${process.version} ✓ 配置 ✓ 服务 ${up ? `HTTP 正常 ✓${how}` : '未运行'}`);
+      // dsh 兼容性自检：放在 doctor 里，因为「实例数据变少 / 看起来空了」正是用户跑 doctor 的
+      // 典型场景，而它最常见的原因就是 dsh 升级后存储契约漂移（且 hwb 侧是静默降级）。
+      // 找不到 dsh 不算错（用户可能只做数据面聚合、没在本机装 CLI）。
+      const compat = checkDshCompat();
+      console.log(formatDshCompat(compat));
+      // 上面查的是「本机装的 dsh」；这里再查「配置里的 home 实际能不能读」——
+      // 两者是独立的：dsh 二进制可以很新，而某个 home 的元数据却是 hwb 读不了的版本；
+      // 也可能反过来（旧 dsh + 新 home）。只查一边会漏掉另一半。
+      console.log(await formatHomeHealth());
+      return;
     }
     case 'upgrade': {
       if (!fs.existsSync(path.join(root, '.git'))) throw Error('upgrade 仅支持 Git 安装；npm 安装请使用 npm install -g hwb@latest 后 hwb restart');
