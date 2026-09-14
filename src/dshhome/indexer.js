@@ -201,6 +201,14 @@ export class Indexer {
         sessionCount: snapshot.sessions.length,
         workspaceCount: snapshot.workspaces.length,
         degraded: snapshot.degraded,
+        // 带上「读了哪种 projcache 布局 / 最高版本」：排查「某实例数据变少」时，
+        // 第一个要回答的问题就是「它走的是 per-record 还是那个冻结的聚合文件」。
+        // 放在 payload 里，日志与 SSE 都能看到，不必再去翻代码。
+        // 已实测这条数据通路：磁盘 → reader → 本 payload → `/api/events` 的
+        // `index:updated` 事件（收到 `pcLayout:{"perRecord":476,"aggregate":false,
+        // "versions":{"5":466,"7":10}}`）。
+        pcLayout: snapshot.pcLayout,
+        pcVersion: snapshot.pcVersion,
         indexedAt: snapshot.generatedAt,
       };
       if (failed) {
@@ -208,6 +216,15 @@ export class Indexer {
       } else if (snapshot.degraded.length) {
         log.debug('部分域降级（其余照常索引）', { homeId, degraded: snapshot.degraded });
       }
+      // 布局与版本记在 debug 档：正常运行时安静，排查时一行 `HWB_LOG=debug hwb restart`
+      // 就能看到每个实例走的是哪种布局。perRecord=0 而磁盘上有文件 = 布局不认识（事故形态）。
+      log.debug('索引布局', {
+        homeId,
+        perRecord: snapshot.pcLayout?.perRecord ?? 0,
+        aggregate: snapshot.pcLayout?.aggregate ?? false,
+        versions: snapshot.pcLayout?.versions ?? null,
+        sessionCount: snapshot.sessions.length,
+      });
     this.lastFailure.delete(homeId);   // 成功了 → 复位「重复失败」抑制（下次失败要重新记全）
     this.broadcast('index:updated', payload);
     results.push({ homeId, ok: !failed, ...payload });

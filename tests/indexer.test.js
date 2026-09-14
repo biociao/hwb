@@ -292,3 +292,15 @@ test('indexer: 同一实例的同一失败原因不再每次记全套栈（首�
     .filter((e) => String(e.message).includes('读取远程 dsh home 元数据失败'));
   assert.equal(remoteNoise.length, 1, `remote-reader 那条同理只该记 1 条（实际 ${remoteNoise.length}）`);
 });
+
+test('indexer: 广播的 index:updated 载荷带上 projcache 布局与版本（排查「数据变少」的第一手信息）', async () => {
+  const { indexer, events } = fixture();
+  await indexer.reindexNow();
+  const upd = events.find((e) => e.event === 'index:updated');
+  assert.ok(upd, '应广播 index:updated');
+  // 排查「某实例数据怎么变少了」时，第一个要回答的问题是
+  // 「它走的是 per-record 还是那个已冻结的聚合文件」—— 这个字段就是答案。
+  assert.ok(upd.data.pcLayout, '载荷应带 pcLayout（否则日志/SSE 都看不出读了哪种布局）');
+  assert.equal(typeof upd.data.pcLayout.perRecord, 'number', 'pcLayout.perRecord 应是数字');
+  assert.ok('pcVersion' in upd.data, '载荷应带 pcVersion');
+});
