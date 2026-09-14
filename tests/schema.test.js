@@ -152,28 +152,33 @@ test('validateModelTierJson: __proto__ 作为 tierId 不会污染原型、也不
   assert.equal({}.provider, undefined);
 });
 
-// dsh 的域声明（dsh-session-projection-cache/lib/index.js:86-90）是
-// `{ name: 'session_projcache', version: 5, compatibleVersions: [3, 4] }`，
-// 而记录形状在 3/4/5 之间**对 hwb 用到的字段完全一致**：
-// `{ identity: { createdAt, cwd? }, rows: { key: { ver, seq, val } } }`（同包 spec.d.ts:40-66），
-// 4/5 只是多了可选的 lineage 字段。hwb 原先只认 3 —— 一旦某个 home 被新版 dsh 标成 4/5，
-// 该域会被判 degraded、**整块停止更新**（「实例看起来空了」那一类）。
-test('schema: projcache 的 3/4/5 都被接受，其它版本仍然拒绝', () => {
+// dsh 的域声明（dsh-session-projection-cache/lib/index.js:89-101，实测 dsh 0.1.5-rc.1）是
+// `{ name: 'session_projcache', version: 7, compatibleVersions: [3, 4, 5, 6] }`，
+// 而记录形状在 3–7 之间**对 hwb 用到的字段完全一致**：
+// `{ identity: { createdAt, cwd? }, rows: { key: { ver, seq, val } } }`（同包 spec.d.ts），
+// 4–7 只是多了可选的 lineage 字段（formatVersion / isSeeded / inheritedEventCount）。
+// hwb 原先只认 3（后来是 3/4/5）—— 一旦某个 home 被新版 dsh 标成 6/7，该域会被判 degraded、
+// **整块停止更新**（「实例看起来空了」那一类）。
+//
+// ⚠️ 这条测试的版本清单**故意写死**，用来固定「已知契约」；而「dsh 是否又漂移了」由
+// tests/compat/dsh-compat.test.js 从实际安装的 dsh 里提取后比对。两者分工不同：
+// 这里防**回归**（别把已支持的版本改窄），compat 那边发现**新漂移**。
+test('schema: projcache 的 3/4/5/6/7 都被接受，其它版本仍然拒绝', () => {
   const mk = (version) => ({
     unit: { name: 'session_projcache', version },
     global: null,
     tables: { sessions: { s1: {
-      identity: { createdAt: 1, cwd: '/r', isSeeded: true, inheritedEventCount: 3 }, // 4/5 才有的可选字段
+      identity: { createdAt: 1, cwd: '/r', isSeeded: true, inheritedEventCount: 3 }, // 4+ 才有的可选字段
       rows: { title: { ver: 1, seq: 2, val: 'T' }, tokenUsage: { ver: 1, seq: 3, val: { totals: { uncachedInputTokens: 5, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 8 }, last: null } } },
     } } },
   });
-  for (const v of [3, 4, 5]) {
+  for (const v of [3, 4, 5, 6, 7]) {
     const res = validateProjcacheJson(mk(v));
     assert.equal(res.ok, true, `version ${v} 应被接受（实际 ${JSON.stringify(res).slice(0, 120)}）`);
     assert.equal(res.sessions[0].title, 'T');
-    assert.equal(res.sessions[0].tokenUsage.uncachedInputTokens, 5, '记录形状在 3/4/5 之间一致');
+    assert.equal(res.sessions[0].tokenUsage.uncachedInputTokens, 5, '记录形状在 3–7 之间一致');
   }
-  for (const v of [0, 1, 2, 6, 99]) {
+  for (const v of [0, 1, 2, 8, 99]) {
     assert.equal(validateProjcacheJson(mk(v)).ok, false, `version ${v} 必须拒绝（dsh 没有声明兼容它）`);
   }
 });

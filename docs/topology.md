@@ -79,10 +79,12 @@
 - **稳定第一**：连接问题只降级重探测，不重启/杀健康实例；`stop/restart` 需二次确认。
 
 ### 3.2 数据聚合（数据平面）
-- 统一 Reader：本机走 `fs`，远程经一次 `ssh host bash -s` `cat` 4 个文件（`remote-reader`）。
+- 统一 Reader：本机走 `fs`，远程经一次 `ssh host bash -s` `cat` 元数据文件 + per-record 目录（`remote-reader`）。
 - 共用同一套 `buildSnapshot → schema 校验 → normalize → SQLite upsert`。
-- 只读投影缓存 `session_projcache.json`，**永不碰 `*.zstd`**。
+- 只读投影缓存（`session_projcache`，per-record 为准、单文件聚合为补充），**永不碰 `*.zstd`**。
 - 版本不兼容只将该域标记 `degraded`，其余域照常，不白屏。
+- dsh 存储契约（域版本 / 磁盘布局）由 `tests/compat/` 从**实际安装的 dsh** 提取并比对；
+  `hwb doctor` 也会做一次同样的自检。
   `session_projcache` 接受 **3/4/5**（依据 dsh 自己的 `compatibleVersions: [3,4]` 与当前 5；
   三者的记录形状对 hwb 用到的字段一致），只认 3 会让「新版 dsh 写过的 home」整块停止更新。
 - 配额只读：`.credentials.yaml` 仅取 provider 名 → `balance.js` 查余额 → TTL 缓存 → SSE，key 永不出服务端。

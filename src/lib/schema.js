@@ -2,19 +2,26 @@ import { deriveSessionStatus } from './status.js';
 import { msToIso } from './time.js';
 
 // 每个域**允许**的版本清单（不是「唯一版本」）。依据来自 dsh 自己的域声明，而不是猜：
-//   · `session_projcache`：`projectionCacheDomainSpec = { name, version: 5, compatibleVersions: [3, 4],
-//     layout: 'per-record', tables: { sessions: checkpointRecord } }`
-//     （dsh-session-projection-cache/lib/index.js:86-90）。记录形状在 3/4/5 之间**对 hwb 用到的字段
-//     完全一致**：`{ identity: { createdAt, cwd? }, rows: { <key>: { ver, seq, val } } }`
-//     （同包 lib/types/spec.d.ts:40-66）；4/5 只多了可选的 lineage 字段（isSeeded/inheritedEventCount），
-//     而 hwb 只读 `identity.cwd` / `identity.createdAt` / `rows[*].val`。
-//     为什么必须放宽：dsh 认为 3/4/5 都可读（它自己声明 compatible），而 hwb 原先只认 3 ——
-//     一旦某个 home 的文件被新版 dsh 标成 4 或 5，hwb 就会把该域判 degraded、**整块停止更新**
+//   · `session_projcache`：`projectionCacheDomainSpec = { name, version: 7,
+//     compatibleVersions: [3, 4, 5, 6], invalidRecords: 'backup-and-skip', layout: 'per-record',
+//     tables: { sessions: checkpointRecord } }`
+//     （dsh-session-projection-cache/lib/index.js:89-101，实测 dsh 0.1.5-rc.1）。
+//     记录形状在 3–7 之间**对 hwb 用到的字段完全一致**：
+//     `{ identity: { createdAt, cwd? }, rows: { <key>: { ver, seq, val } } }`
+//     （同包 lib/types/spec.d.ts 的 checkpointRecord 与 checkpointIdentity）。4–7 只多了可选的
+//     lineage 字段（formatVersion / isSeeded / inheritedEventCount），而 hwb 只读
+//     `identity.cwd` / `identity.createdAt` / `rows[*].val`。
+//     为什么必须放宽：dsh 认为 3–7 都可读（它自己声明 compatible），而 hwb 原先只认 3 ——
+//     一旦某个 home 的文件被新版 dsh 标成 4/5/6/7，hwb 就会把该域判 degraded、**整块停止更新**
 //     （「实例看起来空了」那一类，只是这次不是版本未知、而是我们没列出来）。
-//   · `workspace`：dsh-workspace 当前写 `version: 2`（lib/index.js:226）—— 与这里一致。
+//     ⚠️ **不要手抄**：tests/compat/dsh-compat.test.js 会从**实际安装的 dsh** 里提取这份清单
+//     并逐条比对，dsh 一升级就报出「缺哪个版本」。升级 dsh 后先跑 `npm run test:compat`，
+//     再按它的提示改这里。
+//   · `workspace`：dsh-workspace 当前写 `version: 2`（lib/index.js:248-260，实测 0.1.5-rc.1）
+//     —— 与这里一致；且 dsh 未声明 compatibleVersions（single 布局是硬校验，版本不符直接抛）。
 export const SUPPORTED_VERSIONS = {
   workspace: [2],
-  projcache: [3, 4, 5],
+  projcache: [3, 4, 5, 6, 7],
   modelTier: [2],
 };
 
@@ -68,6 +75,53 @@ export function validateWorkspaceJson(data) {
   return { ok: true, version: u.version, workspaces };
 }
 
+/**
+ * 把「一条 projcache 记录」(`{ identity, rows }`) 折成 hwb 的会话 meta。
+ *
+ * **两种磁盘布局共用这一处**：聚合文件里 `tables.sessions[id]` 的值、per-record 文件里
+ * `record` 字段的值，形状**完全一致**（dsh 的 checkpointRecord 是同一个 zod schema）。
+ * 抽出来是为了保证两条读取路径永远产出同一组字段 —— 否则「per-record 会话缺 status」
+ * 这类分歧会以「有些会话不显示状态」的形式悄悄出现，且只在部分数据上复现。
+ */
+function projcacheRecordToSession(sessionId, s) {
+  const rows = s.rows ?? {};
+  const totals = rows.tokenUsage?.val?.totals ?? {};
+  const cp = rows.contextPressure?.val;
+  const meta = {
+    sessionId,
+    cwd: typeof s.identity?.cwd === 'string' ? s.identity.cwd : '',
+    title: typeof rows.title?.val === 'string' ? rows.title.val : '',
+    tokenUsage: {
+      uncachedInputTokens: num(totals.uncachedInputTokens),
+      outputTokens: num(totals.outputTokens),
+      cacheReadTokens: num(totals.cacheReadTokens),
+      cacheWriteTokens: num(totals.cacheWriteTokens),
+    },
+    lastActivity: msToIso(rows.sessionListMetadata?.val?.lastPromptAt) ?? msToIso(s.identity?.createdAt),
+  };
+  if (cp && typeof cp === 'object') {
+    meta.contextPressure = {
+      pressureTokens: num(cp.pressureTokens),
+      projectedTokens: num(cp.projectedTokens),
+      contextWindow: num(cp.contextWindow),
+    };
+  }
+  // 折叠状态类投影 → 会话工作状态（running / completed / idle）。
+  meta.status = deriveSessionStatus({
+    sessionStats: rows.sessionStats?.val,
+    goal: rows.goal?.val,
+    todos: rows.todos?.val,
+    subagent: rows.subagent?.val,
+    plan: rows.plan?.val,
+    permissions: rows.permissions?.val,
+    // 投影缓存是**快照**：进程被杀/机器休眠/会话被放弃时，里面那些「进行中」的信号会永远
+    // 冻结在那里。不断言新鲜度的话，几周前的会话会一直显示「运行中」（实测真实 home：
+    // 179 个会话里 18 个被判 running，全部空闲 7–28 天，0 个在 10 分钟内）。
+    lastActivity: meta.lastActivity,
+  });
+  return meta;
+}
+
 export function validateProjcacheJson(data) {
   const u = unitVersion(data, 'session_projcache.json');
   if (u.error) return fail(u.error);
@@ -81,44 +135,44 @@ export function validateProjcacheJson(data) {
   const sessions = [];
   for (const [sessionId, s] of Object.entries(table)) {
     if (!s || typeof s !== 'object') continue;
-    const rows = s.rows ?? {};
-    const totals = rows.tokenUsage?.val?.totals ?? {};
-    const cp = rows.contextPressure?.val;
-    const meta = {
-      sessionId,
-      cwd: typeof s.identity?.cwd === 'string' ? s.identity.cwd : '',
-      title: typeof rows.title?.val === 'string' ? rows.title.val : '',
-      tokenUsage: {
-        uncachedInputTokens: num(totals.uncachedInputTokens),
-        outputTokens: num(totals.outputTokens),
-        cacheReadTokens: num(totals.cacheReadTokens),
-        cacheWriteTokens: num(totals.cacheWriteTokens),
-      },
-      lastActivity: msToIso(rows.sessionListMetadata?.val?.lastPromptAt) ?? msToIso(s.identity?.createdAt),
-    };
-    if (cp && typeof cp === 'object') {
-      meta.contextPressure = {
-        pressureTokens: num(cp.pressureTokens),
-        projectedTokens: num(cp.projectedTokens),
-        contextWindow: num(cp.contextWindow),
-      };
-    }
-    // 折叠状态类投影 → 会话工作状态（running / completed / idle）。
-    meta.status = deriveSessionStatus({
-      sessionStats: rows.sessionStats?.val,
-      goal: rows.goal?.val,
-      todos: rows.todos?.val,
-      subagent: rows.subagent?.val,
-      plan: rows.plan?.val,
-      permissions: rows.permissions?.val,
-      // 投影缓存是**快照**：进程被杀/机器休眠/会话被放弃时，里面那些「进行中」的信号会永远
-      // 冻结在那里。不断言新鲜度的话，几周前的会话会一直显示「运行中」（实测真实 home：
-      // 179 个会话里 18 个被判 running，全部空闲 7–28 天，0 个在 10 分钟内）。
-      lastActivity: meta.lastActivity,
-    });
-    sessions.push(meta);
+    sessions.push(projcacheRecordToSession(sessionId, s));
   }
   return { ok: true, version: u.version, sessions };
+}
+
+/**
+ * 校验一个 **per-record** projcache 文件，并折成会话 meta。
+ *
+ * per-record 布局（dsh 的 `layout: 'per-record'`）下每个会话一个文件：
+ *   `storages/session_projcache/sessions/<sessionId>.json`
+ * 信封与聚合文件**不同** —— 是 `{ version: N, record: { identity, rows } }`
+ * （dsh-storage-json 的 `serializeRecord`，无 unit/global/tables）。实测 dsh 0.1.5-rc.1。
+ *
+ * `fileName` 用于把错误定位回具体文件（读取失败只记日志，不该让整域 degraded）。
+ * 会话 id 取 `record.identity` 之外的文件名？—— **不**：文件名可能带 `.bak.<stamp>` 后缀，
+ * 而 dsh 的键就是会话 id（含 `session-` 前缀）。这里以**文件名去掉 .json** 为准，
+ * 因为 dsh 用会话 id 作为 per-record 的 key（`SAFE_KEY_RE=[a-zA-Z0-9_-]+`，会话 id 恰好合法）；
+ * 与聚合路径的 `table` 键语义一致（那里也是会话 id）。
+ */
+export function validateProjcacheRecord(data, fileName = 'per-record') {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return fail(`${fileName}: root must be an object`);
+  }
+  const v = data.version;
+  if (typeof v !== 'number') {
+    return fail(`${fileName}: missing numeric version`);
+  }
+  if (!SUPPORTED_VERSIONS.projcache.includes(v)) {
+    return fail(`${fileName}: unsupported version ${v} (supported: ${SUPPORTED_VERSIONS.projcache.join('/')})`);
+  }
+  const record = data.record;
+  if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+    return fail(`${fileName}: record must be an object`);
+  }
+  // 会话 id：文件名去 .json。`session-<uuid>.json` / `<uuid>.json` 都是合法形态
+  // （实测两种都存在：带 `session-` 前缀的是新版，纯 uuid 来自更早的写法）。
+  const base = String(fileName).split('/').pop().replace(/\.json$/, '');
+  return { ok: true, version: v, session: projcacheRecordToSession(base, record) };
 }
 
 export function validateModelTierJson(data) {

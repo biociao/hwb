@@ -1106,7 +1106,7 @@ export class IndexStore {
     // 「按 Model」只能拿到**当前档位配置**，不是会话真实用的模型 —— 这一点必须让用户看得见。
     //
     // 会话真实用过的模型只在会话日志（`sessions/<项目>/<会话>/session.jsonl.zstd`）里，
-    // 而本项目的硬性规则是**永不碰 `*.zstd`**（README「Reader 只读取以下 4 个文件」/ docs/topology /
+    // 而本项目的硬性规则是**永不碰 `*.zstd`**（README「读取的 dsh home 文件」/ docs/topology /
     // 架构文档 §数据源，共 8 处）：工作台活在投影缓存（projection cache）第一层，绝不下探日志。
     // 这条规则不是洁癖 —— 日志格式是 dsh 的内部细节（多帧拼接的 zstd，node 的
     // zstdDecompressSync 只解第一帧就静默返回），下探它等于把仪表盘绑在一个随时会变的实现上。
