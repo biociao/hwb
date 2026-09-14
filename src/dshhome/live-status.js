@@ -24,6 +24,18 @@ const log = logger('live-status');
 
 const RPC_TIMEOUT_MS = 4000;
 
+// dsh 的 RPC 端点有两代命名，必须都认：
+//   · 0.1.2（本机 MBP）：`/api/session/list`
+//   · 0.1.1-rc.2（远端 dgx21 实测）：`/api/session.list`
+// 用错写法的唯一症状是 HTTP 404 —— 而 hwb 原先写死 `session/list`，于是 dgx21 的实时状态
+// **从来没生效过**（日志里每 3 秒一条 `rpc http 404`，工作台一直回退到冻结的文件索引）。
+// 成功一次就按 home 记住写法（见 endpoints），之后每轮只发一次请求。
+//
+// **导出**供契约测试断言「首选写法是否仍与 dsh 现状一致」：回退能容错，但首选写错会让
+// 每次发现都先白发一条 404（实测 0.1.5-rc.1 的 host 注册 slash 形，与首选一致）。
+// 见 tests/compat 的 C2。
+export const DEFAULT_ENDPOINTS = ['session/list', 'session.list'];
+
 // 从带 `?token=` 的 URL 拆出 origin 与 token。兼容 `http://host:port/?token=x` 与裸 origin。
 function splitAuthUrl(url) {
   let u;
@@ -273,10 +285,19 @@ function extractLiveRows(result) {
 }
 
 export class LiveStatusReader {
-  constructor({ timeoutMs = RPC_TIMEOUT_MS, maxResponseBytes = MAX_RPC_BYTES } = {}) {
+  constructor({ timeoutMs = RPC_TIMEOUT_MS, maxResponseBytes = MAX_RPC_BYTES, endpoints = DEFAULT_ENDPOINTS } = {}) {
     this.timeoutMs = timeoutMs;
     this.maxResponseBytes = maxResponseBytes;   // 可注入：测试不必真造 32 MiB 的响应
     this.states = new Map();
+    this.candidates = endpoints;
+    this.endpoints = new Map();                 // homeId/origin -> 这个实例认得的那种写法
+  }
+
+  // 该实例先试哪种写法：记住过的优先，其余按默认顺序补齐。
+  #candidateEndpoints(key) {
+    const remembered = this.endpoints.get(key);
+    if (!remembered) return this.candidates;
+    return [remembered, ...this.candidates.filter((e) => e !== remembered)];
   }
 
   // 对一个「运行中的 dsh 实例」（url 形如 http://127.0.0.1:<port>/?token=<x>）
@@ -286,28 +307,39 @@ export class LiveStatusReader {
     if (!url) return null;
     const { origin } = splitAuthUrl(url);
     const key = homeId ?? origin;
-    const report = (error, count = 0) => {
-      const state = error ?? 'ok';
+    const report = (error, count = 0, endpoint = null) => {
+      // 端点写进 state：同一实例换了写法（或换了可用写法）时只记一次。
+      const state = error ?? `ok:${endpoint}`;
       if (this.states.get(key) === state) return;
       this.states.set(key, state);
       // 不记录 URL/token/cookie、RPC 正文或远端错误详情。
-      const context = { homeId, host, endpoint: 'session/list', timeoutMs: this.timeoutMs };
+      const context = { homeId, host, endpoint: endpoint ?? this.endpoints.get(key) ?? this.candidates[0], timeoutMs: this.timeoutMs };
       if (error) log.warn('实时会话同步失败，工作台仍使用文件索引', { ...context, reason: error });
       else log.info('实时会话读取成功（写入由轮询器负责，失败会单独记 warn）', { ...context, sessionCount: count });
     };
     try {
-      const result = await rpc(url, 'session/list', { _request: {} }, this.timeoutMs, this.maxResponseBytes);
-      if (result?.__error) {
-        report(result.__error);
-        return null;
+      let lastError = null;
+      for (const endpoint of this.#candidateEndpoints(key)) {
+        const result = await rpc(url, endpoint, { _request: {} }, this.timeoutMs, this.maxResponseBytes);
+        if (result?.__error) {
+          lastError = result.__error;
+          // 只有「这个端点不存在」才值得换写法；超时/鉴权/响应超限换写法也一样失败，
+          // 多打一轮只是把这条已经很窄的链路再占一次。
+          if (!/rpc http 404/.test(result.__error)) break;
+          if (this.endpoints.get(key) === endpoint) this.endpoints.delete(key);   // 远端换了版本 → 忘掉旧写法
+          continue;
+        }
+        this.endpoints.set(key, endpoint);
+        const rows = extractLiveRows(result);
+        if (rows === null) {
+          report('invalid session list response', 0, endpoint);
+          return null;
+        }
+        report(null, rows.length, endpoint);
+        return rows;
       }
-      const rows = extractLiveRows(result);
-      if (rows === null) {
-        report('invalid session list response');
-        return null;
-      }
-      report(null, rows.length);
-      return rows;
+      report(lastError ?? 'rpc failed');
+      return null;
     } catch {
       report('invalid session data');
       return null;

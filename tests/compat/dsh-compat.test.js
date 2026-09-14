@@ -513,7 +513,16 @@ test('C2. RPC 端点命名：hwb 首选的写法仍是 dsh 当前的写法', { s
   const slash = /#session\/list/.test(src);
   const dot = /#session\.list/.test(src);
   const { DEFAULT_ENDPOINTS } = await import('../../src/dshhome/live-status.js').catch(() => ({}));
-  if (!DEFAULT_ENDPOINTS) return;   // 没导出就不判定
+  if (!DEFAULT_ENDPOINTS) {
+    // 没导出就**断言失败**，而不是悄悄 return ——
+    // 悄悄 return 会让这条用例变成「假绿」：报「通过」，其实一行断言都没跑。
+    // 本仓库对「静默跳过」的态度见 tests/compat/README.md：不确定就明确说，
+    // 不要用沉默冒充通过。
+    assert.fail(
+      'src/dshhome/live-status.js 没有导出 DEFAULT_ENDPOINTS → 本条契约无法判定。'
+      + ' 需要改：把 `const DEFAULT_ENDPOINTS` 改成 `export const DEFAULT_ENDPOINTS`',
+    );
+  }
 
   if (slash) {
     assert.equal(
