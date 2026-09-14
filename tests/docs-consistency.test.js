@@ -109,7 +109,29 @@ test('tests/ 下的测试文件确实都被 npm test 的 glob 覆盖', async () 
   const files = (await readdir(path.join(root, 'tests'))).filter((f) => f.endsWith('.test.js'));
   assert.match(pkg.scripts.test, /tests\/\*\.test\.js/, 'npm test 的 glob 应覆盖 tests/*.test.js');
   assert.ok(files.length > 0, '至少要有一个测试文件');
+
+  // 子目录也必须被覆盖：`tests/*.test.js` 不递归，所以 tests/compat/ 会被**静默跳过** ——
+  // 跑 npm test 看到全绿，其实一行兼容性契约都没验（这正是本项目最怕的那类失败）。
+  // 新增子目录时也要同步加进 glob，否则这里会红。
+  for (const sub of await subTestDirs()) {
+    assert.ok(
+      pkg.scripts.test.includes(`tests/${sub}/*.test.js`),
+      `npm test 的 glob 没有覆盖 tests/${sub}/（readdir 不递归 → 该子目录的用例会被静默跳过）。`
+      + ` → 需要改：package.json 的 scripts.test 加上 tests/${sub}/*.test.js`,
+    );
+  }
 });
+
+/** tests/ 下含 *.test.js 的子目录（跳过点开头的）。 */
+async function subTestDirs() {
+  const out = [];
+  for (const entry of await readdir(path.join(root, 'tests'), { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const inside = await readdir(path.join(root, 'tests', entry.name)).catch(() => []);
+    if (inside.some((f) => f.endsWith('.test.js'))) out.push(entry.name);
+  }
+  return out;
+}
 
 test('README 的 SSE 事件清单覆盖 store.js 订阅的全部事件', async () => {
   const [readme, store] = await Promise.all([
