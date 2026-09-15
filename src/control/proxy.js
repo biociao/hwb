@@ -3,6 +3,7 @@ import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { gunzipSync, brotliDecompressSync, inflateSync } from 'node:zlib';
 const bridge = readFileSync(new URL('../web/preview-bridge.js', import.meta.url));
+const themeLive = readFileSync(new URL('../web/dsh-theme-live.js', import.meta.url));
 import { logger } from '../lib/logger.js';
 
 const log = logger('proxy');
@@ -85,6 +86,12 @@ export function createProxy({ target, host = '127.0.0.1', preview = false, port:
         res.end(bridge);
         return;
       }
+      // 主题实时下发脚本：与 preview-bridge 同一条「本地生成、不入缓存」的路径。
+      if (preview && req.url === '/__hwb/dsh-theme.js') {
+        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(themeLive);
+        return;
+      }
       forwardRequest(req, res, targetUrl.hostname, Number(targetUrl.port), preview);
     });
     const sockets = new Set();
@@ -154,7 +161,10 @@ function forwardRequest(req, res, hostname, port, preview) {
           let body = Buffer.concat(chunks);
           const decode = { gzip: gunzipSync, br: brotliDecompressSync, deflate: inflateSync }[upRes.headers['content-encoding']];
           if (decode) body = decode(body, { maxOutputLength: 32 * 1024 * 1024 });
-          const tag = '<script src="/__hwb/preview-bridge.js"></script>';
+          // 两个注入脚本都用**同步** <script src>：preview-bridge 必须尽早挂上点击拦截，
+          // dsh-theme-live 要在 dsh 首帧前拿到主题偏好（否则暗色下会先闪一下亮色）。
+          const tag = '<script src="/__hwb/preview-bridge.js"></script>'
+            + '<script src="/__hwb/dsh-theme.js"></script>';
           const html = body.toString('utf8');
           const updated = workspaceScript ? addWorkspaceFinderMenu(html) : (/<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, '$&' + tag) : tag + html);
           const outHeaders = workspaceScript && updated === html

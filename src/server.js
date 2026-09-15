@@ -21,6 +21,8 @@ import { QuotaService } from './dshhome/quota.js';
 import { SSEHub } from './api/sse.js';
 import { createApiServer, allowedHostsFromEnv } from './api/server.js';
 import { initLogger, logger, defaultLogFile, installCrashHandlers, getLogs, onLog } from './lib/logger.js';
+import { readConfig, saveConfig } from './lib/service-config.js';
+import { DshVersionResolver } from './lib/dsh-version.js';
 
 const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const defaultDb = path.join(homedir(), '.hwb', 'hwb.db');
@@ -116,6 +118,12 @@ for (const homePath of opts.homes) {
 const hub = new SSEHub();
 // 每条通过阈值的新日志（含报错时的上下文/堆栈）实时推送到「日志区域」。
 onLog((entry) => hub.broadcast('log:event', entry));
+// 每个实例上的 dsh 版本号（实例卡展示）：本地实例同步读本机安装，远程实例后台 ssh 探测。
+// 远程拿到（或换掉）版本时广播 instance:status，让前端立刻重画实例卡 —— 否则那个值要等到
+// 下一次心跳广播（最长 30s）才可能出现在界面上。
+const dshVersion = new DshVersionResolver({
+  onChange: (homeId, version) => hub.broadcast('instance:status', { homeId, dshVersion: version }),
+});
 const registry = new InstanceRegistry(); // 控制平面唯一权威状态（M6）
 const launcher = new Launcher({ registry, rememberAccessPort: (homeId, accessPort) => {
   if (!store.getHome(homeId)) throw new Error('实例已移除');
@@ -177,10 +185,15 @@ const server = createApiServer({
   monitor,
   quota,
   logApi: { getLogs },
+  // 主题偏好：读 hwb 自己的配置（`hwb config set theme dark` 也能改），写回同一份配置，
+  // 于是它跨重启稳定、且不依赖任何一个浏览器。
+  themePreference: () => readConfig().theme,
+  setThemePreference: (value) => { saveConfig({ ...readConfig(), theme: value }); },
   webRoot: path.join(pkgRoot, 'src', 'web'),
   // 逃生口：/etc/hosts 别名、devcontainer 转发域名、保留浏览器 authority 的反代都会让 Host
   // 不是回环名，此时 SPA 能加载但每个 /api/* 都 403。显式用 HWB_ALLOWED_HOSTS 放行。
   allowedHosts: allowedHostsFromEnv(),
+  dshVersion,
 });
 server.listen(opts.port, '127.0.0.1', () => {
   globalThis.hwbServiceReady?.();

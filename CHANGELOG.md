@@ -6,6 +6,39 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+#### 主题同步：hwb 切换界面外观时，dsh 实例跟着变（`src/lib/dsh-theme.js`、`src/web/dsh-theme-live.js`）
+
+- 右上角 🌓 菜单新增 **「同步到 dsh 实例」** 开关（默认开）。开启后 hwb 每次切主题都把同一个
+  偏好**单向下发**给已连接的 dsh 实例 —— hwb 是权威、dsh 跟随，dsh 内的主题改动不回流。
+- 两条腿一起做，否则都是假同步：
+
+  | | 作用 | 机制 |
+  |---|---|---|
+  | 落盘 | 重启 dsh / 重开浏览器后依然一致 | 写实例 dsh home 的 `settings.yaml`（`ui-theme.preference`），本机直接写、远程经 shell |
+  | 即时 | 已打开的 dsh 页面立刻换肤 | 预览代理注入 `dsh-theme.js`，hwb 用 `postMessage` 推主题 |
+
+  只做即时 → 刷新即失效；只做落盘 → 要等 dsh 自己的 settings watcher 热重载（数百 ms，后台标签页更慢）。
+- **只改自己那一节**：`settings.yaml` 里有 API key / 模型白名单 / locale，因此写盘走「手写 YAML
+  编辑器」而不是「解析后重序列化」——除 `preference` 那一行外整份文档逐字节不变（注释、引号风格、
+  缩进都保住），同节内 dsh 自己写的 `fontSize` 也不会被顺手删掉。
+- **原子替换 + 0600**：dsh 用 chokidar watcher 热重载该文件，原地写会让它读到半截 YAML 并整份丢弃
+  （只留一句 warn）。故先写临时文件再 `rename`，权限对齐 dsh 的 0600。CRLF 文件的换行风格也会保留。
+- **失败不拖垮连接**：主题同步是附加能力。某实例 ssh 不通只影响它自己，连接照常成功；`POST /api/theme`
+  逐实例返回成功/失败，部分失败仍是 200（用 5xx 概括会把另外那些实例的成功事实一起丢掉）。
+- **新连接的实例自动补齐**：连接成功后立刻写入当前主题，避免「hwb 早改了主题、这个实例后来才连上」
+  留下不一致；某次下发失败的实例重新连接时会被补齐。
+- **`system` 不重复下发**：系统亮暗翻转时偏好值没变（仍是 `system`），不该触发写盘；已打开的页面
+  由注入脚本自己的 `prefers-color-scheme` 跟随（两边解析同一查询，结果必然一致）。
+- **偏好存服务端**（`config.json` 的 `theme`，可 `hwb config set theme dark`）而非只存 localStorage：
+  它是「下发给 dsh 的那个值」，hwb 重启或换浏览器打开时都必须仍是同一个。
+- 新增 `GET /api/theme`（偏好 + 各实例 dsh 侧实际值；远程不读盘，为 `null`）与
+  `POST /api/theme`（body `{preference, homeIds?}`；缺省只下发**已连接**的实例）。
+- 测试：`tests/dsh-theme.test.js`（节级读写、原子性、权限、幂等、CRLF；远程命令是**真的用 bash 跑一遍**，
+  覆盖节存在/不存在/文件不存在/路径含空格与单引号）、`tests/dsh-theme-live.test.js`（假 DOM：属性写对、
+  system 跟随与翻转、明确选择不被系统覆盖、非父窗口与 `origin='null'` 的消息一律忽略）、
+  `tests/api-theme.test.js`（只发已连接、部分失败、先存后发、跨站 403）、
+  `tests/launcher-theme.test.js`（本机/远程两条路与失败语义）；`tests/proxy.test.js` 钉住两个注入脚本同时出现在 HTML 里。
+
 #### dsh 升级到 0.1.5-rc.1：修掉「只显示 179 个会话，实际有 476 个」的静默漏读
 
 - **现象**：换上 dsh 0.1.5-rc.1 后，仪表盘上的会话数只有磁盘真值的 **38%**，而且

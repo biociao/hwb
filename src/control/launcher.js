@@ -4,8 +4,9 @@ import { openTunnel } from './tunnel.js';
 import { httpProbe, sshPathExists } from './prober.js';
 import { fingerprint } from './guard.js';
 import { InstanceRegistry } from './registry.js';
-import { ensureRemoteToken, restartRemoteToken, stopRemote, normalizeWebToken, selfServiceHint } from './remote.js';
+import { ensureRemoteToken, restartRemoteToken, stopRemote, normalizeWebToken, selfServiceHint, sshBash } from './remote.js';
 import { createProxy } from './proxy.js';
+import { isThemePreference, writeThemePreference, remoteThemeSettingsPath, remoteThemeCommand } from '../lib/dsh-theme.js';
 import { logger } from '../lib/logger.js';
 
 const log = logger('launcher');
@@ -21,7 +22,7 @@ const STOP_KILL_MS = 2000;
 // 进程句柄存 this.procs；控制状态（phase/url/port/pid）写入共享 registry，
 // 由 Monitor 推进状态机。stop 前经 guard 指纹校验，防误杀。
 export class Launcher {
-  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy, stopTermMs = STOP_TERM_MS, stopKillMs = STOP_KILL_MS, env = null } = {}) {
+  constructor({ registry = new InstanceRegistry(), tunnelFactory = openTunnel, remotePathExists = sshPathExists, waitHttp = waitForHttp, tunnelReadyDelayMs = 800, recoveryDelaysMs = [1000, 2000, 4000, 8000, 16_000], recoveryCooldownMs = 30_000, stopRemoteFn = stopRemote, rememberAccessPort = () => {}, proxyFactory = createProxy, stopTermMs = STOP_TERM_MS, stopKillMs = STOP_KILL_MS, env = null, remoteThemeWriter = null } = {}) {
     this.registry = registry;
     this.tunnelFactory = tunnelFactory;
     this.remotePathExists = remotePathExists;
@@ -31,6 +32,10 @@ export class Launcher {
     this.recoveryCooldownMs = recoveryCooldownMs;
     this.stopRemoteFn = stopRemoteFn;
     this.rememberAccessPort = rememberAccessPort;
+    // 远端主题写入器可注入：真实路径要跑 ssh（测试里既慢又不该依赖网络）。
+    // 契约与 sshBash 一致：返回 { code, stdout, stderr }，code !== 0 视为失败。
+    this.remoteThemeWriter = remoteThemeWriter
+      ?? ((home, preference) => sshBash(home.host, remoteThemeCommand(home.remoteHome, preference)));
     this.proxyFactory = proxyFactory; // 可注入：预览代理的建立是异步的，竞态需要能被测试复现
     this.stopTermMs = stopTermMs;     // 可注入：测试不该为「忽略信号的子进程」真的等 5 秒
     this.stopKillMs = stopKillMs;
@@ -342,6 +347,45 @@ export class Launcher {
       throw new Error(`dsh web 入口返回 HTTP ${res.status}：这个地址可能不是 dsh web（或入口路径不对）。`);
     }
     return res.status;
+  }
+
+  // —— 主题同步：把 hwb 的界面外观单向下发给 dsh 实例 ——
+  //
+  // 两条腿，缺一不可：
+  //   · **落盘**：写实例的 `settings.yaml`（本地直接写，远程经 SSH），dsh 自己的 settings
+  //     watcher 会热重载 → 主题切换且持久化。重启 dsh / 重开浏览器后依然一致。
+  //   · **即时**：已经打开的 dsh 页面不会等 watcher，由注入脚本 `dsh-theme-live.js` 收到
+  //     宿主 postMessage 后立刻换肤（前端 app.js 负责在切换主题时广播）。
+  //
+  // 为什么放在 Launcher：它持有「哪些实例连上了」的权威状态（this.procs），而主题下发只对
+  // **已连接**的实例有意义——没连上的实例连 dsh 都没在跑，写文件也只是留个偏好（那属于
+  // 「连接时补一次」的路径，见 open() 后的 syncThemeOnConnect）。
+  async syncTheme(home, preference) {
+    if (!isThemePreference(preference)) throw new Error(`invalid theme preference: ${preference}`);
+    if (home.hostType === 'remote') {
+      const result = await this.remoteThemeWriter(home, preference);
+      if (result.code !== 0) {
+        throw new Error(`远端主题写入失败（退出码 ${result.code}）：${(result.stderr || '').trim().split('\n').slice(-3).join('；') || '无错误输出'}`);
+      }
+      return { changed: true, path: remoteThemeSettingsPath(home.remoteHome), preference, transport: 'ssh' };
+    }
+    const written = writeThemePreference(home.homePath, preference);
+    return { ...written, transport: 'file' };
+  }
+
+  // 连接成功后的主题补齐：把「当前 hwb 主题」写进刚连上的实例，避免「hwb 已切主题、
+  // 但这个实例是后来才连上的」留下不一致。失败**不影响连接结果**（连接本身是主任务），
+  // 只记一条 warn 并在返回值里带上，让调用方/界面能如实呈现。
+  async syncThemeOnConnect(home, preference) {
+    if (!isThemePreference(preference)) return null;
+    try {
+      const result = await this.syncTheme(home, preference);
+      if (result.changed) log.info('连接后已同步主题到 dsh 实例', { homeId: home.homeId, preference, transport: result.transport });
+      return { ok: true, ...result };
+    } catch (error) {
+      log.warn('连接后同步主题失败（不影响连接）', { homeId: home.homeId, preference, err: error?.message ?? String(error) });
+      return { ok: false, error: error?.message ?? String(error) };
+    }
   }
 
   // 重启：先撤当前实例（远程=停远端 dsh + 拆隧道；本地=杀进程），再拉起。

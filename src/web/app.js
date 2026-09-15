@@ -393,7 +393,14 @@ function hideFrameCover(pane) {
 // 说明刚完成种 cookie 的握手, 继续二段跳到最终目标并保持遮罩; 否则(最终目标已到达/普通打开)收起遮罩。
 function onFrameLoad(pane) {
   const iframe = pane.iframe;
-  if (pane.url) iframe.contentWindow?.postMessage({ type: 'hwb:preview-init' }, new URL(pane.url).origin);
+  if (pane.url) {
+    const origin = new URL(pane.url).origin;
+    iframe.contentWindow?.postMessage({ type: 'hwb:preview-init' }, origin);
+    // 主题要**随 load 一起下发**：注入脚本 dep 上只有「宿主主动告知」这一条来源，
+    // 一个刚挂载的 iframe 若没收到第一条消息，就会用 dsh 自己 settings 里的（可能过时的）
+    // 偏好去渲染首帧 —— 暗色下表现为闪一下亮色。
+    iframe.contentWindow?.postMessage({ type: 'hwb:theme-init', preference: currentThemeMode() }, origin);
+  }
   const target = pane._navTarget;
   if (!target) { hideFrameCover(pane); return; }
   if (iframe.src !== target) {
@@ -845,6 +852,11 @@ tabs.addEventListener('drop', (e) => e.preventDefault());
 tabs.addEventListener('dragend', handleDragEnd);
 
 // —— 界面主题切换：白天 / 黑夜 / 跟随系统 ——
+//
+// 主题有两个消费者：① hwb 自己的界面（localStorage + data-theme）；② 各 dsh 实例
+// （下发到它的 settings.yaml + 注入脚本即时换肤）。两者的关系是**单向**的：
+// hwb 是权威，dsh 跟随。所以主题值的来源仍是 hwb 的 localStorage（本地即时、无网络往返），
+// 每次变更都顺带 POST /api/theme 把同一个值推给服务端，由服务端分发给已连接的实例。
 const THEME_MODES = ['light', 'dark', 'system'];
 const THEME_KEY = 'hwb:theme';
 const THEME_GLYPH = { light: '☀️', dark: '🌙', system: '🌓' };
@@ -871,16 +883,72 @@ function setTheme(mode) {
   try { localStorage.setItem(THEME_KEY, mode); } catch { /* storage 不可用则本次生效 */ }
   applyTheme(mode);
   rerenderForTheme();
+  broadcastThemeToFrames(mode);   // 已打开的 dsh 页面立刻换肤（不等 settings 热重载）
+  if (themeSyncEnabled()) syncThemeToInstances(mode);   // 落盘到各实例，重启/重开页面后依然一致
 }
 // 主题切换后重绘工作台：chip 配色为内联样式，深浅两套调色板需重渲染才能切换
 function rerenderForTheme() {
   if (view.kind === 'dashboard' && lastHomes.length) renderDashboard();
+}
+
+// —— 主题下发（hwb → dsh）——
+
+// 同步开关（默认开）。关掉后 hwb 只改自己的界面，不再动任何实例的 settings.yaml ——
+// 给「我就是想让两边不一样」留一个出口，而不是把功能做成不可关的副作用。
+const THEME_SYNC_KEY = 'hwb:theme-sync';
+function themeSyncEnabled() {
+  try { return localStorage.getItem(THEME_SYNC_KEY) !== '0'; } catch { return true; }
+}
+function setThemeSyncEnabled(on) {
+  try { localStorage.setItem(THEME_SYNC_KEY, on ? '1' : '0'); } catch { /* 同上 */ }
+  const btn = document.getElementById('theme-sync');
+  if (btn) btn.setAttribute('aria-checked', on ? 'true' : 'false');
+}
+
+// 把主题 postMessage 给**每一个已挂载**的 iframe。
+// 为什么广播给全部而不只是当前可见的那个：切走只 hidden，iframe 还活着（见下文的 iframe 预算），
+// 用户切回来时不该看到它还是旧主题。
+function broadcastThemeToFrames(mode) {
+  for (const pane of panes.values()) {
+    if (!pane.url || !pane.iframe?.contentWindow) continue;
+    try {
+      pane.iframe.contentWindow.postMessage({ type: 'hwb:theme', preference: mode }, new URL(pane.url).origin);
+    } catch { /* 入口 URL 不可解析时跳过这一个 */ }
+  }
+}
+
+// 落盘到各实例。**不 await、不阻塞界面**：主题切换必须瞬时，写盘（远程还要走 ssh）是副作用。
+// 失败时会话里给一条普通提示 —— 但只在真的失败时提示，成功是常态、不该打扰。
+function syncThemeToInstances(mode) {
+  api('/api/theme', { method: 'POST', body: { preference: mode } })
+    .then((result) => {
+      if (result.failed) {
+        const names = result.results.filter((r) => !r.ok).map((r) => r.alias || r.homeId.slice(0, 6)).join('、');
+        note.set(`主题已切换，但有 ${result.failed} 个实例同步失败（${names}）——重新连接后会补齐`);
+      } else if (result.synced) {
+        note.clearUnlessSticky();
+      }
+    })
+    .catch((error) => {
+      // 服务端不可达（hwb 重启中）不算致命：hwb 自己的主题已经切了，实例等下次连接时补齐。
+      console.warn('主题下发失败:', error.message);
+    });
+}
 }
 function closeThemeMenu() { if (themeMenu) themeMenu.hidden = true; }
 function toggleThemeMenu() { if (themeMenu) themeMenu.hidden = !themeMenu.hidden; }
 themeBtn?.addEventListener('click', (e) => { e.stopPropagation(); toggleThemeMenu(); });
 themeMenu?.addEventListener('click', (e) => {
   const item = e.target.closest('.menu-item[data-mode]');
+  // 同步开关：切换后**不关菜单**（开关是设置项，不是「选完即走」的动作），
+  // 并且立即把当前主题补推一次 —— 用户打开同步的意图通常就是「让 dsh 也变成现在这样」。
+  const sync = e.target.closest('#theme-sync');
+  if (sync) {
+    const next = !themeSyncEnabled();
+    setThemeSyncEnabled(next);
+    if (next) syncThemeToInstances(currentThemeMode());
+    return;
+  }
   if (item) { setTheme(item.dataset.mode); closeThemeMenu(); }
 });
 // 点击菜单以外任意处关闭
@@ -891,8 +959,18 @@ document.addEventListener('click', (e) => {
 (function watchSystemTheme() {
   const mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
   if (!mq) return;
-  mq.addEventListener?.('change', () => { if (currentThemeMode() === 'system') { applyTheme('system'); rerenderForTheme(); } });
+  mq.addEventListener?.('change', () => {
+    if (currentThemeMode() !== 'system') return;
+    applyTheme('system');
+    rerenderForTheme();
+    // 系统亮暗翻转时**不重写 settings.yaml**：偏好值仍是 `system`（没有变化），
+    // 变的是解析结果。已打开的 dsh 页面由注入脚本自己的 media query 跟随，
+    // 无需从这边推 —— 两边解析同一个查询，结果必然一致。
+  });
 })();
+
+// 初始化同步开关的选中态（localStorage 是唯一来源，与主题值同样的存法）。
+setThemeSyncEnabled(themeSyncEnabled());
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && themeMenu && !themeMenu.hidden) {

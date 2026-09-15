@@ -110,8 +110,8 @@ export function ensureResponded(res, log, meta) {
   return true;
 }
 
-export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec, usageTtlMs, maxConcurrentUploads }) {
-  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs, maxConcurrentUploads });
+export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec, usageTtlMs, maxConcurrentUploads, themePreference, setThemePreference }) {
+  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs, maxConcurrentUploads, themePreference, setThemePreference });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {

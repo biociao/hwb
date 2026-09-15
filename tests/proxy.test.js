@@ -96,10 +96,17 @@ test('preview proxy injects bridge only in authenticated HTML, preserves origina
     const auth = await fetch(`${prox.url}/?token=good`, { redirect: 'manual' });
     assert.equal(auth.status, 303);
     const html = await fetch(prox.url, { headers: { cookie: auth.headers.get('set-cookie').split(';')[0] } });
-    assert.match(await html.text(), /__hwb\/preview-bridge.js/);
+    const htmlText = await html.text();
+    assert.match(htmlText, /__hwb\/preview-bridge.js/);
+    // 主题脚本必须**一起**注入：它是「hwb 切主题 → 已打开的 dsh 页面立刻换肤」的那条腿，
+    // 漏注入不会报错、只表现为「主题切换要等 dsh 自己热重载」，所以在这里钉住它。
+    assert.match(htmlText, /__hwb\/dsh-theme\.js/);
     assert.equal(html.headers.get('cache-control'), 'no-store');
     const bridge = await fetch(`${prox.url}/__hwb/preview-bridge.js`);
     assert.match(await bridge.text(), /hwb:file-preview/);
+    const theme = await fetch(`${prox.url}/__hwb/dsh-theme.js`);
+    assert.match(await theme.text(), /hwb:theme/);
+    assert.equal(theme.headers.get('cache-control'), 'no-store', '主题脚本绝不能进浏览器缓存');
     assert.equal(await (await fetch(`${prox.url}/plugins/`)).text(), '/* plugin */');
   } finally { await prox.close(); up.server.close(); }
 });

@@ -320,6 +320,12 @@
     .menu-item.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
     .menu-item .mk { margin-left: auto; font-weight: 700; color: var(--accent); opacity: 0; }
     .menu-item.active .mk { opacity: 1; }
+    /* 主题同步开关：与上面的三选一是两种语义（一组互斥选择 vs 一个布尔开关），
+       用一条细分隔线分开，并让开关的选中态同样落在 .mk 对勾上。 */
+    .menu-sep { height: 1px; margin: 5px 6px; background: var(--border); }
+    .menu-toggle-label { flex: 1; }
+    .menu-toggle[aria-checked="true"] .mk { opacity: 1; }
+    .menu-toggle[aria-checked="true"] { color: var(--accent); }
   .endpoint-editor { flex-basis: 100%; border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 12px; min-width: 0; }
     .endpoint-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .55fr); gap: 10px 12px; padding: 14px 0; border-bottom: 1px solid var(--border, #ddd); }
     .endpoint-row input, .endpoint-switch select { min-width: 0; max-width: 100%; }
@@ -351,6 +357,13 @@
           <button class="menu-item" data-mode="light" role="menuitem"><span>☀️</span>白天<span class="mk">✓</span></button>
           <button class="menu-item" data-mode="dark" role="menuitem"><span>🌙</span>黑夜<span class="mk">✓</span></button>
           <button class="menu-item" data-mode="system" role="menuitem"><span>💻</span>跟随系统<span class="mk">✓</span></button>
+          <!-- 主题同步开关：hwb 是权威、dsh 跟随（单向下发）。默认开启 ——
+               「hwb 与 dsh 外观一致」是这个功能的全部意义，要求用户先找到开关才生效不合理。 -->
+          <div class="menu-sep" role="separator"></div>
+          <button id="theme-sync" class="menu-item menu-toggle" role="menuitemcheckbox" aria-checked="true"
+                  title="切换主题时同步给已连接的 dsh 实例（写入其 settings.yaml）">
+            <span>🔄</span><span class="menu-toggle-label">同步到 dsh 实例</span><span class="mk">✓</span>
+          </button>
         </div>
       </div>
     </div>

@@ -8,6 +8,7 @@ import path from 'node:path';
 import { parseMultipart } from '../lib/multipart.js';
 import { logger } from '../lib/logger.js';
 import { readFilePreview, resolveUploadDir, writeUpload, UPLOAD_BYTES, sessionWorkspace } from '../lib/file-preview.js';
+import { THEME_PREFERENCES, isThemePreference, readThemePreference } from '../lib/dsh-theme.js';
 
 // 实例对象出站前的整形：去掉 dsh 的 token。
 //
@@ -150,6 +151,14 @@ function sameSiteRequest(req) {
   return true;
 }
 
+// 读实例 dsh 侧当前的主题偏好。失败一律回 null（「不知道」）而不是抛：
+// 这是 GET /api/theme 的一个**旁路信息**，某个 home 的 settings.yaml 读不动
+// （权限、被别的进程锁住、路径已不存在）不该让整个主题视图 500。
+function safeReadThemePreference(homePath) {
+  try { return readThemePreference(homePath); }
+  catch (error) { logger('api').debug('读取 dsh 主题偏好失败', { homePath, err: error?.message ?? String(error) }); return null; }
+}
+
 function dshHomeInfo(homePath) {
   const exists = existsSync(homePath) && statSync(homePath).isDirectory();
   return {
@@ -162,8 +171,12 @@ function dshHomeInfo(homePath) {
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1 }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {} }) {
   const connecting = new Set();
+  // 主题：server.js 注入一个读写闭包（把偏好持久化进 hwb 自己的配置），这里只负责转发。
+  // 默认实现是内存态 —— 单测直接建 router 时不必关心落盘，也不会写用户的 ~/.hwb。
+  let themePreferenceState = null;
+  const themePref = () => themePreferenceState ?? themePreference();
   // 上传并发上限（见 upload 路由里的说明）。默认 1：最坏内存 ≈ 单次上限（256 MiB → ~1.1 GiB）。
   const MAX_CONCURRENT_UPLOADS = maxConcurrentUploads;
   let uploadsInFlight = 0;
@@ -644,6 +657,69 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
 
+    // —— 主题同步（hwb → dsh，单向下发）——
+    //
+    // GET  `/api/theme`            查当前 hwb 主题偏好 + 各实例的 dsh 侧实际值
+    // POST `/api/theme`            下发主题（body {preference, homeIds?}）
+    //
+    // 下发对象**只含已连接的实例**：没连上的实例连 dsh 都没在跑，写 settings.yaml 只是留个
+    // 将来才生效的偏好；而「当前主题」在每次 open() 之后会自动补齐（见 server.js 的连接钩子）。
+    if (req.method === 'GET' && pathname === '/api/theme') {
+      const homes = store.listHomes();
+      send(res, 200, {
+        preference: themePref(),
+        supported: THEME_PREFERENCES,
+        homes: homes.map((home) => ({
+          homeId: home.homeId,
+          alias: home.alias,
+          hostType: home.hostType,
+          connected: Boolean(launcher.status(home.homeId)),
+          // 读盘（远端不读：每次 GET 都跑 ssh 太贵，且远端值在下次下发/连接时会对齐）。
+          dshPreference: home.hostType === 'remote' ? null : safeReadThemePreference(home.homePath),
+        })),
+      });
+      return;
+    }
+    if (req.method === 'POST' && pathname === '/api/theme') {
+      const body = await readJsonBodyOr400(req, res);
+      if (body === BODY_HANDLED) return;
+      const preference = body.preference;
+      if (!isThemePreference(preference)) {
+        send(res, 400, { error: `preference 必须是 ${THEME_PREFERENCES.join(' / ')} 之一` });
+        return;
+      }
+      // 先持久化偏好，再下发：万一某个实例写失败，偏好本身仍然被记住 —— 下次连接它时会补齐。
+      // 反过来的顺序会让「全部实例都写失败」的情况下偏好也丢掉，用户看到的是「点了没反应」。
+      try {
+        setThemePreference(preference);
+        themePreferenceState = preference;
+      } catch (error) {
+        send(res, 500, { error: `保存主题偏好失败：${error.message}` });
+        return;
+      }
+      // homeIds 缺省 = 全部**已连接**的实例；显式给了就只对这几个下发。
+      const all = store.listHomes();
+      const targets = Array.isArray(body.homeIds) && body.homeIds.length
+        ? all.filter((h) => body.homeIds.includes(h.homeId))
+        : all.filter((h) => launcher.status(h.homeId));
+      const results = await Promise.all(targets.map(async (home) => {
+        if (typeof launcher.syncTheme !== 'function') {
+          return { homeId: home.homeId, alias: home.alias, ok: false, error: '当前连接实现不支持主题下发' };
+        }
+        try {
+          const written = await launcher.syncTheme(home, preference);
+          return { homeId: home.homeId, alias: home.alias, ok: true, changed: written.changed, transport: written.transport };
+        } catch (error) {
+          return { homeId: home.homeId, alias: home.alias, ok: false, error: error.message };
+        }
+      }));
+      const failed = results.filter((r) => !r.ok);
+      // 部分失败时仍回 200（另外那些实例确实成功了），把逐实例结果如实带给前端 ——
+      // 用 502 概括会让「3 个实例里 1 个 ssh 不通」看起来像整个功能坏了。
+      send(res, 200, { preference, synced: results.length - failed.length, failed: failed.length, results });
+      return;
+    }
+
     const openHome = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/open$/);
     if (req.method === 'POST' && openHome) {
       const home = store.getHome(openHome[1]);
@@ -665,7 +741,15 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         // 连接成功后立即索引一次（此时 runtime=running，liveStatus 实时通道可用），
         // 新会话/状态马上进入工作台，不用等下一个 60s tick。
         reindexInBackground(home.homeId);
-        send(res, 200, inst);
+        // 主题补齐：这个实例可能是「hwb 改了主题之后」才连上的 —— 把当前偏好写进去。
+        // 失败不影响连接结果（连接本身是主任务），由 syncThemeOnConnect 记 warn 并在响应里如实带出。
+        //
+        // 可选调用：launcher 若没有这个方法（测试替身、或将来换一套连接实现）就跳过 ——
+        // 主题同步是**附加**能力，不该让一次成功的连接因为它的缺失而变成 502。
+        const theme = typeof launcher.syncThemeOnConnect === 'function'
+          ? await launcher.syncThemeOnConnect(home, themePref())
+          : null;
+        send(res, 200, theme ? { ...inst, theme } : inst);
       } catch (e) {
         send(res, 502, { error: e.message });
       } finally {
@@ -753,7 +837,15 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         const inst = await launcher.restart(home);
         await monitor.refresh(home.homeId);
         reindexInBackground(home.homeId); // 同 open：重启后立即索引，实时状态即刻入库
-        send(res, 200, inst);
+        // 主题补齐：这个实例可能是「hwb 改了主题之后」才连上的 —— 把当前偏好写进去。
+        // 失败不影响连接结果（连接本身是主任务），由 syncThemeOnConnect 记 warn 并在响应里如实带出。
+        //
+        // 可选调用：launcher 若没有这个方法（测试替身、或将来换一套连接实现）就跳过 ——
+        // 主题同步是**附加**能力，不该让一次成功的连接因为它的缺失而变成 502。
+        const theme = typeof launcher.syncThemeOnConnect === 'function'
+          ? await launcher.syncThemeOnConnect(home, themePref())
+          : null;
+        send(res, 200, theme ? { ...inst, theme } : inst);
       } catch (e) {
         send(res, 502, { error: e.message });
       } finally {

@@ -54,6 +54,8 @@
 - 每个实例给浏览器一个**直接可寻址**的入口：**本地** home 用原始服务连接
   `http://127.0.0.1:<port>/?token=<x>`（同机直连，无需转发）；**远程** home 经 hwb 的
   **1:1 根路径反向代理** 提供（`/plugins/*`、`/assets/*`、WebSocket 全部走通，不暴露隧道端口）。
+- **主题一致性**：切换 hwb 的界面外观时，把同一个偏好单向下发给各已连接的 dsh 实例
+  （写它们的 `settings.yaml` + 让已打开的页面即时换肤），并带一个可关闭的开关。
 
 **不做（显式非目标，见架构文档 §12）：**
 
@@ -79,6 +81,7 @@
 | **Token 用量面板** | 汇总 + 分时堆叠趋势（自适应桶粒度）+ 按项目拆分 |
 | **会话深链** | 客户端装有 `dsh-session-deeplink` 插件时，可二段跳转直达单个会话，且有加载遮罩防白闪 |
 | **SSH 远程生命周期** | 远端点按钮即可启动 / 重启 / 关闭远端 dsh web（把 `dsh-remote-web.sh` 算法搬进 Node） |
+| **主题同步** | hwb 切主题单向下发给已连接的 dsh 实例：写其 `settings.yaml`（持久）+ 注入脚本即时换肤；逐实例报成功/失败，可在主题菜单里关闭 |
 
 ---
 
@@ -136,7 +139,8 @@ hwb --help
 `hwb` / `hwb serve` 保留前台运行方式，并读取同一份配置；原有 `--port` 等选项可覆盖配置。
 `node src/server.js` 和 `npm start` 仍是原来的直接启动方式，不读取新配置文件，也不受后台管理命令控制。
 
-配置保存在 `~/.hwb/config.json`，支持 `port`、`db`、`intervalMs`、`homes`、`log`、`verbose`、`silent`；
+配置保存在 `~/.hwb/config.json`，支持 `port`、`db`、`intervalMs`、`homes`、`log`、`verbose`、`silent`、`theme`；
+`log: false` 禁用结构化文件日志。`theme`（`light` / `dark` / `system`）是界面外观偏好，也是**下发给 dsh 实例**的那个值。
 `log: false` 禁用结构化文件日志。`hwb config path` 显示配置位置。相对路径在保存时转为绝对路径。
 设置 `HWB_DIR=/其他目录 hwb ...` 可隔离一套服务的配置、数据库和运行文件（多服务需配置不同端口）。
 实例及连接端点继续通过工作台管理，保存在数据库中。
@@ -254,6 +258,47 @@ SSH 意外退出后按 1/2/4/8/16 秒退避，最多重连 5 次，只重建到�
 它与「连接端点」中的 dsh 服务端口独立；外部打开仍沿用原服务入口。需要更换时先断开实例，
 清空后保存可重新自动分配。保存的端口若被占用会报错，不会自动换成其他端口。
 本机实例的外部打开直连 dsh 服务端口；内嵌页面使用自动分配端口的预览代理，注入工作区与文件点击通信脚本。本机无需配置或保存接入端口。
+
+---
+
+## 主题同步（hwb → dsh）
+
+右上角的 🌓 菜单除了「白天 / 黑夜 / 跟随系统」，还带一个 **「同步到 dsh 实例」** 开关（默认开）。
+开启后，hwb 每次切主题都会**单向下发**给各个已连接的 dsh 实例 —— hwb 是权威，dsh 跟随，
+dsh 自己设置里的主题改动不会回流到 hwb。
+
+下发分两条腿，缺一不可：
+
+| | 作用 | 机制 |
+|---|---|---|
+| **落盘** | 重启 dsh / 重开浏览器后依然一致 | 写该实例 dsh home 下的 `settings.yaml`（`ui-theme.preference`）。本机直接写文件；SSH 远程实例经远端 shell 写入 |
+| **即时** | 已打开的 dsh 页面**立刻**换肤 | 预览代理往 dsh 页面注入 `dsh-theme.js`，hwb 通过 `postMessage` 把主题推给它 |
+
+只做「即时」会是假同步（刷新即失效），只做「落盘」则要等 dsh 自己的 settings watcher 热重载
+（有数百毫秒延迟、后台标签页更慢），所以两者都做。
+
+几个刻意的取舍：
+
+- **只写自己那一节**。`settings.yaml` 里有 API key、模型白名单、locale —— 写入走「手写 YAML 编辑器」
+  而非「解析后重序列化」，除 `ui-theme.preference` 那一行之外整份文档逐字节不变（注释、引号风格、
+  缩进都保住），同节内 dsh 自己写的 `fontSize` 也不会被顺手删掉。
+- **原子替换**。dsh 用 chokidar watcher 热重载这份文件，原地写会让它读到半截 YAML 并整份丢弃
+  （只留一句 warn）。因此先写临时文件再 `rename`，并保持 0600 权限。
+- **失败不拖垮连接**。主题同步是**附加**能力：某实例 ssh 不通时只影响它自己，连接本身照常成功；
+  接口逐实例返回成功/失败，部分失败仍是 200（用 5xx 概括会让「3 个实例里 1 个不通」看起来像整个功能坏了，
+  也丢掉另外 2 个的成功事实）。
+- **新连接的实例自动补齐**。连接成功后会立刻把当前主题写进这个实例，避免「hwb 早改了主题、
+  但这个实例是后来才连上的」留下不一致；某次下发失败的实例，重新连接时也会被补齐。
+- **`system` 不重复下发**。系统亮暗翻转时偏好值本身没变（仍是 `system`），不应触发写盘；
+  已打开的 dsh 页面由注入脚本自己的 `prefers-color-scheme` 跟随 —— 两边解析同一个查询，结果必然一致。
+- **可关**。关掉开关后 hwb 只改自己的界面，不再碰任何实例的 `settings.yaml`（给「我就是想让两边不一样」留出口）。
+- **偏好存在服务端**（`~/.hwb/config.json` 的 `theme`，也可 `hwb config set theme dark`），
+  不只是浏览器 localStorage —— 它是「下发给 dsh 的那个值」，hwb 重启或换个浏览器打开时都必须还是同一个。
+
+> 远程实例的主题下发经 SSH 执行一小段 shell（`awk` 维护节边界 + 临时文件 + `mv` 原子替换），
+> 需要远端有 `awk`（POSIX 环境默认都有）。远端写入失败时错误信息里会带上 ssh 的退出码与 stderr 尾部。
+
+---
 
 ---
 
@@ -380,6 +425,8 @@ bootstrap，之后**不再更新**。hwb 以 **per-record 为准、聚合为补�
 | `POST` | `/api/homes/{homeId}/switch` | 切换到另一个连接端点（body `{endpointId}`）；先验证新端点再释放旧连接 |
 | `POST` | `/api/homes/{homeId}/disconnect` | 仅断开 hwb 接入（不停止远端 dsh web，也不回收本机受管进程） |
 | `GET` | `/api/logs` | 后端结构化日志环缓冲快照（`?level=&limit=`，limit ≤ 1000） |
+| `GET` | `/api/theme` | 当前主题偏好 + 各实例 dsh 侧的实际值（`dshPreference`；远程实例不读盘，为 `null`） |
+| `POST` | `/api/theme` | 把主题下发给已连接的实例（body `{preference, homeIds?}`）；逐实例返回成功/失败，部分失败仍为 200 |
 
 > 额度（§8）**只返回** `{ provider, remaining, currency }`；**API key 永不越界**——
 > key 只在服务端内存（读 `.credentials.yaml` 后查余额），浏览器拿不到。
@@ -441,6 +488,7 @@ hwb/
 │   │   ├── endpoints.js         # 连接端点规范化（host/port/唯一 id）
 │   │   ├── access-port.js       # 本地接入端口校验
 │   │   ├── open-workspace.js    # 在 Finder 中打开工作区（仅 macOS）
+│   │   ├── dsh-theme.js         # 主题同步：dsh settings.yaml 的节级读写（本机 fs / 远端 shell）
 │   │   └── service-config.js    # ~/.hwb/config.json 的读写与校验
 │   ├── dshhome/                 # 数据平面
 │   │   ├── reader.js            # 编排 read + normalize + store
@@ -471,6 +519,7 @@ hwb/
 │       ├── store.js             # 前端缓存（SSE 订阅 + 工具）
 │       ├── instance-navigation.js / instance-state.js   # 实例入口与实例键
 │       ├── preview-bridge.js    # 内嵌页 → 父页的工作区/会话上报
+│       ├── dsh-theme-live.js    # 内嵌页主题即时换肤（接收父页 postMessage）
 │       ├── file-preview.css
 │       └── components/
 │           ├── workbench.js         # 仪表盘布局

@@ -8,7 +8,11 @@ export const configFile = path.join(serviceDir, 'config.json');
 export const socketFile = path.join(serviceDir, 'service.sock');
 export function defaults() {
   return { port: 4310, db: path.join(serviceDir, 'hwb.db'), intervalMs: 60000,
-    homes: [], log: path.join(serviceDir, 'hwb.log'), verbose: false, silent: false };
+    homes: [], log: path.join(serviceDir, 'hwb.log'), verbose: false, silent: false,
+    // 界面外观偏好（白天/黑夜/跟随系统）。存在服务端而不只是浏览器 localStorage：
+    // 它正是「下发给 dsh 实例」的那个值 —— hwb 重启、或换一个浏览器打开时都必须还是同一个，
+    // 否则「新连接的实例该同步成什么主题」就无从判断。
+    theme: 'system' };
 }
 export function validate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('配置必须是 JSON 对象');
@@ -20,6 +24,7 @@ export function validate(value) {
   // 服务反而开始每毫秒跑一轮（实测 1e16 曾原样通过校验）。
   if (cfg.intervalMs > MAX_TIMER_MS) throw Error(`intervalMs 过大（上限 ${MAX_TIMER_MS} ms ≈ 24.8 天；再大 setTimeout 会退化成 1ms 空转）`);
   for (const key of ['verbose', 'silent']) if (typeof cfg[key] !== 'boolean') throw Error(`${key} 必须为 boolean`);
+  if (!['light', 'dark', 'system'].includes(cfg.theme)) throw Error(`theme 必须是 light / dark / system 之一`);
   for (const key of ['db', 'log']) {
     if (key === 'log' && cfg[key] === false) continue;
     if (typeof cfg[key] !== 'string' || !cfg[key].trim()) throw Error(`${key} 必须为非空路径`);
