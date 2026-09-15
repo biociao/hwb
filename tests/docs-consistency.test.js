@@ -252,15 +252,33 @@ test('src/web 下没有「谁都不引用」的孤儿文件', async () => {
 // 真事：一次替换把 `#### 预览代理的建立竞态…` 这一行which 连同空行一起删掉了，
 // 于是那条修复的正文变成挂在上一篇末尾的孤儿 —— 渲染出来是「上一条的附带说明」，
 // 读者根本不知道它在讲什么，而且没有任何测试会红。这里把结构钉住。
+
+/**
+ * 最新的「有内容」的小节：发布之后 `## [Unreleased]` 会是空的，条目落在最新版本小节里。
+ * 旧实现把起点写死在 [Unreleased]：发布那一刻它要么退化成「在空段上检查」（headingCount 恒为
+ * 断言下限以下 → `npm test` 红），要么被人顺手改成永真断言。两种结局都比没有测试更糟，
+ * 所以这里改为「跳过空小节、取最新一个含 #### 的」，发布前后都检查同一件事。
+ */
+function newestContentSection(lines) {
+  const heads = [];
+  for (let i = 0; i < lines.length; i++) if (lines[i].startsWith('## [')) heads.push(i);
+  for (let h = 0; h < heads.length; h++) {
+    const start = heads[h];
+    const end = heads[h + 1] ?? lines.length;
+    const body = lines.slice(start, end);
+    if (body.some((l) => /^#### /.test(l))) return { start, body };
+  }
+  return null;
+}
+
 test('CHANGELOG 的每条修复都有标题，不存在挂在别人末尾的孤儿正文', async () => {
   const changelog = await readFile(path.join(root, 'CHANGELOG.md'), 'utf8');
   const lines = changelog.split('\n');
 
-  // 取 [Unreleased] 段（到下一个 ## [ 版本标题为止）
-  const start = lines.findIndex((l) => l.startsWith('## [Unreleased]'));
-  assert.ok(start >= 0, '找不到 [Unreleased] 段');
-  const end = lines.findIndex((l, i) => i > start && l.startsWith('## ['));
-  const body = lines.slice(start, end === -1 ? lines.length : end);
+  const section = newestContentSection(lines);
+  assert.ok(section, 'CHANGELOG 里应至少有一个含 #### 条目的版本小节');
+  const start = section.start;
+  const body = section.body;
 
   // 判据只用一条：**连续两个空行之后直接跟列表项**。正常排版不会这样，
   // 而「标题行被删掉、正文留在原处」恰好会留下这个形状（实测就是这么被发现的）。
@@ -272,5 +290,5 @@ test('CHANGELOG 的每条修复都有标题，不存在挂在别人末尾的孤�
       assert.fail(`第 ${start + i + 3} 行附近：连续空行后直接跟列表项，疑似标题被删（孤儿正文）`);
     }
   }
-  assert.ok(headingCount >= 10, `[Unreleased] 里应有多条 #### 修复条目，实际 ${headingCount}`);
+  assert.ok(headingCount >= 10, `最新的版本小节里应有多条 #### 条目，实际 ${headingCount}`);
 });

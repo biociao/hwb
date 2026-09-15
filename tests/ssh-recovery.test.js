@@ -356,3 +356,45 @@ test('ssh recovery cooldown stops once the instance is disconnected', async (t) 
   await sleep(150);
   assert.equal(f.tunnels.length, tunnelsAtDisconnect, '取消后不得再建隧道');
 });
+
+test('HTTP failure recovery rebuilds a live SSH path once and preserves the stable browser port', async (t) => {
+  const ready = deferred();
+  const f = await fixture(t, { waitHttp: attempt => attempt === 2 ? ready.promise : true });
+  const original = await f.launcher.open(f.home);
+  f.registry.nextBackoffMs = () => 10;
+  let healthy = true;
+  f.monitor.probe = async () => healthy;
+  await f.monitor.refresh(f.home.homeId);
+  healthy = false;
+  await f.monitor.refresh(f.home.homeId);
+  await f.monitor.refresh(f.home.homeId);
+  assert.equal(f.tunnels.length, 1, 'transient failures do not rebuild');
+  await f.monitor.refresh(f.home.homeId);
+  await until(() => f.tunnels.length === 2, 'HTTP failures never rebuilt the live SSH path');
+  assert.equal(f.tunnels[0].proc.exitCode, null, 'original SSH is still alive during recovery');
+  await f.monitor.refresh(f.home.homeId);
+  await sleep(30);
+  assert.equal(f.tunnels.length, 2, 'recovery must not overlap');
+  healthy = true;
+  ready.resolve(true);
+  await until(() => f.launcher.status(f.home.homeId)?.recovering === false, 'recovery did not finish');
+  const restored = f.launcher.status(f.home.homeId);
+  assert.notEqual(restored.url, original.url);
+  assert.equal(restored.iframeUrl, original.iframeUrl);
+  assert.equal(f.tunnels[0].proc.killCalls, 1);
+  assert.deepEqual(f.remoteStops, []);
+  await assertClosed(original.url);
+  assert.equal((await fetch(restored.iframeUrl)).status, 200);
+});
+
+test('HTTP recovery timer cannot resurrect an explicitly disconnected instance', async (t) => {
+  const f = await fixture(t);
+  await f.launcher.open(f.home);
+  f.registry.nextBackoffMs = () => 20;
+  f.monitor.probe = async () => false;
+  for (let i = 0; i < 3; i++) await f.monitor.refresh(f.home.homeId);
+  await f.launcher.disconnect(f.home);
+  await sleep(60);
+  assert.equal(f.launcher.status(f.home.homeId), null);
+  assert.equal(f.tunnels.length, 1);
+});

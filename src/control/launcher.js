@@ -112,7 +112,21 @@ export class Launcher {
     const inst = this.procs.get(homeId);
     // 直连已有实例（adopted-local）无子进程：只判「是否处于运行态」，不能靠 exitCode。
     if (!inst || inst.detached || inst.cancelled || (!inst.recovering && inst.proc && (inst.proc.exitCode !== null || inst.proc.signalCode != null))) return null;
-    return { url: inst.url, iframeUrl: inst.iframeUrl, port: inst.port, pid: inst.pid, deeplink: inst.deeplink, kind: inst.kind, recovering: !!inst.recovering };
+    return { url: inst.url, iframeUrl: inst.iframeUrl, externalUrl: inst.externalUrl ?? null, port: inst.port, pid: inst.pid, deeplink: inst.deeplink, kind: inst.kind, recovering: !!inst.recovering };
+  }
+
+  // Recover an unresponsive HTTP path even while its SSH handle is still alive.
+  // Keep the stable browser listener and never start/stop the remote dsh service.
+  recoverConnection(home, expected) {
+    const inst = this.procs.get(home.homeId);
+    if (!inst || inst.kind !== 'ssh' || inst.cancelled || inst.detached
+      || inst.url !== expected?.url || inst.pid !== expected?.pid) return Promise.resolve(null);
+    if (!inst.recovering) {
+      inst.recovering = true;
+      inst.recoveryAttempts = 0;
+      this.registry.set(home.homeId, { phase: 'degraded', lastError: 'HTTP 连续探测失败，正在重建接入连接' });
+    }
+    return this.#recoverRemote(home, inst);
   }
 
   // 仅撤销 hwb 接入；不停止远端 dsh web。
@@ -132,6 +146,7 @@ export class Launcher {
       delete inst.previewProxy;
       delete inst.previewPending;
       delete inst.iframeUrl;
+      delete inst.externalUrl;
     } else {
       if (release && inst?.proc && fingerprint(inst.proc)) {
         log.info('回收 hwb 拉起的本机 dsh web（移除实例，或连接建立失败）', { homeId: home.homeId, pid: inst.pid });
@@ -142,7 +157,7 @@ export class Launcher {
       }
       this.procs.delete(home.homeId);
     }
-    this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
+    this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, externalUrl: null, port: null, pid: null });
   }
 
   async stop(home) {
@@ -161,7 +176,7 @@ export class Launcher {
       }
     }
     if (!inst) {
-      this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
+      this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, externalUrl: null, port: null, pid: null });
       log.info('stop: 实例未在运行', { homeId: home.homeId });
       if (remoteStopError) throw new Error(`远端 dsh web 未能停止：${remoteStopError.message ?? remoteStopError}`);
       return false;
@@ -190,7 +205,7 @@ export class Launcher {
     if (inst.previewProxy) await inst.previewProxy.close().catch(() => {});
     if (inst.proxy) await inst.proxy.close().catch(() => {});
     this.procs.delete(home.homeId);
-    this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
+    this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, externalUrl: null, port: null, pid: null });
     if (remoteStopError) throw new Error(`本地连接已断开，但远端 dsh web 未能停止：${remoteStopError.message ?? remoteStopError}`);
     // 返回值的语义：**true = 这次确实停掉了一个受管子进程**，false = 本来就没有受管子进程可停
     // （直连已有实例 adopted-local，或它早就退出了）。
@@ -255,7 +270,7 @@ export class Launcher {
         delete next.previewProxy;
         await this.#withPreview(home, result, next);
       }
-      result = { ...result, iframeUrl: next.iframeUrl };
+      result = { ...result, iframeUrl: next.iframeUrl, externalUrl: next.externalUrl ?? null };
       await this.disconnect(home);
       this.procs.delete(stagingId);
       staged.homeId = home.homeId; // SSH exit 回调随连接归入稳定的实例 ID。
@@ -275,7 +290,7 @@ export class Launcher {
     const remote = home.hostType === 'remote';
     if (!inst.previewProxy) {
       // Separate iframe entry preserves the original external dsh URL.
-      inst.previewPending ||= this.proxyFactory({ target: new URL(inst.url).origin, preview: true, port: remote ? home.accessPort || 0 : 0 });
+      inst.previewPending ||= this.proxyFactory({ target: new URL(inst.url).origin, preview: true, port: remote ? home.accessPort || 0 : 0, cacheScope: home.homeId });
       try { inst.previewProxy = await inst.previewPending; }
       catch (error) {
         if (error.code === 'EADDRINUSE') {
@@ -298,6 +313,7 @@ export class Launcher {
         await inst.previewProxy.close().catch(() => {});
         delete inst.previewProxy;
         delete inst.iframeUrl;
+        delete inst.externalUrl;
         return result;
       }
       if (remote && !home.transient) {
@@ -311,9 +327,19 @@ export class Launcher {
         }
       }
       inst.iframeUrl = inst.previewProxy.url + '/' + new URL(inst.url).search;
-      if (this.procs.get(home.homeId) === inst) this.registry.set(home.homeId, { iframeUrl: inst.iframeUrl });
+      // —— 浏览器入口（2026-09-13）——
+      // 远程实例的对外地址必须落在**已保存的接入端口**（accessPort）上，而不是 inst.url：
+      // 后者是本次连接现分配的反代端口（见 tunnel.js 的 freePort），重连即换，
+      // 用户复制/收藏到手就失效（实测：配置 49670，↗ 给的却是 127.0.0.1:57686）。
+      // 预览代理的监听口由 accessPort 决定、跨重连 retarget 复用（见 #transferPreview），
+      // 于是外链与 iframe 共用同一 origin：token→cookie 只握一次手，地址也不再漂移。
+      // 本机实例不设此项：inst.url 就是 dsh web 的真实端口，本来就稳定。
+      if (remote) inst.externalUrl = inst.iframeUrl;
+      if (this.procs.get(home.homeId) === inst) {
+        this.registry.set(home.homeId, { iframeUrl: inst.iframeUrl, externalUrl: inst.externalUrl ?? null });
+      }
     }
-    return { ...result, iframeUrl: inst.iframeUrl };
+    return { ...result, iframeUrl: inst.iframeUrl, externalUrl: inst.externalUrl ?? null };
   }
 
   #transferPreview(inst, previous) {
@@ -321,6 +347,8 @@ export class Launcher {
     delete previous.previewProxy;
     inst.previewProxy.retarget(new URL(inst.url).origin);
     inst.iframeUrl = inst.previewProxy.url + '/' + new URL(inst.url).search;
+    // retarget 复用同一监听口，故 externalUrl 与 iframeUrl 一样保持稳定（仅远程实例走到这里）。
+    inst.externalUrl = inst.iframeUrl;
   }
 
   // 连上之后必须验证**鉴权真的通过**，否则「连接成功」是假的。
@@ -347,6 +375,16 @@ export class Launcher {
       throw new Error(`dsh web 入口返回 HTTP ${res.status}：这个地址可能不是 dsh web（或入口路径不对）。`);
     }
     return res.status;
+  }
+
+  // 重启：先撤当前实例（远程=停远端 dsh + 拆隧道；本地=杀进程），再拉起。
+  async restart(home) {
+    const running = this.status(home.homeId);
+    if (running) await this.stop(home);
+    this.registry.set(home.homeId, { phase: 'probing' });
+    if (home.hostType !== 'remote') return this.#withPreview(home, await this.#openLocal(home)); // 本地重启 = 停 + 重开
+    const token = await restartRemoteToken(home);
+    return this.#withPreview(home, await this.#connectRemote(home, token));
   }
 
   // —— 主题同步：把 hwb 的界面外观单向下发给 dsh 实例 ——
@@ -386,16 +424,6 @@ export class Launcher {
       log.warn('连接后同步主题失败（不影响连接）', { homeId: home.homeId, preference, err: error?.message ?? String(error) });
       return { ok: false, error: error?.message ?? String(error) };
     }
-  }
-
-  // 重启：先撤当前实例（远程=停远端 dsh + 拆隧道；本地=杀进程），再拉起。
-  async restart(home) {
-    const running = this.status(home.homeId);
-    if (running) await this.stop(home);
-    this.registry.set(home.homeId, { phase: 'probing' });
-    if (home.hostType !== 'remote') return this.#withPreview(home, await this.#openLocal(home)); // 本地重启 = 停 + 重开
-    const token = await restartRemoteToken(home);
-    return this.#withPreview(home, await this.#connectRemote(home, token));
   }
 
   // 「连接」本地实例：hwb 需持有子进程才能从 stdout 抓 token，故“连接”即“确保本地 dsh web
@@ -462,7 +490,7 @@ export class Launcher {
       // iframe 指向一个已经没人监听的端口，服务端「已连接实例」的过滤也照样把它算进去。
       // 对照：ssh 隧道退出那条路径早就会把 phase 置为 degraded 并调度恢复，本机子进程这条漏了。
       if (wasCurrent && !inst.detached) {
-        this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null });
+        this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, externalUrl: null, port: null, pid: null });
       }
       if (signal !== null) {
         log.debug('dsh web 子进程退出（被信号终止）', { homeId: home.homeId, pid: inst.pid, signal });
@@ -669,7 +697,7 @@ export class Launcher {
       const remoteHome = home.remoteHome || '~/.dsh';
       if (!(await this.remotePathExists(home.host, remoteHome))) throw new Error(`远端 dsh home 不可访问: ${home.host}:${remoteHome}${selfServiceHint(home)}`);
       assertCurrent();
-      inst.proxy = await createProxy({ target: base });
+      inst.proxy = await createProxy({ target: base, cacheScope: home.homeId });
       assertCurrent();
       inst.url = hasToken ? `${inst.proxy.url}/${tokenFragment}` : inst.proxy.url;
       inst.port = inst.proxy.port;
@@ -685,7 +713,7 @@ export class Launcher {
         assertCurrent();
         if (replacing.previewProxy) {
           this.#transferPreview(inst, replacing);
-          result = { ...result, iframeUrl: inst.iframeUrl };
+          result = { ...result, iframeUrl: inst.iframeUrl, externalUrl: inst.externalUrl ?? null };
         }
         replacing.recoveryPending = null;
         this.procs.set(home.homeId, inst);
@@ -700,7 +728,7 @@ export class Launcher {
       if (replacing?.recoveryPending === inst) replacing.recoveryPending = null;
       if (!replacing && this.procs.get(home.homeId) === inst) {
         this.procs.delete(home.homeId);
-        this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, port: null, pid: null, lastError: error.message });
+        this.registry.set(home.homeId, { phase: 'stopped', url: null, iframeUrl: null, externalUrl: null, port: null, pid: null, lastError: error.message });
       }
       throw error;
     }

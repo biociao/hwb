@@ -153,7 +153,10 @@ function renderTabs() {
     const rt = h.runtime?.runtime ?? 'stopped';
     const active = view.kind === 'instance' && view.homeId === h.homeId;
     const pane = panes.get(h.homeId);
-    const externalUrl = active && (pane?.externalUrl || pane?.url);
+    // 外链优先用稳定入口（远程实例 = 已保存的接入端口）：它跨隧道重建不变，
+    // 且与 iframe 同 origin（token→cookie 已握手过）。externalUrl 是本次连接的运行地址，
+    // 只在稳定入口不可得时兜底（例如尚未建立预览代理的旧响应）。
+    const externalUrl = active && (pane?.popoutUrl || pane?.externalUrl || pane?.url);
     return `<button class="tab ${active ? 'active' : ''}" draggable="true"
                     data-action="nav-instance" data-home-id="${esc(h.homeId)}"
                     title="${esc(h.homePath)}${rt === 'unreachable' ? ' · 连接暂时无响应，等待恢复' : ''}${pane?.released ? ' · 已释放内存（重新进入时重新加载）' : ''}">
@@ -197,6 +200,7 @@ async function refresh() {
     if (recovery) {
       pane.deeplink = recovery.deeplink;
       pane.externalUrl = recovery.externalUrl;
+      pane.popoutUrl = recovery.popoutUrl;
       mountPane(view.homeId, recovery.url, recovery.sessionId, pane, recovery.force);
     }
   }
@@ -526,6 +530,7 @@ async function enterInstance(homeId, extra = {}) {
     // 是否拼 `?session=` 由 mountPane 在 cookie 就绪后处理。
     const url = inst.iframeUrl || inst.url;
     pane.externalUrl = inst.url;
+    pane.popoutUrl = inst.externalUrl || inst.url; // 稳定入口：远程实例 = 已保存的接入端口
     mountPane(homeId, url, view.sessionId, pane);
     renderTabs();
   } catch (e) {
@@ -934,7 +939,7 @@ function syncThemeToInstances(mode) {
       console.warn('主题下发失败:', error.message);
     });
 }
-}
+
 function closeThemeMenu() { if (themeMenu) themeMenu.hidden = true; }
 function toggleThemeMenu() { if (themeMenu) themeMenu.hidden = !themeMenu.hidden; }
 themeBtn?.addEventListener('click', (e) => { e.stopPropagation(); toggleThemeMenu(); });

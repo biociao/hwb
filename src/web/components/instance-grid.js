@@ -14,6 +14,17 @@ function degradedChips(degraded) {
   }).join('');
 }
 
+// 该实例上的 dsh 版本号（服务端探测：本地读本机安装、远程经 SSH 问 `dsh --version`）。
+//
+// 取不到时**什么都不显示**：卡片上的「未连接 / 连接不可达」说的是 hwb 与这个实例的接入，
+// 而版本取不到还可能是「远端没装 dsh」或「SSH 主机不通」—— 画一个「dsh —」会把两件事混成
+// 一件，读者反而不知道该去查什么。版本号本身已由服务端限定成干净的版本字面量，这里仍转义。
+function versionChip(runtime) {
+  const version = runtime?.dshVersion;
+  if (typeof version !== 'string' || !version) return '';
+  return `<span class="chip ver" title="该实例上 dsh 的版本号">dsh ${esc(version)}</span>`;
+}
+
 export function renderInstanceGrid(homes) {
   if (!homes.length) return '<div class="empty">暂无实例，请添加实例</div>';
   return `<div class="rows">${homes.map((h) => {
@@ -23,8 +34,7 @@ export function renderInstanceGrid(homes) {
     return `<div class="row">
       <div class="t">
         <span class="name">${esc(h.alias || h.serverId || h.homePath)}</span>
-        <span class="chip ${running ? 'ok' : attached ? 'warn' : ''}">${running ? '已连接' : attached ? '连接不可达' : '未连接'}</span>
-        ${degradedChips(h.degraded)}
+        <span class="chips">${versionChip(h.runtime)}<span class="chip ${running ? 'ok' : attached ? 'warn' : ''}">${running ? '已连接' : attached ? '连接不可达' : '未连接'}</span>${degradedChips(h.degraded)}</span>
       </div>
       ${attached ? `<div class="meta">当前通道：${esc(currentChannel(h))}</div>` : ''}
       ${running ? `<div class="meta"><span>${h.workspaceCount} projects</span><span>${h.sessionCount} sessions</span><span>响应 ${h.runtime.latencyMs ?? '—'} ms</span><span>检查 ${timeAgo(h.runtime.checkedAt)}</span></div>` : ''}

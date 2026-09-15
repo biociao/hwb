@@ -113,6 +113,50 @@ test('instance-grid: 降级原因里的 HTML 被转义（错误文本可能含�
   assert.match(html, /&lt;img/);
 });
 
+// dsh 版本号 chip：每个实例卡都要能看出「这台跑的是哪个 dsh」。
+// 版本来自服务端探测（本地读安装、远程 ssh `dsh --version`），取不到时**不画**这个 chip。
+test('instance-grid: 显示 dsh 版本号；未知时不画（也不留 "dsh —" 这种半截文案）', () => {
+  const base = {
+    homeId: 'abcdef1234567890', homePath: '/home/u/.dsh', status: 'ok',
+    workspaceCount: 1, sessionCount: 2, degraded: [],
+  };
+  const known = renderInstanceGrid([{ ...base, runtime: { runtime: 'running', latencyMs: 3, checkedAt: null, dshVersion: '0.1.5-rc.1' } }]);
+  assert.match(known, /dsh 0\.1\.5-rc\.1/);
+  // 未连接（探测不到运行时状态）的实例同样显示版本 —— 它恰恰是用户想确认的那一项
+  assert.match(renderInstanceGrid([{ ...base, runtime: { runtime: 'stopped', dshVersion: '0.1.1-rc.2' } }]), /dsh 0\.1\.1-rc\.2/);
+  for (const dshVersion of [null, undefined, '', 0]) {
+    const html = renderInstanceGrid([{ ...base, runtime: { runtime: 'stopped', dshVersion } }]);
+    assert.doesNotMatch(html, /dsh /, `dshVersion=${JSON.stringify(dshVersion)} 时不该出现版本 chip`);
+  }
+  // 没有任何 runtime 也不能崩（例如索引还没跑过的新实例）
+  assert.doesNotMatch(renderInstanceGrid([{ homeId: 'a', homePath: '/x' }]), /dsh /);
+});
+
+// 版本号在服务端已被限定成 `x.y.z[-suffix]` 的字面量；这里仍然要求前端转义 ——
+// 同 recent-sessions 的 approval：数据来源（远端命令输出 / package.json）不该是唯一防线。
+test('instance-grid: 版本号里的 HTML 同样被转义', () => {
+  const evil = '"><img src=x onerror=alert(1)>';
+  const html = renderInstanceGrid([{
+    homeId: 'abcdef1234567890', homePath: '/x', status: 'ok', workspaceCount: 0, sessionCount: 0, degraded: [],
+    runtime: { runtime: 'stopped', dshVersion: evil },
+  }]);
+  assert.doesNotMatch(html, INJECTED_TAG);
+  assert.match(html, /dsh &quot;&gt;&lt;img/);
+});
+
+// 版本 chip 与状态 chip 必须同处一个 chip 组：.row .t 是 space-between，
+// 三个平级子元素会把它们摊到整行（版本号漂到标题中间），所以结构本身是契约。
+test('instance-grid: 版本与状态 chip 收在同一个 chip 组里（否则会被 space-between 摊开）', () => {
+  const html = renderInstanceGrid([{
+    homeId: 'abcdef1234567890', homePath: '/x', status: 'ok', workspaceCount: 0, sessionCount: 0, degraded: [],
+    runtime: { runtime: 'running', latencyMs: 1, checkedAt: null, dshVersion: '0.1.5-rc.1' },
+  }]);
+  const group = /<span class="chips">([\s\S]*?)<\/span>\s*\n?\s*<\/div>/.exec(html);
+  assert.ok(group, '应有一个 class="chips" 的容器');
+  assert.match(group[1], /dsh 0\.1\.5-rc\.1/);
+  assert.match(group[1], /已连接/);
+});
+
 // 键盘可达性：drill-in 行是 <div> + 委托 click —— 只给了鼠标用户。补 role/tabindex 后
 // 才能被 Tab 聚焦、被 Enter/Space 激活（见 app.js 的 keydown 委托）。
 test('recent-projects/sessions: 可点击行带 role=button 与 tabindex=0', () => {

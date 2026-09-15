@@ -85,6 +85,25 @@ function sshBash(host, script, args = [], timeoutMs = DEFAULT_TIMEOUT, { maxStdo
   });
 }
 
+// —— 远端非交互会话的 PATH 补齐（**唯一的**一份，启动 dsh web 与问它的版本号共用）——
+// SSH 非交互会话往往缺少 nvm/本地 bin 目录(如 dsh 装在 v24.15.0/bin 而 PATH 指向旧版本),
+// 导致 dsh 找不到;把常见位置加进 PATH 再启动。
+//
+// 为什么抽出来而不是各写一份：一旦两条路径漂移，「跑起来的是哪个 dsh」与「卡片上报的是哪个
+// 版本的 dsh」就可能不是同一个安装 —— 版本号最不该出错的地方恰好在这里。
+//
+// 注意 PATH 的最终优先级由「逐个前插」决定：**最后**处理的那个目录排在最前面（优先级最高）。
+// `$HOME/.local/node/bin` 放在列表**最前**＝加进来的一串里优先级最低：它是「官方 Node tarball
+// 解到 ~/.local/node」这种布局的兜底（`scripts/dsh21-deploy.sh` 的注释里就写着这是 dgx21 的
+// 布局、c4g.tun 则在 nvm 的 v24.15.0 下；soak 脚本也是这么找远端 dsh 的）。放在最后一位处理
+// 意味着「只在别处都找不到 dsh 时」才生效 —— 对既有远端**不改变**解析结果，只把「原本 dsh
+// 压根找不到、连 dsh web 都起不来」的那类主机救回来（实测 dgx21：非交互与 login shell 的
+// PATH 里都没有 dsh，它只在 ~/.local/node/bin 下）。
+const REMOTE_PATH_PRELUDE = String.raw`for d in "$HOME/.local/node/bin" "$HOME/.nvm/versions/node/"*/bin "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
+  [ -d "$d" ] || continue
+  case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH";; esac
+done`;
+
 // 远端启动脚本(驻留于远端 shell 自身变量,避免与 JS 模板插值冲突)。
 // 参数顺序:$1=port $2=log $3=cmd $4=pollSeconds $5=mode(ensure|restart)
 //
@@ -96,12 +115,7 @@ function sshBash(host, script, args = [], timeoutMs = DEFAULT_TIMEOUT, { maxStdo
 //     而不是干等满整个 poll 窗口(旧逻辑会白等 40s,前端若设了更短的 timeout 就会报错)。
 const REMOTE_START = String.raw`
 log="$2"; port="$1"; cmd="$3"; t="$4"; mode="$5"
-# SSH 非交互会话往往缺少 nvm/本地 bin 目录(如 dsh 装在 v24.15.0/bin 而 PATH 指向旧版本),
-# 导致 dsh 找不到;把常见位置加进 PATH 再启动。
-for d in "$HOME/.nvm/versions/node/"*/bin "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
-  [ -d "$d" ] || continue
-  case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH";; esac
-done
+` + REMOTE_PATH_PRELUDE + String.raw`
 # 端口监听检测 / 回收。必须跨 Linux 与 BSD(macOS) 远端都能用:
 #   · 原生实现只用 ss + netstat -tln + fuser —— 三者都是 Linux 专有。远端若是 macOS,
 #     listening() 恒为 false、killport() 是空操作:ensure 模式于是跳过「复用已在跑的服务」
@@ -282,4 +296,6 @@ export function selfServiceHint({ host, remotePort, remoteCmd, remoteLog }) {
 }
 
 // —— 暴露(供 Launcher 使用)—— REMOTE_START / defaultRemoteCmd 亦导出,便于做回归测试。
-export { ensureRemoteToken, restartRemoteToken, stopRemote, REMOTE_START, sshBash };
+// REMOTE_PATH_PRELUDE 导出给「问远端 dsh 版本」那条旁路共用（见 lib/dsh-version.js）：
+// 两条路径必须看到同一个 dsh，否则卡片上的版本号会与真正跑着的实例对不上。
+export { ensureRemoteToken, restartRemoteToken, stopRemote, REMOTE_START, REMOTE_PATH_PRELUDE, sshBash };

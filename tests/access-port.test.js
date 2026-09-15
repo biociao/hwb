@@ -133,6 +133,32 @@ test('auto-assigned browser entry survives disconnect and a new launcher', async
   assert.match(await (await fetch(reopened.iframeUrl)).text(), /existing service/);
 });
 
+test('remote 外链拿到的就是配置的接入端口，且跨重连不变（不再给随机端口）', async (t) => {
+  const target = await upstream(t, 'remote dsh');
+  // 预留一个空闲端口当「用户配置的本地接入端口」：起一个监听再关掉，与真实分配路径一致。
+  const reserved = http.createServer();
+  await new Promise((resolve) => reserved.listen(0, '127.0.0.1', resolve));
+  const wanted = reserved.address().port;
+  await new Promise((resolve) => reserved.close(resolve));
+
+  const store = new IndexStore(); t.after(() => store.close());
+  const id = store.registerHome({ homePath: '/entry', hostType: 'remote', host: 'mock.invalid', remotePort: target.port, token: 'test', accessPort: wanted });
+  const first = launcherFor(t, store, target);
+  const opened = await first.open(store.getHome(id));
+  assert.equal(new URL(opened.iframeUrl).port, String(wanted), 'iframe 入口 = 配置端口');
+  assert.equal(new URL(opened.externalUrl).port, String(wanted), '外链入口 = 同一个配置端口（不是 inst.url）');
+  assert.notEqual(new URL(opened.url).port, String(wanted), 'inst.url 仍是本次连接的反代端口，两者必须区分开');
+  assert.equal(first.status(id).externalUrl, opened.externalUrl, 'status() 必须带上 externalUrl，否则监控会把它抹掉');
+  assert.match(await (await fetch(opened.externalUrl)).text(), /remote dsh/);
+
+  // 重连（新 launcher、新隧道/反代端口）后，外链地址一字不变。
+  await first.disconnect(store.getHome(id));
+  const second = launcherFor(t, store, target);
+  const reopened = await second.open(store.getHome(id));
+  assert.equal(reopened.externalUrl, opened.externalUrl);
+  assert.equal(new URL(reopened.externalUrl).port, String(wanted));
+});
+
 test('occupied saved port fails explicitly and never silently changes the browser origin', async (t) => {
   const target = await upstream(t, 'service');
   const occupied = await upstream(t, 'unrelated service');

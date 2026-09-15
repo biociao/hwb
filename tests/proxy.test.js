@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createProxy } from '../src/control/proxy.js';
+import { createProxyCache } from '../src/control/proxy-cache.js';
 
 // 模拟一个「dsh web」上游: `/?token=good` → 303+set-cookie; 带 cookie 的 `/` → 200 index;
 // `/plugins/...` → 200 插件; 无 cookie 的 `/` → 401。
@@ -121,7 +122,10 @@ test('proxy: immutable browser caching is limited to versioned static responses'
     res.end('static response bytes');
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
-  const proxy = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}`, preview: true });
+  // 本地读取缓存（proxy-cache）在同一个 URL 上会记住第一次的响应，而这个用例刻意用同一个 URL
+  // 逐场景换响应来验证头策略 —— 所以每个场景前必须清空缓存，否则它验证的是「上一个场景」。
+  const cache = createProxyCache({ dir: null });
+  const proxy = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}`, preview: true, cache });
   t.after(async () => { await proxy.close(); upstream.closeAllConnections(); upstream.close(); });
   const cases = [
     { name: 'hashed script', path: asset, cache: cacheControl },
@@ -165,6 +169,7 @@ test('proxy: immutable browser caching is limited to versioned static responses'
   ];
   for (const scenario of cases) {
     await t.test(scenario.name, async () => {
+      cache.clear();
       responseStatus = scenario.status || 200;
       responseHeaders = { ...(scenario.type === null ? {} : { 'content-type': scenario.type || 'text/javascript; charset=utf-8' }), ...scenario.headers };
       const response = await fetch(proxy.url + scenario.path, { method: scenario.method || 'GET' });
@@ -176,7 +181,13 @@ test('proxy: immutable browser caching is limited to versioned static responses'
   }
 });
 
-test('proxy: static cache headers survive preview chaining without sharing authenticated responses', async (t) => {
+test('proxy: 内容寻址静态资源的本地缓存（含 preview 链路），且鉴权响应绝不进缓存', async (t) => {
+  // 行为变更（2026-09-14）：这里的旧版本断言「代理只给浏览器策略，从不复用响应体」。
+  // 远端 dsh 给插件 bundle 回 `cache-control: no-cache` 且不带任何校验器，浏览器没有任何
+  // 复用依据 —— 每开一次页面就把 3.27 MiB 重下一遍（实测链路 25–30 KB/s，约 2 分钟/次）。
+  // 所以代理现在会**本地存一份**内容寻址的静态资源（URL 自带内容指纹），这正是本次修复的核心。
+  // 代价与边界：命中时不再回源，因此响应体必须与请求者无关 —— 带 set-cookie 的响应、以及
+  // 非内容寻址的 URL 仍然一律不缓存（见 tests/proxy-cache.test.js）。
   let requests = 0;
   const upstream = createServer((req, res) => {
     requests++;
@@ -187,16 +198,24 @@ test('proxy: static cache headers survive preview chaining without sharing authe
   const original = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}` });
   const preview = await createProxy({ target: original.url, preview: true });
   t.after(async () => { await preview.close(); await original.close(); upstream.closeAllConnections(); upstream.close(); });
-  for (const [hash, cookie] of [['BNsW4eBh', 'user=one'], ['BNsW4eBh', 'user=two'], ['C0xS9mPB', 'user=one']]) {
-    const path = `/assets/vendor-${hash}.js`;
-    const response = await fetch(preview.url + path, { headers: { cookie } });
-    assert.equal(response.headers.get('cache-control'), 'private, max-age=31536000, immutable');
-    assert.equal(response.headers.get('etag'), '"asset-revision"');
-    assert.equal(response.headers.get('vary'), 'Accept-Encoding');
-    assert.deepEqual(await response.json(), { path, cookie });
-  }
-  // The proxy supplies browser policy; it never stores or reuses response bodies.
-  assert.equal(requests, 3);
+  const path = '/assets/vendor-BNsW4eBh.js';
+  const first = await fetch(preview.url + path, { headers: { cookie: 'user=one' } });
+  assert.equal(first.headers.get('cache-control'), 'private, max-age=31536000, immutable');
+  assert.equal(first.headers.get('etag'), '"asset-revision"', '上游 ETag 必须原样保留（不覆盖成 hwb 自己的）');
+  assert.equal(first.headers.get('vary'), 'Accept-Encoding');
+  assert.deepEqual(await first.json(), { path, cookie: 'user=one' });
+  const hitsAfterFirst = requests;
+
+  const second = await fetch(preview.url + path, { headers: { cookie: 'user=two' } });
+  assert.equal(second.headers.get('x-hwb-cache'), 'hit');
+  assert.equal(second.headers.get('etag'), '"asset-revision"');
+  assert.deepEqual(await second.json(), { path, cookie: 'user=one' }, '命中即复用副本（内容寻址 ⇒ 与请求者无关）');
+  assert.equal(requests, hitsAfterFirst, '第二次必须由本地副本作答，不再打上游');
+
+  // 另一个指纹 → 另一份内容，必须回源。
+  const other = await fetch(preview.url + '/assets/vendor-C0xS9mPB.js');
+  await other.json();
+  assert.equal(requests, hitsAfterFirst + 1);
 });
 
 // 目标协议/URL 两条守卫在套件里从没被走到过（审查指出：把协议检查删掉，整套仍然全绿）。
@@ -214,4 +233,190 @@ test('createProxy: 非 http 目标与非法 URL 必须被拒绝', async () => {
   } finally {
     await proxy.close();
   }
+});
+
+// —— 上游瞬时失败重试（2026-09-14）——
+//
+// 动机（实测）：经 dgx21.tun 的隧道带宽很差，dsh 前端启动要并发拉约 10 个插件 bundle，
+// 无头 Chrome 抓包显示其中若干会拿到 `proxy: upstream error — socket hang up`（502），
+// 而同一 URL 随后单发 curl 又是 200 —— 纯瞬时失败。插件加载器对任何一次失败都会整体报
+// "Failed to load plugins"，浏览器自己又不会重试，于是整个 UI 打不开。
+function flakyUpstream(body = 'second try ok') {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    if (calls === 1) { req.socket.destroy(); return; } // 第一次：连接被掐断（隧道瞬时抽风）
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(body);
+  });
+  return { server, calls: () => calls };
+}
+
+test('proxy: GET 遇上游瞬时断连会重试一次并成功（浏览器不会自己重试）', async (t) => {
+  const up = flakyUpstream();
+  await new Promise((resolve) => up.server.listen(0, '127.0.0.1', resolve));
+  const proxy = await createProxy({ target: `http://127.0.0.1:${up.server.address().port}` });
+  t.after(async () => { await proxy.close(); up.server.closeAllConnections(); up.server.close(); });
+
+  const res = await fetch(`${proxy.url}/plugins/x/client.js?rev=abc`);
+  assert.equal(res.status, 200, '瞬时失败必须被一次重试救回来');
+  assert.equal(await res.text(), 'second try ok');
+  assert.equal(up.calls(), 2, '恰好重试一次');
+});
+
+test('proxy: POST 不重试（有副作用且带请求体）', async (t) => {
+  const up = flakyUpstream();
+  await new Promise((resolve) => up.server.listen(0, '127.0.0.1', resolve));
+  const proxy = await createProxy({ target: `http://127.0.0.1:${up.server.address().port}` });
+  t.after(async () => { await proxy.close(); up.server.closeAllConnections(); up.server.close(); });
+
+  const res = await fetch(`${proxy.url}/api/rpc`, { method: 'POST', body: '{"a":1}' });
+  assert.equal(res.status, 502);
+  assert.match(await res.text(), /upstream error/);
+  assert.equal(up.calls(), 1, 'POST 绝不能被重放');
+});
+
+test('proxy: 上游持续失败时仍然只重试一次，然后如实报 502', async (t) => {
+  let calls = 0;
+  const up = createServer((req) => { calls += 1; req.socket.destroy(); });
+  await new Promise((resolve) => up.listen(0, '127.0.0.1', resolve));
+  const proxy = await createProxy({ target: `http://127.0.0.1:${up.address().port}` });
+  t.after(async () => { await proxy.close(); up.closeAllConnections(); up.close(); });
+
+  const res = await fetch(`${proxy.url}/plugins/x/client.js`);
+  assert.equal(res.status, 502);
+  assert.match(await res.text(), /upstream error/);
+  assert.equal(calls, 2, '最多两次尝试，不做无限重试');
+});
+
+// —— 上游并发上限：直接决定占用几个 ssh channel（2026-09-14）——
+//
+// 远端 sshd 默认 MaxSessions 10，而 hwb 全部流量复用一条 master：浏览器并发 + hwb 自身轮询
+// 一起越过 10 时，多出来的 channel 会被远端拒绝（本侧表现为 socket hang up → 502 →
+// "Failed to load plugins"）。故代理用一个自带上限的 keep-alive 连接池把并发压下去。
+test('proxy: 并发请求共用有限的上游连接（不超过 HWB_PROXY_MAX_SOCKETS）', async (t) => {
+  let live = 0, peak = 0;
+  const upstream = createServer((_req, res) => {
+    live += 1; peak = Math.max(peak, live);
+    setTimeout(() => { live -= 1; res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok'); }, 150);
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}` });
+  t.after(async () => { await proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+
+  const results = await Promise.all(Array.from({ length: 9 }, () => fetch(`${proxy.url}/p`).then((r) => r.status)));
+  assert.deepEqual(results, Array(9).fill(200), '排队不能丢请求');
+  assert.equal(peak, Number(process.env.HWB_PROXY_MAX_SOCKETS || 3), `上游并发峰值应为 3（实际 ${peak}）`);
+});
+
+test('proxy: close 时释放池里的空闲上游连接（别白占远端 channel 名额）', async (t) => {
+  let connections = 0;
+  const upstream = createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok'); });
+  upstream.on('connection', (socket) => { connections += 1; socket.on('close', () => { connections -= 1; }); });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  const proxy = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}` });
+
+  await fetch(`${proxy.url}/p`);
+  assert.equal(connections, 1, 'keep-alive：一条连接承载多次请求');
+  await proxy.close();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(connections, 0, 'close 必须把空闲上游连接也拆掉');
+});
+
+test('proxy: long-lived SSE streams do not starve page and auth requests', async (t) => {
+  const upstream = createServer((req, res) => {
+    if (req.url === '/events') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': ready\n\n');
+    } else res.end('page');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const inner = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}` });
+  const outer = await createProxy({ target: inner.url, preview: true });
+  const abort = new AbortController();
+  t.after(async () => {
+    abort.abort();
+    await outer.close(); await inner.close();
+    upstream.closeAllConnections(); upstream.close();
+  });
+  const streams = [];
+  for (let i = 0; i < 3; i++) {
+    const response = await fetch(`${outer.url}/events`, { signal: abort.signal });
+    const reader = response.body.getReader();
+    await reader.read();
+    streams.push(reader);
+  }
+  const page = await fetch(outer.url, { signal: AbortSignal.timeout(1200) });
+  assert.equal(await page.text(), 'page');
+  assert.equal(streams.length, 3);
+});
+
+test('proxy: silent upstreams time out and release capacity for later requests', async (t) => {
+  let posts = 0;
+  const upstream = createServer((req, res) => {
+    if (req.url === '/hang') { posts++; req.resume(); }
+    else res.end('recovered');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}`, requestTimeoutMs: 80 });
+  t.after(async () => { await proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+  const failures = await Promise.all(Array.from({ length: 4 }, () => fetch(`${proxy.url}/hang`, {
+    method: 'POST', body: 'once', signal: AbortSignal.timeout(1500),
+  }).then(async r => { await r.text(); return r.status; })));
+  assert.deepEqual(failures, [504, 504, 504, 504]);
+  assert.equal(posts, 3, 'fourth request expired while queued; no POST is replayed');
+  const next = await fetch(proxy.url, { signal: AbortSignal.timeout(1000) });
+  assert.equal(await next.text(), 'recovered');
+});
+
+test('proxy: idle SSE survives the ordinary response timeout and closes on retarget', async (t) => {
+  const upstream = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(': ready\n\n');
+    setTimeout(() => { if (!res.destroyed) res.write(': still alive\n\n'); }, 160);
+  });
+  const next = createServer((_req, res) => res.end('new target'));
+  await Promise.all([upstream, next].map(s => new Promise(resolve => s.listen(0, '127.0.0.1', resolve))));
+  const proxy = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}`, requestTimeoutMs: 60 });
+  t.after(async () => { await proxy.close(); for (const s of [upstream, next]) { s.closeAllConnections(); s.close(); } });
+  const response = await fetch(proxy.url, { signal: AbortSignal.timeout(1500) });
+  const reader = response.body.getReader();
+  await reader.read();
+  assert.match(new TextDecoder().decode((await reader.read()).value), /still alive/);
+  proxy.retarget(`http://127.0.0.1:${next.address().port}`);
+  await assert.rejects(reader.read());
+  assert.equal(await (await fetch(proxy.url)).text(), 'new target');
+});
+
+test('proxy: plugin downloads cannot starve auth and page requests', async (t) => {
+  const pending = [];
+  const upstream = createServer((req, res) => {
+    if (req.url.startsWith('/plugins/')) pending.push(res);
+    else res.end('auth ok');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const inner = await createProxy({ target: `http://127.0.0.1:${upstream.address().port}` });
+  const outer = await createProxy({ target: inner.url, preview: true });
+  const abort = new AbortController();
+  t.after(async () => { abort.abort(); await outer.close(); await inner.close(); upstream.closeAllConnections(); upstream.close(); });
+  const downloads = Array.from({length:3}, (_,i) => fetch(`${outer.url}/plugins/p${i}/client.js`, {signal:abort.signal}).catch(() => null));
+  const deadline = Date.now()+1000;
+  while (pending.length < 3 && Date.now()<deadline) await new Promise(r=>setTimeout(r,5));
+  assert.equal(pending.length,3);
+  assert.equal(await (await fetch(outer.url,{signal:AbortSignal.timeout(600)})).text(),'auth ok');
+  for (const res of pending) res.end('plugin');
+  const responses = await Promise.all(downloads);
+  for (const res of responses) assert.equal(await res.text(),'plugin');
+});
+
+test('proxy: header-only SSE opens through two layers before any event arrives', async (t) => {
+  const upstream = createServer((_req,res) => {res.writeHead(200,{'content-type':'text/event-stream'});res.flushHeaders();});
+  await new Promise(resolve => upstream.listen(0,'127.0.0.1',resolve));
+  const inner=await createProxy({target:`http://127.0.0.1:${upstream.address().port}`});
+  const outer=await createProxy({target:inner.url});
+  t.after(async()=>{await outer.close();await inner.close();upstream.closeAllConnections();upstream.close();});
+  const res=await fetch(outer.url,{signal:AbortSignal.timeout(600)});
+  assert.equal(res.status,200);
+  await res.body.cancel();
 });

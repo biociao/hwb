@@ -1,0 +1,42 @@
+{
+  "host": "dgx21.tun",
+  "takenAt": "2026-09-13T18:34:51.838Z",
+  "paths": {
+    "/home/bot/.local/share/pnpm/store": {
+      "state": "present",
+      "mtime": "1788075547",
+      "kb": "2292"
+    },
+    "/home/bot/.pnpm-store": {
+      "state": "absent",
+      "mtime": "NA",
+      "kb": "NA"
+    },
+    "/home/bot/.cache/pnpm": {
+      "state": "present",
+      "mtime": "1788166035",
+      "kb": "10464"
+    },
+    "/home/bot/.npm/_cacache": {
+      "state": "present",
+      "mtime": "1779328345",
+      "kb": "544108"
+    },
+    "/home/bot/.cache/node-gyp": {
+      "state": "absent",
+      "mtime": "NA",
+      "kb": "NA"
+    },
+    "/home/bot/.dsh/profiles/node_modules": {
+      "state": "present",
+      "mtime": "1788074550",
+      "kb": "1824"
+    }
+  },
+  "scalars": {
+    "profiles_node_modules_entries": "185",
+    "headless_dir_files": "cordis.yml,package.json,",
+    "headless_dir_kb": "12",
+    "dsh_version": "0.1.1-rc.2"
+  }
+}

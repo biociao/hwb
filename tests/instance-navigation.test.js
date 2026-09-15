@@ -56,7 +56,8 @@ test('background recovery adopts the new iframe entry once and preserves the lat
   updatePaneSession(pane, 'selected-in-dsh');
   const runtime = { runtime: 'running', url: 'http://localhost:6666/?token=new', iframeUrl: 'http://localhost:7777/?token=new', deeplink: true };
   const recovery = planPaneRecovery(pane, runtime);
-  assert.deepEqual(recovery, { url: runtime.iframeUrl, externalUrl: runtime.url, deeplink: true, sessionId: 'selected-in-dsh' });
+  assert.deepEqual(recovery, { url: runtime.iframeUrl, externalUrl: runtime.url, popoutUrl: runtime.url, deeplink: true, sessionId: 'selected-in-dsh' });
+  assert.equal(recovery.popoutUrl, runtime.url, '无稳定入口时（旧响应）外链兜底用运行地址');
   const navigation = planPaneNavigation(pane, recovery.url, recovery.sessionId);
   assert.equal(navigation.firstTarget, runtime.iframeUrl);
   assert.equal(new URL(navigation.finalTarget).searchParams.get('session'), 'selected-in-dsh');
@@ -80,7 +81,21 @@ test('older status responses retain the preview entry until the external connect
   assert.equal(planPaneRecovery(pane, { runtime: 'running', url: entry, deeplink: true }), null);
   const nextEntry = 'http://localhost:6666/?token=new';
   const recovery = planPaneRecovery(pane, { runtime: 'running', url: nextEntry, deeplink: true });
-  assert.deepEqual(recovery, { url: nextEntry, externalUrl: nextEntry, deeplink: true, sessionId: 'session-one' });
+  assert.deepEqual(recovery, { url: nextEntry, externalUrl: nextEntry, popoutUrl: nextEntry, deeplink: true, sessionId: 'session-one' });
+});
+
+test('外链走稳定入口，而入口变更判定仍看本次连接的运行地址', () => {
+  const stable = 'http://localhost:49670/?token=stable';
+  const runtime = { runtime: 'running', url: 'http://localhost:57686/', iframeUrl: stable, externalUrl: stable, deeplink: false };
+  // 用户已经挂在稳定入口（49670）上，而这一次连接的随机端口又换了一个。
+  const pane = mounted({ url: stable, externalUrl: runtime.url });
+  const recovery = planPaneRecovery(pane, { ...runtime, url: 'http://localhost:60000/' });
+  assert.equal(recovery.url, stable);
+  assert.equal(recovery.popoutUrl, stable, '外链必须拿到配置的接入端口，而不是随机的 57686');
+  assert.equal(recovery.externalUrl, 'http://localhost:60000/', 'externalUrl 保持「本次连接地址」语义，供入口变更判定');
+  assert.equal(recovery.force, true, '隧道换端口仍要重新认证一次：retarget 会掐断 iframe 里的实时通道');
+  // 同一运行地址的重复状态推送不重载；用户手上/收藏的地址始终是 49670。
+  assert.equal(planPaneRecovery(pane, runtime), null);
 });
 
 test('authentication context cannot erase a pending session, but selecting a new session can clear it', () => {

@@ -3,7 +3,7 @@
 # hwb — harness workbench
 
 [![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.1.5-blue)](CHANGELOG.md)
 [![milestones](https://img.shields.io/badge/milestones-M1%E2%80%93M7-brightgreen)](DSH_Workbench_Fusion_Architecture.md)
 [![node](https://img.shields.io/badge/node-%E2%89%A522-blue)](package.json)
 [![npm deps](https://img.shields.io/badge/npm_deps-0-blue)](package.json)
@@ -141,7 +141,7 @@ hwb --help
 
 配置保存在 `~/.hwb/config.json`，支持 `port`、`db`、`intervalMs`、`homes`、`log`、`verbose`、`silent`、`theme`；
 `log: false` 禁用结构化文件日志。`theme`（`light` / `dark` / `system`）是界面外观偏好，也是**下发给 dsh 实例**的那个值。
-`log: false` 禁用结构化文件日志。`hwb config path` 显示配置位置。相对路径在保存时转为绝对路径。
+`hwb config path` 显示配置位置。相对路径在保存时转为绝对路径。
 设置 `HWB_DIR=/其他目录 hwb ...` 可隔离一套服务的配置、数据库和运行文件（多服务需配置不同端口）。
 实例及连接端点继续通过工作台管理，保存在数据库中。
 
@@ -209,8 +209,12 @@ npm test           # 全量（含 tests/compat 版本兼容性契约）
 1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
 2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
 3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip（已连接 / 连接不可达 / 未连接，域降级时另加
-   「⚠ <域> 降级」chip）、workspace/会话数，以及 **连接（连接到 / 必要时拉起 dsh web）** / **断开** /
+   「⚠ <域> 降级」chip）、**该实例上 dsh 的版本号**（`dsh 0.1.5-rc.1`；本地实例读本机安装、
+   远程实例经 SSH `dsh --version` 探测，与远端启动共用同一份 PATH 补齐；取不到时不显示）、
+   workspace/会话数，以及 **连接（连接到 / 必要时拉起 dsh web）** / **断开** /
    **切换**（配置了多个连接端点时）/ **⚙ 设置** 按钮。
+   版本号在**未连接**的实例卡上也显示 —— 「这台上跑的是哪个 dsh」正是排查「连不上 / 数据变少 /
+   域降级」时最先要看的一项；远程探测是后台做的，不拖慢仪表盘渲染。
    重启 / 停止 / 重新索引 / 移除 在 **⚙ 设置** 弹窗内（不在卡片上，避免误点）。
    远程实例经 SSH 只读索引入库后同样显示。
    （实例卡不再重复展示「当前项目/当前会话」——该信息已由 Recent Projects / Recent Sessions 聚合呈现。）
@@ -297,8 +301,6 @@ dsh 自己设置里的主题改动不会回流到 hwb。
 
 > 远程实例的主题下发经 SSH 执行一小段 shell（`awk` 维护节边界 + 临时文件 + `mv` 原子替换），
 > 需要远端有 `awk`（POSIX 环境默认都有）。远端写入失败时错误信息里会带上 ssh 的退出码与 stderr 尾部。
-
----
 
 ---
 
@@ -483,6 +485,7 @@ hwb/
 │   │   ├── time.js              # 毫秒时间戳 → ISO（越界降级为 null）
 │   │   ├── node-version.js      # Node 版本门槛（engines / doctor / 启动预检 同源）
 │   │   ├── dsh-compat.js        # dsh 存储契约自检（doctor 用；从安装的 dsh 提取域版本）
+│   │   ├── dsh-version.js       # 每个实例的 dsh 版本号（本地读安装 / 远程 ssh --version，带 TTL 缓存）
 │   │   ├── file-preview.js      # 预览/下载/上传（本机 fs + 远端 python，含路径围栏）
 │   │   ├── multipart.js         # 流式 multipart 解析（线性扫描 + 边界保持）
 │   │   ├── endpoints.js         # 连接端点规范化（host/port/唯一 id）
@@ -582,6 +585,13 @@ dsh 的版本号也不遵循 semver 承诺（0.1.x → 0.1.5 之间就改过存�
 | `dsh web` 启动打印 | `dsh web: http://127.0.0.1:<port>/?token=<t>` | 抓 `?token=`（抓不到则退回裸 URL） |
 | RPC 端点 | `POST /api/session/list`（slash 形） | 先试 slash，404 回退 dot 形 |
 
+> **实例卡上的版本号**也是按同一口径取的，而且**每个实例各取各的**：本机实例读本机安装的 dsh
+> （与 `hwb doctor` 同一份代码），远程实例经 SSH `dsh --version`（与启动远端 dsh web 共用同一份
+> PATH 补齐，且优先用你在实例配置里填的那个 dsh 路径）。所以「工作台上写着 0.1.5-rc.1、
+> 远端其实是 0.1.1-rc.2」这种会让人查错方向的情形不会发生 —— 版本不同只可能因为两台机器上的
+> dsh 本来就不同。注意域版本（上表的 2 / 7）与 dsh 版本号是两件事：老版本 dsh 写出的 home
+> 里域版本也可能很新，反之亦然（详见 `hwb doctor` 的两项独立检查）。
+
 **升级 dsh 后怎么办**：
 
 ```sh
@@ -620,7 +630,7 @@ dsh 0.1.5-rc.1 兼容 ✓
 
 ## 已知限制
 
-> 这些是 v0.1.1 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
+> 这些是 v0.1.5 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
 
 - **上传的内存占用有界但不为零**：multipart 解析器是流式的，但上传路由目前会把整份文件先攒在内存
   再落盘（解析器的 `write` 回调是同步契约，而落盘写入是异步的）。单文件上限 256 MiB，
@@ -727,7 +737,7 @@ dsh 0.1.5-rc.1 兼容 ✓
 | M4 — Quota Balancer | 🟡 后端 + 单测完成（UI 接线池） |
 | M5 — Drill-in Pane | ✅ 完成 |
 | M6 — Re-own Control | ✅ 完成 |
-| M7 — Publish | 🎯 v0.1.1（本版） |
+| M7 — Publish | 🎯 v0.1.5（本版） |
 
 后续方向（见架构文档 §14 开放问题）：远程钻入方式、会话标题来源、首批额度 provider 的取舍等。
 

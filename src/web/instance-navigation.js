@@ -30,7 +30,17 @@ export function planPaneRecovery(pane, runtime) {
   const url = runtime.iframeUrl || runtime.url;
   const force = url === pane.url && !!pane.externalUrl && runtime.url !== pane.externalUrl;
   if (url === pane.url && !force) return null;
-  return { url, externalUrl: runtime.url, deeplink: !!runtime.deeplink, sessionId: pane.sessionId, ...(force ? { force: true } : {}) };
+  // `externalUrl` 是**本次连接**的运行地址（隧道/反代随机端口），只用于「入口是否变了」的判定；
+  // `popoutUrl` 是给「在外部浏览器打开」用的**稳定**入口（远程实例 = 绑在已保存接入端口上的
+  // 预览代理，见 launcher 的 #withPreview）。两者不可混用：前者每次重连都变，后者才该给用户。
+  return {
+    url,
+    externalUrl: runtime.url,
+    popoutUrl: runtime.externalUrl || runtime.url,
+    deeplink: !!runtime.deeplink,
+    sessionId: pane.sessionId,
+    ...(force ? { force: true } : {}),
+  };
 }
 
 // 认证中间页报告的空会话不能覆盖待恢复会话；正常 SPA 切换则跟随其当前选择。

@@ -78,6 +78,18 @@ export function sshOpts({ host = null, mux = muxEnabled() } = {}) {
     '-o', `ServerAliveInterval=${envInt('HWB_SSH_ALIVE_INTERVAL', 15)}`,
     '-o', `ServerAliveCountMax=${envInt('HWB_SSH_ALIVE_COUNT_MAX', 4)}`,
     '-o', 'TCPKeepAlive=yes',
+    // —— 压缩（2026-09-13 实测加回）——
+    //
+    // 这条**必须留在共享策略里**，而不是只给隧道那一条命令：一旦隧道复用了 master
+    // （见 tunnel.js 的 `-O forward` 路径），实际承载数据的就是 **master 这条连接**，
+    // 它的压缩设置才决定吞吐；在隧道自己的 argv 上加 -C 对它毫无作用。
+    //
+    // 实测（dgx21，加载 dsh web 的 46 个插件 bundle 共 3.32 MB）：
+    //   带 -C：30.4s        不带 -C：140.5s     —— 相差 4.6 倍
+    // 该链路有效吞吐仅约 110 KB/s，而 JS bundle 可压缩比很高，所以缺压缩会直接把
+    // 页面加载拖到几分钟：浏览器等不到插件 bundle 就报
+    // "Failed to load plugins … bundle script … failed to load"。
+    '-C',
   ];
   if (host && mux) {
     const path = muxPath(host);

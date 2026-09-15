@@ -1,0 +1,34 @@
+{
+  "name": "dsh-history-delta",
+  "version": "0.1.0",
+  "description": "给 dsh 的 session.history 加 afterSeq（向前增量）：调用方带着「我已经有的最后一个 seq」来，服务端只回它缺的那一段，而不是把整个尾部窗口（实测大会话 8–10 MiB）重传一遍。不改前端、不改协议既有字段，无 afterSeq 时行为与上游逐字节一致。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "history",
+    "incremental",
+    "bandwidth"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.1.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

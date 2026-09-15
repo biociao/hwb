@@ -6,6 +6,153 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-09-15
+
+**对齐 dsh 0.1.5 的兼容性版本。** 从本版起 hwb 的版本号与 **dsh 的主版本**对齐（dsh 当前
+`0.1.5-rc.1`）。上一版 v0.1.1（2026-09-06）之后，dsh 一路从 0.1.1/0.1.2 走到 0.1.5：
+`session_projcache` 域版本升到 **7**、磁盘布局迁到 **per-record**、CLI 与启动输出也有变化。
+本版把这些漂移从「一次性修补」升级为**可断言的兼容性契约**（`tests/compat/` + `npm run compat`
++ `hwb doctor`），并顺带修掉一批远程低带宽通道、代理缓存与控制平面的问题。
+
+> 本版基线：`npm test` **937 例（936 通过 / 1 skip / 0 失败）**；`npm run compat` 在 dsh
+> **0.1.5-rc.1** 上结论为「兼容 ✓」；`hwb doctor` 同时报告**域契约**与**本机 home 可读性**
+> 两个互相独立的检查。
+
+#### 一、dsh 0.1.5 兼容性（本版主题）
+
+- **修掉一次静默漏读：会话 179 → 476（38% → 100%）**。换上 dsh 0.1.5-rc.1 后仪表盘只显示 179 个
+  会话，磁盘上（per-record 文件数）却有 476 个，而且 **`degraded` 是空的** —— 界面上没有任何异常，
+  看起来只是「这个实例数据少」。两个根因叠加在一起：
+  1. **版本白名单过窄**：dsh 声明 `session_projcache` 域 `version: 7, compatibleVersions: [3,4,5,6]`，
+     而 hwb 只认 `[3,4,5]`；某个 home 的 `unit.version` 一旦是 6 或 7，整个域判 `degraded`、**整块停止更新**。
+  2. **磁盘布局早已迁移**：dsh 从「单文件聚合」迁到 **per-record**
+     （`storages/session_projcache/sessions/<id>.json`），而 hwb 一直在读那个**已被冻结**的聚合文件
+     `storages/session_projcache.json` —— 实测它停在 9-5，也就是说 hwb 展示的是 **10 天前的快照**。
+- **会话读取改为布局感知**：以 per-record 为准、聚合文件为补充（补齐 bootstrap 期的老会话），
+  同 id 冲突以 per-record 为准；本机与远程两条读取路径产出**同一组字段**；`SUPPORTED_VERSIONS.projcache`
+  放宽到 **3–7**，与 dsh 的 `acceptedStamps` 对齐。**语义修正**：文件缺失**不再**判 `degraded`
+  （新 home / 旧版没有该布局 ≠ 版本不兼容），真正读不出（版本不认识）才算。效果：用量聚合从 179 个
+  会话扩到 476 个（52.9M input / 19.9M output / 4.4B cache-read tokens）；476 个会话 73ms、
+  5000 个 96ms（索引周期 60s，余量充足）。
+- **兼容性契约测试 `tests/compat/`（A–G 八组）**：契约**从实际安装的 dsh 里提取**（括号配平读
+  `defineDomain({...})` 字面量，不 `eval`、不 `import`），而不是把常量抄进代码。覆盖：存储域版本、
+  磁盘布局、CLI 表面（`dsh web: ` 打印行 / token query）、**真实 home 端到端**（唯一能抓「读了但读少了」
+  的一组）、域发现、UI 注入锚点、路径一致性。找不到 dsh 时 `skip` 并写明原因（**不假装通过**）；
+  失败信息直接给出「需要改哪个文件的哪一行」。**顺带修掉 `npm test` 静默跳过 `tests/compat` 整个子目录**
+  的问题（glob 不递归 ⇒ 全绿却一条契约都没验），并加了守卫。
+- **`npm run compat` 一键结论 + `hwb doctor` 兼容性自检**：升级 dsh 后一条命令给出「兼容 / 不兼容 +
+  改哪里」（不兼容时退出码 1，可进 CI）。`doctor` 同时报**两个互相独立**的检查 —— dsh 二进制契约
+  与本机 home 实际布局/版本（只做其中一个会漏掉另一半）。仅 `webServer`/`connection`/`apiProxy`
+  这类**运行时服务名字符串**无法做契约测试，如实标为已知边界：实测 dsh 0.1.5-rc.1 里 `apiProxy`
+  不存在，可选的 `dsh-history-delta`（低带宽增量历史，**默认关闭**）因此走「不打补丁」分支，
+  后果仅性能、不会错也不会崩。
+- **把「静默漏读」变成可断言的信号**：索引载荷与日志新增 `pcLayout`（实际用到的布局、域版本分布、
+  以及**部分文件读失败时的计数与样例原因** —— 原先部分失败被静默丢弃）与 `pcVersion`
+  （改取**最高**版本；原先取 readdir 顺序里的第一个，是假信号）。
+- **per-record 的传输量**：远程索引要抓**每个会话一个文件**（本机 476 会话 4.07 MiB，而旧聚合文件
+  只有 635 KB，6.4×），在 25–30 KB/s 的链路上约 160s，而 ssh 脚本超时 90s。改为**远端先投影**
+  再传（只留 hwb 实际读取的约 10 / 21 个 projection）——本机真实 home **4.07 MiB → 1.28 MiB（省 69%）**、
+  含大 projection 的合成夹具 **604 KB → 18 KB（省 97%）**；投影任一步失败（没有 python3 / JSON 损坏 /
+  结构不符）都**原文回退**，宁可多传也不少读。
+
+#### 二、最近一批更新（v0.1.1 → v0.1.5）
+
+**实例卡与外观**
+- 每张实例卡显示**该实例自己的 dsh 版本号**（如 `dsh 0.1.5-rc.1`，**未连接也显示**）：本地实例同步
+  读本机安装、远程实例后台 `ssh <host> 'dsh --version'`（TTL 30 分钟、失败退避 2 分钟、**失败不清空**
+  旧值、绝不阻塞 `/api/homes`）；版本号只接受 `x.y.z[-suffix]` 字面量，取不到就不画 chip。
+  顺带修掉远端 PATH 补齐缺 `$HOME/.local/node/bin` 的既有缺口 —— **dgx21 的 dsh 只在那里**，
+  也就是说旧版 hwb 在那台机器上**连 `dsh web` 都起不来**。
+- **主题同步**：hwb 切主题时把同一个偏好**单向下发**给已连接的 dsh 实例（hwb 是权威、dsh 跟随）。
+  落盘靠对 dsh home 的 `settings.yaml` 做**节级 YAML 编辑**（只为 `preference` 那一行，其余逐字节不变，
+  原子 rename + 0600、保留 CRLF），即时换肤靠预览代理注入脚本 + `postMessage`；新增 `GET/POST /api/theme`。
+
+**远程 / 低带宽通道**
+- **代理层本地缓存**（`src/control/proxy-cache.js`）：远端 dsh 对插件 bundle 回 `no-cache` **且不带
+  ETag/Last-Modified**、只读 RPC 又走 POST，浏览器侧**根本无法缓存** —— 每次打开页面都要在
+  25–30 KB/s 的链路上重下 **3.33 MiB**（≈2 分钟）。现在内容寻址的静态资源与只读 RPC 本地回
+  （补 ETag、stale-while-revalidate、刷新单飞），实测两次页面加载的插件部分
+  **3.33 MiB / 61.8s + 3.33 MiB / 39.5s → 3.34 MiB / 0.1s（冷）+ 0.12 MiB / 0.1s（热，全部 304）**；
+  写类 RPC、带 `set-cookie` 或 token 的 URL 一律不进缓存。
+- **历史会话载入**：`session.history` 是**原始事件日志**（一个 50 条消息窗口的大会话就有 8–10 MiB），
+  且代理原先「先攒完整个正文再写响应头」，会被 30s 的上游超时打成 **504 —— 用户根本拿不到历史**。
+  现在只读 RPC 立刻发头、边流边攒；已结束会话用长 TTL（默认 30 分钟新鲜 / 7 天宽限），
+  运行中的会话仍用短窗口且**连陈旧副本也不供**（dsh 的 `session.history` 只有 `beforeSeq`
+  而没有 `afterSeq`，中间那段事件补不回来）。实测大会话 **43.4s → 0.135s**；新增
+  `scripts/warm-cache.mjs` 预热（可连最近 N 个已结束会话的历史一起灌）。
+- **隧道与代理**：`ssh -O check` 说 master 活着 **≠** `-L` 还在（旧 master 崩溃后新连接复用同一
+  ControlPath，句柄永不 `exit` ⇒ 实例永久卡在 unreachable；实测 `lsof` 里一个 ssh 监听都没有）——
+  隧道巡检改为「master 存活 **且** 本地转发口可建立 TCP」，并让 SSH 隧道**独占连接**；
+  上游瞬时失败对 GET/HEAD 重试一次（**POST 绝不重放**）+ 上游连接池上限（真凶是远端 sshd 的
+  `MaxSessions` 10 —— 实测第 11 条会话被拒 ⇒ 502 ⇒ 插件加载器整体报 `Failed to load plugins`）；
+  SSE 与插件下载分池、补响应超时；「在外部浏览器打开」改用配置的**稳定接入端口**
+  （不再给每次随机、重连即失效的地址）。
+
+**控制平面与安全**
+- 停止实例**确认退出才算停掉**（SIGTERM→3s→SIGKILL→2s，杀不掉就抛错并保留句柄）；退出时先
+  `await stopAll()`；启动失败收掉刚拉起的子进程；连接**真的验证鉴权**（401/403 不再算「已连接」，
+  且三条连接路径都走一次真 token→cookie 交接）；父进程提前退出不再打死刚起来的后台 dsh web。
+- `GET /api/homes` 不再回传 dsh token（端点只给 `tokenSet: true`）；日志 / 库 / 状态目录权限收紧到
+  **0600 / 0700**；脱敏覆盖全局；修掉**存储型 XSS**（`approval` 未转义可突破 `title` 属性）、
+  **DNS rebinding**（只靠 Origin/Host 比较挡不住，Host 必须指向回环）与写路由的跨站来源校验缺口。
+- 一批「报成功而实际没做到」与「只在真实布局 / 真实进程里才暴露」的问题：降级 + 实时合并会把文件
+  索引撑起来的会话「洗白」甚至删掉（实测用量 1520550 → 620550，CRITICAL）；迁移失败让历史用量
+  **永久显示 0**（真实 SQLITE_FULL 复现）；实时 `tokenUsage` 只带部分计数器时整列覆盖（静默丢 99.9%）；
+  一个坏 JSON 列 / FIFO 元数据文件能让整个工作台退出或永久卡死。
+
+**性能与规模**
+- 大库上 `recentProjects` 会让整个服务停几十秒（缺一个索引）→ 加索引后 **44.3s → 1.2s**；
+  `/api/usage` 的 8 个同步聚合会冻住服务 → 服务端 10s 记忆 + 客户端 15s 节流 + 派生整数列；
+  实时轮询从「每 3s 重写每个实例的每一行」改成**差分只写变化的行**；`service.log` 加上轮转
+  （失败形态下约 490 MB/天）；SSE 触顶不再一声不响。
+
+**测试与工具链**
+- 端到端冒烟 `scripts/smoke-e2e.mjs`（已加进 CI 步骤）、真浏览器渲染检查 `scripts/render-check.mjs`
+  （CDP 驱动 headless Chrome，含 6 宽度 × 3 形态的宽度扫描）、`scripts/soak/` 长跑与限速工具、
+  `docs/dgx21-*.md` 低带宽通道实录（每个数字都带复现命令，并由 `tests/docs-flags.test.js` 校验）。
+  审查方式之一是**「把守卫改坏，看套件会不会红」**，一次就找出 7 处「存在但没人守」的守卫。
+
+> 以下是从 v0.1.1 起的**逐条详细记录（新 → 旧）**：保留原始现象 / 根因 / 修复 / 实测数字与回归测试说明。
+> 上面的要点只做导航与汇总；细节与边界（含 `### 已知残留`）都在下面。
+
+---
+
+#### 实例卡显示每个 dsh 实例自己的版本号（`src/lib/dsh-version.js`、`src/control/remote.js`、`src/api/routes.js`、`src/web/components/instance-grid.js`）
+
+- **Instances 区块的每张实例卡在名称右侧新增版本 chip**（`dsh 0.1.5-rc.1`），与「已连接 / 未连接」
+  状态 chip 同处一个右对齐的 chip 组（`.row .t .chips`）。**未连接的实例照样显示** ——
+  「这台上跑的是哪个 dsh」恰恰是在排查「连不上 / 数据变少 / 域降级」时最先要看的一项。
+- 取值口径与 `hwb doctor` 同源，且**本地同步、远程异步**：
+  - **本地实例**：读本机安装的 dsh（复用 `dsh-compat` 的 `findDshRoot` + `dshVersionOf`），
+    一次文件读、同步返回，实例卡首帧就带版本号；
+  - **远程实例**：`ssh <host> 'dsh --version'`，与启动远端 dsh web 共用**同一份** PATH 补齐前导
+    （`remote.js` 的 `REMOTE_PATH_PRELUDE`）—— 两条路径必须看到同一个 dsh，否则会出现「跑的是
+    新版、卡片报旧版」。实例配置里显式填了带路径的远端启动命令（如 `~/.local/node/bin/dsh web …`）
+    时就用那个二进制；`env FOO=1 dsh web` / `bash -lc '…'` 这类包装一律退回 PATH 探测
+    （把 `env`/`bash` 当成 dsh 去问版本只会得到一句无关输出，宁可不猜）。
+- **绝不阻塞 `/api/homes`**：远程探测是一次 SSH 往返（慢链路可达秒级），所以远程一律「就地返回
+  上一次的已知值 + 后台探测」；结果到手后广播 `instance:status`，前端刷新后补上 chip。
+  TTL 30 分钟、失败退避 2 分钟，**失败不清空**已显示的版本（陈旧的值比没有值有用，dsh 升级是
+  低频事件），且同一实例同时只有一次探测（`inflight`）；配置一改（主机 / 远端启动命令 / home）
+  缓存立刻按新身份失效，迟到的旧结果被丢弃（实测：同一个 home 反复「添加」只是换别名，
+  homeId 不变 ⇒ 命中缓存、不重复 ssh）。
+- **版本号只接受 `x.y.z[-suffix]` 字面量**：远端命令的输出与 `package.json` 的内容都被当成不可信
+  输入去提取，取不到就**不画那个 chip** —— 画一个「dsh —」会把「SSH 不通」与「远端没装 dsh」
+  混成一个状态，读者反而不知道该查什么。
+- **顺带修掉远端 PATH 补齐的一个既有缺口**：列表里原先没有 `$HOME/.local/node/bin`
+  （官方 Node tarball 解到 `~/.local/node` 的布局；`scripts/dsh21-deploy.sh` 的注释里写着这正是
+  dgx21 的布局，`scripts/soak/nodownload-check.mjs` 也是这么找远端 dsh 的）。实测 **dgx21 的 dsh
+  只在这个目录里**，非交互与 login shell 的 PATH 都没有它 —— 也就是说旧版 hwb 在那台机器上
+  **连 `dsh web` 都起不来**。该目录放在补齐列表的**最前**（前插语义 ⇒ 优先级最低），只在别处都
+  找不到 dsh 时才生效，对既有远端**不改变**解析结果。
+- 实测（本机三个真实实例，一条 `/api/homes`）：MBP → `0.1.5-rc.1`（同步、首帧即有）；
+  c4g.tun → `0.1.5-rc.1`、dgx21.tun → `0.1.1-rc.2`（首次返回 `null`，后台 ssh 探测到手后
+  经 `instance:status` 事件补上，单次 `dsh --version` 往返约 0.4s）。
+- 测试：`tests/dsh-version.test.js`（版本字面量净化、本地/远端两条取值路径、TTL 与失败退避、
+  身份变更与迟到结果、`prune`、`/api/homes` 注入与缺省不改行为）；`tests/web-render-safety.test.js`
+  增补版本 chip 的正向渲染、未知时不画、转义，以及 chip 分组结构（`.row .t` 是 `space-between`，
+  三个平级子元素会把版本号摊到标题中间）。
+
 #### 主题同步：hwb 切换界面外观时，dsh 实例跟着变（`src/lib/dsh-theme.js`、`src/web/dsh-theme-live.js`）
 
 - 右上角 🌓 菜单新增 **「同步到 dsh 实例」** 开关（默认开）。开启后 hwb 每次切主题都把同一个

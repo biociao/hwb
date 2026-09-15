@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { LiveStatusReader } from '../src/dshhome/live-status.js';
 
 
 // dsh 的投影值在**文件**侧是带版本包装的 `{ver,seq,val:{totals:{…}}}`；而 `/api/session/list`
@@ -158,4 +159,41 @@ test('rpc 读取被 abort 时报「rpc timeout」而不是「not json」', async
     // 状态里记的是 timeout 这个原因（report 只在原因变化时打日志，所以这里直接读 states）
     assert.equal([...reader.states.values()][0], 'rpc timeout');
   } finally { globalThis.fetch = saved; }
+});
+
+// —— v0.1.1 兼容：端点命名有两代 ——
+// 0.1.2 是 `/api/session/list`，0.1.1-rc.2（远端 dgx21 实测）是 `/api/session.list`。
+// 写死一种写法的后果不是「慢一点」，而是**整个实时通道从未生效**（每 3 秒一条 404，
+// 工作台一直回退冻结的文件索引）。
+test('live reader 遇到 404 会换用另一代端点命名，并记住可用写法', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    if (opts.method !== 'POST') return new Response(null, { status: 303, headers: { 'Set-Cookie': 'auth=ok; HttpOnly' } });
+    calls.push(new URL(url).pathname);
+    if (String(url).endsWith('/api/session/list')) return new Response('not found', { status: 404 });
+    return Response.json({ type: 'server-response', result: { value: { items: [{ sessionId: 's1', running: true }] } } });
+  });
+  const reader = new LiveStatusReader();
+  const rows = await reader.read('http://localhost:3080/', { homeId: 'h1' });
+  assert.equal(rows.length, 1);
+  assert.deepEqual(calls.slice(-2), ['/api/session/list', '/api/session.list'], '先试 0.1.2 的写法，404 后再试 0.1.1 的');
+  assert.equal(reader.endpoints.get('h1'), 'session.list');
+
+  // 第二轮：直接用记住的写法，不再白发那条 404。
+  const before = calls.length;
+  await reader.read('http://localhost:3080/', { homeId: 'h1' });
+  assert.deepEqual(calls.slice(before), ['/api/session.list']);
+});
+
+test('live reader 只在 404 时换写法：超时/鉴权失败不做第二次尝试（慢链路上别多打一轮）', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    if (opts.method !== 'POST') return new Response(null, { status: 303, headers: { 'Set-Cookie': 'auth=ok; HttpOnly' } });
+    calls.push(new URL(url).pathname);
+    return new Response('boom', { status: 401 });
+  });
+  const reader = new LiveStatusReader();
+  const rows = await reader.read('http://localhost:3080/', { homeId: 'h2' });
+  assert.equal(rows, null);
+  assert.deepEqual(calls, ['/api/session/list'], '401 不是「写法不对」，不该再试第二种');
 });

@@ -65,6 +65,9 @@ export class Monitor {
       latencyMs: e.latencyMs ?? null,
       url: e.url,
       iframeUrl: e.iframeUrl,
+      // 浏览器入口（外链/iframe 共用，远程实例才有）：绑在已保存的接入端口上，
+      // 不随隧道重建漂移。前端用它而非 url 作为「在外部浏览器打开」的目标。
+      externalUrl: e.externalUrl ?? null,
       port: e.port,
       pid: e.pid,
       deeplink: e.deeplink,
@@ -154,11 +157,11 @@ export class Monitor {
       phase = 'gone';
     } else if (!inst) {
       phase = 'stopped';
-      patch = { url: null, iframeUrl: null, port: null, pid: null, deeplink: false };
+      patch = { url: null, iframeUrl: null, externalUrl: null, port: null, pid: null, deeplink: false };
     } else if (inst.recovering) {
       // SSH 已退出时由 Launcher 有界重连；保留旧入口，使前端等待新地址而非关闭页面。
       phase = 'degraded';
-      patch = { url: inst.url, iframeUrl: inst.iframeUrl, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
+      patch = { url: inst.url, iframeUrl: inst.iframeUrl, externalUrl: inst.externalUrl ?? null, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
     } else {
       const started = Date.now();
       const ok = await Promise.resolve().then(() => this.probe(inst.url, home.hostType === 'remote' ? 10_000 : 3000)).catch(() => false);
@@ -171,7 +174,7 @@ export class Monitor {
         || connectionKey(latestHome, latestInst, latestGone) !== key) {
         return this.#check(homeId, latestHome);
       }
-      patch = { latencyMs: ok ? Date.now() - started : null, url: inst.url, iframeUrl: inst.iframeUrl, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
+      patch = { latencyMs: ok ? Date.now() - started : null, url: inst.url, iframeUrl: inst.iframeUrl, externalUrl: inst.externalUrl ?? null, port: inst.port, pid: inst.pid, deeplink: inst.deeplink };
       health = { ...health, confirmed: health.confirmed || ok, failures: ok ? 0 : health.failures + 1 };
       // 仅对已成功探测的远程连接容忍短暂拥塞；冷启动失败仍立即不可达。
       phase = ok || (home.hostType === 'remote' && health.confirmed && health.failures < 3) ? 'running' : 'degraded';
@@ -181,7 +184,8 @@ export class Monitor {
     const next = this.registry.set(homeId, { phase, attempts, checkedAt: new Date().toISOString(), latencyMs: null, ...patch });
     if (inst) this.health.set(homeId, { ...health, entry: next });
     else this.health.delete(homeId);
-    if (prev.phase !== next.phase || prev.url !== next.url || prev.iframeUrl !== next.iframeUrl || prev.port !== next.port) {
+    if (prev.phase !== next.phase || prev.url !== next.url || prev.iframeUrl !== next.iframeUrl
+      || prev.externalUrl !== next.externalUrl || prev.port !== next.port) {
       // 仅在状态迁移/URL 变化时记录，避免每 30s 心跳刷屏。
       if (next.phase === 'degraded') {
         log.warn('实例降级（unreachable），安排退避重连', {
@@ -198,24 +202,37 @@ export class Monitor {
         runtime: PHASE_RUNTIME[next.phase] ?? next.phase,
         url: next.url,
         iframeUrl: next.iframeUrl,
+        externalUrl: next.externalUrl ?? null,
         port: next.port,
         pid: next.pid,
         deeplink: next.deeplink,
       });
     }
 
-    if (phase === 'degraded' && !inst?.recovering) this.#scheduleReconnect(homeId);
+    if (phase === 'degraded' && !inst?.recovering) this.#scheduleReconnect(homeId, key);
     else this.#clearReconnect(homeId);
     return next;
   }
 
   // §5.2/§5.3：degraded 时按退避（1/2/4/8/16/30s）安排一次更快的重连再探测。
-  #scheduleReconnect(homeId) {
+  #scheduleReconnect(homeId, key) {
     if (this.degradedTimers.has(homeId)) return;
     const ms = this.registry.nextBackoffMs(homeId);
     const t = setTimeout(() => {
       this.degradedTimers.delete(homeId);
-      this.refresh(homeId);
+      const home = this.store.getHome(homeId);
+      const inst = this.launcher.status(homeId);
+      const health = this.health.get(homeId);
+      // Recheck identity at execution time: a stopped/switched instance must
+      // never be resurrected by a stale timer. Three failures also gate cold starts.
+      const recover = home?.hostType === 'remote' && inst && !inst.recovering
+        && connectionKey(home, inst, false) === key && health?.failures >= 3
+        && this.registry.get(homeId).phase === 'degraded';
+      Promise.resolve().then(() => recover
+        ? this.launcher.recoverConnection?.(home, inst) : null)
+        .catch(error => log.warn('接入连接重建失败，后续继续退避重试', { homeId, error: error.message }))
+        .then(() => this.refresh(homeId))
+        .catch(error => log.warn('重连后探测失败', { homeId, error: error.message }));
     }, ms);
     t.unref?.();
     this.degradedTimers.set(homeId, t);

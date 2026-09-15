@@ -1,0 +1,10 @@
+# dsh-history-delta 的 bundle patch：向 web 组合挂载本插件（Host 半）。
+#
+# 只在内存里包一层 `apiProxy.sessions.history`，不改磁盘上的任何 dsh 文件；
+# 卸载 = 从 profile 里删掉这一行（或 link: 依赖）再重启 dsh web。
+# 需要 host 侧日志时打开 debug：
+#   config:
+#     debug: true
+- insert:
+    - id: dsh-history-delta
+      name: dsh-history-delta

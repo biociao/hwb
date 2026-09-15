@@ -113,6 +113,9 @@
     .chip.home-chip { background: var(--accent-soft); color: var(--accent); }
     .chip.proj-chip { background: var(--proj-bg); color: var(--proj-fg); }
     .row .t { display: flex; justify-content: space-between; gap: 8px; }
+    /* 实例卡右上角的 chip 组：版本号 + 连接状态 + 降级提示。收进一个 flex 容器，
+       否则 .t 的 space-between 会把每个 chip 摊到整行，版本号会漂到标题中间。 */
+    .row .t .chips { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
     .row .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .row .meta { color: var(--dim); font-size: 12px; margin-top: 2px;
                  display: flex; gap: 10px; flex-wrap: wrap; }
@@ -123,6 +126,8 @@
     .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
             background: var(--panel-2); color: var(--accent); }
     .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--bad); }
+    /* dsh 版本 chip：等宽 + 弱化色，与「已连接/未连接」状态 chip 在同一行里区分开 */
+    .chip.ver { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     /* 会话状态 chip：彩色圆点 + 文本。run=运行中(green)，done=已完成(accent)，idle=空闲(dim) */
     .chip.status { display: inline-flex; align-items: center; gap: 4px; padding-right: 9px; }
     .chip.status::before { content: ''; width: 6px; height: 6px; border-radius: 50%;

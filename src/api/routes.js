@@ -171,8 +171,12 @@ function dshHomeInfo(homePath) {
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {} }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null }) {
   const connecting = new Set();
+  // 实例上的 dsh 版本号（DshVersionResolver，见 lib/dsh-version.js）。可以缺省：本地实例同步
+  // 读本机安装、远程实例后台 ssh 探测，两者都**不是**渲染实例列表的前置条件 —— 单测直接建
+  // router 时不必关心它，那时 runtime.dshVersion 为 null，前端按「未知」处理（不画那个 chip）。
+  const runtimeOf = (home) => ({ ...monitor.get(home.homeId), dshVersion: dshVersion?.resolve?.(home) ?? null });
   // 主题：server.js 注入一个读写闭包（把偏好持久化进 hwb 自己的配置），这里只负责转发。
   // 默认实现是内存态 —— 单测直接建 router 时不必关心落盘，也不会写用户的 ~/.hwb。
   let themePreferenceState = null;
@@ -381,8 +385,10 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     }
 
     if (req.method === 'GET' && pathname === '/api/homes') {
-      const homes = store.listHomes().map((h) => ({ ...publicHome(h), runtime: monitor.get(h.homeId) }));
-      send(res, 200, { homes });
+      const homes = store.listHomes();
+      // 版本缓存里已移除实例的条目顺手清掉：否则反复增删实例会让那张表单调增长。
+      dshVersion?.prune?.(homes.map((h) => h.homeId));
+      send(res, 200, { homes: homes.map((h) => ({ ...publicHome(h), runtime: runtimeOf(h) })) });
       return;
     }
     if (req.method === 'GET' && pathname === '/api/homes/detect') {
@@ -558,7 +564,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       const updated = store.updateHomeConfig(home.homeId, patch);
       dropUsageMemo();   // 别名决定「按实例」维度里的显示名，改名后不该还挂着旧名字
-      send(res, 200, { home: { ...publicHome(updated), runtime: monitor.get(home.homeId) } });
+      send(res, 200, { home: { ...publicHome(updated), runtime: runtimeOf(updated) } });
       return;
     }
     if (req.method === 'DELETE' && delHome) {
@@ -837,15 +843,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
         const inst = await launcher.restart(home);
         await monitor.refresh(home.homeId);
         reindexInBackground(home.homeId); // 同 open：重启后立即索引，实时状态即刻入库
-        // 主题补齐：这个实例可能是「hwb 改了主题之后」才连上的 —— 把当前偏好写进去。
-        // 失败不影响连接结果（连接本身是主任务），由 syncThemeOnConnect 记 warn 并在响应里如实带出。
-        //
-        // 可选调用：launcher 若没有这个方法（测试替身、或将来换一套连接实现）就跳过 ——
-        // 主题同步是**附加**能力，不该让一次成功的连接因为它的缺失而变成 502。
-        const theme = typeof launcher.syncThemeOnConnect === 'function'
-          ? await launcher.syncThemeOnConnect(home, themePref())
-          : null;
-        send(res, 200, theme ? { ...inst, theme } : inst);
+        send(res, 200, inst);
       } catch (e) {
         send(res, 502, { error: e.message });
       } finally {

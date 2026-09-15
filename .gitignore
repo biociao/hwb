@@ -24,3 +24,6 @@ dsh-remote-index/dsh-sessions.html
 # Tests / tmp
 *.tmp
 coverage/
+
+# Agent state (biomni reflect log 等，不随仓库分发)
+.biomni/
