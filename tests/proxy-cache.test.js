@@ -16,7 +16,14 @@ import { createProxyCache } from '../src/control/proxy-cache.js';
 const BUNDLE = '/plugins/dsh-drop-any-file/client.js?rev=9eae050df40e';
 const BUNDLE_BODY = '/* plugin bundle */'.repeat(64);
 
-function mockUpstream() {
+/**
+ * `apiDelayMs`：让 `/api/*` 的响应慢一点。
+ * 单飞（stale-while-revalidate）只有在**刷新还没回来**的时候才可能被观测到：
+ * 上游秒回时，「5 次陈旧命中压了几条上游请求」就退化成机器调度问题 ——
+ * CI 上实测过 3 次（本机 1 次）而红，那是在测调度、不是在测单飞。
+ * 想验「慢链路上不会每个陈旧命中都压一条」，就得真的把上游变慢。
+ */
+function mockUpstream({ apiDelayMs = 0 } = {}) {
   const hits = new Map();
   const server = createServer((req, res) => {
     const key = `${req.method} ${req.url}`;
@@ -39,8 +46,12 @@ function mockUpstream() {
       }
       if (req.url.startsWith('/api/')) {
         const envelope = JSON.parse(body);
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ type: 'server-response', rpcId: envelope.rpcId, result: { ok: true, method: envelope.method, value: { items: [{ sessionId: 's1', running: false }, { sessionId: 's2', running: true }] } } }));
+        const respond = () => {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ type: 'server-response', rpcId: envelope.rpcId, result: { ok: true, method: envelope.method, value: { items: [{ sessionId: 's1', running: false }, { sessionId: 's2', running: true }] } } }));
+        };
+        if (apiDelayMs > 0) setTimeout(respond, apiDelayMs);
+        else respond();
         return;
       }
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'set-cookie': 'auth=1; Path=/' });
@@ -274,7 +285,9 @@ test('proxy 缓存：远端点号命名的只读 RPC（session.history）第二�
 });
 
 test('proxy 缓存：同一键的后台刷新单飞（慢链路上不能每个陈旧命中都压一条上游请求）', async () => {
-  const up = await mockUpstream();
+  // 上游必须**真的慢**：只有刷新还在飞的时候才谈得上「单飞」。用秒回的上游测这条，量到的是
+  // 调度而不是单飞 —— 同一份代码 CI 上实测 3 次、本机 1 次，就是这么红的（2026-09-15）。
+  const up = await mockUpstream({ apiDelayMs: 400 });
   // 上游故意慢：刷新没结束时再来几个陈旧命中，也只允许有一条刷新在飞。
   const cache = createProxyCache({ dir: null, staticTtlMs: 10, rpcTtlMs: 1, rpcStaleMs: 5_000 });
   const proxy = await createProxy({ target: up.base, cache, cacheScope: 'home-single-flight' });
@@ -282,14 +295,17 @@ test('proxy 缓存：同一键的后台刷新单飞（慢链路上不能每个�
     const post = (rpcId) => fetch(`${proxy.url}/api/session.list`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: rpcBody('session.list', rpcId),
     });
-    await (await post('a')).text();
+    await (await post('a')).text();                     // 首次回源（400ms），写入缓存
     assert.equal(up.count('POST', '/api/session.list'), 1);
-    await new Promise((r) => setTimeout(r, 30));
+    await new Promise((r) => setTimeout(r, 30));         // 越过 1ms 的 ttl，进入 stale 窗口
     const before = up.count('POST', '/api/session.list');
+    // 5 次陈旧命中：每次都立刻拿到旧副本（不受上游那 400ms 影响），只应有**一条**后台刷新在飞。
     for (let i = 0; i < 5; i++) await (await post(`s${i}`)).text();
-    await new Promise((r) => setTimeout(r, 400));
-    const during = up.count('POST', '/api/session.list') - before;
-    assert.ok(during <= 2, `陈旧命中期间的上游刷新次数应被单飞压住（实测 ${during}）`);
+    assert.equal(up.count('POST', '/api/session.list') - before, 1,
+      '5 次陈旧命中必须被单飞压成 1 条上游刷新（每次命中各压一条 = 单飞失效）');
+    await new Promise((r) => setTimeout(r, 600));        // 等那条刷新落地，确认它不会带出更多请求
+    assert.equal(up.count('POST', '/api/session.list') - before, 1,
+      '刷新落地后不应再冒出额外请求');
   } finally {
     await proxy.close();
     up.server.close();
