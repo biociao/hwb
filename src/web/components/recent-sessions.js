@@ -23,10 +23,15 @@ function pressureBar(cp) {
   </div>`;
 }
 
-export function renderRecentSessions(sessions) {
+// homes 用于在会话行里标出「属于哪个实例」：dsh 与 Codex 会话现在都汇总进同一栏，
+// 没有实例 chip 时 Codex 会话和 dsh 会话长得一模一样。缺实例信息时不画 chip（旧调用兼容）。
+export function renderRecentSessions(sessions, homes = []) {
   if (!sessions.length) return '<div class="empty">no sessions indexed yet</div>';
+  const homeById = new Map((Array.isArray(homes) ? homes : []).map((h) => [h.homeId, h]));
   return `<div class="rows">${sessions.map((s) => {
     const projColor = s.project ? chipColor(s.project) : null;
+    const inst = homeById.get(s.homeId);
+    const instName = inst ? (inst.alias || inst.homePath) : null;
     return `
     <div class="row clickable" role="button" tabindex="0" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}"
          data-session-id="${esc(s.sessionId)}" data-title="${esc(s.title || '')}" data-project="${esc(s.project ?? '')}"
@@ -40,6 +45,7 @@ export function renderRecentSessions(sessions) {
       </div>
       <div class="meta">
         ${s.project ? `<span class="chip proj-chip" style="background:${projColor.bg};color:${projColor.fg}">${esc(s.project)}</span>` : '<span class="chip">unknown</span>'}
+        ${instName ? `<span class="chip home-chip" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
         <span>${esc(s.sessionId)}</span>
       </div>
       ${pressureBar(s.contextPressure)}

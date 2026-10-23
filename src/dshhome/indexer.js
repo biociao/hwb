@@ -1,5 +1,6 @@
 import { homeIdOf } from '../lib/read-home.js';
 import { indexRemoteHome, readHomeSnapshot, indexSnapshot } from './reader.js';
+import { codexIndexRows } from '../codexhome/index-rows.js';
 import { logger } from '../lib/logger.js';
 
 const log = logger('indexer');
@@ -35,12 +36,14 @@ export class Indexer {
   //   对「运行中且可达」的 home 读取 dsh 实例实时状态索引前抓取，覆盖冻结投影缓存推导出的状态、
   //   并补插 projcache 里还没有的新会话。任何失败（不可达/token 无效/端点缺失）都返回 null，
   //   回退到投影缓存（绝不阻塞主索引）。
-  constructor({ store, homes, broadcast = () => {}, baseMs = 60_000, maxMs = 300_000, remoteExec, liveStatus = null, concurrency = 3 }) {
+  constructor({ store, homes, broadcast = () => {}, baseMs = 60_000, maxMs = 300_000, remoteExec, liveStatus = null, codex = null, concurrency = 3 }) {
     this.store = store;
     this.homes = homes;
     this.broadcast = broadcast;
     this.remoteExec = remoteExec;
     this.liveStatus = liveStatus;
+    // Codex 数据源（{ readProjects }）：由 server.js 在版本预检之后动态注入（reader 依赖 node:sqlite）。
+    this.codex = codex;
     this.baseMs = baseMs;
     this.maxMs = maxMs;
     this.concurrency = Math.max(1, Math.min(8, Number(concurrency) || 3)); // 同时索引的实例数上限
@@ -146,6 +149,10 @@ export class Indexer {
 
   // 索引单个 home，结果追加到 results；返回是否成功（供 per-home 退避）。
   async #indexHome(home, homeId, results) {
+    // Codex 是第二个 harness：没有进程/端口/隧道，直接读 ~/.codex 的元数据。
+    // 它走独立索引路径，但仍写同一套 homes/workspaces/sessions 行 —— RECENT PROJECTS /
+    // RECENT SESSIONS / 用量等既有面板因此天然生效。
+    if (home.harness === 'codex') return this.#indexCodexHome(home, homeId, results);
     try {
       // 实时状态：本地实例先读文件、**再**抓实时状态。这两步的顺序很要紧 —— 反过来的话，
       // 「实时快照被取到」与「落库」之间就夹着一次完整的文件读取（远程实例是 SSH，几秒到
@@ -187,6 +194,47 @@ export class Indexer {
       // 让 #runAll 的循环半途而废（后续实例这一轮完全不刷新）。
       try { this.store.markHomeError(homeId, e.message); } catch { /* 已在 store 内部记录 */ }
       logFailure.call(this, homeId, e, { host: home.host, homePath: home.homePath });
+      results.push({ homeId, ok: false, error: e.message });
+      return false;
+    }
+  }
+
+  // Codex 实例的索引：读 ~/.codex 元数据 → 同构行 → upsertRows（与 dsh 完全同一条落库路径）。
+  // 这样实例卡、Recent Projects/Sessions、用量、搜索都不需要为它写第二套展示逻辑。
+  async #indexCodexHome(home, homeId, results) {
+    try {
+      if (!this.codex?.readProjects) throw new Error('Codex 数据源未启用');
+      const snapshot = this.codex.readProjects({
+        home: home.homePath,
+        // 索引口径是全量：不受 7 天窗口限制（窗口只在查询 Recent 时生效）。
+        days: 3650,
+        limit: 1000,
+        threadsPerProject: 100_000,
+        maxThreads: 20_000,
+      });
+      const rows = codexIndexRows(home, snapshot);
+      this.store.upsertRows(rows);
+      this.lastFailure.delete(homeId);
+      const sessionCount = rows.filter((r) => r.type === 'session').length;
+      const workspaceCount = rows.filter((r) => r.type === 'workspace').length;
+      const payload = {
+        homeId,
+        rowCount: rows.length,
+        sessionCount,
+        workspaceCount,
+        degraded: rows[0]?.degraded ?? [],
+        indexedAt: snapshot.generatedAt,
+        harness: 'codex',
+      };
+      if (payload.degraded.length) {
+        log.warn('Codex 索引部分降级', { homeId, homePath: home.homePath, reasons: snapshot.reasons });
+      }
+      this.broadcast('index:updated', payload);
+      results.push({ homeId, ok: true, ...payload });
+      return true;
+    } catch (e) {
+      try { this.store.markHomeError(homeId, e.message); } catch { /* store 内部已记 */ }
+      logFailure.call(this, homeId, e, { harness: 'codex', homePath: home.homePath });
       results.push({ homeId, ok: false, error: e.message });
       return false;
     }

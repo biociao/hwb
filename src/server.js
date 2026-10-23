@@ -11,6 +11,10 @@ import { MAX_TIMER_MS } from './lib/timers.js';
 // 由于静态 import 全部先于模块体求值，store.js 这里只能改成动态引入。
 enforceNodeVersion();
 const { IndexStore } = await import('./dshhome/store.js');
+// Codex 侧同样只读元数据，且 reader.js 也 import 'node:sqlite' —— 所以必须跟 store.js 一样
+// 放在版本预检之后动态引入；否则 Node < 22.5 下会先炸在与根因无关的模块解析上。
+const { readCodexProjects, resolveJumpTarget, isThreadId } = await import('./codexhome/reader.js');
+const { openCodexThread } = await import('./codexhome/open.js');
 import { Indexer } from './dshhome/indexer.js';
 import { LiveStatusReader } from './dshhome/live-status.js';
 import { LiveStatusPoller } from './dshhome/live-poller.js';
@@ -140,6 +144,29 @@ const quota = new QuotaService({
   store,
   broadcast: (event, data) => hub.broadcast(event, data),
 });
+
+// Codex 是第二个 harness：以 harness='codex' 的实例接入（INSTANCES 里添加/配置），
+// 索引器把它翻译成同一套 workspace/session 行，Recent Projects/Sessions 直接复用。
+// 这里只暴露两件事给 API/索引器：读快照、把「项目/会话/实例」解析成一个可跳转的 threadId。
+const codex = {
+  readProjects: (options) => readCodexProjects(options),
+  // 跳转解析（home 来自 /api/codex/open 的 homeId）：
+  //   · threadId 优先（Recent Sessions / 实例卡附带的会话）；
+  //   · projectId → 该项目最近一条会话（Recent Projects）；
+  //   · 两者都没有 → 该实例最近一条会话（实例卡「打开 Codex」）。
+  // 只接受 UUID 格式 —— 这是无鉴权的本机接口，不能变成任意深链的派发器。
+  resolveThreadId(home, { threadId, projectId } = {}) {
+    if (typeof threadId === 'string' && threadId) {
+      if (!isThreadId(threadId)) throw new Error('无效的 Codex threadId');
+      return threadId;
+    }
+    const snapshot = readCodexProjects({ home: home.homePath, limit: 1000, threadsPerProject: 1, days: 3650 });
+    if (typeof projectId === 'string' && projectId) return resolveJumpTarget(snapshot, { projectId });
+    const first = snapshot.projects.find((p) => p.lastThread?.id);
+    return first?.lastThread?.id ?? null;
+  },
+  openThread: (threadId) => openCodexThread(threadId),
+};
 const liveStatusReader = new LiveStatusReader();
 const readLiveStatus = async (home) => {
   const rt = monitor.get(home.homeId);
@@ -168,9 +195,12 @@ const indexer = new Indexer({
   // 读取源扩展：对「运行中且可直达」的实例，从 dsh web 的 /api RPC channel 读取实时会话状态，
   // 覆盖（可能冻结的）投影缓存推导出的状态。实例不可达 / token 无效 / 端点缺失一律回退（返回 null）。
   liveStatus: readLiveStatus,
+  // Codex 实例走 #indexCodexHome（读 ~/.codex + 同构行），不经过 dsh 的 projection cache。
+  codex: { readProjects: readCodexProjects },
 });
 const livePoller = new LiveStatusPoller({
-  store, homes: () => store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running'), read: readLiveStatus,
+  // 实时状态只对 dsh 有意义：Codex 没有 dsh web，也没有实时 RPC。
+  store, homes: () => store.listHomes().filter((h) => h.harness !== 'codex' && monitor.get(h.homeId).runtime === 'running'), read: readLiveStatus,
   broadcast: (event, data) => hub.broadcast(event, data),
 });
 monitor.start();
@@ -194,6 +224,7 @@ const server = createApiServer({
   // 不是回环名，此时 SPA 能加载但每个 /api/* 都 403。显式用 HWB_ALLOWED_HOSTS 放行。
   allowedHosts: allowedHostsFromEnv(),
   dshVersion,
+  codex,
 });
 server.listen(opts.port, '127.0.0.1', () => {
   globalThis.hwbServiceReady?.();

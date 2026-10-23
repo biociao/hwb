@@ -6,6 +6,29 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+**Codex 接入：作为 harness='codex' 的普通实例（INSTANCES 添加，会话进 RECENT）。**
+
+hwb 原先只服务 dsh；这次加上第二个 harness 数据源，且**不另起面板**——Codex 和 dsh 实例同构：
+在 INSTANCES 里添加/配置，项目与会话汇总进 RECENT PROJECTS / RECENT SESSIONS，点击经 `codex://`
+深链跳回 Codex 桌面端。
+
+- **`homes.harness`（'dsh' | 'codex'）**：老库自动补列并默认 dsh。Codex 实例没有进程/端口/隧道，
+  monitor 直接标 running（目录缺失则 gone），不触发 HTTP 探测；实时轮询/启停/切换端点对它是 400。
+- **新增 `src/codexhome/`**：`reader.js` 以 `readOnly` 打开 `~/.codex/state_5.sqlite`（Codex 退出、
+  WAL 无 `-shm` 时自动改 `immutable=1` 快照），结合 `.codex-global-state.json` 的 `local-projects` /
+  `thread-project-assignments`，按 cwd 最长根路径归属会话；`index-rows.js` 把 Codex 项目/用户会话
+  翻译成同构 workspace/session 行（自动审查/子 agent 线程不进会话列表），`open.js` 派发深链。
+  **不读** `rollout-*.jsonl(.zst)` 正文，也不写 Codex 的状态库。
+- **API**：`POST /api/homes` 支持 `{harness:"codex", homePath}`（默认 `~/.codex`，注册后立即索引
+  并刷新运行时）；`POST /api/codex/open` 接受 `{homeId, threadId?|projectId?}`，解析成
+  `codex://threads/<id>` 并用 `open(1)` 派发（实测触发桌面端 `thread/resume`）；只接受 UUID，
+  非 macOS 或唤起失败返回 `codex resume <id>` 回退命令，沿用同站写保护。
+- **UI**：INSTANCES 卡片（Codex 标记 / 已就绪 / 打开 Codex / 重新索引）、添加表单新增
+  「Codex（只读）」类型与首装引导一键添加、设置表单只保留名称与 home 路径；Recent Projects
+  对 Codex 显示 `total X tokens`（无输入/输出拆分），Recent Sessions 增加实例 chip 以便多实例区分。
+- **测试**：`tests/codex-reader.test.js`、`codex-index.test.js`、`codex-api.test.js`、
+  `codex-instance-ui.test.js`。
+
 ## [0.1.5] — 2026-09-15
 
 **对齐 dsh 0.1.5 的兼容性版本。** 从本版起 hwb 的版本号与 **dsh 的主版本**对齐（dsh 当前

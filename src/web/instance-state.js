@@ -25,6 +25,8 @@ export function tabHomes(homes) {
   const runningKeys = new Set(connectedHomes(homes).map(instanceKey));
   const seen = new Set();
   return homes.filter((home) => {
+    // Codex 实例没有 dsh web 页面，不能开 iframe / 标签页；它的入口是 codex:// 深链。
+    if (home.harness === 'codex') return false;
     const key = instanceKey(home);
     const runtime = home.runtime;
     const retained = runtime?.runtime === 'unreachable' && runtime.url && !runningKeys.has(key);

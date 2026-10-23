@@ -25,9 +25,40 @@ function versionChip(runtime) {
   return `<span class="chip ver" title="该实例上 dsh 的版本号">dsh ${esc(version)}</span>`;
 }
 
+// Codex 实例卡：与 dsh 实例同构（同一张 INSTANCES 列表），但语义是「只读元数据接入」——
+// 没有连接/断开、没有当前通道、没有端点选择，也没有版本号。状态只有两种：
+//   running → 已就绪（能读到 home 并完成过一次索引）；
+//   其他    → 路径缺失（homePath 不在，需要用户去设置里改路径）。
+// 「打开 Codex」由 app.js 调 POST /api/codex/open（homeId → 最近会话/最近项目）。
+function codexCard(h) {
+  const id = esc(h.homeId);
+  const running = h.runtime?.runtime === 'running';
+  return `<div class="row">
+      <div class="t">
+        <span class="name">${esc(h.alias || h.serverId || h.homePath)}</span>
+        <span class="chips">
+          <span class="chip harness-codex" title="只读接入的 Codex 本地实例">Codex</span>
+          <span class="chip ${running ? 'ok' : 'bad'}">${running ? '已就绪' : '路径缺失'}</span>
+          ${degradedChips(h.degraded)}
+        </span>
+      </div>
+      <div class="meta">
+        <span>${Number(h.workspaceCount) || 0} projects</span>
+        <span>${Number(h.sessionCount) || 0} sessions</span>
+        <span>检查 ${timeAgo(h.runtime?.checkedAt)}</span>
+      </div>
+      <div class="meta actions">
+        <button class="primary" data-action="codex-open-home" data-home-id="${id}">打开 Codex</button>
+        <button data-action="reindex" data-home-id="${id}">重新索引</button>
+        <button data-action="settings" data-home-id="${id}" title="编辑实例配置">⚙ 设置</button>
+      </div>
+    </div>`;
+}
+
 export function renderInstanceGrid(homes) {
   if (!homes.length) return '<div class="empty">暂无实例，请添加实例</div>';
   return `<div class="rows">${homes.map((h) => {
+    if (h.harness === 'codex') return codexCard(h);
     const running = h.runtime?.runtime === 'running';
     const attached = running || h.runtime?.runtime === 'unreachable';
     const id = esc(h.homeId);

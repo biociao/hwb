@@ -128,8 +128,9 @@
     .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--bad); }
     /* dsh 版本 chip：等宽 + 弱化色，与「已连接/未连接」状态 chip 在同一行里区分开 */
     .chip.ver { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    /* 会话状态 chip：彩色圆点 + 文本。run=运行中(green)，done=已完成(accent)，idle=空闲(dim) */
-    .chip.status { display: inline-flex; align-items: center; gap: 4px; padding-right: 9px; }
+    /* 会话状态 chip：彩色圆点 + 文本。run=运行中(green)，done=已完成(accent)，idle=空闲(dim)。
+       nowrap：RECENT SESSIONS 右侧是窄列，标签（如「已保存」）被折成两行会撑高整行。 */
+    .chip.status { display: inline-flex; align-items: center; gap: 4px; padding-right: 9px; white-space: nowrap; }
     .chip.status::before { content: ''; width: 6px; height: 6px; border-radius: 50%;
                            background: currentColor; flex: none; }
     .chip.status.run { color: var(--ok); }
@@ -345,6 +346,10 @@
     .endpoint-switch { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; width: 100%; }
     .endpoint-switch .config-field { flex: 1; }
     .endpoint-switch select { width: 100%; box-sizing: border-box; font: inherit; }
+
+    /* Codex 实例卡上的 harness 标识：与 dsh 实例区分开（Codex 是只读元数据接入），
+       用项目色而不是状态色，避免和「已就绪 / 路径缺失」的状态语义混在一起。 */
+    .chip.harness-codex { flex: none; color: var(--proj-fg); background: var(--proj-bg); }
     </style>
   <link rel="stylesheet" href="/file-preview.css">
 </head>

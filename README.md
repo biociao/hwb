@@ -30,6 +30,7 @@
 - [快速开始](#快速开始)
 - [工作台怎么用](#工作台怎么用)
 - [读取的 dsh home 文件](#读取的-dsh-home-文件)
+- [Codex 作为实例接入（可选数据源）](#codex-作为实例接入可选数据源)
 - [架构：三平面分离](#架构三平面分离)
 - [REST API](#rest-api)
 - [辅助工具包](#辅助工具包)
@@ -80,6 +81,7 @@
 | **手填 token 直连** | 实例设置/添加表单 `token` 栏——远端自行更新 dsh 后填入新 token 即直连，**不重启实例**；不可达时自带可自行执行的 ssh 命令提示 |
 | **Token 用量面板** | 汇总 + 分时堆叠趋势（自适应桶粒度）+ 按项目拆分 |
 | **会话深链** | 客户端装有 `dsh-session-deeplink` 插件时，可二段跳转直达单个会话，且有加载遮罩防白闪 |
+| **Codex 实例（只读）** | 在 INSTANCES 里添加 Codex（`harness=codex`），只读 `state_5.sqlite` + `.codex-global-state.json`；其项目/会话进入 RECENT PROJECTS/SESSIONS，点击经 `codex://` 深链跳回 Codex |
 | **SSH 远程生命周期** | 远端点按钮即可启动 / 重启 / 关闭远端 dsh web（把 `dsh-remote-web.sh` 算法搬进 Node） |
 | **主题同步** | hwb 切主题单向下发给已连接的 dsh 实例：写其 `settings.yaml`（持久）+ 注入脚本即时换肤；逐实例报成功/失败，可在主题菜单里关闭 |
 
@@ -363,6 +365,56 @@ bootstrap，之后**不再更新**。hwb 以 **per-record 为准、聚合为补�
 
 ---
 
+## Codex 作为实例接入（可选数据源）
+
+hwb 支持第二个 harness：Codex（ChatGPT 桌面版 / codex-cli）。它**不是单独的面板**，而是一个
+普通实例：在 **INSTANCES → ＋ 添加** 里把类型选成「Codex（只读）」（或首装引导里点
+「添加检测到的 ~/.codex」），之后它的项目与会话就和 dsh 实例一样出现在
+**RECENT PROJECTS / RECENT SESSIONS** 里。
+
+- 不启动、不连接任何进程：没有 token / 端口 / 隧道 / 端点，实例卡状态只有「已就绪 / 路径缺失」。
+- 点会话 → `codex://threads/<id>` 跳到 Codex 桌面端；点项目 → 该项目最近一条会话；
+  实例卡「打开 Codex」→ 该实例最近一条会话（仅 macOS 自动打开，其它平台给 `codex resume` 命令）。
+- Codex 只暴露每个 thread 的**累计 token**（没有输入/输出/缓存拆分）：项目行显示
+  `total X tokens`；Token 用量面板不包含 Codex，避免把总量伪造成某一类。
+
+**读什么（只读元数据，不碰会话正文）：**
+
+| 文件 | 内容 |
+|------|------|
+| `$CODEX_HOME/state_5.sqlite`（默认 `~/.codex`） | `threads` 表：标题 / cwd / token / 活跃时间 / 归档 / git 分支；`projects` + `project_roots`（仅作兜底） |
+| `$CODEX_HOME/.codex-global-state.json` | 桌面端项目模型：`local-projects`（名称 + 根路径）、`pinned-project-ids`、`project-order`、`thread-project-assignments` |
+
+- 以 `readOnly` 打开 SQLite（Codex 退出、WAL 文件已 checkpoint 时自动改用 `immutable=1` 读快照）
+  —— **绝不写 Codex 的状态库**，也不解压/读取 `rollout-*.jsonl(.zst)` 会话正文。
+- 项目归属：先看 `thread-project-assignments`，再用 cwd 的**最长根路径前缀**回退；仍未归属的
+  会话按 `basename(cwd)` 归一化成项目（与 dsh 对无 workspace 会话的口径一致）。
+- 自动线程（`guardian_review` / `subagent`，本机占 82%）不进会话列表，否则 RECENT SESSIONS
+  会被 0 token 的自动审查淹没；只有自动线程的项目也不会占位。
+- 读取失败（没装 Codex、库被锁、schema 变了）只让该实例 `degraded` 并在实例卡上给出原因，
+  不影响 dsh 实例索引与控制平面。
+
+**添加 / 配置：**
+
+- 添加：`INSTANCES → ＋ 添加` → 类型选 `Codex（只读）`，home 路径默认 `~/.codex`；
+  首装引导会检测并给出一键添加按钮。
+- 配置：设置里只保留「实例名称 / home 路径」；没有接入端口、token、端点。
+- `重新索引` 立刻按最新元数据刷新；`移除实例` 只删 hwb 索引，不碰 `~/.codex`。
+
+**手工验证（不经过 UI）：**
+
+```bash
+curl -s 'http://127.0.0.1:4310/api/homes' | head -c 800          # 找到 harness=codex 的 homeId
+curl -s -X POST 'http://127.0.0.1:4310/api/homes' \
+  -H 'Content-Type: application/json' -d '{"harness":"codex","homePath":"~/.codex"}'
+curl -s -X POST 'http://127.0.0.1:4310/api/codex/open' \
+  -H 'Content-Type: application/json' -d '{"homeId":"<codex homeId>"}'
+```
+
+> `CODEX_HOME` 会覆盖默认的 `~/.codex`（与 Codex CLI 自己的约定一致）。
+
+---
+
 ## 架构：三平面分离
 
 ```
@@ -420,6 +472,8 @@ bootstrap，之后**不再更新**。hwb 以 **per-record 为准、聚合为补�
 | `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
 | `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`） |
 | `GET` | `/api/workspaces` | 工作区列表 |
+| `POST` | `/api/homes` | 除 dsh 本机/远程外，`{harness:"codex", homePath}` 可注册只读 Codex 实例（默认 `~/.codex`，注册后立即索引并刷新运行时） |
+| `POST` | `/api/codex/open` | 跳转到 Codex 会话/项目/实例（body `{homeId, threadId?}` 或 `{homeId, projectId?}`；解析成 `codex://threads/<id>` 深链，仅 macOS 自动打开） |
 | `GET` | `/api/usage` | 用量汇总 + 趋势 + 按项目（`?days=30&hours=24`） |
 | `GET` | `/api/quota` | 额度列表（TTL 缓存；只读） |
 | `POST` | `/api/quota/refresh` | 强制刷新额度 |
@@ -501,6 +555,10 @@ hwb/
 │   │   ├── live-poller.js       # 实时状态轮询（3s，仅运行中的本机实例）
 │   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目）
 │   │   └── quota.js             # 额度服务（TTL 缓存 60s，单 flight）
+│   ├── codexhome/               # 第二个 harness 数据源（Codex，只读；作为普通实例接入）
+│   │   ├── reader.js            # state_5.sqlite + .codex-global-state.json → 项目/会话快照（按 cwd 最长前缀归属）
+│   │   ├── index-rows.js        # Codex 快照 → 同构 workspace/session 行（复用 RECENT / 用量 / 搜索）
+│   │   └── open.js              # codex://threads/<id> 深链派发（仅 macOS；其它平台回退 codex resume 命令）
 │   ├── control/                 # 控制平面
 │   │   ├── registry.js          # 实例注册表（状态机 + 退避）
 │   │   ├── monitor.js           # 进程/端口探测（30s 循环）
@@ -632,6 +690,15 @@ dsh 0.1.5-rc.1 兼容 ✓
 
 > 这些是 v0.1.5 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
 
+- **Codex 侧没有版本化契约**：dsh 的元数据文件带 `unit.version`，hwb 能按主版本降级；Codex 的
+  `state_5.sqlite` / `.codex-global-state.json` 没有等价版本号。Reader 用固定的列名/字段名读取，
+  Codex 升级若改名，对应域会整体降级并在实例卡上给出原因（不会 5xx，也不会写坏 Codex 的库）。
+  目前只覆盖本机 `local` 项目：远程 host 的 Codex 项目、云端任务不在读取范围内。
+- **Codex 只有累计 token**：thread 粒度只存 `tokens_used`，没有输入/输出/缓存拆分。项目行显示
+  `total X tokens`，Token 用量面板与用量趋势**不含 Codex**（避免伪造分项）；Codex 会话状态
+  只能标成「已保存」，桌面端是否正在跑该 thread 不在落盘元数据里。
+- **Codex 跳转依赖桌面端**：`codex://` scheme 由 ChatGPT/Codex 桌面 app 注册；只装了 `codex` CLI
+  时按钮会返回回退命令（`codex resume <id>`），需要自己在终端执行。非 macOS 平台不做自动派发。
 - **上传的内存占用有界但不为零**：multipart 解析器是流式的，但上传路由目前会把整份文件先攒在内存
   再落盘（解析器的 `write` 回调是同步契约，而落盘写入是异步的）。单文件上限 256 MiB，
   因此峰值是同量级的一次性开销，不会随并发累积（上传是串行处理的）。改成真流式需要让解析器

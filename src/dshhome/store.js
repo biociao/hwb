@@ -31,7 +31,7 @@ function degradedTables(degraded) {
 }
 
 // listHomes 与 getHome 共用的实例基础查询：单实例点查只需在末尾拼一个 WHERE。
-const HOME_SELECT = `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.status, h.lastIndexedAt, h.degraded,
+const HOME_SELECT = `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.harness, h.status, h.lastIndexedAt, h.degraded,
               h.endpoints, h.activeEndpointId, h.serverId, h.host, h.remotePort, h.localPort, h.accessPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
               (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
               (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS homes (
   homePath TEXT NOT NULL,
   alias TEXT,
   hostType TEXT CHECK(hostType IN ('local','remote')) DEFAULT 'local',
+  -- harness：这个实例是谁的数据源。'dsh'（默认）走进程/端口/隧道与 projection cache；
+  -- 'codex' 是只读的 Codex 本地环境（~/.codex），没有进程可托管，索引器直接读 SQLite/JSON。
+  harness TEXT NOT NULL DEFAULT 'dsh',
   status TEXT DEFAULT 'unknown',
   lastIndexedAt TEXT,
   degraded TEXT DEFAULT '[]',
@@ -193,6 +196,11 @@ const TOK = {
   total: 'COALESCE(SUM(tokInput + tokOutput + tokCacheRead + tokCacheWrite), 0)',
 };
 
+// Token 用量/趋势/按项目拆分只统计 dsh 实例：Codex 的 session 只带 totalTokens（没有
+// 输入/输出/缓存拆分），放进来会让「新增输入 / 输出 / 缓存命中率」失真，或者只提高会话数。
+// Recent Projects/Sessions 不受影响（那是跨实例聚合，Codex 应该出现）。
+const DSH_ONLY = "homeId IN (SELECT homeId FROM homes WHERE harness = 'dsh')";
+
 // 「实时写入活跃」的宽限期：该 home 在这个窗口内有过实时状态写入时，文件索引的整表替换不能把
 // status/lastActivity 一起带走（见 upsertRows）。比轮询间隔（3s）宽裕，又足够短：通道一停，
 // 宽限期结束，文件索引重新拿到权威。
@@ -313,6 +321,10 @@ export class IndexStore {
     }
     this.#migrateTokenColumns(sess);
     const homes = this.db.prepare("SELECT name FROM pragma_table_info('homes')").all().map((c) => c.name);
+    // harness 是后加的：老库里的实例一律是 dsh（DEFAULT 'dsh' 保证回填），不需要逐行 UPDATE。
+    if (!homes.includes('harness')) {
+      this.db.exec("ALTER TABLE homes ADD COLUMN harness TEXT NOT NULL DEFAULT 'dsh'");
+    }
     if (!homes.includes('sortIndex')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN sortIndex INTEGER');
     }
@@ -402,8 +414,11 @@ export class IndexStore {
     this.db.close();
   }
 
-  registerHome({ homePath, alias = null, hostType = 'local', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null, serverId = null, endpoints, activeEndpointId, accessPort }) {
+  registerHome({ homePath, alias = null, hostType = 'local', harness = 'dsh', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null, serverId = null, endpoints, activeEndpointId, accessPort }) {
     const homeId = homeIdOf(homePath);
+    if (harness !== 'codex' && harness !== 'dsh') throw new Error('未知的 harness');
+    // Codex 只有本机只读环境：没有 dsh 进程/端口，也不支持 SSH 远端。
+    if (harness === 'codex' && hostType !== 'local') throw new Error('Codex 实例只支持本机路径');
     if (hostType !== 'remote' && normalizeAccessPort(accessPort) !== null) throw new Error('本机实例直接使用 dsh 服务端口，无需本地接入端口');
     if (accessPort !== undefined) accessPort = this.#checkAccessPort(homeId, accessPort);
     const previous = this.getHome(homeId);
@@ -414,15 +429,15 @@ export class IndexStore {
     // 新 home 排在末尾；已存在（冲突）只更新路径/别名/远程配置，保留原 sortIndex。
     const { n } = this.db.prepare('SELECT COALESCE(MAX(sortIndex), -1) + 1 AS n FROM homes').get();
     this.db.prepare(
-      `INSERT INTO homes (homeId, homePath, alias, hostType, status, sortIndex, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort)
-       VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO homes (homeId, homePath, alias, hostType, harness, status, sortIndex, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort)
+       VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(homeId) DO UPDATE SET
          homePath = excluded.homePath, alias = excluded.alias,
-         hostType = excluded.hostType, host = excluded.host,
+         hostType = excluded.hostType, harness = excluded.harness, host = excluded.host,
          remotePort = excluded.remotePort, remoteHome = excluded.remoteHome,
          remoteCmd = excluded.remoteCmd, remoteLog = excluded.remoteLog,
          token = excluded.token, localPort = excluded.localPort`
-    ).run(homeId, homePath, alias, hostType, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
+    ).run(homeId, homePath, alias, hostType, harness, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
     const choices = normalized ?? (previous?.endpoints?.length ? previous.endpoints.map((e) => e.id === previous.activeEndpointId ? { ...e, host, port: hostType === 'remote' ? remotePort : localPort, token } : e) : [legacyEndpoint({ homeId, hostType, host, remotePort, localPort, token })].filter(Boolean));
     if (choices.length || hostType === 'local') this.updateHomeConfig(homeId, { endpoints: choices, activeEndpointId: activeEndpointId || previous?.activeEndpointId || choices[0]?.id || null });
     if (serverId) this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?').run(serverId, homeId);
@@ -435,8 +450,9 @@ export class IndexStore {
   }
 
   // 索引器只用本地 home 的路径（远程实例的元数据不本地索引，走 tunnel 访问）。
+  // 这里只返回 dsh；Codex 的索引走自己的 reader（见 src/codexhome/），不经过 dsh projection cache。
   listLocalHomePaths() {
-    return this.db.prepare("SELECT homePath FROM homes WHERE hostType = 'local' ORDER BY (sortIndex IS NULL), sortIndex, homeId").all().map((r) => r.homePath);
+    return this.db.prepare("SELECT homePath FROM homes WHERE hostType = 'local' AND harness = 'dsh' ORDER BY (sortIndex IS NULL), sortIndex, homeId").all().map((r) => r.homePath);
   }
 
   // 拖拽排序持久化：把 homeIds 依次写为 sortIndex 0..n-1。
@@ -951,6 +967,10 @@ export class IndexStore {
               MAX(s.lastActivity) AS lastActivity,
               SUM(s.tokInput + s.tokCacheRead + s.tokCacheWrite) AS inputTokens,
               SUM(s.tokOutput) AS outputTokens,
+              -- Codex 只暴露每个 thread 的累计 tokens（没有输入/输出/缓存拆分），
+              -- 放在 totalTokens 里单独展示；dsh 行没有这个键，自然为 0。
+              -- 注意 json_valid 必须与 json_extract 同处一行：tests/bad-json-sql 的结构守卫按行扫描。
+              SUM(CASE WHEN json_valid(s.tokenUsage) THEN COALESCE(json_extract(s.tokenUsage, '$.totalTokens'), 0) ELSE 0 END) AS totalTokens,
               (SELECT x.homeId FROM visible_sessions x WHERE x.project = s.project
                  ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS homeId,
               (SELECT x.sessionId FROM visible_sessions x WHERE x.project = s.project
@@ -968,7 +988,7 @@ export class IndexStore {
     // 无最新会话，sessionId 为 null。
     const orphanWs = this.db.prepare(
       `SELECT w.project AS project, 0 AS sessionCount, NULL AS lastActivity,
-              0 AS inputTokens, 0 AS outputTokens,
+              0 AS inputTokens, 0 AS outputTokens, 0 AS totalTokens,
               w.homeId AS homeId, NULL AS sessionId, w.workspaceId AS workspaceId
        FROM workspaces w
        WHERE (? IS NULL OR w.homeId IN (SELECT value FROM json_each(?))) AND w.archived = 0 AND NOT EXISTS (
@@ -1021,7 +1041,7 @@ export class IndexStore {
          ${TOK.cacheWrite} AS cacheWrite,
          ${TOK.total} AS totalTokens
        FROM sessions
-       WHERE lastActivity IS NOT NULL AND lastActivity >= ?`
+       WHERE lastActivity IS NOT NULL AND lastActivity >= ? AND ${DSH_ONLY}`
     ).get(since);
     const hit = r.inputTokens + r.cacheRead;
     return {
@@ -1059,7 +1079,7 @@ export class IndexStore {
               ${TOK.cacheRead} AS cacheRead,
               ${TOK.cacheWrite} AS cacheWrite
        FROM sessions
-       WHERE lastActivity IS NOT NULL AND lastActivity >= ?
+       WHERE lastActivity IS NOT NULL AND lastActivity >= ? AND ${DSH_ONLY}
        GROUP BY h`
     ).all(endHour, endHour, startIso);
     const byH = new Map(rows.map((r) => [r.h, r]));
@@ -1085,7 +1105,7 @@ export class IndexStore {
               COUNT(*) AS sessionCount,
               ${TOK.total} AS tokens
        FROM sessions
-       WHERE project IS NOT NULL AND lastActivity IS NOT NULL AND lastActivity >= ?
+       WHERE project IS NOT NULL AND lastActivity IS NOT NULL AND lastActivity >= ? AND ${DSH_ONLY}
        GROUP BY project
        ORDER BY tokens DESC
        LIMIT ${int(limit, 15)}`
@@ -1148,6 +1168,7 @@ export class IndexStore {
               COALESCE(SUM(s.tokInput + s.tokOutput + s.tokCacheRead + s.tokCacheWrite), 0) AS tokens
        FROM sessions s
        WHERE s.lastActivity IS NOT NULL AND s.lastActivity >= ?
+         AND s.homeId IN (SELECT homeId FROM homes WHERE harness = 'dsh')
        GROUP BY h, grp
        ORDER BY h, tokens DESC`
     ).all(stepSec, endBucket, endBucket, startIso);

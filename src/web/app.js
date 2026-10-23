@@ -251,7 +251,7 @@ async function renderDashboard(sequence = refreshSequence) {
   const draft = captureAddFormDraft();
   dashboardEl.innerHTML = renderWorkbench({
     projects: connectedIds.size ? renderRecentProjects(projects.filter((p) => connectedIds.has(p.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
-    sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId))) : '<div class="empty">连接实例后显示对应会话</div>',
+    sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应会话</div>',
     homes: renderInstanceGrid(lastHomes),
     usage: renderUsageCard(usage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
@@ -262,7 +262,7 @@ async function renderDashboard(sequence = refreshSequence) {
     dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm());
     const form = dashboardEl.querySelector('#add-home');
     const restored = restoreFormDraft(form, draft); // 内部会重放模式（显隐/必填）
-    applyHomeMode(form, form.mode?.value === 'remote' ? 'remote' : 'local');
+    applyHomeMode(form, form.mode?.value === 'remote' ? 'remote' : form.mode?.value === 'codex' ? 'codex' : 'local');
     if (!restored) form.querySelector('input[name=homePath]')?.focus();
   }
   hlProject = null; hlRow = null; hlKind = null; // 刷新后清除残留高亮状态
@@ -514,7 +514,30 @@ function mountPane(homeId, url, sessionId, pane, force = false) {
   enforceFrameBudget();
 }
 
+// 跳 Codex 是服务端的进程外动作（`open "codex://threads/<id>"`）：按钮/行做防连点，
+// 并把 502 里带的手动命令原样展示（非 macOS / 未装桌面端时这是唯一可操作的出路）。
+async function openCodexTarget({ homeId, threadId, projectId } = {}, btn = null) {
+  if (btn?.dataset.busy === '1') return null;
+  if (btn) { btn.dataset.busy = '1'; btn.disabled = true; }
+  try {
+    const result = await api('/api/codex/open', { method: 'POST', body: { homeId, threadId, projectId } });
+    note.set('已在 Codex 中打开对应会话');
+    return result;
+  } catch (error) {
+    note.set(`打开 Codex 失败：${error.message}`, { sticky: true });
+    return null;
+  } finally {
+    if (btn) { delete btn.dataset.busy; btn.disabled = false; }
+  }
+}
+
 async function enterInstance(homeId, extra = {}) {
+  // Codex 实例没有 dsh web 页面：任何「进入实例」都转成 codex:// 深链（含旧书签/恢复路径）。
+  const targetHome = lastHomes.find((h) => h.homeId === homeId);
+  if (targetHome?.harness === 'codex') {
+    await openCodexTarget({ homeId, threadId: extra.sessionId || undefined, projectId: extra.workspaceId || undefined });
+    return;
+  }
   const token = Symbol('view');
   const pane = paneFor(homeId);
   view = { kind: 'instance', homeId, token, sessionId: pane.sessionId, ...extra };
@@ -545,7 +568,8 @@ async function enterInstance(homeId, extra = {}) {
 }
 
 function formMsg(form, text, isError) {
-  const el = form.querySelector('.form-msg');
+  const el = form?.querySelector('.form-msg');
+  if (!el) return; // 表单可能已被 SSE 重建并脱离文档，调用方另有粘性提示兜底
   el.hidden = false;
   el.textContent = text;
   el.classList.toggle('error', isError);
@@ -559,13 +583,15 @@ function closeModal() {
 function openSettings(homeId) {
   const home = lastHomes.find((h) => h.homeId === homeId);
   if (!home) return;
+  // Codex 只读实例没有进程可重启/停止，操作面只剩「重新索引 / 移除」。
+  const isCodex = home.harness === 'codex';
   modalEl.innerHTML = `
     <div class="modal-card">
       <h3>编辑实例：${esc(home.alias || home.homePath || homeId)}</h3>
       ${renderSettingsForm(home)}
       <div class="meta actions">
-        <button data-action="restart" data-home-id="${esc(homeId)}">重启实例</button>
-        <button data-action="stop" data-home-id="${esc(homeId)}">停止实例</button>
+        ${isCodex ? '' : `<button data-action="restart" data-home-id="${esc(homeId)}">重启实例</button>
+        <button data-action="stop" data-home-id="${esc(homeId)}">停止实例</button>`}
         <button data-action="reindex" data-home-id="${esc(homeId)}">重新索引</button>
         <button data-action="remove-home" data-home-id="${esc(homeId)}" data-name="${esc(home.alias || home.homePath)}">移除实例</button>
       </div>
@@ -583,6 +609,17 @@ async function saveSettings(homeId) {
   const form = modalEl.querySelector('#settings-form');
   const home = lastHomes.find((h) => h.homeId === homeId);
   if (!form || !home) return;
+  // Codex 只读实例：只改别名与 home 路径，没有端点/token/端口字段可读。
+  if (home.harness === 'codex') {
+    await api(`/api/homes/${homeId}`, {
+      method: 'PUT',
+      body: { alias: form.alias.value.trim(), homePath: form.homePath.value.trim() },
+    });
+    dropUsageCache();
+    closeModal();
+    await refresh();
+    return;
+  }
   const body = { alias: form.alias.value.trim(), endpoints: readEndpoints(form) };
   if (home.hostType === 'remote') {
     body.accessPort = form.accessPort.value.trim() || null;
@@ -604,12 +641,20 @@ async function saveSettings(homeId) {
   await refresh();
 }
 
-async function addHome({ homePath, alias, hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort, accessPort }, form) {
-  const body = hostType === 'remote'
-    ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, token: token || undefined, alias }
-    : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
-  if (hostType === 'remote' && accessPort !== undefined) body.accessPort = accessPort;
+async function addHome({ homePath, alias, harness = 'dsh', hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort, accessPort }, form) {
+  // Codex 是第二个 harness：只带路径/别名，没有 host/端口/token。
+  const body = harness === 'codex'
+    ? { harness: 'codex', homePath, alias }
+    : hostType === 'remote'
+      ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, token: token || undefined, alias }
+      : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
+  if (harness !== 'codex' && hostType === 'remote' && accessPort !== undefined) body.accessPort = accessPort;
   const data = await api('/api/homes', { method: 'POST', body });
+  // 前后端版本错位的逃生提示：旧后端不认识 harness，会把 Codex 路径当 dsh 处理。
+  // 正常情况下这条不会触发（服务端回 400 更早），但升级中途的混合状态值得给一句明确的话。
+  if (harness === 'codex' && data?.harness !== 'codex') {
+    throw new Error('当前 hwb 后端还不支持 Codex 实例，请先重启 hwb 再试');
+  }
   // warning 必须挂在**持久**的 #note 上：紧接着的 showAddForm = false; refresh() 会重建整个
   // dashboard 的 innerHTML（表单只在 showAddForm 为真时才重新插入），写进表单的消息会被直接抹掉
   // —— 服务端明明回了「这个目录看起来不像 dsh home」，用户一个字都看不到。
@@ -617,10 +662,31 @@ async function addHome({ homePath, alias, hostType = 'local', host, remotePort, 
   showAddForm = false;
   dropUsageCache();   // 新实例可能立刻带来一批历史会话，别让「按实例」图滞后 15s
   await refresh();
+  if (harness === 'codex') {
+    // 新卡片排在 Instances 列表末尾、且表单会立刻消失：滚动到它并闪一下。
+    // 注意 dashboard 紧接着会被 monitor 的 SSE 刷新重建，所以要按「可能已被替换」重试几次。
+    const reveal = (attempt = 0) => {
+      const card = dashboardEl.querySelector('.chip.harness-codex')?.closest('.row');
+      if (card) {
+        card.scrollIntoView({ block: 'nearest' });
+        card.classList.add('hl-project');
+        setTimeout(() => card.classList.remove('hl-project'), 2000);
+      } else if (attempt < 3) {
+        setTimeout(() => reveal(attempt + 1), 400);
+      }
+    };
+    reveal();
+  }
   if (warning) {
     // 粘性：这类提示描述的是「需要你处理的事实」，不是「刚刚那一轮刷新失败了」，
     // 所以刷新与重连都不该把它撤掉（用户处理完之后再刷新页面即可）。
     note.set(`已添加，但注意：${warning}`, { sticky: true });
+  } else if (harness === 'codex') {
+    // 添加成功后表单立即消失、卡片排在列表末尾：给一句明确的成功反馈。
+    // 用粘性 + 6s 定时清除：普通 note 会被紧接着的 SSE 刷新立刻清掉（实测 3s 内就没），
+    // 而长期粘住又会挡住后续真实错误，所以只留几秒。
+    note.set('已添加 Codex 实例：项目与会话已汇总到 Recent Projects / Sessions', { sticky: true });
+    setTimeout(() => note.clear(), 6000);
   }
 }
 
@@ -639,12 +705,26 @@ async function handleAction(e) {
       case 'nav-instance':
         await enterInstance(btn.dataset.homeId);
         break;
-      case 'drill-in':
+      case 'drill-in': {
+        const home = lastHomes.find((h) => h.homeId === btn.dataset.homeId);
+        // Codex 没有 iframe 页面：项目行/会话行直接跳桌面端（项目 → 最近会话，会话 → 自身）。
+        if (home?.harness === 'codex') {
+          await openCodexTarget({
+            homeId: home.homeId,
+            threadId: btn.dataset.sessionId || undefined,
+            projectId: btn.dataset.workspaceId || undefined,
+          }, btn);
+          break;
+        }
         await enterInstance(btn.dataset.homeId, {
           sessionId: btn.dataset.sessionId || null,
           sessionTitle: btn.dataset.title || null,
           project: btn.dataset.project || null,
         });
+        break;
+      }
+      case 'codex-open-home':
+        await openCodexTarget({ homeId: btn.dataset.homeId }, btn);
         break;
       case 'popout':
         window.open(btn.dataset.url, '_blank');
@@ -654,7 +734,10 @@ async function handleAction(e) {
         await refresh();
         break;
       case 'add-detected':
-        await addHome({ homePath: btn.dataset.path });
+        await addHome({
+          homePath: btn.dataset.path,
+          harness: btn.dataset.harness === 'codex' ? 'codex' : 'dsh',
+        });
         break;
       case 'add-endpoint': {
         const editor = btn.closest('.endpoint-editor');
@@ -999,8 +1082,18 @@ main.addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
   const alias = form.alias.value.trim() || undefined;
+  const submitBtn = form.querySelector('button[type=submit]');
+  const submitLabel = submitBtn?.textContent;
+  // 添加要等一次索引（Codex 本机 2k+ 会话约 1s）：没有 loading 时按钮看起来「点了没反应」。
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = '添加中…'; }
   try {
-    if (form.mode.value === 'remote') {
+    if (form.mode.value === 'codex') {
+      await addHome({
+        harness: 'codex',
+        homePath: form.homePath.value.trim() || undefined,
+        alias,
+      }, form);
+    } else if (form.mode.value === 'remote') {
       await addHome({
         hostType: 'remote',
         host: form.host.value.trim(),
@@ -1021,9 +1114,27 @@ main.addEventListener('submit', async (e) => {
       }, form);
     }
   } catch (err) {
+    // 两条通道都写：表单可能已被这一轮的 SSE 重建（旧节点脱离文档，消息谁看不见）；
+    // 粘性 note 挂在 dashboard 之外，跨刷新存活，能把「为什么添加失败」留给用户。
     formMsg(form, err.message, true);
+    note.set(`添加实例失败：${err.message}`, { sticky: true });
+  } finally {
+    if (submitBtn?.isConnected) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = submitLabel;
+    }
   }
 });
+
+// 原生校验（required / type=number）不触发 submit 事件，只在字段上弹一个短暂的浏览器气泡：
+// 用户点「添加」看起来就是「没反应」。这里把校验信息落到表单里，给出可见反馈。
+main.addEventListener('invalid', (e) => {
+  const form = e.target.closest?.('#add-home');
+  if (!form) return;
+  const label = e.target.placeholder || e.target.name || '必填项';
+  const text = e.target.validity?.valueMissing ? `请填写「${label}」` : (e.target.validationMessage || '请检查表单');
+  setTimeout(() => formMsg(form, text, true), 0);
+}, true);
 
 dashboardEl.addEventListener('change', (e) => {
   if (!e.target.matches('#add-home .home-mode')) return;

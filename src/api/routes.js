@@ -168,10 +168,33 @@ function dshHomeInfo(homePath) {
   };
 }
 
+// Codex home 的探测口径与 dsh 不同：没有 workspace.json，认的是元数据落盘文件。
+function codexHomeInfo(homePath) {
+  const exists = existsSync(homePath) && statSync(homePath).isDirectory();
+  return {
+    path: homePath,
+    exists,
+    looksLikeCodexHome: exists && (
+      existsSync(path.join(homePath, 'state_5.sqlite'))
+      || existsSync(path.join(homePath, '.codex-global-state.json'))
+    ),
+  };
+}
+
+// 用户填的路径可以是 `~/.codex`（表单默认值），path.resolve('~/.codex') 会把它变成
+// `<cwd>/~/.codex` —— 一个永远不存在的目录。单独把 `~` 展开成 homedir。
+function resolveUserPath(raw, fallback) {
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text) return fallback;
+  if (text === '~') return homedir();
+  if (text.startsWith('~/')) return path.join(homedir(), text.slice(2));
+  return path.resolve(text);
+}
+
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null, codex = null }) {
   const connecting = new Set();
   // 实例上的 dsh 版本号（DshVersionResolver，见 lib/dsh-version.js）。可以缺省：本地实例同步
   // 读本机安装、远程实例后台 ssh 探测，两者都**不是**渲染实例列表的前置条件 —— 单测直接建
@@ -253,6 +276,17 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (MUTATING_METHODS.has(req.method) && !sameSiteRequest(req)) {
       send(res, 403, { error: '不允许跨站请求' });
       return;
+    }
+
+    // Codex 是只读数据源：没有「连接/重启/停止/切换端点」这些动作。统一挡在这里，
+    // 免得 UI 上出现一个永远失败的按钮（也会在 launcher 里留下无意义的进程状态）。
+    const codexAction = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(open|restart|stop|disconnect|switch)$/);
+    if (req.method === 'POST' && codexAction) {
+      const actionHome = store.getHome(codexAction[1]);
+      if (actionHome?.harness === 'codex') {
+        send(res, 400, { error: 'Codex 实例是只读数据源，无需连接/重启/停止' });
+        return;
+      }
     }
 
     const finder = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/open-workspace$/);
@@ -392,12 +426,39 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
     if (req.method === 'GET' && pathname === '/api/homes/detect') {
-      send(res, 200, dshHomeInfo(path.join(homedir(), '.dsh')));
+      send(res, 200, {
+        ...dshHomeInfo(path.join(homedir(), '.dsh')),
+        // 第二个 harness：Codex 的默认 home 与判定文件都和 dsh 不同，单独给一份。
+        codex: codexHomeInfo(path.join(homedir(), '.codex')),
+      });
       return;
     }
     if (req.method === 'POST' && pathname === '/api/homes') {
       const body = await readJsonBodyOr400(req, res);
       if (body === BODY_HANDLED) return;
+      // —— Codex 实例（harness='codex'）：只读本地 ~/.codex，没有进程/端口/端点/token ——
+      if (body.harness === 'codex') {
+        const alias = typeof body.alias === 'string' && body.alias.trim() ? body.alias.trim() : null;
+        const homePath = resolveUserPath(body.homePath, path.join(homedir(), '.codex'));
+        const info = codexHomeInfo(homePath);
+        if (!info.exists) { send(res, 400, { error: `not a directory: ${homePath}` }); return; }
+        const homeId = store.registerHome({ homePath, alias, hostType: 'local', harness: 'codex' });
+        // 立即索引一次，让新增的 Codex 实例马上出现在 Recent Projects/Sessions（不再等 60s 节拍）。
+        let result = null;
+        try { result = (await indexer.reindexNow(homeId))[0] ?? null; } catch { /* 失败会写进实例状态，不阻断注册 */ }
+        // 紧接着刷新运行时：Codex 的 runtime 由 monitor 直接标 running，
+        // 不刷新的话它要等下一次 30s 心跳才进入 connectedHomes —— 用户会看到实例卡「路径缺失」
+        // 且 Recent 两栏为空，像是添加失败。
+        try { await monitor.refresh(homeId); } catch { /* 运行时快照失败不阻断注册 */ }
+        dropUsageMemo();
+        send(res, 200, {
+          homeId,
+          harness: 'codex',
+          warning: info.looksLikeCodexHome ? null : 'directory does not look like a Codex home (state_5.sqlite / .codex-global-state.json missing)',
+          result,
+        });
+        return;
+      }
       if (body.endpoints !== undefined) {
         try {
           body.endpoints = normalizeEndpoints(mergeEndpointTokens(body.endpoints, []), body.hostType || 'local');
@@ -478,6 +539,23 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       const body = await readJsonBodyOr400(req, res);
       if (body === BODY_HANDLED) return;
+      // Codex 实例的配置面只有别名与 home 路径：没有端点/token/端口可改，也没有进程可冲突。
+      if (home.harness === 'codex') {
+        const codexPatch = {};
+        if (typeof body.alias === 'string') codexPatch.alias = body.alias.trim() || null;
+        if (typeof body.homePath === 'string' && body.homePath.trim()) {
+          const hp = resolveUserPath(body.homePath, home.homePath);
+          const info = codexHomeInfo(hp);
+          if (!info.exists) { send(res, 400, { error: `not a directory: ${hp}` }); return; }
+          codexPatch.homePath = hp;
+        }
+        const updated = store.updateHomeConfig(home.homeId, codexPatch);
+        try { await monitor.refresh(updated.homeId); } catch { /* 运行时快照刷新失败不影响保存 */ }
+        reindexInBackground(updated.homeId);
+        dropUsageMemo();
+        send(res, 200, { home: { ...publicHome(updated), runtime: runtimeOf(updated) } });
+        return;
+      }
       if (connecting.has(instanceKey(home))) {
         send(res, 409, { error: '请先断开连接再修改实例配置' });
         return;
@@ -601,6 +679,42 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       send(res, 200, { ok: true });
       return;
     }
+    // —— Codex 深链跳转（Codex 是 harness='codex' 的实例，不经过 dsh web）——
+    //
+    // 点击 Recent Projects / Recent Sessions / 实例卡上的 Codex 条目时调用。只接受
+    // 「本机已注册的 Codex 实例 + UUID thread」：本 API 无鉴权，不能让任意 UUID 变成深链派发器。
+    if (req.method === 'POST' && pathname === '/api/codex/open') {
+      if (!codex?.openThread || !codex?.resolveThreadId) { send(res, 503, { error: 'Codex 数据源未启用' }); return; }
+      const body = await readJsonBodyOr400(req, res);
+      if (body === BODY_HANDLED) return;
+      const codexHomes = store.listHomes().filter((h) => h.harness === 'codex');
+      const home = body.homeId
+        ? store.getHome(body.homeId)
+        : (codexHomes.length === 1 ? codexHomes[0] : null);
+      if (!home || home.harness !== 'codex') {
+        send(res, body.homeId ? 404 : 400, {
+          error: body.homeId ? `不是 Codex 实例：${body.homeId}` : '存在多个 Codex 实例，需要传 homeId',
+        });
+        return;
+      }
+      let threadId;
+      try {
+        threadId = codex.resolveThreadId(home, { threadId: body.threadId, projectId: body.projectId });
+      } catch (error) {
+        send(res, 400, { error: error.message });
+        return;
+      }
+      if (!threadId) { send(res, 400, { error: '缺少可跳转的 Codex 会话（threadId 或 projectId）' }); return; }
+      try {
+        const result = await codex.openThread(threadId);
+        // ok=false 用 502：目标解析到了，只是本机没能唤起 Codex；前端展示可复制的手动命令。
+        send(res, result.ok ? 200 : 502, result);
+      } catch (error) {
+        send(res, 400, { error: error.message });
+      }
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/api/projects/recent') {
       send(res, 200, {
         projects: store.recentProjects({

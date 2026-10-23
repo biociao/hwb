@@ -124,6 +124,17 @@ export class Monitor {
       this.#clearReconnect(homeId);
       return Promise.resolve(this.registry.get(homeId));
     }
+    // Codex 是只读数据源，没有可托管的进程/端口/隧道：不做 HTTP/SSH 探测，也不参与重连退避。
+    // 只要 home 目录还在就算「已就绪」（runtime=running），索引器负责读 SQLite/JSON。
+    if (home.harness === 'codex') {
+      this.registry.seed(homeId);
+      this.registry.set(homeId, {
+        phase: this.exists(home.homePath) ? 'running' : 'gone',
+        url: null, iframeUrl: null, externalUrl: null, port: null, pid: null, deeplink: false,
+        checkedAt: Date.now(), latencyMs: 0,
+      });
+      return Promise.resolve(this.registry.get(homeId));
+    }
     const prev = this.registry.seed(homeId);
     const gone = home.hostType !== 'remote' && !this.exists(home.homePath);
     const inst = gone ? null : this.launcher.status(homeId);
