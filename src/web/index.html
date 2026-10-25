@@ -156,7 +156,26 @@
     .pane-filter .filter-clear { flex: none; padding: 0 6px; font-size: 11px; line-height: 18px; }
     .pane-filter .filter-count { flex: none; margin-left: auto; font-size: 11px;
       font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .pane-filter .filter-mute { flex: none; font-size: 11px; padding: 1px 8px; }
     .pane-filter .filter-open { flex: none; font-size: 11px; padding: 1px 8px; }
+    /* 默认静音项目的标记（项目卡）与说明条（Sessions 列表底部）。 */
+    .chip.muted-chip { color: var(--dim); background: transparent; border: 1px dashed var(--border); }
+    /* 项目卡上的隐藏开关：未静音时只在 hover / 键盘聚焦时出现（不占常驻视觉噪音），
+       已静音时是常驻的「已隐藏」按钮（点一下恢复显示）。两个都是原生 button，委托 click 处理。 */
+    button.chip { cursor: pointer; }
+    button.chip.muted-chip { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-style: normal; }
+    button.chip.card-mute { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-style: normal;
+      color: var(--dim); background: transparent; border: 1px dashed var(--border);
+      opacity: 0; transition: opacity .12s; }
+    .row.project-card:hover button.chip.card-mute,
+    .row.project-card:focus-within button.chip.card-mute { opacity: 1; }
+    .pane-filter .filter-state { flex: none; font-size: 10px; color: var(--dim);
+      border: 1px dashed var(--border); border-radius: 9px; padding: 0 6px; white-space: nowrap; }
+    .muted-note { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 8px 10px; border-top: 1px dashed var(--border); color: var(--dim); font-size: 11.5px; }
+    .muted-note.muted-idle { border-top-style: dotted; opacity: .9; }
+    .muted-note b { color: var(--fg); font-variant-numeric: tabular-nums; }
+    .muted-note button { padding: 0 8px; font-size: 11px; }
 
     /* —— 两种卡的第一视觉锚点不同：项目 = 身份徽标（左），会话 = 状态竖轨（左）——
        这样即使两栏并排、行高相近，扫视时也不会把「项目」看成「会话」。 */

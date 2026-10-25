@@ -6,6 +6,73 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 界面：默认静音批量/自动化项目的会话（内置 `relic-distill-cwd`）
+
+**动机**：`relic-distill-cwd` 这类批量项目会持续产出同名会话（"Distill durable knowledge from
+the"），实测**最近 50 条里有 26 条**来自它，把其它项目的会话挤出 Recent Sessions 的视野。
+用户要求「默认过滤掉 relic 的 distill 相关会话」。这类项目仍然要能被查看/搜索，所以不能从
+索引或接口里删掉，只能做**展示层默认隐藏**。
+
+- **行为**：Recent Sessions 默认不显示静音项目的会话，但**必须可见地说明**：列表底部一条
+  「已按默认规则隐藏 N 条会话（「relic-distill-cwd」）· 显示」，点「显示」临时展开全部，再点
+  「恢复隐藏」回到默认。项目卡上直接给开关：未静音时 hover 出现「隐藏」按钮，已静音时是常驻
+  可点的「已隐藏」按钮（点一下恢复显示）—— 不必先点开项目、再去筛选条里找入口；否则用户会
+  奇怪这个项目的会话去哪了。搜索态下文案改成「N 条匹配会话被默认规则隐藏」，不会误报「没有匹配」。
+- **不会「看起来没生效」**：在某个项目的筛选视图里点「默认隐藏」时，显式视图按定义会显示它的
+  全部会话，停在那里等于什么都没变。此时自动退回默认视图（会话消失 + 底部说明 + 卡片「已隐藏」
+  + 顶栏 5 秒提示）。从筛选条取消隐藏后若又误点，也随时能点项目卡上的「隐藏」恢复。筛选条在
+  已静音时同时显示「已默认隐藏」状态 chip，按钮文案改为「取消默认隐藏」，避免把取消当成隐藏。
+- **误关默认的出路**：默认列表是一次性偏好，点过「取消默认隐藏」会写入显式 `[]`。若用户只是
+  试探、之后不再隐藏，Recent Sessions 底部会出现弱提示「默认静音已关闭（…）· 恢复默认静音」，
+  一键把内置默认装回来（否则用户会认为「隐藏功能坏了」）。
+- **显式选择覆盖默认**：点开被静音的项目（项目筛选）仍显示它的全部会话 —— 点进去就是想看它；
+  此时筛选条里显示「取消隐藏」，可把该项目移出静音列表。筛选条的「隐藏」按钮则可以把任意
+  当前项目加入静音列表。
+- **持久化**：静音列表存 localStorage `hwb:muted-projects`。key 不存在时用内置默认
+  `['relic-distill-cwd']`；用户点过「取消隐藏」后写入显式列表（`[]` = 什么都不隐藏），默认值
+  不再回来。坏 JSON / storage 不可用（隐私模式、配额）一律回默认且不崩；`window.localStorage`
+  的访问本身也可能抛 SecurityError，取一次并兜底。「显示」只是当前视图的临时开关，不写偏好。
+- **过滤边界**：只发生在前端展示层，且在 `filterRecent()`（连接/搜索/项目筛选）**之后**、
+  `splitMutedSessions()` 一处切分；接口数据、项目卡上的 sessionCount、搜索命中的原始行都不变，
+  所以隐藏的会话随时能看回来、也不会「搜不到却不知道去哪了」。分区计数只算屏上可见行，隐藏了
+  多少由提示条单独说明。
+- **实现**：新增 `src/web/components/session-mute.js`（`normalizeMutedProjects` /
+  `readMutedProjects` / `writeMutedProjects` / `toggleMutedProject` / `splitMutedSessions` /
+  `mutedNoteSpec` / `renderMutedNote`，项目名一律 esc）；`app.js` 读取偏好、`paintDashboard()` 在 filterRecent
+  之后切分并渲染提示条，新增 `toggle-mute-project` / `show-muted-sessions` /
+  `hide-muted-sessions` 三个动作；`renderRecentProjects()` 增加 `{mutedProjects}`（「已隐藏」
+  chip），`renderSessionFilter()` 增加 `{muted}`（隐藏 / 取消隐藏）；`index.html` 增加
+  `.chip.muted-chip` / `.muted-note` / `.filter-mute` 样式（浅/深主题共用变量）。
+- **混合版本兜底**：前端静态资源每次请求从磁盘取、后端进程却是启动时加载，升级后只刷新浏览器
+  会出现「新前端 + 旧后端」——旧后端不认识 `?project=`，会把**全局最近 200 条**当项目会话返回
+  （实测筛选条写着 PMAID-GPPH、列表里混着 relic-distill-cwd）。`filterExactProject()` 在前端
+  再按项目名精确过滤一次（后端已是新版时是纯空操作），并一次性提示「重启 hwb 后可取到该项目
+  的全部会话」；这样混合状态下也绝不显示错的行。
+- **真浏览器验证**：headless Chrome（隔离实例 + 隔离 fixture：GPPH 60 / PMAID 1 / relic 3）
+  main 40/40、clean 35/35、旧回归 28/28 + API 8/8 全过：默认 47 行且 0 条 relic、note 写明
+  「已按默认规则隐藏 3 条 · 显示」；点显示 → 50 行 + note 变「已显示默认隐藏的 3 条 · 恢复隐藏」，
+  点恢复隐藏回 47；点开 relic 项目显式覆盖（3 行、筛选条「取消隐藏」），取消后 localStorage=`[]`、
+  清筛选恢复 50 行；把 PMAID-GPPH 加入静音后 4 行 + note 46 条。额外验证：真实 SSE 重绘（reindex
+  广播）后显示态与「恢复隐藏」入口仍在；localStorage 三种状态跨 3 次 reload 保持。所有运行
+  `console.error` / 未捕获异常均为 0。**该轮验证发现并修掉一个真实缺陷**：`splitMutedSessions`
+  在 showMuted 时 `hidden=[]`，app.js 却把它传给提示条 → 点「显示」后「恢复隐藏」入口消失
+  （单元测试只测组件、没测接线，全绿也没抓到）。修法：split 同时返回 `muted`（按规则本该隐藏的
+  全部行）与 `hidden`（当前真的藏起来的行），新增 `mutedNoteSpec()` 合成提示条入参并用纯函数
+  测试覆盖该接线；修复后按同一套脚本复跑通过。
+- **真浏览器复核（用户真实实例）**：前端热更新（后端仍是旧版）后直接打开 127.0.0.1:4310
+  实测：初始 24 行 + note「已按默认规则隐藏 26 条」；点项目卡「已隐藏」→ 显示 50 行、note 变
+  「默认静音已关闭 · 恢复默认静音」；点恢复默认 → 回 24 行+note；点开 relic 项目 → 174 行、
+  筛选条「已默认隐藏 · 取消默认隐藏」；取消后按钮变「默认隐藏」；再点「默认隐藏」→ 自动退出
+  筛选、24 行 + note + 顶栏 5 秒提示。consoleErrors / 未捕获异常均为 0。
+- **测试**：新增 `tests/session-mute.test.js`（默认值 / 显式空列表 / 坏数据 / 持久化失败 /
+  增删 / 显示与项目筛选覆盖 / `mutedNoteSpec` 接线回归 / 提示文案与转义）、
+  `tests/dashboard-mute.test.js`（项目卡 chip、筛选条按钮、paintDashboard 切分顺序与计数口径、
+  三个动作、CSS 契约）；`tests/search-filter.test.js` 增加 `filterExactProject` 用例、
+  `tests/web-project-filter.test.js` 增加混合版本兜底接线断言。`npm test`：1252 tests /
+  1248 pass / 3 fail / 1 skipped（与改动前相同的环境性兼容失败：已安装 dsh 0.2.1-alpha.2 多出
+  schedule 域、真实 bundle 注入锚点变化），无新增失败。
+- **文档**：README（能力表、工作台用法、Recent Projects/Sessions 说明）。
+
 ### 界面：点 Recent Projects 改为「筛出该项目的会话」（不再直接跳转 app）
 
 **动机**：Recent Projects 的点击语义是「跳到该项目最新会话所属实例」，但用户在这个位置想做的

@@ -22,11 +22,15 @@ export function monogramOf(name) {
 // 点击项目卡不再直接跳转实例，而是把它名下的会话筛到 Recent Sessions（见 app.js 的
 // setProjectFilter）；再次点击同一个项目取消筛选，所以这张卡同时也是筛选开关，
 // 用 aria-pressed 表达开关状态。跳转能力仍在：筛选条里的「打开项目」按钮保留原语义。
-export function renderRecentProjects(projects, homes = [], { selectedProject = null } = {}) {
+// mutedProjects：默认静音项目列表（见 components/session-mute.js）。被静音的项目卡上画
+// 「已隐藏」chip —— 否则用户会奇怪「Recent Sessions 里怎么没有这个项目的会话」。
+export function renderRecentProjects(projects, homes = [], { selectedProject = null, mutedProjects = [] } = {}) {
   if (!projects.length) return '<div class="empty">no active projects in the last 7 days</div>';
+  const mutedSet = new Set(Array.isArray(mutedProjects) ? mutedProjects : []);
   const homeById = new Map(homes.map((h) => [h.homeId, h]));
   const rows = projects.map((p) => {
     const selected = selectedProject !== null && p.project === selectedProject;
+    const muted = mutedSet.has(p.project);
     const inst = homeById.get(p.homeId);
     const instName = inst ? (inst.alias || inst.homePath) : null;
     const instColor = inst ? chipColor(p.homeId) : null;
@@ -66,6 +70,13 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
         <div class="meta project-meta">
           ${instName ? `<span class="chip home-chip" style="background:${instColor.bg};color:${instColor.fg}" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
           ${p.historical ? '<span class="chip hist-chip" title="不在最近 7 天列表里，来自全库检索">历史</span>' : ''}
+          ${muted
+            // 已隐藏 = 可点按钮（点一下恢复显示）；未隐藏 = hover 才出现的「隐藏」按钮。
+            // 直接放在项目卡上是为了可发现：用户不必先点开项目、再从筛选条里找隐藏入口。
+            ? `<button type="button" class="chip muted-chip" data-action="toggle-mute-project" data-project="${esc(p.project)}"
+                title="该项目的会话在 Recent Sessions 中默认隐藏；点击恢复显示">已隐藏</button>`
+            : `<button type="button" class="chip card-mute" data-action="toggle-mute-project" data-project="${esc(p.project)}"
+                title="默认隐藏该项目的会话（不再出现在 Recent Sessions；可随时恢复）">隐藏</button>`}
           <span class="project-stat"><b>${p.sessionCount}</b> session${p.sessionCount === 1 ? '' : 's'}</span>
           ${tokenHtml}
           ${p.sessionId ? '' : '<span class="chip">no sessions</span>'}

@@ -138,7 +138,7 @@ test('app.js：按项目拉会话（精确 project 参数 + 独立 limit），�
   assert.match(appJs, /project \? api\(projectSessionsUrl\(project\)\) : Promise\.resolve\(null\)/,
     '筛选时多拉一份「该项目的会话」，全局最近会话仍然照拉（清筛选时立刻能画）');
   assert.match(appJs, /let projectSessions = \{ project: null, status: 'idle', sessions: \[\], truncated: false \}/);
-  assert.match(appJs, /projectSessions = projectSessionsRes\.status === 'fulfilled'/);
+  assert.match(appJs, /if \(projectSessionsRes\.status === 'fulfilled'\) \{/);
   assert.match(appJs, /status: 'error'/, '项目会话拉取失败要能画出错误态，而不是伪装成「没有会话」');
   assert.match(appJs, /lastLists = \{ projects, sessions, connectedIds \}/, '全局最近会话的生命周期不变');
   // 筛选切换时旧数据必须作废：新项目还没回来之前显示 loading，不拿上一批顶替。
@@ -148,7 +148,7 @@ test('app.js：按项目拉会话（精确 project 参数 + 独立 limit），�
 test('app.js：paintDashboard 使用项目会话作为 Sessions 栏数据源，并把选中项目传给项目卡', () => {
   assert.match(appJs, /const proj = project \? \(projectSessions\.project === project \? projectSessions : null\) : null;/);
   assert.match(appJs, /const baseSessions = project \? projSessions : sessions;/);
-  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: project \}\)/);
+  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: project, mutedProjects \}\)/);
   assert.match(appJs, /renderSessionFilter\(\{/);
   assert.match(appJs, /sessionFilter,/);
   assert.match(appJs, /正在筛出「\$\{esc\(project\)\}」的会话…/, '切换瞬间要给出加载态');
@@ -178,4 +178,12 @@ test('index.html：筛选条与选中项目卡的样式存在（浅/深主题共
   assert.match(indexHtml, /\.pane-filter \.filter-open \{/);
   assert.match(indexHtml, /\.pane-projects \.rows > \.row\.card\.selected \{/, '选中项目卡要常驻可辨识');
   assert.match(indexHtml, /\.pane-filter \.filter-count \{[^}]*margin-left: auto/);
+});
+
+test('app.js：新前端 + 旧后端时按项目名兜底过滤并提示重启（不显示错的行）', () => {
+  assert.match(appJs, /import \{[^}]*\bfilterExactProject\b[^}]*\} from '\.\/components\/search-filter\.js'/);
+  assert.match(appJs, /const exact = filterExactProject\(raw, project\);/);
+  assert.match(appJs, /sessions: exact,/);
+  assert.match(appJs, /hwb 后端仍是旧版本（未识别按项目筛选）：已在前端按项目名兜底过滤。重启 hwb 后即可取到该项目的全部会话。/);
+  assert.match(appJs, /let staleBackendNoted = false;/);
 });

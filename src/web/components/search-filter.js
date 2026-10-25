@@ -34,6 +34,21 @@ export function sessionMatches(session, query) {
   return includesAny([session?.title, session?.workspaceTitle, session?.project], normalizeQuery(query));
 }
 
+// 按项目名**精确**过滤会话（不是搜索：大小写/子串都不折叠）。
+//
+// 服务端 /api/sessions/recent?project= 已经做了一次精确过滤，这里为什么还要再做一次？
+// 因为前端文件是「每次请求都从磁盘取」的静态资源，而服务端进程是**启动时加载**的：
+// 升级后只刷新浏览器、没重启 hwb 时，会出现「新前端 + 旧后端」的混合状态 —— 旧后端不认识
+// project 参数，会把**全局最近 200 条**当成项目会话返回，于是筛选条写着 PMAID-GPPH、列表里
+// 却混着 relic-distill-cwd 的会话（实测真实发生）。前端兜底再过滤一次，混合状态下至少
+// 不会显示错的行；重启后端后就变成一次无害的空操作。
+export function filterExactProject(sessions, project) {
+  const name = String(project ?? '');
+  const list = Array.isArray(sessions) ? sessions.filter(Boolean) : [];
+  if (!name) return list;
+  return list.filter((s) => String(s.project ?? '') === name);
+}
+
 // 过滤 + 计数：列表渲染前的唯一一道口径。
 // connectedIds 是已连接实例的 homeId 集合；为空表示「当前没有可展示的数据源」，
 // 此时返回空列表与 null 计数（渲染方画「连接实例后显示…」空态）。

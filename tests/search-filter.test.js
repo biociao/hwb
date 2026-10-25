@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 // 顶栏搜索的过滤内核。这些用例锁的是**匹配口径**（用户看得见的名字）与**计数口径**
 // （未过滤是数字、过滤中是「命中/总数」），不锁具体渲染文案的排版。
-const { normalizeQuery, projectMatches, sessionMatches, filterRecent, searchEmptyHtml,
+const { normalizeQuery, projectMatches, sessionMatches, filterExactProject, filterRecent, searchEmptyHtml,
   searchPendingHtml, mergeSearchResults } =
   await import('../src/web/components/search-filter.js');
 
@@ -145,4 +145,20 @@ test('mergeSearchResults: 空/非法输入不崩（接口失败时调用方仍�
   });
   assert.deepEqual(withNulls.projects.map((p) => p.project ?? null), ['PMAID-RENJI', 'x']);
   assert.deepEqual(withNulls.sessions, []);
+});
+
+// 新前端 + 旧后端混合状态的兜底：旧后端不认识 ?project=，会返回全局最近会话。
+// 前端必须再精确过滤一次，否则会出现「筛选条写着 A、列表里混着 B」的错位（真实发生过）。
+test('filterExactProject: 精确等值兜底（不做大小写/子串折叠）', () => {
+  const rows = [
+    session({ project: 'PMAID-GPPH', sessionId: 'a' }),
+    session({ project: 'relic-distill-cwd', sessionId: 'b' }),
+    session({ project: 'PMAID', sessionId: 'c' }),
+    null,
+  ];
+  assert.deepEqual(filterExactProject(rows, 'PMAID-GPPH').map((s) => s.sessionId), ['a']);
+  assert.deepEqual(filterExactProject(rows, 'PMAID').map((s) => s.sessionId), ['c'], '不能把 PMAID-GPPH 吞进来');
+  assert.deepEqual(filterExactProject(rows, 'pmaid-gpph'), [], '项目名是身份，不做大小写折叠');
+  assert.equal(filterExactProject(rows, '').length, 3, '空项目名 = 不额外过滤（并滤掉 null 行）');
+  assert.deepEqual(filterExactProject(null, 'x'), []);
 });

@@ -39,12 +39,13 @@ export function shortSessionId(id) {
 //   ① 现在筛的是哪个项目（名字可能很长，要能看出被截断的完整值 → title）；
 //   ② 怎么退出（✕ 清除；点同一个项目卡也会取消）；
 //   ③ 原来的「点项目跳实例」能力去哪了（右侧「打开项目」按钮，语义与原项目卡点击一致）。
+//   ④ 这个项目是否在默认静音列表里（muted → 「取消隐藏」按钮；显式点开时仍显示会话）。
 // 计数只报**筛出来的条数**（不是「命中/总数」—— 项目筛选不是搜索，没有可比的分母）；
 // 被 limit 截断时由调用方在列表底部补一句「仅显示最近 N 条」，这里不重复。
 //
 // 所有字段都来自索引元数据 / 项目卡（不可信输入），进 HTML 前一律 esc；
 // homeId/sessionId/workspaceId 只作为 data-* 交给 drill-in 处理，同样是 esc。
-export function renderSessionFilter({ project, homeId = null, sessionId = null, workspaceId = null, count = null } = {}) {
+export function renderSessionFilter({ project, homeId = null, sessionId = null, workspaceId = null, count = null, muted = false } = {}) {
   const name = String(project ?? '');
   // 条数口径与项目卡不同（卡上是「近 7 天会话数」，这里是索引里的全部会话），title 说明差异，
   // 免得用户以为两个数字有一个错了。
@@ -57,12 +58,19 @@ export function renderSessionFilter({ project, homeId = null, sessionId = null, 
          data-workspace-id="${esc(workspaceId ?? '')}" data-project="${esc(name)}"
          title="打开该项目所在实例的最新会话（恢复原来的项目卡点击行为）">打开项目</button>`
     : '';
+  // 「隐藏」= 把该项目加入 Recent Sessions 的默认静音列表（持久化）；显式点开时仍显示。
+  // 已静音时必须明确写「已默认隐藏」，否则用户会把「取消隐藏」当成隐藏按钮（实测踩过）。
+  const muteHtml = `<button type="button" class="filter-mute" data-action="toggle-mute-project" data-project="${esc(name)}"
+      title="${muted ? '不再默认隐藏该项目的会话' : '把这些会话从 Recent Sessions 的默认视图里隐藏（可随时取消）'}">${muted ? '取消默认隐藏' : '默认隐藏'}</button>`;
+  const mutedStateHtml = muted ? '<span class="filter-state" title="该项目的会话在 Recent Sessions 默认视图中被隐藏；这里是你显式点开的查看视图">已默认隐藏</span>' : '';
   return `<div class="pane-filter" data-project="${esc(name)}">
     <span class="filter-label">项目筛选</span>
     <span class="filter-project" title="${esc(name)}">${esc(name)}</span>
     <button type="button" class="filter-clear" data-action="clear-project-filter"
       title="清除项目筛选，回到最近会话" aria-label="清除项目筛选">✕</button>
     ${countHtml}
+    ${mutedStateHtml}
+    ${muteHtml}
     ${openHtml}
   </div>`;
 }
