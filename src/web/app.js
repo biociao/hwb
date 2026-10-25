@@ -4,6 +4,7 @@ import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js
 import { renderWorkbench } from './components/workbench.js';
 import { renderRecentProjects } from './components/recent-projects.js';
 import { renderRecentSessions } from './components/recent-sessions.js';
+import { filterRecent, searchEmptyHtml } from './components/search-filter.js';
 import { connectedHomes, tabHomes } from './instance-state.js';
 import { planPaneNavigation, planPaneRecovery, updatePaneSession } from './instance-navigation.js';
 import { renderInstanceGrid } from './components/instance-grid.js';
@@ -25,10 +26,20 @@ const note = createNote(document.getElementById('note'));
 const modalEl = document.getElementById('modal');
 const themeBtn = document.getElementById('theme-btn');
 const themeMenu = document.getElementById('theme-menu');
+const searchInput = document.getElementById('search');
+const searchClear = document.getElementById('search-clear');
+const searchWrap = document.getElementById('search-wrap');
+
 let showAddForm = false;
 let lastHomes = [];
 let lastDetected = null; // 最近一次 /api/homes/detect 结果（Instances 添加表单的只读快捷入口用）
 let refreshSequence = 0;
+// 顶栏搜索的原始输入。不持久化：它是「当下想找什么」，刷新后回到未过滤状态，
+// 免得用户下次打开面对一个自己忘了的隐藏过滤器（与 sessionStorage 里的视图位置是两种语义）。
+let searchQuery = '';
+// 最近一轮拉到的原始列表 + 已连接实例集合。按键过滤直接复用它们（见 paintDashboard）：
+// 过滤只改「显示哪些行」，不该每敲一个字就重新打一次 /api/projects|sessions|usage。
+let lastLists = { projects: [], sessions: [], connectedIds: new Set() };
 const endpointSwitching = new Set();
 // Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
 let lastUsage = null;
@@ -229,6 +240,9 @@ function renderTabs() {
 // （releasePaneFrame）—— 保留标签页与会话 id，重新进入时重新挂载。
 function showView() {
   dashboardEl.hidden = view.kind !== 'dashboard';
+  // 搜索只作用于工作台的列表：实例视图（整页 iframe）里放着它没有意义，还会让人以为
+  // 它能过滤 dsh 页面。输入值保留，切回工作台时继续生效。
+  if (searchWrap) searchWrap.hidden = view.kind !== 'dashboard' || lastHomes.length === 0;
   const activeId = view.kind === 'instance' ? view.homeId : null;
   if (activeId) frameOrder = touchFrameOrder(frameOrder, activeId);
   for (const [homeId, pane] of panes) {
@@ -308,18 +322,38 @@ async function renderDashboard(sequence = refreshSequence) {
   lastUsage = usage;
   if (usage) lastUsageKey = usageKey(); // 与 fetchUsage 的缓存键同源（这里拿到的就是这个周期的数据）
   const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
+  lastLists = { projects, sessions, connectedIds };
+  paintDashboard();
+}
+
+// 把「最近一轮数据 + 当前搜索词」画成仪表盘。渲染只有这一条路径：
+//   · SSE 刷新拿到新数据 → renderDashboard → paintDashboard；
+//   · 搜索框输入 → paintDashboard（复用 lastLists，不重新请求）。
+// 计数、空态、过滤全部由 filterRecent() 决定，所以两条路径不可能画出不同的过滤结果。
+function paintDashboard() {
+  const { projects, sessions, connectedIds } = lastLists;
   // 只渲染「已连接实例」的项目/会话；计数与渲染用同一份数组，避免分区头写着 12 但列表只有 5 行。
-  const visibleProjects = connectedIds.size ? projects.filter((p) => connectedIds.has(p.homeId)) : [];
-  const visibleSessions = connectedIds.size ? sessions.filter((s) => connectedIds.has(s.homeId)) : [];
+  const filtered = filterRecent({ projects, sessions, connectedIds, query: searchQuery });
+  // 过滤到 0 条时给「清除搜索」的出路；未过滤的空列表仍用组件自己的空态文案。
+  const projectsHtml = !filtered.connected
+    ? '<div class="empty">连接实例后显示对应项目</div>'
+    : (filtered.filtering && !filtered.projects.length)
+      ? searchEmptyHtml('项目', searchQuery)
+      : renderRecentProjects(filtered.projects, lastHomes);
+  const sessionsHtml = !filtered.connected
+    ? '<div class="empty">连接实例后显示对应会话</div>'
+    : (filtered.filtering && !filtered.sessions.length)
+      ? searchEmptyHtml('会话', searchQuery)
+      : renderRecentSessions(filtered.sessions, lastHomes);
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
   const draft = captureAddFormDraft();
   dashboardEl.innerHTML = renderWorkbench({
-    projects: connectedIds.size ? renderRecentProjects(visibleProjects, lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
-    sessions: connectedIds.size ? renderRecentSessions(visibleSessions, lastHomes) : '<div class="empty">连接实例后显示对应会话</div>',
-    projectCount: connectedIds.size ? visibleProjects.length : null,
-    sessionCount: connectedIds.size ? visibleSessions.length : null,
+    projects: projectsHtml,
+    sessions: sessionsHtml,
+    projectCount: filtered.projectCount,
+    sessionCount: filtered.sessionCount,
     homes: renderInstanceGrid(lastHomes),
-    usage: renderUsageCard(usage, usageDim, lastUsageKey ?? usagePeriod.key),
+    usage: renderUsageCard(lastUsage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
   });
   fitTrendLabels(dashboardEl); // X 轴标签按实测宽度收边/去重叠（见 usage-card.js）
@@ -329,9 +363,27 @@ async function renderDashboard(sequence = refreshSequence) {
     const form = dashboardEl.querySelector('#add-home');
     const restored = restoreFormDraft(form, draft); // 内部会重放模式（显隐/必填）
     applyHomeMode(form, form.mode?.value || 'local');
-    if (!restored) form.querySelector('input[name=homePath]')?.focus();
+    // 默认聚焦 homePath 是「表单刚展开」时的便利；但搜索框输入也会走到这里重绘 ——
+    // 那时把焦点抢到表单上会让用户敲一个字就跳出搜索框（实测会断掉连续输入）。
+    if (!restored && document.activeElement !== searchInput) form.querySelector('input[name=homePath]')?.focus();
   }
   hlProject = null; hlRow = null; hlKind = null; // 刷新后清除残留高亮状态
+}
+
+// —— 顶栏搜索：按名字过滤 Recent Projects / Recent Sessions ——
+// 过滤口径只有一处：filterRecent()（components/search-filter.js）。这里只负责
+// DOM 状态（清除按钮）与「什么时候重画」。
+function syncSearchChrome() {
+  if (searchClear) searchClear.hidden = searchQuery === '';
+}
+function setSearchQuery(value, { repaint = true } = {}) {
+  const next = String(value ?? '');
+  searchQuery = next;
+  // Esc / ✕ 是程序化改值：input 自己不会收到 input 事件，得手动同步。
+  if (searchInput && searchInput.value !== next) searchInput.value = next;
+  syncSearchChrome();
+  // 输入法组合中不重画（见下面的 compositionend）：值可能没变，所以这里不因「没变」而跳过。
+  if (repaint && view.kind === 'dashboard' && lastHomes.length) paintDashboard();
 }
 
 function goDashboard() {
@@ -808,6 +860,11 @@ async function handleAction(e) {
       case 'nav-dashboard':
         goDashboard();
         break;
+      case 'clear-search':
+        // 空态里的「清除搜索」：清空后把焦点放回搜索框，方便接着换一个词。
+        setSearchQuery('');
+        searchInput?.focus();
+        break;
       case 'nav-instance':
         await enterInstance(btn.dataset.homeId);
         break;
@@ -990,6 +1047,42 @@ document.body.addEventListener('keydown', (e) => {
   if (e.target !== el) return; // 只处理「焦点就在这个可激活元素上」，不劫持内部控件的按键
   e.preventDefault(); // Space 默认会滚动页面
   handleAction({ target: el });
+});
+
+// —— 顶栏搜索的输入事件 ——
+// input 事件驱动本地过滤，不 debounce：列表最多 20 + 50 行，字符串比较 + 重绘远低于一次
+// 网络往返，加延迟只会让「敲字 → 列表变化」显得卡。
+// 中文/日文输入法的组合过程（compositionstart → end）里敲的是拼音字母、不是最终词：
+// 若每一步都拿去过滤，列表会在「筛空 → 恢复」之间反复闪；所以组合期间只更新状态与
+// 清除按钮，compositionend 再真正过滤。
+let searchComposing = false;
+searchInput?.addEventListener('compositionstart', () => { searchComposing = true; });
+searchInput?.addEventListener('compositionend', (e) => {
+  searchComposing = false;
+  setSearchQuery(e.target.value);
+});
+searchInput?.addEventListener('input', (e) => {
+  setSearchQuery(e.target.value, { repaint: !searchComposing });
+});
+// type=search 的原生清除（部分浏览器）走 search 事件：统一同步状态。
+searchInput?.addEventListener('search', (e) => setSearchQuery(e.target.value));
+searchInput?.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  // Esc 语义：有内容 → 清空（仍留在搜索框里）；已清空 → 失焦，把键盘交回页面。
+  if (searchQuery !== '') { e.preventDefault(); setSearchQuery(''); return; }
+  searchInput.blur();
+});
+// 全局「/」聚焦搜索（GitHub 式）。不接管 Cmd/Ctrl+K —— 那是浏览器地址栏的既有快捷键，
+// 抢过来会让人以为浏览器坏了。焦点已在输入控件里时不劫持（用户可能真的想输入「/」）。
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+  const target = e.target;
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+  if (view.kind !== 'dashboard' || !searchInput || searchWrap?.hidden) return;
+  if (!modalEl.hidden) return; // 设置弹层里按「/」不该把焦点抢到背后的搜索框
+  e.preventDefault();
+  searchInput.focus();
+  searchInput.select();
 });
 
 // —— 实例 tab 拖拽排序（HTML5 DnD）——

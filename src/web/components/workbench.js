@@ -1,8 +1,12 @@
+import { esc } from '../store.js';
+
 // 三栏的「分区身份」：Projects 用项目色（赭石），Sessions 用强调色（墨蓝），Instances 中性。
 // 分区的颜色 + 图标 + 计数，配合两种卡不同的第一视觉锚点（项目徽标 / 会话状态轨），
 // 让两栏在扫视时不会串。计数由调用方传入（缺省不画，保持旧调用兼容）。
+// projectCount / sessionCount 既可以是数字（未过滤），也可以是 "3/20" 这样的字符串
+// （搜索过滤中：命中/总数）—— 两种形态都走同一条 esc → innerHTML 路径。
 export function renderWorkbench({ projects, sessions, homes, usage, logs, projectCount = null, sessionCount = null }) {
-  const count = (n) => (Number.isInteger(n) ? `<span class="pane-count">${n}</span>` : '');
+  const count = (n) => (n == null || n === '' ? '' : `<span class="pane-count">${esc(n)}</span>`);
   return `
     <section class="pane pane-projects"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">▦</span>Recent Projects</span>${count(projectCount)}</h2>${projects}</section>
     <section class="pane pane-sessions"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">◍</span>Recent Sessions</span>${count(sessionCount)}</h2>${sessions}</section>

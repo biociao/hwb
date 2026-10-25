@@ -462,8 +462,10 @@ test('app.js: 用量卡的高亮周期取自屏上数据（lastUsageKey），不
   assert.match(src, /if \(seq !== usageSequence \|\| key !== usageKey\(\)\) return;[\s\S]{0,300}?lastUsageKey = key;/,
     'lastUsageKey 只能在通过序号/周期校验之后才更新');
   assert.match(src, /renderUsageCard\(usage, usageDim, lastUsageKey\)/);
-  assert.match(src, /renderUsageCard\(usage, usageDim, lastUsageKey \?\? usagePeriod\.key\)/);
-  assert.doesNotMatch(src, /renderUsageCard\(usage, usageDim, usagePeriod\.key\)/,
+  // 仪表盘整卡重绘收敛到 paintDashboard()：变量名从 usage 变成 lastUsage（最近一轮成功
+  // 拿到的用量），周期仍是屏上数据自己的 lastUsageKey —— 语义不变，两条渲染路径都要守。
+  assert.match(src, /renderUsageCard\((?:lastUsage|usage), usageDim, lastUsageKey \?\? usagePeriod\.key\)/);
+  assert.doesNotMatch(src, /renderUsageCard\((?:lastUsage|usage), usageDim, usagePeriod\.key\)/,
     '不得用「用户刚点的周期」去高亮旧数据');
 });
 

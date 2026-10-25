@@ -425,8 +425,35 @@
     .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
     .modal-actions button.primary { color: var(--on-accent); }
 
-    /* —— 右上角主题切换：设置按钮 + 下拉菜单（白天/黑夜/跟随系统） —— */
-    .topbar-right { display: flex; align-items: center; flex-shrink: 0; margin-left: 8px; }
+    /* —— 右上角：搜索框 + 主题切换（设置按钮 + 下拉菜单） —— */
+    .topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: 8px; }
+
+    /* 顶栏搜索：过滤 Recent Projects / Recent Sessions。
+       宽度随窗口伸到 420px 上限（宽屏上足够当一个「找东西」的入口），窄屏收到 170px；
+       输入框用的都是主题 token，深浅两套主题不用各写一遍。 */
+    .search-wrap { position: relative; display: flex; align-items: center; flex: 0 0 auto; }
+    .search-wrap[hidden] { display: none !important; }
+    .search-icon { position: absolute; left: 9px; color: var(--dim); pointer-events: none; }
+    .search-input { width: clamp(170px, 28vw, 420px); height: 30px; padding: 0 28px 0 28px;
+                    font: inherit; font-size: 12.5px; color: var(--fg); background: var(--sunken);
+                    border: 1px solid var(--border); border-radius: 6px; outline: none;
+                    transition: border-color .15s, background .15s, box-shadow .15s; }
+    .search-input::placeholder { color: var(--dim); }
+    .search-input:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+    .search-input:focus { background: var(--panel); border-color: var(--accent);
+                          box-shadow: 0 0 0 3px var(--accent-soft); }
+    /* type=search 的原生清除按钮会和我们自己的 ✕ 重复，隐藏原生那个 */
+    .search-input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+    .search-clear { position: absolute; right: 5px; display: inline-flex; align-items: center;
+                    justify-content: center; width: 20px; height: 20px; padding: 0; font-size: 11px;
+                    line-height: 1; color: var(--dim); background: transparent; border: none;
+                    border-radius: 4px; cursor: pointer; }
+    .search-clear:hover { color: var(--fg); background: var(--hover); }
+    .search-clear[hidden] { display: none !important; }
+    /* 过滤后 0 条：空态里直接给「清除搜索」，不是干巴巴一句「没有」 */
+    .search-empty { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .search-empty button { padding: 0 8px; font-size: 11px; }
+
     .theme-wrap { position: relative; }
     .icon-btn { display: inline-flex; width: 30px; height: 30px; align-items: center; justify-content: center;
                 padding: 0; font-size: 15px; line-height: 1; border: 1px solid var(--border); border-radius: 6px;
@@ -484,6 +511,19 @@
     <div class="brand">(=hωb=) <span id="live" class="live">connecting…</span></div>
     <div id="tabs" class="tabbar"></div>
     <div class="topbar-right">
+      <!-- 顶栏搜索：按名字过滤 Recent Projects / Recent Sessions（见 app.js 的 setSearchQuery）。
+           只作用于工作台列表；切到实例视图时由 showView() 隐藏。 -->
+      <div id="search-wrap" class="search-wrap" role="search">
+        <svg class="search-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
+          <circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" stroke-width="1.6"></circle>
+          <path d="M10.3 10.3 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"></path>
+        </svg>
+        <input id="search" class="search-input" type="search" placeholder="搜索项目 / 会话名…"
+               aria-label="搜索项目或会话名（按 / 聚焦，Esc 清空）"
+               autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="search-clear" class="search-clear" type="button" data-action="clear-search"
+                title="清除搜索 (Esc)" aria-label="清除搜索" hidden>✕</button>
+      </div>
       <div class="theme-wrap">
         <button id="theme-btn" class="icon-btn" title="选择界面外观" aria-haspopup="true"
                 aria-label="切换主题（白天/黑夜/跟随系统）">🌓</button>

@@ -6,6 +6,36 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 界面：顶栏搜索框（过滤项目 / 会话）
+
+**动机**：项目与会话越攒越多（实测 20 个项目 / 50 条会话），要定位某个项目或某次会话只能
+在列表里肉眼滚动；Recent Projects 与 Recent Sessions 又各自是独立滚动区，找一条得滚两遍。
+
+- **位置**：顶栏右侧、主题按钮左侧（原先的空白处），宽度随窗口伸到 420px 上限，窄屏收到
+  170px；浅色 / 深色主题各用一套 token，聚焦时 accent 描边 + 柔和外环。
+- **匹配口径**：只认用户看得见的**名字** —— 项目名；会话标题（缺省回退工作区名）与所属项目名。
+  大小写不敏感，`NFKC` 归一化（全角/半角等价），空白查询视为未过滤。会话 id 不参与：UUID
+  公共前缀会让「敲几个字母」变成全命中。
+- **只影响显示**：计数从 `20` 变成「命中/总数」如 `3/20`；0 命中时两栏各自给出「清除搜索」，
+  而不是一片空白。Token 用量 / Instances / 运行日志不受影响；过滤复用最近一轮数据，
+  **不重新请求接口**，SSE 刷新（每 3s）后过滤继续生效。
+- **交互**：`input` 即时过滤（不 debounce）；`/` 聚焦、`Esc` 清空（已空再按失焦）、✕ 清除；
+  中文输入法组合期间不按拼音中间态过滤（否则列表会反复闪空），`compositionend` 再应用；
+  切到实例 tab 时搜索框隐藏（它只作用于工作台），输入值保留。
+- **实现**：新增 `src/web/components/search-filter.js`（纯函数：`normalizeQuery` /
+  `projectMatches` / `sessionMatches` / `filterRecent` / `searchEmptyHtml`）；`app.js` 把
+  仪表盘渲染收敛成唯一入口 `paintDashboard()`（SSE 刷新与按键过滤共用，不可能出现两套过滤
+  口径），并维护 `lastLists`（最近一轮原始列表 + 已连接实例集合）供本地重绘；
+  `workbench.js` 的计数同时接受数字与「命中/总数」字符串；`index.html` 增加输入框、
+  SVG 放大镜、自绘 ✕（隐藏 `type=search` 的原生清除按钮）与样式。
+- **真浏览器验证**：headless Chrome 实测 18 项（过滤命中 / 计数 / 0 命中空态 / ✕ / Esc /
+  `/` 聚焦 / 添加表单展开时输入不被打断 / SSE 刷新后仍生效 / 浅深主题截图），并抓到两个
+  只有真交互才暴露的缺陷：✕ 漏了 `data-action`（委托处理器收不到）；表单展开时「默认聚焦
+  homePath」会把焦点从搜索框抢走 —— 均已修复并加断言守住。
+- **测试**：新增 `tests/search-filter.test.js`、`tests/dashboard-search.test.js`；并按
+  `paintDashboard()` 重构更新 `tests/web-render-safety.test.js` 的源码级断言（语义不变：
+  用量卡仍按屏上数据自己的 `lastUsageKey` 高亮）。
+
 ### 本地工具实例统一：Codex / dsh 只读 / WorkBuddy
 
 **动机**：Instances 里的本地工具此前各写各的 —— Codex 卡有「已就绪」和「打开」却没有版本号；
