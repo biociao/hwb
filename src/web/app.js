@@ -4,7 +4,7 @@ import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js
 import { renderWorkbench } from './components/workbench.js';
 import { renderRecentProjects } from './components/recent-projects.js';
 import { renderRecentSessions } from './components/recent-sessions.js';
-import { filterRecent, searchEmptyHtml } from './components/search-filter.js';
+import { filterRecent, searchEmptyHtml, searchPendingHtml, mergeSearchResults, normalizeQuery } from './components/search-filter.js';
 import { connectedHomes, tabHomes } from './instance-state.js';
 import { planPaneNavigation, planPaneRecovery, updatePaneSession } from './instance-navigation.js';
 import { renderInstanceGrid } from './components/instance-grid.js';
@@ -40,6 +40,29 @@ let searchQuery = '';
 // 最近一轮拉到的原始列表 + 已连接实例集合。按键过滤直接复用它们（见 paintDashboard）：
 // 过滤只改「显示哪些行」，不该每敲一个字就重新打一次 /api/projects|sessions|usage。
 let lastLists = { projects: [], sessions: [], connectedIds: new Set() };
+// 全库补搜的状态（顶栏搜索框的历史部分）。
+//
+// 为什么不能只过滤 lastLists：那两段数据分别是「近 7 天 top 20 项目」和「最近 50 条会话」，
+// 更早的项目/会话根本不在里面。实测：PMAID-GPPH 最后活动在 32 天前，输入 GPPH 得到
+// 0/20、0/50，而索引里明明有它 7 条会话。这里在用户停手后向 /api/search 再问一次全库，
+// 把历史命中合并进列表（行上打 historical 标记），本地过滤仍然即时生效。
+// query/seq 成对使用：连续输入时先发后到的慢响应不能覆盖新查询的结果。
+let searchState = {
+  query: '',
+  seq: 0,
+  status: 'idle', // idle | loading | done | error
+  projects: [],
+  sessions: [],
+  truncated: { projects: false, sessions: false },
+};
+let searchSeq = 0;
+let searchTimer = null;
+// 防抖窗口：太短会让每个字都触发一次全表扫描（instr 走不了索引），
+// 太长会让「历史结果」明显晚于本地过滤出现。200ms 是输入停顿的常见阈值。
+const SEARCH_DEBOUNCE_MS = 200;
+// 与 /api/projects/recent、/api/sessions/recent 的默认量级一致：搜索是给人定位用的，不是导出。
+const SEARCH_PROJECT_LIMIT = 20;
+const SEARCH_SESSION_LIMIT = 50;
 const endpointSwitching = new Set();
 // Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
 let lastUsage = null;
@@ -326,32 +349,63 @@ async function renderDashboard(sequence = refreshSequence) {
   paintDashboard();
 }
 
-// 把「最近一轮数据 + 当前搜索词」画成仪表盘。渲染只有这一条路径：
+// 当前有效查询词：本地过滤与 /api/search 共用同一个归一化口径（大小写 / 全角 / 空白）。
+const searchKey = () => normalizeQuery(searchQuery);
+
+// 已完成的、与当前输入词一致的全库结果；没有就返回 null（此时只显示最近列表内的命中）。
+function fullSearchResult() {
+  const key = searchKey();
+  if (!key || searchState.query !== key || searchState.status !== 'done') return null;
+  return searchState;
+}
+
+// 全库补搜进行中（本地暂时没有命中时，用它画「正在全库检索…」而不是先闪「没有匹配」）。
+function fullSearchPending() {
+  const key = searchKey();
+  return !!(key && searchState.query === key && searchState.status === 'loading');
+}
+
+// 把「最近一轮数据 + 全库补搜结果 + 当前搜索词」画成仪表盘。渲染只有这一条路径：
 //   · SSE 刷新拿到新数据 → renderDashboard → paintDashboard；
-//   · 搜索框输入 → paintDashboard（复用 lastLists，不重新请求）。
-// 计数、空态、过滤全部由 filterRecent() 决定，所以两条路径不可能画出不同的过滤结果。
+//   · 搜索框输入 → paintDashboard（本地过滤即时生效，不重新请求最近列表）；
+//   · /api/search 返回 → paintDashboard（把历史命中合并进来）。
+// 计数、空态、过滤全部由 filterRecent() 决定，所以几条路径不可能画出不同的过滤结果。
 function paintDashboard() {
   const { projects, sessions, connectedIds } = lastLists;
+  const full = fullSearchResult();
+  // 最近列表优先，全库结果只补「最近列表里没有的」历史行（见 mergeSearchResults 的注释）。
+  const lists = full
+    ? mergeSearchResults({ projects, sessions, searchedProjects: full.projects, searchedSessions: full.sessions })
+    : { projects, sessions };
   // 只渲染「已连接实例」的项目/会话；计数与渲染用同一份数组，避免分区头写着 12 但列表只有 5 行。
-  const filtered = filterRecent({ projects, sessions, connectedIds, query: searchQuery });
-  // 过滤到 0 条时给「清除搜索」的出路；未过滤的空列表仍用组件自己的空态文案。
+  const filtered = filterRecent({ projects: lists.projects, sessions: lists.sessions, connectedIds, query: searchQuery });
+  const pending = fullSearchPending();
+  // 过滤到 0 条时给「清除搜索」的出路；全库补搜还在路上时先说明「正在检索」。
   const projectsHtml = !filtered.connected
     ? '<div class="empty">连接实例后显示对应项目</div>'
     : (filtered.filtering && !filtered.projects.length)
-      ? searchEmptyHtml('项目', searchQuery)
+      ? (pending ? searchPendingHtml('项目', searchQuery) : searchEmptyHtml('项目', searchQuery))
       : renderRecentProjects(filtered.projects, lastHomes);
   const sessionsHtml = !filtered.connected
     ? '<div class="empty">连接实例后显示对应会话</div>'
     : (filtered.filtering && !filtered.sessions.length)
-      ? searchEmptyHtml('会话', searchQuery)
+      ? (pending ? searchPendingHtml('会话', searchQuery) : searchEmptyHtml('会话', searchQuery))
       : renderRecentSessions(filtered.sessions, lastHomes);
+  // 过滤中的计数不再用「命中/最近列表总数」：命中可能来自全库，分母（最近 20/50 条）与它没有
+  // 可比性。只报命中数；未过滤时仍是最近列表的条数（与改造前的 20 / 50 一致）。
+  const count = (shown, total) => (filtered.filtering ? `${shown} 命中` : total);
+  // 命中超过上限时明确说一声，避免用户以为「只有这些」；更精确的关键词可以继续缩小。
+  const projectsMore = full?.truncated.projects
+    ? `<div class="search-more">仅显示最近 ${SEARCH_PROJECT_LIMIT} 个项目，可用更精确的关键词缩小范围</div>` : '';
+  const sessionsMore = full?.truncated.sessions
+    ? `<div class="search-more">仅显示最近 ${SEARCH_SESSION_LIMIT} 条会话，可用更精确的关键词缩小范围</div>` : '';
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
   const draft = captureAddFormDraft();
   dashboardEl.innerHTML = renderWorkbench({
-    projects: projectsHtml,
-    sessions: sessionsHtml,
-    projectCount: filtered.projectCount,
-    sessionCount: filtered.sessionCount,
+    projects: projectsHtml + projectsMore,
+    sessions: sessionsHtml + sessionsMore,
+    projectCount: filtered.connected ? count(filtered.projects.length, filtered.totalProjects) : null,
+    sessionCount: filtered.connected ? count(filtered.sessions.length, filtered.totalSessions) : null,
     homes: renderInstanceGrid(lastHomes),
     usage: renderUsageCard(lastUsage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
@@ -370,18 +424,78 @@ function paintDashboard() {
   hlProject = null; hlRow = null; hlKind = null; // 刷新后清除残留高亮状态
 }
 
-// —— 顶栏搜索：按名字过滤 Recent Projects / Recent Sessions ——
-// 过滤口径只有一处：filterRecent()（components/search-filter.js）。这里只负责
-// DOM 状态（清除按钮）与「什么时候重画」。
+// —— 顶栏搜索：按名字过滤 Recent Projects / Recent Sessions + 全库补搜历史 ——
+// 过滤口径只有一处：filterRecent()（components/search-filter.js）；「历史从哪来」只有一处：
+// /api/search（store.searchAll）。这里只负责 DOM 状态（清除按钮）与「什么时候重画/请求」。
 function syncSearchChrome() {
   if (searchClear) searchClear.hidden = searchQuery === '';
 }
+
+// 在途请求作废 + 取消还没发出去的防抖定时器。清空搜索框、切换查询词都要走这里。
+function resetSearchState() {
+  searchSeq += 1; // 已发出的请求即使回来也会被 seq 挡掉
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }
+  searchState = { query: '', seq: searchSeq, status: 'idle', projects: [], sessions: [], truncated: { projects: false, sessions: false } };
+}
+
+// 每次输入都重新排一次防抖：只有用户停手超过 SEARCH_DEBOUNCE_MS 才真正请求全库。
+// 本地过滤不经过这里（输入当帧就生效），全库只是「补历史」的慢路径。
+function scheduleFullSearch() {
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }
+  const key = searchKey();
+  if (!key) { resetSearchState(); return; }
+  // 立刻切到 loading：本地暂无命中时先画「正在全库检索…」，避免在 200ms 防抖窗口里
+  // 先闪一次「没有匹配」再被结果顶掉。真正的请求在定时器到点后才发出。
+  searchState = { query: key, seq: searchSeq, status: 'loading', projects: [], sessions: [], truncated: { projects: false, sessions: false } };
+  searchTimer = setTimeout(() => {
+    searchTimer = null;
+    requestFullSearch(key);
+  }, SEARCH_DEBOUNCE_MS);
+}
+
+function requestFullSearch(key) {
+  const seq = ++searchSeq;
+  searchState = { query: key, seq, status: 'loading', projects: [], sessions: [], truncated: { projects: false, sessions: false } };
+  const params = new URLSearchParams({
+    q: key,
+    projectLimit: String(SEARCH_PROJECT_LIMIT),
+    sessionLimit: String(SEARCH_SESSION_LIMIT),
+  });
+  api(`/api/search?${params}`)
+    .then((body) => {
+      // 只接受「仍是最新一次请求 + 输入框还是同一个词」的响应：连续输入时慢请求会乱序返回。
+      if (seq !== searchSeq || key !== searchKey()) return;
+      searchState = {
+        query: key,
+        seq,
+        status: 'done',
+        projects: Array.isArray(body?.projects) ? body.projects : [],
+        sessions: Array.isArray(body?.sessions) ? body.sessions : [],
+        truncated: {
+          projects: body?.truncated?.projects === true,
+          sessions: body?.truncated?.sessions === true,
+        },
+      };
+      if (view.kind === 'dashboard') paintDashboard();
+    })
+    .catch((error) => {
+      if (seq !== searchSeq || key !== searchKey()) return;
+      searchState = { query: key, seq, status: 'error', projects: [], sessions: [], truncated: { projects: false, sessions: false } };
+      // 全库补搜失败不能让本地过滤一起失效：保留最近列表内的命中，只提示历史部分不可用。
+      note.set(`全库搜索失败：${error?.message ?? error}（仅显示最近列表内的匹配）`);
+      if (view.kind === 'dashboard') paintDashboard();
+    });
+}
+
 function setSearchQuery(value, { repaint = true } = {}) {
   const next = String(value ?? '');
   searchQuery = next;
   // Esc / ✕ 是程序化改值：input 自己不会收到 input 事件，得手动同步。
   if (searchInput && searchInput.value !== next) searchInput.value = next;
   syncSearchChrome();
+  // 输入法组合期间不触发全库请求：拼音中间态（如 "gpp"）既不是用户要搜的词，也会白打
+  // 一次全表扫描；compositionend 会以最终文本再排一次（那里 searchComposing 已复位）。
+  if (!searchComposing) scheduleFullSearch();
   // 输入法组合中不重画（见下面的 compositionend）：值可能没变，所以这里不因「没变」而跳过。
   if (repaint && view.kind === 'dashboard' && lastHomes.length) paintDashboard();
 }

@@ -453,6 +453,11 @@
     /* 过滤后 0 条：空态里直接给「清除搜索」，不是干巴巴一句「没有」 */
     .search-empty { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .search-empty button { padding: 0 8px; font-size: 11px; }
+    /* 全库检索补出的历史行：虚线边框 + 弱化文字，区别于「最近列表」里本来就在的行。
+       不用实心底色：它只是来源说明，不该抢过项目徽标/状态轨这两个第一视觉锚点。 */
+    .chip.hist-chip { background: transparent; border: 1px dashed var(--border); color: var(--dim); }
+    /* 命中数超过返回上限时的提示：贴着列表底部，语气是说明而不是报错。 */
+    .search-more { padding: 6px 2px; font-size: 11px; color: var(--dim); }
 
     .theme-wrap { position: relative; }
     .icon-btn { display: inline-flex; width: 30px; height: 30px; align-items: center; justify-content: center;

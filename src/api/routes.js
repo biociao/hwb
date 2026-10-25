@@ -982,6 +982,20 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       });
       return;
     }
+    // 全库搜索：顶栏搜索框在「最近列表之外」补历史项目/会话的唯一入口。
+    // 只读、无副作用；homeIds 仍走 dataHomeIds()（只搜运行中实例的索引），
+    // 所以调用方无法借它读到未连接实例的数据。q 为空时 store 直接返回空结果，不做扫描。
+    // 两个 limit 与 /api/projects/recent、/api/sessions/recent 的上限保持同一量级：
+    // 搜索是给人定位用的，不是导出；超出上限由 truncated 标志告诉前端「还有更多」。
+    if (req.method === 'GET' && pathname === '/api/search') {
+      send(res, 200, store.searchAll({
+        q: searchParams.get('q') ?? '',
+        homeIds: dataHomeIds(),
+        projectLimit: numParam(searchParams.get('projectLimit'), 20, 1, 100),
+        sessionLimit: numParam(searchParams.get('sessionLimit'), 50, 1, 200),
+      }));
+      return;
+    }
     if (req.method === 'GET' && pathname === '/api/workspaces') {
       send(res, 200, {
         workspaces: store.listWorkspaces({ homeId: searchParams.get('homeId') || null }),

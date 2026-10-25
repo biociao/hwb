@@ -6,35 +6,53 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-### 界面：顶栏搜索框（过滤项目 / 会话）
+### 界面：顶栏搜索（本地即时过滤 + 全库历史补搜）
 
 **动机**：项目与会话越攒越多（实测 20 个项目 / 50 条会话），要定位某个项目或某次会话只能
 在列表里肉眼滚动；Recent Projects 与 Recent Sessions 又各自是独立滚动区，找一条得滚两遍。
+但只过滤「最近这一小段」并不够：Recent Projects 带 7 天窗口 + `LIMIT 20`，Recent Sessions
+只有最近 50 条。实测在搜索框输入 `GPPH` 得到「0/20、0/50」，可索引里明明有 PMAID-GPPH
+（最后活动 32 天前，7 条会话）与 PUMCH-GPPH（Codex，4 天前，但项目排第 33，被 `LIMIT 20`
+截掉）—— 搜索必须能补历史，而不是只筛屏上那几行。
 
 - **位置**：顶栏右侧、主题按钮左侧（原先的空白处），宽度随窗口伸到 420px 上限，窄屏收到
   170px；浅色 / 深色主题各用一套 token，聚焦时 accent 描边 + 柔和外环。
+- **两段式命中**：本地即时过滤（复用最近一轮数据，零请求）+ 停手 200ms 后 `GET /api/search`
+  全库补搜（不受 7 天窗口 / Recent 条数上限限制）。历史命中与最近列表**合并去重**渲染，
+  只补最近列表里没有的行，并带「历史」chip 说明来源；最近行优先，本地已有命中时不会因为
+  补搜结果而重排。
 - **匹配口径**：只认用户看得见的**名字** —— 项目名；会话标题（缺省回退工作区名）与所属项目名。
   大小写不敏感，`NFKC` 归一化（全角/半角等价），空白查询视为未过滤。会话 id 不参与：UUID
   公共前缀会让「敲几个字母」变成全命中。
-- **只影响显示**：计数从 `20` 变成「命中/总数」如 `3/20`；0 命中时两栏各自给出「清除搜索」，
-  而不是一片空白。Token 用量 / Instances / 运行日志不受影响；过滤复用最近一轮数据，
-  **不重新请求接口**，SSE 刷新（每 3s）后过滤继续生效。
-- **交互**：`input` 即时过滤（不 debounce）；`/` 聚焦、`Esc` 清空（已空再按失焦）、✕ 清除；
-  中文输入法组合期间不按拼音中间态过滤（否则列表会反复闪空），`compositionend` 再应用；
-  切到实例 tab 时搜索框隐藏（它只作用于工作台），输入值保留。
-- **实现**：新增 `src/web/components/search-filter.js`（纯函数：`normalizeQuery` /
-  `projectMatches` / `sessionMatches` / `filterRecent` / `searchEmptyHtml`）；`app.js` 把
-  仪表盘渲染收敛成唯一入口 `paintDashboard()`（SSE 刷新与按键过滤共用，不可能出现两套过滤
-  口径），并维护 `lastLists`（最近一轮原始列表 + 已连接实例集合）供本地重绘；
-  `workbench.js` 的计数同时接受数字与「命中/总数」字符串；`index.html` 增加输入框、
-  SVG 放大镜、自绘 ✕（隐藏 `type=search` 的原生清除按钮）与样式。
-- **真浏览器验证**：headless Chrome 实测 18 项（过滤命中 / 计数 / 0 命中空态 / ✕ / Esc /
-  `/` 聚焦 / 添加表单展开时输入不被打断 / SSE 刷新后仍生效 / 浅深主题截图），并抓到两个
-  只有真交互才暴露的缺陷：✕ 漏了 `data-action`（委托处理器收不到）；表单展开时「默认聚焦
-  homePath」会把焦点从搜索框抢走 —— 均已修复并加断言守住。
-- **测试**：新增 `tests/search-filter.test.js`、`tests/dashboard-search.test.js`；并按
-  `paintDashboard()` 重构更新 `tests/web-render-safety.test.js` 的源码级断言（语义不变：
-  用量卡仍按屏上数据自己的 `lastUsageKey` 高亮）。
+- **计数与空态**：过滤中计数只报「N 命中」—— 命中可能来自全库，分母（最近 20/50 条）不再有
+  可比性；补搜在路上且本地暂无命中时先显示「正在全库检索…」而不是闪一下「没有匹配」；0 命中
+  时两栏各自给出「清除搜索」的出路。超过返回上限（项目 20 / 会话 50）时列表底部说明
+  「仅显示最近 N 条」。Token 用量 / Instances / 运行日志不受影响。
+- **安全与代价**：`/api/search` 只读、只搜 `dataHomeIds()`（运行中实例）的索引；`q` 用
+  `instr(lower(col), ?)` 做**字面子串**匹配（`%` / `_` 不是通配符，不需要转义），服务端再做
+  NFKC 与 120 字符上限。`instr` 走不了索引，所以请求由前端 200ms 防抖触发、服务端限制返回
+  条数，不做分页。实测 2.5k 会话的索引库上单次 `searchAll` 约 1.5ms（含项目 + 会话两条 SQL）。
+- **交互**：`input` 先即时本地过滤，全库请求防抖 200ms；`/` 聚焦、`Esc` 清空（已空再按失焦）、
+  ✕ 清除；中文输入法组合期间既不本地过滤也不发全库请求（拼音中间态会白扫全表），
+  `compositionend` 后再统一应用；切到实例 tab 时搜索框隐藏（它只作用于工作台），输入值保留。
+- **实现**：前端新增 `src/web/components/search-filter.js`（纯函数：`normalizeQuery` /
+  `projectMatches` / `sessionMatches` / `filterRecent` / `searchEmptyHtml` /
+  `searchPendingHtml` / `mergeSearchResults`）；`app.js` 维护 `searchState`（query + seq +
+  truncated）与防抖定时器，用 `(seq, 当前查询词)` 双重守卫丢弃乱序响应，渲染仍收敛在唯一入口
+  `paintDashboard()`；服务端新增 `store.searchAll()` 与 `GET /api/search`，项目侧复用
+  `recentProjects` 的聚合口径（多取 1 行判断 truncated），会话行复用
+  `hydrateSessionRow()` 保证与 `recentSessions` **逐字段同构**；`index.html` 增加输入框、
+  SVG 放大镜、自绘 ✕（隐藏 `type=search` 的原生清除按钮）、「历史」chip 与「仅显示前 N 条」
+  样式。
+- **真浏览器验证**：headless Chrome（`scripts/render-check.mjs`，隔离实例 + 真实索引库）实测
+  10 项全过：本地即时过滤（计数变「N 命中」）、防抖窗口内显示「正在全库检索」而不是先闪
+  「没有匹配」、补出 GPPH 项目/会话并带「历史」chip、清空后恢复 20/50、0 命中时两栏给出
+  「清除搜索」；无 `console.error` / 未捕获异常。
+- **测试**：新增 `tests/store-search.test.js`（7 天窗口外命中 / 大小写与 NFKC / homeIds 作用域 /
+  字面通配符 / 行形状同构 / 孤立 workspace / 截断 / 空查询）、`tests/api-search.test.js`
+  （参数夹取 / 只读 / 端到端旧项目可搜 / 未连接实例不外泄）；扩展
+  `tests/search-filter.test.js`（合并去重、排序、历史标记）与 `tests/dashboard-search.test.js`
+  （防抖 + 序号守卫 + 合并 + 历史 chip 的源码级接线断言）。
 
 ### 本地工具实例统一：Codex / dsh 只读 / WorkBuddy
 

@@ -68,3 +68,49 @@ export function searchEmptyHtml(label, query) {
   return `<div class="empty search-empty">没有匹配「${esc(text)}」的${label}`
     + '<button type="button" data-action="clear-search">清除搜索</button></div>';
 }
+
+// 全库补搜还在路上、最近列表里又暂时没有命中时的占位。
+// 为什么需要：搜索会先做本地过滤、再发 /api/search；历史命中要等后端的响应。
+// 这几十~几百毫秒里如果直接画「没有匹配」，用户会以为真的没有，然后在结果出现时看到
+// 列表自己跳出来 —— 先说「正在全库检索」，语义才对。
+export function searchPendingHtml(label, query) {
+  return `<div class="empty search-empty">正在全库检索「${esc(String(query ?? '').trim())}」的${label}…</div>`;
+}
+
+// —— 全库补搜结果与「最近列表」的合并 ——
+//
+// 分工（为什么不是直接用检索结果替换列表）：
+//   · 最近列表已经在屏幕上，直接替换会让「输入第一个字」时整栏跳变；
+//   · 最近列表的项目卡带有 7 天窗口内的聚合与跳转目标，检索结果的行虽然同构，
+//     但「最近」这两个字本身也是信息，丢掉反而退步。
+// 所以：最近行优先（去重时保留最近那行），检索结果只补最近列表里没有的行，并打
+// historical 标记（组件渲染成「历史」chip，让用户知道它为什么不在 Recent 里）。
+//
+// 去重口径：
+//   · 项目按 project 名（recentProjects / searchAll 都按项目名跨实例聚合）；
+//   · 会话按 homeId + sessionId（同一条会话可能被不同实例索引到）。
+// 合并后按最后活动时间倒序：历史命中可能比最近列表的末位还新（recentProjects 会把
+// 无会话的 workspace 追加在末尾），不能一律 append 到尾部。
+const activityMs = (row) => {
+  const t = Date.parse(row?.lastActivity ?? '');
+  return Number.isFinite(t) ? t : -Infinity;
+};
+
+export function mergeSearchResults({ projects = [], sessions = [], searchedProjects = [], searchedSessions = [] } = {}) {
+  // 入参来自网络（最近列表）与接口（检索结果），任一侧都可能带空行；先滤掉再建 key，
+  // 否则 null 会一路漏进排序与渲染。
+  const baseProjects = projects.filter(Boolean);
+  const baseSessions = sessions.filter(Boolean);
+  const projectKeys = new Set(baseProjects.map((p) => String(p.project ?? '')));
+  const sessionKeys = new Set(baseSessions.map((s) => `${s.homeId ?? ''}\u0000${s.sessionId ?? ''}`));
+  const extraProjects = (Array.isArray(searchedProjects) ? searchedProjects : [])
+    .filter((p) => p && !projectKeys.has(String(p.project ?? '')))
+    .map((p) => ({ ...p, historical: true }));
+  const extraSessions = (Array.isArray(searchedSessions) ? searchedSessions : [])
+    .filter((s) => s && !sessionKeys.has(`${s.homeId ?? ''}\u0000${s.sessionId ?? ''}`))
+    .map((s) => ({ ...s, historical: true }));
+  return {
+    projects: [...baseProjects, ...extraProjects].sort((a, b) => activityMs(b) - activityMs(a)),
+    sessions: [...baseSessions, ...extraSessions].sort((a, b) => activityMs(b) - activityMs(a)),
+  };
+}

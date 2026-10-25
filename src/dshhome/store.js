@@ -230,6 +230,10 @@ const int = (v, dflt) => {
   return Number.isInteger(n) && n > 0 ? n : dflt;
 };
 
+// 全库搜索的查询词上限。搜索是**用户输入**，超长字符串会让 instr 的参数复制放大
+// （一次几 MB 的 q 会随每次防抖请求复制一遍）；这里的上限远大于任何真实项目名/标题。
+const MAX_SEARCH_QUERY_CHARS = 120;
+
 // 依据统计周期自动选择分桶粒度：短周期更细、长周期更粗，使点图数据点保持在合理范围。
 // hours → 每桶毫秒。24h=15分钟(96点) / 3d=1小时(72点) / 7d=3小时(56点) / 14d=6小时(56点) / 30d=12小时(60点)。
 function bucketStepMs(hours) {
@@ -259,6 +263,19 @@ function safeJsonParse(raw, fallback, label) {
     }
     return fallback;
   }
+}
+
+// 会话行的 JSON 列统一降级解析：recentSessions 与 searchAll 共用同一套读法。
+// 数据库里的 JSON 可能被外部工具写坏；解析失败按 null 处理并只记一次 warn（见 safeJsonParse）。
+// 抽成函数是为了让「最近列表」与「全库搜索结果」的行形状**逐字段同构** —— 前端可以直接复用
+// 同一个 renderRecentSessions，不会因为来源不同而少一个 chip 或崩掉。
+function hydrateSessionRow(s) {
+  return {
+    ...s,
+    tokenUsage: safeJsonParse(s.tokenUsage, null, 'sessions.tokenUsage'),
+    contextPressure: safeJsonParse(s.contextPressure, null, 'sessions.contextPressure'),
+    status: safeJsonParse(s.status, null, 'sessions.status'),
+  };
 }
 
 export class IndexStore {
@@ -1047,12 +1064,101 @@ export class IndexStore {
        FROM sessions ${where}
        ORDER BY lastActivity DESC NULLS LAST
        LIMIT ${int(limit, 50)}`
-    ).all(...args).map((s) => ({
-      ...s,
-      tokenUsage: safeJsonParse(s.tokenUsage, null, 'sessions.tokenUsage'),
-      contextPressure: safeJsonParse(s.contextPressure, null, 'sessions.contextPressure'),
-      status: safeJsonParse(s.status, null, 'sessions.status'),
-    }));
+    ).all(...args).map(hydrateSessionRow);
+  }
+
+  // 全库搜索（顶栏搜索框的「历史补搜」）。
+  //
+  // 为什么必须和 recentProjects / recentSessions 分开：
+  //   Recent 面板只装「最近一小段」—— 项目带 7 天窗口 + LIMIT 20，会话 LIMIT 50。
+  //   顶栏搜索若只过滤这两段，就永远搜不到更早的项目/会话。实测：PMAID-GPPH 最后活动在
+  //   32 天前，用户在搜索框里输入 GPPH 得到 0/20、0/50，而索引里明明有它 7 条会话。
+  //   这里在整个索引上匹配，不受时间窗限制，结果取最近活跃的前 N 条，由前端与最近列表
+  //   合并展示（只出现在检索结果里的行由前端打「历史」标记）。
+  //
+  // 匹配口径与 components/search-filter.js 一致（「用户看得见的名字」）：
+  //   项目 = 项目名；会话 = 标题 / 工作区名 / 所属项目名。
+  // 用 instr(lower(col), ?) 而不是 LIKE：LIKE 的 % 和 _ 是通配符，用户搜 "a_b" 会变成模式词元；
+  // instr 是字面子串匹配，不需要转义。lower() 由 SQLite 折叠 ASCII 大小写（中文无大小写），
+  // 全角由这里先做 NFKC 归一化 —— 服务端不依赖前端一定归一化过。
+  //
+  // 代价：instr 走不了索引，是一次全表扫描。定位是「用户停手后才发」的按需查询，所以只在
+  // 返回量上设上限（默认项目 20 / 会话 50，与 Recent 面板同一量级），不做分页。
+  // 返回 truncated 标志：命中超过上限时前端提示「还有更多」，避免用户以为只有这些。
+  searchAll({ q, homeIds = null, projectLimit = 20, sessionLimit = 50 } = {}) {
+    const needle = typeof q === 'string' ? q.normalize('NFKC').trim().slice(0, MAX_SEARCH_QUERY_CHARS) : '';
+    if (!needle) return { projects: [], sessions: [], truncated: { projects: false, sessions: false } };
+    const needleLower = needle.toLowerCase();
+    const scope = homeIds === null ? null : JSON.stringify(homeIds);
+    const pl = int(projectLimit, 20);
+    const sl = int(sessionLimit, 50);
+
+    // 项目：与 recentProjects 同一套聚合（sessionCount / 总输入 / 跳转目标），只是把
+    // 「lastActivity >= 7 天前」换成「项目名包含查询词」。多取 1 行用于判断是否被截断。
+    const sessionProjects = this.db.prepare(
+      `WITH visible_sessions AS (
+         SELECT * FROM sessions
+         WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?)))
+           AND project IS NOT NULL AND lastActivity IS NOT NULL
+           AND instr(lower(project), ?) > 0
+       ) SELECT s.project,
+              COUNT(*) AS sessionCount,
+              MAX(s.lastActivity) AS lastActivity,
+              SUM(s.tokInput + s.tokCacheRead + s.tokCacheWrite) AS inputTokens,
+              SUM(s.tokOutput) AS outputTokens,
+              -- 与 recentProjects 同一行（json_valid 与 json_extract 必须同处一行，tests/bad-json-sql 守卫）。
+              SUM(CASE WHEN json_valid(s.tokenUsage) THEN json_extract(s.tokenUsage, '$.totalTokens') ELSE 0 END) AS totalTokens,
+              (SELECT x.homeId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS homeId,
+              (SELECT x.sessionId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS sessionId,
+              (SELECT x.workspaceId FROM visible_sessions x WHERE x.project = s.project
+                 ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS workspaceId
+       FROM visible_sessions s
+       GROUP BY s.project
+       ORDER BY s.lastActivity DESC
+       LIMIT ${pl + 1}`
+    ).all(scope, scope, needleLower);
+
+    // 没有会话的 workspace 也算项目（与 recentProjects 的「孤立 workspace」一致）。
+    const orphanWs = this.db.prepare(
+      `SELECT w.project AS project, 0 AS sessionCount, NULL AS lastActivity,
+              0 AS inputTokens, 0 AS outputTokens, 0 AS totalTokens,
+              w.homeId AS homeId, NULL AS sessionId, w.workspaceId AS workspaceId
+       FROM workspaces w
+       WHERE (? IS NULL OR w.homeId IN (SELECT value FROM json_each(?)))
+         AND w.archived = 0
+         AND instr(lower(coalesce(w.project, '')), ?) > 0
+         AND NOT EXISTS (
+           SELECT 1 FROM sessions s WHERE s.homeId = w.homeId AND s.workspaceId = w.workspaceId
+         )`
+    ).all(scope, scope, needleLower);
+    const seen = new Set(sessionProjects.map((p) => p.project));
+    const projects = [...sessionProjects];
+    for (const w of orphanWs) {
+      if (!seen.has(w.project)) {
+        seen.add(w.project);
+        projects.push(w);
+      }
+    }
+
+    // 会话：标题 / 工作区名 / 所属项目名任一命中即可；字段与 recentSessions 完全同形。
+    const sessionRows = this.db.prepare(
+      `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
+       FROM sessions
+       WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?)))
+         AND (instr(lower(coalesce(title, '')), ?) > 0
+           OR instr(lower(coalesce(workspaceTitle, '')), ?) > 0
+           OR instr(lower(coalesce(project, '')), ?) > 0)
+       ORDER BY lastActivity DESC NULLS LAST
+       LIMIT ${sl + 1}`
+    ).all(scope, scope, needleLower, needleLower, needleLower);
+
+    return {
+      projects: projects.slice(0, pl),
+      sessions: sessionRows.slice(0, sl).map(hydrateSessionRow),
+      truncated: { projects: projects.length > pl, sessions: sessionRows.length > sl },
+    };
   }
 
   // ⚠️ 两个「输入」口径不同，别把它们当成同一个数：

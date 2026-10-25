@@ -78,7 +78,7 @@
 | 能力 | 说明 |
 |------|------|
 | **多实例聚合** | 一张工作台看全本机 + 所有 SSH 远程 dsh 实例的项目 / 会话 / 用量 |
-| **顶栏搜索** | 输入即按名字过滤 Recent Projects / Recent Sessions（项目名；会话标题 / 所属项目名），计数显示「命中/总数」，`/` 聚焦、`Esc` 或 ✕ 清空；只作用于工作台列表，不重新请求数据 |
+| **顶栏搜索** | 输入即过滤 Recent Projects / Recent Sessions（项目名；会话标题 / 所属项目名），停手 200ms 再经 `GET /api/search` 补搜**全库历史**（不受 7 天窗口 / Recent 条数上限限制），历史命中带「历史」标记；计数显示命中数，`/` 聚焦、`Esc` 或 ✕ 清空 |
 | **当前项目 / 当前会话** | 每个实例（本地 + 远程）缓存「最近活跃会话 + 其所属项目」的元数据与状态（标题 / 状态 chip / token / 上下文 / 最近活动），并在 Recent Projects / Recent Sessions 中跨实例聚合展示 |
 | **零 I/O 读取层** | 只读投影缓存 `session_projcache.json`（`projection cache` 层），**不下探 `.zstd`** |
 | **远程只读索引** | 经一次 `ssh host bash -s` 在远端 cat 出 dsh home 的 4 个元数据文件，与本地共用同一套 schema 验证 / 域降级——远程实例的当前项目/会话与本地同构 |
@@ -217,11 +217,13 @@ npm test           # 全量（含 tests/compat 版本兼容性契约）
 
 **顶栏右侧是搜索框**：输入即过滤 Recent Projects / Recent Sessions —— 项目名、会话标题
 （标题缺失时用工作区名）、会话所属项目名都参与匹配（大小写不敏感，全角/半角等价；会话 id
-不参与，避免 UUID 公共前缀把「搜几个字母」变成全命中）。过滤只影响这两栏的**显示**：计数变成
-「命中/总数」，没有命中时给出「清除搜索」的出路；Token 用量 / Instances / 运行日志不受影响，
-也**不会重新请求接口**（复用最近一轮数据，SSE 刷新后过滤继续生效）。`/` 聚焦搜索框，`Esc`
-清空（已空再按一次失焦），✕ 或空态里的「清除搜索」同效；切到实例 tab 时搜索框隐藏（它只作用于
-工作台）。
+不参与，避免 UUID 公共前缀把「搜几个字母」变成全命中）。本地过滤是即时的（复用最近一轮数据，
+SSE 刷新后继续生效）；停手 200ms 后还会请求 `GET /api/search` 在**整个索引**上补搜一次，所以
+一个月前、早已不在 Recent 面板里的项目/会话也能被找到 —— 这些行带「历史」chip 标明来源
+（Recent Projects 只含近 7 天的项目，Recent Sessions 只含最近 50 条）。计数显示命中数；
+超过返回上限（项目 20 / 会话 50）时列表底部会说明。Token 用量 / Instances / 运行日志不受影响，
+没有命中时给出「清除搜索」的出路。`/` 聚焦搜索框，`Esc` 清空（已空再按一次失焦），✕ 或空态里的
+「清除搜索」同效；切到实例 tab 时搜索框隐藏（它只作用于工作台）。
 
 **工作台（仪表盘，纯元数据、零 iframe）** 分五块：
 
@@ -637,6 +639,7 @@ node scripts/install-dsh-open-session.mjs --uninstall
 | `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web）。**确认式**：SIGTERM→3s→SIGKILL→2s，只有进程真的退出才回 `{ok:true}`；收不掉则回 500（带 pid/端口）且保留句柄。远端停止失败时也会以 500 上报（本地连接仍已断开）。响应里的 `stopped` 表示**这次是否确实停掉了一个受管子进程**（直连已有实例时为 false） |
 | `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
 | `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`） |
+| `GET` | `/api/search` | 全库搜索（`?q=&projectLimit=20&sessionLimit=50`；不受 7 天窗口 / Recent 条数上限限制，只搜运行中实例，返回 `{projects, sessions, truncated}`） |
 | `GET` | `/api/workspaces` | 工作区列表 |
 | `POST` | `/api/homes` | 除 dsh 本机/远程外，`{harness:"codex" \| "workbuddy", homePath, alias?}` 可注册只读本地工具实例（默认 `~/.codex` / `~/.workbuddy`，注册后立即索引并刷新运行时；目录不存在 400） |
 | `POST` | `/api/harness/open` | 统一打开本地工具实例（body `{homeId, sessionId?, projectId?}`）：Codex → `codex://threads/<uuid>`、WorkBuddy → `workbuddy://chat/<uuid>`、本地 dsh 只读 → 插件触发器，无会话/插件缺失时聚焦/启动 DSH 桌面端（200 `code:"app-focused"`）。未知 home 404、非本地工具 400、非法会话 id 400（UUID 白名单）、唤起失败 502 |
@@ -731,7 +734,7 @@ hwb/
 │   │   ├── indexer.js           # 后台索引循环（60s debounce + 按实例退避）
 │   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC；cookie 记忆 + keep-alive + 自适应预算）
 │   │   ├── live-poller.js       # 实时状态轮询（基线 3s，按实测链路自适应 + 失败退避）
-│   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目）
+│   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目/全库搜索）
 │   │   └── quota.js             # 额度服务（TTL 缓存 60s，单 flight）
 │   ├── codexhome/               # 第二个 harness 数据源（Codex，只读；作为普通实例接入）
 │   │   ├── reader.js            # state_5.sqlite + .codex-global-state.json → 项目/会话快照（按 cwd 最长前缀归属）
@@ -769,6 +772,7 @@ hwb/
 │       └── components/
 │           ├── workbench.js         # 仪表盘布局
 │           ├── recent-projects.js / recent-sessions.js / instance-grid.js
+│           ├── search-filter.js      # 搜索：归一化/匹配/本地过滤 + 全库结果合并
 │           ├── usage-card.js        # 用量卡 + 堆叠趋势图 + 周期/维度切换
 │           ├── quota-card.js        # 额度卡片（见「已知限制」）
 │           ├── add-home.js          # 添加/编辑实例表单 + onboarding

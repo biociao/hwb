@@ -59,6 +59,7 @@ export function renderRecentProjects(projects, homes = []) {
         </div>
         <div class="meta project-meta">
           ${instName ? `<span class="chip home-chip" style="background:${instColor.bg};color:${instColor.fg}" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
+          ${p.historical ? '<span class="chip hist-chip" title="不在最近 7 天列表里，来自全库检索">历史</span>' : ''}
           <span class="project-stat"><b>${p.sessionCount}</b> session${p.sessionCount === 1 ? '' : 's'}</span>
           ${tokenHtml}
           ${p.sessionId ? '' : '<span class="chip">no sessions</span>'}
