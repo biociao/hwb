@@ -6,6 +6,58 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 界面：点 Recent Projects 改为「筛出该项目的会话」（不再直接跳转 app）
+
+**动机**：Recent Projects 的点击语义是「跳到该项目最新会话所属实例」，但用户在这个位置想做的
+往往是**看这个项目有哪些会话**：点进去反而离开了刚浏览的项目/会话全局视图，回头还得再找一遍。
+「项目 → 会话」原本只有搜索框里输入项目名这一条路，而 Recent Sessions 只有最近 50 条 ——
+一个项目的会话完全可能被挤出这 50 条（实测 PMAID-GPPH 有 7 条会话、最后活动在 32 天前），
+按名字搜又可能命中别的项目。
+
+- **交互**：点项目卡不再跳转，而是把 Recent Sessions 筛成该项目的全部会话：项目卡进入选中态
+  （常驻强调色描边 + `aria-pressed`），Sessions 分区头下方出现筛选条（项目名 / 条数 / ✕ /
+  打开项目）。再点同一个项目卡或点 ✕ 取消；切换实例 tab 后再回来筛选仍在（只存在内存里，
+  刷新页面回到未筛选 —— 与搜索词同语义，避免留下一个看不见的过滤器）。项目没有会话时明确
+  显示「还没有已索引的会话」，而不是搜索的「0 命中」。
+- **取数**：`GET /api/sessions/recent?project=<项目名>` 在服务端按项目名**精确**过滤（`IN` 子串
+  是搜索语义，不是项目筛选语义），跨实例聚合、不设 7 天窗口、按最后活动倒序；前端取最近 200 条
+  （`PROJECT_SESSION_LIMIT`），服务端多取 1 行判断 `truncated`，超出时列表底部说明「可用顶栏
+  搜索继续定位更早的会话」。全局最近 50 条仍照常拉取并保留：清除筛选时立刻能画，不必等一轮
+  请求。SSE 刷新会带上当前 `project` 重新取数，筛选态不会停在旧数据上。
+- **保留跳转能力**：原「点项目卡打开实例 / DSH 桌面端 / Codex / WorkBuddy」的行为移到筛选条的
+  「打开项目」按钮（仍走 `drill-in`，数据取自项目卡的最新会话）。会话行点击语义不变。
+- **与搜索叠加**：项目筛选下顶栏搜索继续可用：本地在「该项目会话」里即时过滤，停手后
+  `/api/search?project=` 只在该项目内补历史会话（`store.searchAll` 的 `project` 只收窄会话，
+  项目结果不受限 —— 否则筛着 GPPH 就搜不到别的项目、没法切换）；筛选切换/清除会
+  `resetSearchState()` 作废上一轮补搜结果，避免把上一个项目的命中合并进新列表。
+- **实现**：`store.recentSessions({project})` 增加精确等值条件，`store.searchAll({project})`
+  只约束会话 SQL；`GET /api/sessions/recent` 增加 `project` 参数与 `truncated` 字段（参数经
+  `textParam()` 去空白、限长 200，仍走 prepared statement 参数位），`GET /api/search` 透传
+  `project`；新增 `renderSessionFilter()`（`recent-sessions.js`，项目名/条数/按钮全部 esc），
+  `renderWorkbench()` 增加 `sessionFilter` 插槽（在 h2 与滚动区之间，列表滚动时筛选条不滚走），
+  `renderRecentProjects()` 增加 `{selectedProject}` 选中态并把动作改成 `filter-project`；
+  `app.js` 新增 `projectFilter` / `projectSessions` 状态与唯一写入点 `setProjectFilter()`，
+  `paintDashboard()` 按「项目会话 / 全局最近会话」切换数据源并复用 `filterRecent()`；
+  键盘委托把 `filter-project` 加入可激活集合，并跳过原生 `<button>`（否则 Enter/Space 会
+  双触发筛选条的按钮）；`index.html` 增加筛选条与选中项目卡样式（浅/深主题共用变量）。
+- **真浏览器验证**：headless Chrome（`scripts/render-check.mjs`，隔离 hwb 实例 + 隔离 fixture
+  home：PMAID-GPPH 60 条会话 / PMAID 1 条）28/28 断言通过：初始无筛选条、Sessions=50；点项目卡后
+  出现筛选条（项目名 / `60 条` / ✕ / 打开项目）、项目卡 `.selected` + `aria-pressed=true`、
+  Sessions 60 行且全部属于该项目、**不跳转**（无 iframe、URL 不变）；✕ 与再点同卡均回 50 行；
+  筛选态下搜索 1 行命中且清空后恢复 60 行；附加点「PMAID」卡只出 1 行（精确等值）。
+  `console.error` / 未捕获异常均为 0。API 直测 8/8：全量 60 / 精确 1 / limit=50 时
+  `truncated=true`。
+- **测试**：新增 `tests/store-project-sessions.test.js`（精确等值 vs 子串、跨实例、homeIds
+  作用域、limit、行形状、searchAll 只收窄会话）、`tests/api-project-sessions.test.js`
+  （参数归一化/多取 1 行判断截断/未筛选形状不变/只读、端到端 60 条旧会话能全取且不含未连接
+  实例、精确等值、项目内补搜不限制项目结果）、`tests/web-project-filter.test.js`
+  （项目卡动作/选中态/转义、筛选条 DOM 与无 homeId 退化、workbench 插槽位置、app.js 接线与
+  键盘守卫、CSS 契约）；按新语义更新 `dashboard-card-distinction` / `dashboard-search` /
+  `web-render-safety` / `api-search` 里的旧断言。`npm test`：1231 tests / 1227 pass /
+  3 fail（与改动前相同的环境性兼容失败：已安装 dsh 0.2.1-alpha.2 多出 schedule 域、
+  真实 bundle 注入锚点变化），无新增失败。
+- **文档**：README（能力表、工作台用法、Recent Projects/Sessions 说明、REST API 参数）。
+
 ### 界面：顶栏搜索（本地即时过滤 + 全库历史补搜）
 
 **动机**：项目与会话越攒越多（实测 20 个项目 / 50 条会话），要定位某个项目或某次会话只能

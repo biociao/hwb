@@ -33,6 +33,40 @@ export function shortSessionId(id) {
   return tail;
 }
 
+// 项目筛选条：Recent Sessions 分区头下方的一条状态带。
+//
+// 为什么单独一条而不是只把标题改掉：筛选态必须同时回答三个问题 ——
+//   ① 现在筛的是哪个项目（名字可能很长，要能看出被截断的完整值 → title）；
+//   ② 怎么退出（✕ 清除；点同一个项目卡也会取消）；
+//   ③ 原来的「点项目跳实例」能力去哪了（右侧「打开项目」按钮，语义与原项目卡点击一致）。
+// 计数只报**筛出来的条数**（不是「命中/总数」—— 项目筛选不是搜索，没有可比的分母）；
+// 被 limit 截断时由调用方在列表底部补一句「仅显示最近 N 条」，这里不重复。
+//
+// 所有字段都来自索引元数据 / 项目卡（不可信输入），进 HTML 前一律 esc；
+// homeId/sessionId/workspaceId 只作为 data-* 交给 drill-in 处理，同样是 esc。
+export function renderSessionFilter({ project, homeId = null, sessionId = null, workspaceId = null, count = null } = {}) {
+  const name = String(project ?? '');
+  // 条数口径与项目卡不同（卡上是「近 7 天会话数」，这里是索引里的全部会话），title 说明差异，
+  // 免得用户以为两个数字有一个错了。
+  const countHtml = count == null ? '' : `<span class="filter-count"
+      title="该项目在索引中的全部会话（不受 Recent 的 7 天窗口 / 最近 50 条限制）">${Number(count) || 0} 条</span>`;
+  // 无 homeId 时不画「打开项目」：没有可解析的目标，点了只会弹错误。
+  const openHtml = homeId
+    ? `<button type="button" class="filter-open" data-action="drill-in" data-kind="project"
+         data-home-id="${esc(homeId)}" data-session-id="${esc(sessionId ?? '')}"
+         data-workspace-id="${esc(workspaceId ?? '')}" data-project="${esc(name)}"
+         title="打开该项目所在实例的最新会话（恢复原来的项目卡点击行为）">打开项目</button>`
+    : '';
+  return `<div class="pane-filter" data-project="${esc(name)}">
+    <span class="filter-label">项目筛选</span>
+    <span class="filter-project" title="${esc(name)}">${esc(name)}</span>
+    <button type="button" class="filter-clear" data-action="clear-project-filter"
+      title="清除项目筛选，回到最近会话" aria-label="清除项目筛选">✕</button>
+    ${countHtml}
+    ${openHtml}
+  </div>`;
+}
+
 // homes 用于在会话行里标出「属于哪个实例」：dsh 与 Codex 会话现在都汇总进同一栏，
 // 没有实例 chip 时 Codex 会话和 dsh 会话长得一模一样。缺实例信息时不画 chip（旧调用兼容）。
 export function renderRecentSessions(sessions, homes = []) {

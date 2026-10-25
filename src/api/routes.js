@@ -72,6 +72,16 @@ function numParam(raw, fallback, min, max) {
   return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
+// 自由文本查询参数：去首尾空白、限长。
+// 项目名来自索引元数据（可能是任意长度的目录名），这里只当**等值过滤条件**用，
+// 不进 SQL 拼接（走 prepared statement 的参数位），限长只是别把超长串塞进查询。
+const TEXT_PARAM_MAX = 200;
+function textParam(raw, max = TEXT_PARAM_MAX) {
+  if (raw === null || raw === undefined) return null;
+  const text = String(raw).trim();
+  return text ? text.slice(0, max) : null;
+}
+
 const JSON_BODY_LIMIT = 64 * 1024;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 // 带 code 的错误：路由的 catch 需要据此区分「包太大」与「JSON 非法」，否则前者的真实原因
@@ -972,13 +982,22 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       });
       return;
     }
+    // 项目筛选会话：`?project=` 按项目名**精确**取该项目的全部会话（点 Recent Projects 一行时用）。
+    // 与 /api/search 的字面子串匹配不同 —— 这里不是搜索，是「只看这个项目」。
+    // 项目筛选时多查 1 行判断是否被 limit 截断（truncated），前端据此提示「还有更多」；
+    // 未筛选时保持原语义（最近 N 条），不额外扫一行。
     if (req.method === 'GET' && pathname === '/api/sessions/recent') {
+      const project = textParam(searchParams.get('project'));
+      const limit = numParam(searchParams.get('limit'), 50, 1, 500);
+      const rows = store.recentSessions({
+        homeIds: dataHomeIds(),
+        homeId: searchParams.get('homeId') || null,
+        project,
+        limit: project ? limit + 1 : limit,
+      });
       send(res, 200, {
-        sessions: store.recentSessions({
-          homeIds: dataHomeIds(),
-          homeId: searchParams.get('homeId') || null,
-          limit: numParam(searchParams.get('limit'), 50, 1, 500),
-        }),
+        sessions: project ? rows.slice(0, limit) : rows,
+        truncated: project ? rows.length > limit : false,
       });
       return;
     }
@@ -987,12 +1006,14 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     // 所以调用方无法借它读到未连接实例的数据。q 为空时 store 直接返回空结果，不做扫描。
     // 两个 limit 与 /api/projects/recent、/api/sessions/recent 的上限保持同一量级：
     // 搜索是给人定位用的，不是导出；超出上限由 truncated 标志告诉前端「还有更多」。
+    // project（可选）只把**会话**结果收在该项目内（项目筛选下的补搜），项目结果不受它限制。
     if (req.method === 'GET' && pathname === '/api/search') {
       send(res, 200, store.searchAll({
         q: searchParams.get('q') ?? '',
         homeIds: dataHomeIds(),
         projectLimit: numParam(searchParams.get('projectLimit'), 20, 1, 100),
         sessionLimit: numParam(searchParams.get('sessionLimit'), 50, 1, 200),
+        project: textParam(searchParams.get('project')),
       }));
       return;
     }

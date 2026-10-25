@@ -52,8 +52,17 @@ test('GET /api/search: 默认参数与 homeIds 作用域', async () => {
   const route = makeRouter({ calls });
   const res = await request(route, 'GET', '/api/search?q=GPPH');
   assert.equal(res.status, 200);
-  assert.deepEqual(calls, [{ q: 'GPPH', homeIds: [HOME_ID], projectLimit: 20, sessionLimit: 50 }]);
+  assert.deepEqual(calls, [{ q: 'GPPH', homeIds: [HOME_ID], projectLimit: 20, sessionLimit: 50, project: null }]);
   assert.deepEqual(res.body, { projects: [], sessions: [], truncated: { projects: false, sessions: false } });
+});
+
+test('GET /api/search: project 参数原样传给 store（项目筛选下的补搜作用域）', async () => {
+  const calls = [];
+  await request(makeRouter({ calls }), 'GET', '/api/search?q=GPPH&project=%20PMAID-GPPH%20');
+  assert.equal(calls[0].project, 'PMAID-GPPH', '首尾空白去掉；项目名是精确等值条件');
+  const blank = [];
+  await request(makeRouter({ calls: blank }), 'GET', '/api/search?q=GPPH&project=%20%20');
+  assert.equal(blank[0].project, null, '只有空白等于没传（不能被当成空项目名去匹配）');
 });
 
 test('GET /api/search: 查询参数有上下界（防 1e9 / 0 / 非数字）', async () => {

@@ -3,7 +3,7 @@ import { downloadFile, uploadFiles, partitionUploads, MAX_UPLOAD_BYTES, MAX_UPLO
 import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js';
 import { renderWorkbench } from './components/workbench.js';
 import { renderRecentProjects } from './components/recent-projects.js';
-import { renderRecentSessions } from './components/recent-sessions.js';
+import { renderRecentSessions, renderSessionFilter } from './components/recent-sessions.js';
 import { filterRecent, searchEmptyHtml, searchPendingHtml, mergeSearchResults, normalizeQuery } from './components/search-filter.js';
 import { connectedHomes, tabHomes } from './instance-state.js';
 import { planPaneNavigation, planPaneRecovery, updatePaneSession } from './instance-navigation.js';
@@ -40,6 +40,16 @@ let searchQuery = '';
 // 最近一轮拉到的原始列表 + 已连接实例集合。按键过滤直接复用它们（见 paintDashboard）：
 // 过滤只改「显示哪些行」，不该每敲一个字就重新打一次 /api/projects|sessions|usage。
 let lastLists = { projects: [], sessions: [], connectedIds: new Set() };
+// 项目筛选（Recent Projects → Recent Sessions 联动）。
+// 点项目卡不再跳转实例，而是把这个项目名下的会话筛到 Sessions 栏；服务端按 project **精确**
+// 取该项目的全部会话（/api/sessions/recent?project=），不受「最近 50 条」限制。
+// 与搜索词同语义：只存在内存里，刷新页面回到未筛选 —— 免得下次打开面对一个忘了的隐藏过滤器。
+let projectFilter = null; // { project, homeId, sessionId, workspaceId } | null
+// 已拉到的项目会话，与 projectFilter.project 配对；筛选切换时旧数据立即作废（paint 显示 loading）。
+let projectSessions = { project: null, status: 'idle', sessions: [], truncated: false };
+// 一个项目最多取这么多条会话：够定位，又不会把 990 会话的大项目整页渲染出来。
+// 超出时服务端回 truncated，列表底部说明「还有更多，可用顶栏搜索定位」。
+const PROJECT_SESSION_LIMIT = 200;
 // 全库补搜的状态（顶栏搜索框的历史部分）。
 //
 // 为什么不能只过滤 lastLists：那两段数据分别是「近 7 天 top 20 项目」和「最近 50 条会话」，
@@ -326,13 +336,22 @@ async function renderDashboard(sequence = refreshSequence) {
   }
   // allSettled 而不是 all：任何一个端点失败（后端重启、单个查询 500）都不该把另外三栏一起清空。
   // 失败的栏目退化为空态渲染，并在顶部提示具体是哪个接口挂了。
-  const [projectsRes, sessionsRes, usageRes] = await Promise.allSettled([
+  // 项目筛选中多拉一条 `/api/sessions/recent?project=`：这是「该项目的全部会话」，
+  // 与全局最近 50 条是两份数据（后者仍然保留，清掉筛选时立刻能画）。
+  const project = projectKey();
+  const [projectsRes, sessionsRes, projectSessionsRes, usageRes] = await Promise.allSettled([
     api('/api/projects/recent'),
     api('/api/sessions/recent'),
+    project ? api(projectSessionsUrl(project)) : Promise.resolve(null),
     fetchUsage(),
   ]);
   if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
-  const failed = [['项目列表', projectsRes], ['会话列表', sessionsRes], ['用量统计', usageRes]]
+  const failed = [
+    ['项目列表', projectsRes],
+    ['会话列表', sessionsRes],
+    ...(project ? [['项目会话列表', projectSessionsRes]] : []),
+    ['用量统计', usageRes],
+  ]
     .filter(([, r]) => r.status === 'rejected')
     .map(([label, r]) => `${label}(${r.reason?.message ?? r.reason})`);
   if (failed.length) {
@@ -342,11 +361,55 @@ async function renderDashboard(sequence = refreshSequence) {
   const projects = projectsRes.status === 'fulfilled' ? projectsRes.value.projects : [];
   const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value.sessions : [];
   const usage = usageRes.status === 'fulfilled' ? usageRes.value : null;
+  if (project) {
+    // 只有成功时才算「这批数据属于当前筛选」；失败保留 error 状态让 Sessions 栏说清原因，
+    // 而不是拿空的 done 数据画一句「该项目没有会话」——那是在撒谎。
+    projectSessions = projectSessionsRes.status === 'fulfilled'
+      ? {
+        project,
+        status: 'done',
+        sessions: Array.isArray(projectSessionsRes.value?.sessions) ? projectSessionsRes.value.sessions : [],
+        truncated: projectSessionsRes.value?.truncated === true,
+      }
+      : { project, status: 'error', sessions: [], truncated: false };
+  }
   lastUsage = usage;
   if (usage) lastUsageKey = usageKey(); // 与 fetchUsage 的缓存键同源（这里拿到的就是这个周期的数据）
   const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
   lastLists = { projects, sessions, connectedIds };
   paintDashboard();
+}
+
+// 当前被筛选的项目名；没有筛选时为 null。
+const projectKey = () => projectFilter?.project ?? null;
+
+// 项目会话的取数地址：project 是**精确**等值条件（不是搜索词），limit 用专门的常量。
+function projectSessionsUrl(project) {
+  return `/api/sessions/recent?${new URLSearchParams({ project, limit: String(PROJECT_SESSION_LIMIT) })}`;
+}
+
+// 切换/清除项目筛选。这是唯一的写入点（点项目卡、点筛选条的 ✕ 都走这里）：
+//   · 先同步状态并立刻重画：点击当帧就能看到「选中 + 正在筛出…」，不等网络往返；
+//   · 再 refresh() 拉这个项目的会话（renderDashboard 会带上 project 参数）；
+//   · 清掉筛选时先用 lastLists.sessions（最近 50 条）立刻画出来，再靠 refresh() 校正。
+// 搜索词与项目筛选是**叠加**关系：筛选变了以后全库补搜的会话作用域也必须跟着变，
+// 否则会把上一个项目的历史命中合并进新列表 —— 所以这里重置补搜状态并重新排一次。
+function setProjectFilter(next) {
+  const nextProject = typeof next?.project === 'string' && next.project ? next.project : null;
+  if (projectKey() === nextProject) return; // 同一项目重复点击由调用方处理成「取消」
+  projectFilter = nextProject === null ? null : {
+    project: nextProject,
+    homeId: next.homeId || null,
+    sessionId: next.sessionId || null,
+    workspaceId: next.workspaceId || null,
+  };
+  projectSessions = projectFilter
+    ? { project: projectFilter.project, status: 'loading', sessions: [], truncated: false }
+    : { project: null, status: 'idle', sessions: [], truncated: false };
+  resetSearchState();
+  if (searchKey()) scheduleFullSearch();
+  paintDashboard();
+  refresh().catch(reportRefreshFailure);
 }
 
 // 当前有效查询词：本地过滤与 /api/search 共用同一个归一化口径（大小写 / 全角 / 空白）。
@@ -372,11 +435,19 @@ function fullSearchPending() {
 // 计数、空态、过滤全部由 filterRecent() 决定，所以几条路径不可能画出不同的过滤结果。
 function paintDashboard() {
   const { projects, sessions, connectedIds } = lastLists;
+  const project = projectKey();
+  // 项目筛选下的数据源：只认「与当前项目配对」的那份；刚切换/还没回来时是 loading，
+  // 不能拿上一轮的数组顶替（否则会先闪一段别的项目的会话，再被新数据换掉）。
+  const proj = project ? (projectSessions.project === project ? projectSessions : null) : null;
+  const projectLoading = !!project && (!proj || proj.status === 'loading');
+  const projectErrored = !!project && proj?.status === 'error';
+  const projSessions = project && proj?.status === 'done' ? proj.sessions : [];
+  const baseSessions = project ? projSessions : sessions;
   const full = fullSearchResult();
   // 最近列表优先，全库结果只补「最近列表里没有的」历史行（见 mergeSearchResults 的注释）。
   const lists = full
-    ? mergeSearchResults({ projects, sessions, searchedProjects: full.projects, searchedSessions: full.sessions })
-    : { projects, sessions };
+    ? mergeSearchResults({ projects, sessions: baseSessions, searchedProjects: full.projects, searchedSessions: full.sessions })
+    : { projects, sessions: baseSessions };
   // 只渲染「已连接实例」的项目/会话；计数与渲染用同一份数组，避免分区头写着 12 但列表只有 5 行。
   const filtered = filterRecent({ projects: lists.projects, sessions: lists.sessions, connectedIds, query: searchQuery });
   const pending = fullSearchPending();
@@ -385,12 +456,31 @@ function paintDashboard() {
     ? '<div class="empty">连接实例后显示对应项目</div>'
     : (filtered.filtering && !filtered.projects.length)
       ? (pending ? searchPendingHtml('项目', searchQuery) : searchEmptyHtml('项目', searchQuery))
-      : renderRecentProjects(filtered.projects, lastHomes);
+      : renderRecentProjects(filtered.projects, lastHomes, { selectedProject: project });
+  // Sessions 栏的空态有优先级：未连接 → 项目会话加载中 → 加载失败 → 该项目确实没有会话，
+  // 最后才是搜索的「0 命中 / 正在全库检索」。项目本来就没有会话时提示「清除搜索」是误导
+  // （搜索不是原因，清掉也还是没有）。
   const sessionsHtml = !filtered.connected
     ? '<div class="empty">连接实例后显示对应会话</div>'
-    : (filtered.filtering && !filtered.sessions.length)
-      ? (pending ? searchPendingHtml('会话', searchQuery) : searchEmptyHtml('会话', searchQuery))
-      : renderRecentSessions(filtered.sessions, lastHomes);
+    : projectLoading
+      ? `<div class="empty">正在筛出「${esc(project)}」的会话…</div>`
+      : projectErrored
+        ? '<div class="empty">项目会话加载失败；可清除筛选回到最近会话</div>'
+        : (project && !projSessions.length)
+          ? `<div class="empty">「${esc(project)}」还没有已索引的会话</div>`
+          : (filtered.filtering && !filtered.sessions.length)
+            ? (pending ? searchPendingHtml('会话', searchQuery) : searchEmptyHtml('会话', searchQuery))
+            : renderRecentSessions(filtered.sessions, lastHomes);
+  // 项目筛选条：只在筛选时画；count 只报筛出来的条数（不是搜索的「命中/总数」）。
+  const sessionFilter = project && filtered.connected
+    ? renderSessionFilter({
+      project,
+      homeId: projectFilter.homeId,
+      sessionId: projectFilter.sessionId,
+      workspaceId: projectFilter.workspaceId,
+      count: proj?.status === 'done' ? projSessions.length : null,
+    })
+    : '';
   // 过滤中的计数不再用「命中/最近列表总数」：命中可能来自全库，分母（最近 20/50 条）与它没有
   // 可比性。只报命中数；未过滤时仍是最近列表的条数（与改造前的 20 / 50 一致）。
   const count = (shown, total) => (filtered.filtering ? `${shown} 命中` : total);
@@ -399,11 +489,16 @@ function paintDashboard() {
     ? `<div class="search-more">仅显示最近 ${SEARCH_PROJECT_LIMIT} 个项目，可用更精确的关键词缩小范围</div>` : '';
   const sessionsMore = full?.truncated.sessions
     ? `<div class="search-more">仅显示最近 ${SEARCH_SESSION_LIMIT} 条会话，可用更精确的关键词缩小范围</div>` : '';
+  // 项目会话被 limit 截断：明确说「只显示了这么多」，并指出继续定位的路径（顶栏搜索会按
+  // 项目作用域去全库补搜，不受这个 limit 限制）。
+  const projectMore = project && proj?.status === 'done' && proj.truncated
+    ? `<div class="search-more">该项目会话较多，仅显示最近 ${PROJECT_SESSION_LIMIT} 条；可用顶栏搜索继续定位更早的会话</div>` : '';
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
   const draft = captureAddFormDraft();
   dashboardEl.innerHTML = renderWorkbench({
     projects: projectsHtml + projectsMore,
-    sessions: sessionsHtml + sessionsMore,
+    sessions: sessionsHtml + projectMore + sessionsMore,
+    sessionFilter,
     projectCount: filtered.connected ? count(filtered.projects.length, filtered.totalProjects) : null,
     sessionCount: filtered.connected ? count(filtered.sessions.length, filtered.totalSessions) : null,
     homes: renderInstanceGrid(lastHomes),
@@ -461,6 +556,10 @@ function requestFullSearch(key) {
     projectLimit: String(SEARCH_PROJECT_LIMIT),
     sessionLimit: String(SEARCH_SESSION_LIMIT),
   });
+  // 项目筛选下的补搜只在该项目内找会话（项目结果不受限，见 store.searchAll 的注释）。
+  // 筛选变化会走 resetSearchState() 把 seq 推进，所以这里不必再单独记 project。
+  const project = projectKey();
+  if (project) params.set('project', project);
   api(`/api/search?${params}`)
     .then((body) => {
       // 只接受「仍是最新一次请求 + 输入框还是同一个词」的响应：连续输入时慢请求会乱序返回。
@@ -979,6 +1078,26 @@ async function handleAction(e) {
         setSearchQuery('');
         searchInput?.focus();
         break;
+      case 'filter-project': {
+        // 项目卡的唯一动作：把 Sessions 栏筛到这个项目（不再直接跳转实例）。
+        // 再点一次同一个项目 = 取消筛选；「打开项目」仍由筛选条里的按钮提供。
+        const project = btn.dataset.project;
+        if (!project) break;
+        if (projectKey() === project) {
+          setProjectFilter(null);
+        } else {
+          setProjectFilter({
+            project,
+            homeId: btn.dataset.homeId || null,
+            sessionId: btn.dataset.sessionId || null,
+            workspaceId: btn.dataset.workspaceId || null,
+          });
+        }
+        break;
+      }
+      case 'clear-project-filter':
+        setProjectFilter(null);
+        break;
       case 'nav-instance':
         await enterInstance(btn.dataset.homeId);
         break;
@@ -1153,12 +1272,15 @@ document.body.addEventListener('click', handleAction);
 // 键盘可达性：Recent Projects / Recent Sessions 的行是 <div class="row clickable"> 配一个
 // 委托到 body 的 click 处理器 —— 只有鼠标能用。这里给同一批 [data-action] 元素补上键盘激活
 // （Enter / Space），并让它们在标记里带 role=button + tabindex=0（见两个 recent-* 组件）。
-const ACTIVATABLE = new Set(['drill-in', 'nav-instance', 'nav-dashboard']);
+const ACTIVATABLE = new Set(['drill-in', 'filter-project', 'nav-instance', 'nav-dashboard']);
 document.body.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
   const el = e.target.closest?.('[data-action]');
   if (!el || !ACTIVATABLE.has(el.dataset.action)) return;
   if (e.target !== el) return; // 只处理「焦点就在这个可激活元素上」，不劫持内部控件的按键
+  // 原生 <button> 自己会把 Enter/Space 变成 click（筛选条里的「打开项目」「✕」）；
+  // 这里再调一次 handleAction 就会双触发（打开两次 / 筛选闪两下），所以跳过按钮。
+  if (el.tagName === 'BUTTON') return;
   e.preventDefault(); // Space 默认会滚动页面
   handleAction({ target: el });
 });

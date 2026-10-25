@@ -79,6 +79,7 @@
 |------|------|
 | **多实例聚合** | 一张工作台看全本机 + 所有 SSH 远程 dsh 实例的项目 / 会话 / 用量 |
 | **顶栏搜索** | 输入即过滤 Recent Projects / Recent Sessions（项目名；会话标题 / 所属项目名），停手 200ms 再经 `GET /api/search` 补搜**全库历史**（不受 7 天窗口 / Recent 条数上限限制），历史命中带「历史」标记；计数显示命中数，`/` 聚焦、`Esc` 或 ✕ 清空 |
+| **点项目筛会话** | 点 Recent Projects 的任意项目卡，Recent Sessions 只列**该项目名下的全部会话**（跨实例、按最后活动倒序，不受「最近 50 条」限制）；再点同一个项目或筛选条的 ✕ 取消。筛选条保留「打开项目」按钮，等价于原来的「点项目卡跳实例 / 桌面端」 |
 | **当前项目 / 当前会话** | 每个实例（本地 + 远程）缓存「最近活跃会话 + 其所属项目」的元数据与状态（标题 / 状态 chip / token / 上下文 / 最近活动），并在 Recent Projects / Recent Sessions 中跨实例聚合展示 |
 | **零 I/O 读取层** | 只读投影缓存 `session_projcache.json`（`projection cache` 层），**不下探 `.zstd`** |
 | **远程只读索引** | 经一次 `ssh host bash -s` 在远端 cat 出 dsh home 的 4 个元数据文件，与本地共用同一套 schema 验证 / 域降级——远程实例的当前项目/会话与本地同构 |
@@ -225,13 +226,23 @@ SSE 刷新后继续生效）；停手 200ms 后还会请求 `GET /api/search` �
 没有命中时给出「清除搜索」的出路。`/` 聚焦搜索框，`Esc` 清空（已空再按一次失焦），✕ 或空态里的
 「清除搜索」同效；切到实例 tab 时搜索框隐藏（它只作用于工作台）。
 
+**点 Recent Projects 的一行**不再直接跳到对应 app，而是把 **Recent Sessions 筛成这个项目的会话**：
+服务端按项目名精确取数（`GET /api/sessions/recent?project=…`，跨实例、按最后活动倒序，最多 200 条，
+不受「最近 50 条」限制），筛选条写明当前项目与条数、提供 ✕ 清除；项目卡变选中态，再点同一个项目
+也会取消。原「点项目卡打开实例 / DSH 桌面端」的能力保留在筛选条的「打开项目」按钮上（会话行
+点击语义不变，仍会钻入该会话）。项目筛选与顶栏搜索是叠加关系：项目内搜索只在该项目的会话里
+补历史；切换/清除项目会作废上一轮的全库补搜结果。
+
 **工作台（仪表盘，纯元数据、零 iframe）** 分五块：
 
-1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
+1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击**筛选**该项目的会话（见上，
+   不再直接跳转实例；跳转走筛选条的「打开项目」）。
    **卡片底色按数据来源 app 区分**：dsh 蓝、Codex 灰、Claude Code 橙、WorkBuddy 绿，
    未识别来源用中性紫（深/浅主题各一套底色）；项目徽标与左侧竖轨仍是项目自己的身份色，
    两种语义分开 —— 「底色说来源，徽标说项目」。
-2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
+2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）；
+   从项目卡进入筛选态时，这里换成**该项目的全部会话**，并在分区头下方显示项目筛选条（项目名 / 条数 /
+   ✕ / 打开项目）。
 3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip（已连接 / 连接不可达 / 未连接，域降级时另加
    「⚠ <域> 降级」chip）、**该实例上 dsh 的版本号**（`dsh 0.1.5-rc.1`；本地实例读本机安装、
    远程实例经 SSH `dsh --version` 探测，与远端启动共用同一份 PATH 补齐；取不到时不显示）、
@@ -258,10 +269,11 @@ SSE 刷新后继续生效）；停手 200ms 后还会请求 `GET /api/search` �
 
 > **项目 ↔ 会话联动高亮**：把鼠标悬停在某个项目（或会话）上，会在两栏间同步高亮同名项目。
 
-**钻入某个实例 / 会话**：点实例 tab 或某项目/会话行，会懒创建一个 iframe 挂载该 dsh web
-（本地经预览代理，远端经 SSH 隧道 + 反代）。本地 dsh 的会话/项目行会先尝试交给 DSH 桌面端
-（装了 `dsh-hwb-open-session` 插件时直接切到对应会话）；只读实例没有 Web 页面，不会创建 iframe。
-切走只隐藏；被预算释放过的实例再次进入时重新加载（dsh 支持会话深链时会回到同一个会话）。
+**钻入某个实例 / 会话**：点实例 tab、某条会话行，或项目筛选条里的「打开项目」，会懒创建一个
+iframe 挂载该 dsh web（本地经预览代理，远端经 SSH 隧道 + 反代）。本地 dsh 的会话/项目会先尝试
+交给 DSH 桌面端（装了 `dsh-hwb-open-session` 插件时直接切到对应会话）；只读实例没有 Web 页面，
+不会创建 iframe。切走只隐藏；被预算释放过的实例再次进入时重新加载（dsh 支持会话深链时会回到
+同一个会话）。
 
 > **iframe 预算（前端内存的上界）**：每个实例 iframe 都是一整个 dsh web SPA（自己的实时通道、
 > 会话 DOM、插件脚本），隐藏的 iframe 并不会被冻结。原先「切走只 hidden、永不销毁」的代价是
@@ -638,8 +650,8 @@ node scripts/install-dsh-open-session.mjs --uninstall
 | `POST` | `/api/homes/{homeId}/restart` | 重启实例 |
 | `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web）。**确认式**：SIGTERM→3s→SIGKILL→2s，只有进程真的退出才回 `{ok:true}`；收不掉则回 500（带 pid/端口）且保留句柄。远端停止失败时也会以 500 上报（本地连接仍已断开）。响应里的 `stopped` 表示**这次是否确实停掉了一个受管子进程**（直连已有实例时为 false） |
 | `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
-| `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`） |
-| `GET` | `/api/search` | 全库搜索（`?q=&projectLimit=20&sessionLimit=50`；不受 7 天窗口 / Recent 条数上限限制，只搜运行中实例，返回 `{projects, sessions, truncated}`） |
+| `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`）；`?project=<项目名>` 精确筛出该项目的全部会话（不设 7 天窗口，多取 1 行判断截断，响应带 `truncated`） |
+| `GET` | `/api/search` | 全库搜索（`?q=&projectLimit=20&sessionLimit=50`；不受 7 天窗口 / Recent 条数上限限制，只搜运行中实例，返回 `{projects, sessions, truncated}`）。`?project=` 只把**会话**命中收在该项目内（项目筛选下的补搜），项目命中不受限 |
 | `GET` | `/api/workspaces` | 工作区列表 |
 | `POST` | `/api/homes` | 除 dsh 本机/远程外，`{harness:"codex" \| "workbuddy", homePath, alias?}` 可注册只读本地工具实例（默认 `~/.codex` / `~/.workbuddy`，注册后立即索引并刷新运行时；目录不存在 400） |
 | `POST` | `/api/harness/open` | 统一打开本地工具实例（body `{homeId, sessionId?, projectId?}`）：Codex → `codex://threads/<uuid>`、WorkBuddy → `workbuddy://chat/<uuid>`、本地 dsh 只读 → 插件触发器，无会话/插件缺失时聚焦/启动 DSH 桌面端（200 `code:"app-focused"`）。未知 home 404、非本地工具 400、非法会话 id 400（UUID 白名单）、唤起失败 502 |

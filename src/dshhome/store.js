@@ -1055,10 +1055,15 @@ export class IndexStore {
     return this.db.prepare('SELECT sessionId, workspaceId, project FROM sessions WHERE homeId = ? AND sessionId = ?').get(homeId, sessionId) || null;
   }
 
-  recentSessions({ homeId = null, limit = 50, homeIds = null } = {}) {
+  // project：**精确**按项目名筛选（Recent Projects 点进来时用，见前端 setProjectFilter）。
+  // 不用 instr/LIKE：项目名是身份标识，不是搜索词 —— 搜 "PMAID" 命中 PMAID-GPPH 是搜索语义，
+  // 但「只看 PMAID」不能把 PMAID-GPPH 的会话一起带进来。
+  // 与 recentProjects 的 7 天窗口不同，这里**不设时间窗**：点开一个项目就是要看它的全部会话
+  // （最多 limit 条），而不是「最近 7 天里活跃的那部分」。
+  recentSessions({ homeId = null, limit = 50, homeIds = null, project = null } = {}) {
     const scope = homeIds === null ? null : JSON.stringify(homeIds);
-    const where = 'WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?))) AND (? IS NULL OR homeId = ?)';
-    const args = [scope, scope, homeId, homeId];
+    const where = 'WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?))) AND (? IS NULL OR homeId = ?) AND (? IS NULL OR project = ?)';
+    const args = [scope, scope, homeId, homeId, project, project];
     return this.db.prepare(
       `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
        FROM sessions ${where}
@@ -1085,7 +1090,11 @@ export class IndexStore {
   // 代价：instr 走不了索引，是一次全表扫描。定位是「用户停手后才发」的按需查询，所以只在
   // 返回量上设上限（默认项目 20 / 会话 50，与 Recent 面板同一量级），不做分页。
   // 返回 truncated 标志：命中超过上限时前端提示「还有更多」，避免用户以为只有这些。
-  searchAll({ q, homeIds = null, projectLimit = 20, sessionLimit = 50 } = {}) {
+  // project（可选）：把**会话**结果限制在这个项目内（顶栏搜索 + 项目筛选叠加时用）。
+  // 项目结果不受它约束 —— 搜索框在筛选状态下仍然要能搜到别的项目，否则用户没法从
+  // 「筛着 PMAID-GPPH」跳到另一个 PMAID 项目。会话必须受限，否则全库命中会把别的项目的
+  // 会话合并进已筛过的列表里（前端在项目筛选下只显示该项目的会话）。
+  searchAll({ q, homeIds = null, projectLimit = 20, sessionLimit = 50, project = null } = {}) {
     const needle = typeof q === 'string' ? q.normalize('NFKC').trim().slice(0, MAX_SEARCH_QUERY_CHARS) : '';
     if (!needle) return { projects: [], sessions: [], truncated: { projects: false, sessions: false } };
     const needleLower = needle.toLowerCase();
@@ -1143,16 +1152,18 @@ export class IndexStore {
     }
 
     // 会话：标题 / 工作区名 / 所属项目名任一命中即可；字段与 recentSessions 完全同形。
+    // project 参数是精确作用域（与 recentSessions 同口径），不参与「命中」判定。
     const sessionRows = this.db.prepare(
       `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
        FROM sessions
        WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?)))
+         AND (? IS NULL OR project = ?)
          AND (instr(lower(coalesce(title, '')), ?) > 0
            OR instr(lower(coalesce(workspaceTitle, '')), ?) > 0
            OR instr(lower(coalesce(project, '')), ?) > 0)
        ORDER BY lastActivity DESC NULLS LAST
        LIMIT ${sl + 1}`
-    ).all(scope, scope, needleLower, needleLower, needleLower);
+    ).all(scope, scope, project, project, needleLower, needleLower, needleLower);
 
     return {
       projects: projects.slice(0, pl),

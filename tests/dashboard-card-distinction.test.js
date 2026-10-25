@@ -62,7 +62,7 @@ test('项目卡底色按 app 来源（实例 harness）区分：dsh / Codex / Cl
   assert.deepEqual(sources, ['dsh', 'codex', 'claude-code', 'workbuddy', 'claude-code', 'other'],
     '别名归一化到同一来源；未知/恶意 harness 一律归 other');
   assert.doesNotMatch(html, INJECTED_TAG, 'data-source 是白名单值，不可能带出注入');
-  assert.match(html, /title="数据来源：Codex · 点击打开该项目所在实例的最新会话"/, 'title 说明底色的来源含义');
+  assert.match(html, /title="数据来源：Codex · 点击筛选该项目会话"/, 'title 说明底色的来源含义 + 点击语义');
 });
 
 test('index.html：项目卡按来源着色的 CSS 契约（明/暗主题各一套底色）', async () => {

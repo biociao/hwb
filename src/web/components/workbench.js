@@ -5,11 +5,13 @@ import { esc } from '../store.js';
 // 让两栏在扫视时不会串。计数由调用方传入（缺省不画，保持旧调用兼容）。
 // projectCount / sessionCount 既可以是数字（未过滤），也可以是 "3/20" 这样的字符串
 // （搜索过滤中：命中/总数）—— 两种形态都走同一条 esc → innerHTML 路径。
-export function renderWorkbench({ projects, sessions, homes, usage, logs, projectCount = null, sessionCount = null }) {
+// sessionFilter：项目筛选条（见 recent-sessions.js 的 renderSessionFilter）。它放在 h2 与
+// 列表之间、不属于滚动区（.rows），所以筛选中时它会一直留在分区顶部，不被列表滚走。
+export function renderWorkbench({ projects, sessions, homes, usage, logs, projectCount = null, sessionCount = null, sessionFilter = '' }) {
   const count = (n) => (n == null || n === '' ? '' : `<span class="pane-count">${esc(n)}</span>`);
   return `
     <section class="pane pane-projects"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">▦</span>Recent Projects</span>${count(projectCount)}</h2>${projects}</section>
-    <section class="pane pane-sessions"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">◍</span>Recent Sessions</span>${count(sessionCount)}</h2>${sessions}</section>
+    <section class="pane pane-sessions"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">◍</span>Recent Sessions</span>${count(sessionCount)}</h2>${sessionFilter}${sessions}</section>
     <section class="pane pane-instances"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">▣</span>Instances</span><button class="add" data-action="toggle-add-form">＋ 添加</button></h2>${homes}</section>
     <section class="usage"><h2>Token 用量</h2><div id="usage-card">${usage}</div></section>
     ${logs || ''}

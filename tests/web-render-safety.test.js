@@ -157,14 +157,15 @@ test('instance-grid: 版本与状态 chip 收在同一个 chip 组里（否则�
   assert.match(group[1], /已连接/);
 });
 
-// 键盘可达性：drill-in 行是 <div> + 委托 click —— 只给了鼠标用户。补 role/tabindex 后
+// 键盘可达性：可点击行是 <div> + 委托 click —— 只给了鼠标用户。补 role/tabindex 后
 // 才能被 Tab 聚焦、被 Enter/Space 激活（见 app.js 的 keydown 委托）。
+// 项目行的动作是 filter-project（点击筛会话，不再直接跳实例；见 app.js 的 handleAction）。
 test('recent-projects/sessions: 可点击行带 role=button 与 tabindex=0', () => {
   const projectHtml = renderRecentProjects(
     [{ homeId: 'abcdef1234567890', project: 'p', sessionId: 's', lastActivity: null, sessionCount: 1, inputTokens: 0, outputTokens: 0 }],
     [],
   );
-  assert.match(projectHtml, /data-action="drill-in"[^>]*/, 'sanity');
+  assert.match(projectHtml, /data-action="filter-project"[^>]*/, 'sanity');
   assert.match(projectHtml, /role="button"/);
   assert.match(projectHtml, /tabindex="0"/);
 

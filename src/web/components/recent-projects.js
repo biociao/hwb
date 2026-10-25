@@ -18,10 +18,15 @@ export function monogramOf(name) {
   return [...text].slice(0, 2).join('');
 }
 
-export function renderRecentProjects(projects, homes = []) {
+// selectedProject：当前被「筛选」的项目名（与 Recent Sessions 联动）。
+// 点击项目卡不再直接跳转实例，而是把它名下的会话筛到 Recent Sessions（见 app.js 的
+// setProjectFilter）；再次点击同一个项目取消筛选，所以这张卡同时也是筛选开关，
+// 用 aria-pressed 表达开关状态。跳转能力仍在：筛选条里的「打开项目」按钮保留原语义。
+export function renderRecentProjects(projects, homes = [], { selectedProject = null } = {}) {
   if (!projects.length) return '<div class="empty">no active projects in the last 7 days</div>';
   const homeById = new Map(homes.map((h) => [h.homeId, h]));
   const rows = projects.map((p) => {
+    const selected = selectedProject !== null && p.project === selectedProject;
     const inst = homeById.get(p.homeId);
     const instName = inst ? (inst.alias || inst.homePath) : null;
     const instColor = inst ? chipColor(p.homeId) : null;
@@ -44,12 +49,13 @@ export function renderRecentProjects(projects, homes = []) {
       // 总消耗排序），但只写 in/out 会让人以为两处应该相等，所以标签写全。
       : `<span class="project-tokens" title="新增输入 + 缓存读 + 缓存写"><span>in ${fmtTokens(p.inputTokens)}</span><span>out ${fmtTokens(p.outputTokens)}</span></span>`;
     return `
-    <div class="row clickable card project-card" role="button" tabindex="0" data-action="drill-in" data-kind="project" data-home-id="${esc(p.homeId)}"
+    <div class="row clickable card project-card${selected ? ' selected' : ''}" role="button" tabindex="0" data-action="filter-project" data-kind="project" data-home-id="${esc(p.homeId)}"
          data-workspace-id="${esc(p.workspaceId ?? '')}"
          data-session-id="${esc(p.sessionId ?? '')}" data-project="${esc(p.project)}"
          data-source="${source}"
+         aria-pressed="${selected ? 'true' : 'false'}"
          style="--card-accent:${projColor.fg};--card-tint:${projColor.bg}"
-         title="数据来源：${esc(sourceLabel(source))} · 点击打开该项目所在实例的最新会话">
+         title="数据来源：${esc(sourceLabel(source))} · ${selected ? '再次点击取消筛选，回到最近会话' : '点击筛选该项目会话'}">
       <span class="card-rail" aria-hidden="true"></span>
       <div class="card-body">
         <div class="t">

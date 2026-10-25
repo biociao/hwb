@@ -89,7 +89,9 @@ test('app.js：全库补搜走防抖 + 序号守卫，结果经 mergeSearchResul
   assert.match(appJs, /api\(`\/api\/search\?\$\{params\}`\)/);
   assert.match(appJs, /if \(seq !== searchSeq \|\| key !== searchKey\(\)\) return;/,
     '乱序响应必须被 (seq, 当前查询词) 双重守卫挡掉');
-  assert.match(appJs, /mergeSearchResults\(\{ projects, sessions, searchedProjects: full\.projects, searchedSessions: full\.sessions \}\)/,
+  // 会话基底从 `sessions` 变成 `baseSessions`（项目筛选下是该项目会话，否则是最近 50 条）；
+  // 合并语义不变：最近行优先、全库结果只补缺。
+  assert.match(appJs, /mergeSearchResults\(\{ projects, sessions: baseSessions, searchedProjects: full\.projects, searchedSessions: full\.sessions \}\)/,
     '全库结果必须与最近列表合并，而不是直接替换');
   assert.match(appJs, /searchState\.status === 'loading'/);
   assert.match(appJs, /searchPendingHtml\('项目', searchQuery\)/);
