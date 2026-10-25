@@ -222,3 +222,80 @@ test('live poller: 一轮 refresh 只点查一次该实例（原先是两次相�
   await poller.refresh('h1');
   assert.equal(gets, 1, `一次 refresh 只该点查一次实例（实际 ${gets} 次）`);
 });
+
+// —— 自适应轮询节奏（2026-09-22，dgx21.tun 实测）——
+//
+// 背景：轮询原先固定 3s，而经隧道取一次 session.list（实测 129 KB）要 3.4–7.3s。
+// 固定节奏下每一轮都在上一轮还没回来时就到点，日志里成功与失败交替刷屏
+// （实测 3380 失败 / 2135 成功），实例长期 degraded、实时状态几乎从不生效。
+// 这几条用例守住：**慢链路自动放慢、本地实例行为不变、失败退避、成功复位**。
+
+test('live poller: 慢链路按实测耗时放慢节奏（一轮 5s → 下一轮约 10s）', async () => {
+  const home = { homeId: 'h1', activeEndpointId: null };
+  const poller = new LiveStatusPoller({
+    store: { getHome: () => home, applyLiveStatus: () => {} },
+    homes: () => [home],
+    // 用 5s 的「一轮」模拟慢链路（真实链路一次 129 KB 要 3.4–7.3s）。
+    read: async () => { await new Promise((r) => setTimeout(r, 5000)); return [{ sessionId: 's1' }]; },
+    intervalMs: 3000,
+  });
+  poller.running = true;
+  await poller.refresh(home);
+  const interval = poller.cadence.get('h1').interval;
+  assert.ok(interval > 3000, `慢链路上必须放慢（实际 ${interval}ms）`);
+  assert.ok(interval >= 9000 && interval <= 11000, `应约为「本轮耗时 × 2」（实际 ${interval}ms）`);
+});
+
+test('live poller: 快链路（本地实例）保持基线节奏，行为不变', async () => {
+  const home = { homeId: 'h1', activeEndpointId: null };
+  const poller = new LiveStatusPoller({
+    store: { getHome: () => home, applyLiveStatus: () => {} },
+    homes: () => [home],
+    read: async () => [{ sessionId: 's1' }],   // 本地实例：毫秒级
+    intervalMs: 3000,
+  });
+  poller.running = true;
+  await poller.refresh(home);
+  assert.equal(poller.cadence.get('h1').interval, 3000, '快链路不该被放慢');
+});
+
+test('live poller: 失败指数退避并有上界，成功一次即复位', async () => {
+  const home = { homeId: 'h1', activeEndpointId: null };
+  let ok = false;
+  const poller = new LiveStatusPoller({
+    store: { getHome: () => home, applyLiveStatus: () => {} },
+    homes: () => [home],
+    read: async () => (ok ? [{ sessionId: 's1' }] : null),
+    intervalMs: 3000,
+  });
+  poller.running = true;
+  await poller.refresh(home);
+  assert.equal(poller.cadence.get('h1').interval, 6000, '第一次失败退避到 2×');
+  await poller.refresh(home);
+  assert.equal(poller.cadence.get('h1').interval, 12000, '第二次失败退避到 4×');
+  // 退避必须有上界：否则一个长期不可达的实例会被推到几小时后才重试。
+  for (let i = 0; i < 8; i += 1) await poller.refresh(home);
+  assert.equal(poller.cadence.get('h1').interval, 30_000, '退避封顶在 maxIntervalMs');
+  ok = true;
+  await poller.refresh(home);
+  assert.equal(poller.cadence.get('h1').interval, 3000, '成功一次即回到基线');
+  assert.equal(poller.cadence.get('h1').failures, 0);
+});
+
+test('live poller: 没到点的实例在 tick 里被跳过（慢实例不再每 3s 被叫醒）', async () => {
+  const home = { homeId: 'h1', activeEndpointId: null };
+  let reads = 0;
+  const poller = new LiveStatusPoller({
+    store: { getHome: () => home, applyLiveStatus: () => {} },
+    homes: () => [home],
+    read: async () => { reads += 1; return [{ sessionId: 's1' }]; },
+    intervalMs: 30,   // 让 tick 跑得快，便于观察「跳过」
+  });
+  poller.start();
+  await new Promise((r) => setTimeout(r, 120));
+  poller.stop();
+  // 首轮之后 cadence 已排到 30ms 后；即使 tick 每 30ms 一次，也不该出现远超预期的读取次数。
+  // 关键是**不该退化成每 tick 都读**：120ms 窗口内最多约 4-5 次。
+  assert.ok(reads >= 1, '至少要读过一次');
+  assert.ok(reads <= 6, `没到点的实例应被跳过（实际读了 ${reads} 次）`);
+});

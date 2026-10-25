@@ -144,6 +144,12 @@ master 已是认证态，因此绕过 `MaxStartups` 那条未认证队列。无 
   `HWB_SSH_CONNECT_TIMEOUT`、`HWB_SSH_ALIVE_INTERVAL`、`HWB_SSH_ALIVE_COUNT_MAX`、`HWB_SSH_MUX`；
   本次新增 `HWB_TUNNEL_MASTER_POLL_MS`（master 巡检间隔，默认 10s）、
   `HWB_TUNNEL_MASTER_CHECK_MS`（`-O check` 超时，默认 4s）。
+- 2026-09-19 追加（master 健康自愈 + 实时探测预算，见
+  [`c4g-tun-reconnect.md`](./c4g-tun-reconnect.md)）：`HWB_TUNNEL_MASTER_RTT_MS`（单轮往返
+  超它即记「不健康」，默认 3000）、`HWB_TUNNEL_MASTER_RTT_TIMEOUT_MS`（默认 8000）、
+  `HWB_TUNNEL_MASTER_RTT_STREAK`（连续 N 轮才回收，默认 3）、
+  `HWB_TUNNEL_MASTER_HEAL_COOLDOWN_MS`（同主机自愈冷却，默认 10 分钟），
+  以及 `HWB_LIVE_RPC_TIMEOUT_MS`（实时 RPC 预算，默认仍是 4000）。
 
 > 说明：`RemoteForward 7897` 对 hwb 早在 2026-09-11 就由代码处理过
 > （`withoutForwardings()` 会从快照里剥掉转发指令，commit `3243989`）——日志里 6 次
@@ -504,3 +510,75 @@ ICMP DF: payload 1300 (IP 1328) 0% 丢包；payload 1310 (IP 1338) 起即为 100
 - 关键点：`TCP_INFO` 的 `cwnd/ssthresh/rwnd_limited/sndbuf_limited/tot_retrans` 是本轮定性的核心；
   单纯看「带宽」会误判为窗口/MTU 问题。
 - 对照必须做「VPN 内主机对主机」，否则无法区分客户端 ISP 与 VPN 核心。
+
+---
+
+## 2026-09-22 第四轮：hwb 侧能做的都做了（少往返、少字节、按实测自适应）
+
+第三轮把根因锁在 VPN 核心（~1 Mbps + 丢包），并得出「提速没有客户端解」。这一轮换目标：
+**不追求提速，只减少 hwb 自己制造的无谓往返与重传**。以下每条都先在现网量到代价，再改。
+
+### 本轮新测到的两个数字（之前没有）
+
+| 测量 | 结果 | 含义 |
+|---|---|---|
+| 远端 dsh 服务端自测 `/` | **1.0–5.2 ms**（load 0.44、20 核） | 服务端无关，全部时间在链路 |
+| 经隧道同一 URL | **1.75–3.94 s** | 差约 1000× |
+| 隧道内裸 `ssh dgx21.tun true` | **1.97–5.60 s** | 单次往返就是这个量级 |
+| 隧道吞吐 256 KB | **26.5 s ≈ 9.9 KB/s**（1 MB / 30s、4 MB / 60s 均传不完） | 与第三轮 25–50 KB/s 同量级 |
+| `session.list` 响应体 | **129 KB**（179 个会话） | **这才是轮询的真成本** |
+| PMTU 断崖（本轮复测） | IP ≥1348 B **100% 全丢**；1308 B 丢 25% | 与第三轮「断崖在 1328–1338」一致 |
+
+### hwb 原先的三处自伤（`~/.hwb/service.log` 实测计数）
+
+```
+失败原因分布：auth timeout 2215 ｜ auth fetch failed 461 ｜ rpc http 4xx 283
+              auth http 4xx 244 ｜ rpc timeout 226 ｜ rpc fetch failed 3
+总计数：实时会话同步失败 3380 次 / 读取成功 2135 次   ⇒ 约 61% 失败
+```
+
+失败**绝大多数发生在 `auth` 那一段**，而不是真正的 RPC —— 因为原实现每轮都重做一次
+token→cookie 交接（`GET /?token=` → `POST /api/…`），远程实例上就是**两个隧道往返**，
+而整个预算只有 4s。
+
+### 改动（全部在 hwb 侧；服务端 / VPN / 远端主机都没动）
+
+| # | 改动 | 省掉什么 | 本地实例是否受影响 |
+|---|---|---|---|
+| 1 | cookie 交接按实例记忆（TTL 10 min） | 每轮**一整段隧道往返**（实测 500–900 ms/轮） | 否（本地也少一次 0.1ms 请求） |
+| 2 | keep-alive 连接池 `LIVE_AGENT`（maxSockets 2） | 每轮新建 TCP + 慢启动（实测冷 1.86s → 热 0.17s） | 否 |
+| 3 | RPC 预算自适应：`min(30s, max(配置, EWMA×3+2s))` | 消除「必然超时」 | 否（毫秒级往返 ⇒ 仍用 4s） |
+| 4 | 轮询节奏自适应 + 失败退避（6→12→24→30s 封顶） | 慢链路上从 ~1200 轮/时降到 ~200 轮/时 | 否（仍 3s） |
+| 5 | 慢链路上 `session.list` TTL 3s → 15s | **每轮重搬的 129 KB** | 否（无慢观测即 3s） |
+
+第 5 条是**省字节**的那一条：129 KB ÷ ~10 KB/s ≈ 13 s，而 TTL 只有 3 s ——
+等于每一轮都在重搬一份「3 秒内几乎不会变」的数据。判据用**实测上游耗时**（≥1.5s 判为慢链路），
+不用配置里的 hostType：hwb 无从可靠区分「本地实例」与「快隧道」，耗时是直接测出来的事实。
+
+**刻意不放宽的那一处**：历史类 RPC（`session.history`）在「会话在跑 / 状态未知」时**必须**
+保持短窗口。事件流 `/api/events.host` 开流 payload 是空的（没有游标），一份陈旧的历史窗口
+补不回中间那段事件 —— 放宽 TTL 会让界面出现**静默的消息空洞**，那比慢更糟。
+
+### 实测效果（现网，同一个隧道口）
+
+```
+改造前：3 次请求（每次新连接、每次重做交接、每次重搬 129 KB）
+        7257ms / 4188ms / 4386ms
+改造后：3 次请求（交接记忆化）
+        6098ms / 3672ms / 3426ms     ← 每轮省 500–900ms
+连续 6 轮轮询（原 4s 预算）：6 成功 / 0 失败      ← 改造前约 61% 失败
+```
+
+> 说明：6/6 那组里第 2 轮起命中了代理缓存的本地副本（4–8ms）。真正的链路成本
+> 仍由第 5 条（TTL）压住 —— 没有它，每轮都会重新过隧道搬 129 KB。
+
+### 仍然没解决的
+
+- **~1 Mbps 上限在 VPN 核心**，客户端无解（见第三轮）。以上只减少往返与字节，**不提速**。
+- **PMTU 断崖仍在**：本机 `utun8` MTU 1400、远端 `tun0` MTU 1500、远端 `tcp_mtu_probing=0`。
+  当前靠 profile 的 `mssfix 1360`（实际段 1312–1324）压在断崖（≥1348 全丢）之下，
+  **余量只有 ~25 B** —— 这正是「偶发卡 7.5–10 s」的来源。建议改
+  `~/Library/Application Support/OpenVPN Connect/profiles/*.ovpn`：
+  `tun-mtu 1300` + `mssfix 1240`，重连后生效（需用户操作，profile 在工作区沙箱之外）。
+- 每次连接仍会打 `Warning: remote port forwarding failed for listen port 7897`
+  （远端 7897 被占用）；`RemoteForward 7897` 可以删掉。

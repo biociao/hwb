@@ -1,23 +1,49 @@
 import { endpointEditor, endpointSelector } from './endpoint-editor.js';
-import { esc } from '../store.js';
+import {
+  esc, isLocalToolHome, localToolKind, localToolLabel, localToolHomePlaceholder,
+} from '../store.js';
 
 const DSH_HOME_PLACEHOLDER = 'dsh home 路径，如 ~/.dsh';
-const CODEX_HOME_PLACEHOLDER = '~/.codex';
+const DSH_HOME_DEFAULT = '~/.dsh';
+const CODEX_HOME_PLACEHOLDER = localToolHomePlaceholder('codex');
+const WORKBUDDY_HOME_PLACEHOLDER = localToolHomePlaceholder('workbuddy');
+// 各模式自动填入的默认 home：切模式时只清理「来自别的模式的默认值」，绝不动用户手输的路径。
+const DEFAULT_HOMES = new Set([DSH_HOME_DEFAULT, CODEX_HOME_PLACEHOLDER, WORKBUDDY_HOME_PLACEHOLDER]);
+
+// 「只读本地工具」模式（codex / workbuddy / local-readonly 的 dsh）的路径占位与说明。
+function localToolModeDefaults(mode) {
+  if (mode === 'codex') return { home: CODEX_HOME_PLACEHOLDER, placeholder: CODEX_HOME_PLACEHOLDER };
+  if (mode === 'workbuddy') return { home: WORKBUDDY_HOME_PLACEHOLDER, placeholder: WORKBUDDY_HOME_PLACEHOLDER };
+  return { home: DSH_HOME_DEFAULT, placeholder: DSH_HOME_PLACEHOLDER }; // local-readonly
+}
 
 // 实例设置表单（实例名称 / 远程连接参数）。
 function settingsField(name, title, value, placeholder) {
   return `<label class="config-field"><span>${esc(title)}</span><input name="${name}" placeholder="${esc(placeholder)}" value="${esc(value ?? '')}" autocomplete="off"></label>`;
 }
 
+// 本地工具设置面的说明：三种工具同构（只有 alias + homePath），差异只在读的是哪个文件。
+const LOCAL_TOOL_NOTES = {
+  codex: '只读读取 state_5.sqlite 与 .codex-global-state.json，不连接任何进程。',
+  workbuddy: '只读读取 workbuddy.db（项目 / 会话元数据），不连接任何进程、不写库。',
+  dsh: '只读读取该 home 的索引：不连接 dsh web、不需要 token；点会话时由 DSH 桌面端打开。',
+};
+
 export function renderSettingsForm(home) {
-  // Codex 是「只读元数据实例」：没有进程、端点、端口或 token。设置里只保留名称与 home 路径，
-  // 否则用户会在这里找一个不存在的「接入端口」，或者以为改 endpoint 能换数据源。
-  if (home.harness === 'codex') {
+  // 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）：没有进程、端点、端口或 token。
+  // 设置里只保留名称与 home 路径，否则用户会在这里找一个不存在的「接入端口」，
+  // 或者以为改 endpoint 能换数据源。
+  if (isLocalToolHome(home)) {
+    const kind = localToolKind(home);
+    const label = localToolLabel(home);
+    const attrs = kind === 'dsh'
+      ? 'data-mode="local-readonly" data-readonly="true"'
+      : `data-mode="${kind}" data-harness="${kind}"`;
     return `
-    <form id="settings-form" class="home-form" data-mode="codex" data-harness="codex">
-      ${settingsField('alias', '实例名称', home.alias || home.serverId, '例如 Codex 本机')}
-      ${settingsField('homePath', '本机 Codex home 路径', home.homePath, CODEX_HOME_PLACEHOLDER)}
-      <p class="meta readonly">只读读取 state_5.sqlite 与 .codex-global-state.json，不连接任何进程。</p>
+    <form id="settings-form" class="home-form" ${attrs}>
+      ${settingsField('alias', '实例名称', home.alias || home.serverId, `例如 ${label} 本机`)}
+      ${settingsField('homePath', `本机 ${label} home 路径`, home.homePath, localToolHomePlaceholder(kind))}
+      <p class="meta readonly">${LOCAL_TOOL_NOTES[kind]}</p>
     </form>`;
   }
   const isRemote = home.hostType === 'remote';
@@ -38,13 +64,30 @@ export function renderSettingsForm(home) {
     </form>`;
 }
 
-export function renderHomeForm() {
+export function renderHomeForm(detected = null) {
+  // 检测到的本机 dsh：给一个「只读添加」快捷入口（Codex 同款；与已有可连接实例可并存）。
+  const detectedDsh = detected?.exists
+    ? `<p class="hint">检测到本机 dsh home：<code>${esc(detected.path)}</code>
+         <button type="button" data-action="add-detected" data-path="${esc(detected.path)}" data-readonly="true">添加为只读实例</button>
+       </p>`
+    : '';
+  // 检测到的本机 WorkBuddy：一键注册为只读本地工具实例（与 Codex / dsh 同构）。
+  const workbuddy = detected?.workbuddy;
+  const detectedWorkbuddy = workbuddy?.exists
+    ? `<p class="hint">检测到本机 WorkBuddy home：<code>${esc(workbuddy.path)}</code>
+         <button type="button" data-action="add-detected" data-path="${esc(workbuddy.path)}" data-harness="workbuddy">添加为 WorkBuddy 实例</button>
+       </p>`
+    : '';
   return `
+    ${detectedDsh}
+    ${detectedWorkbuddy}
     <form id="add-home" class="home-form" data-mode="local">
       <select name="mode" class="home-mode" title="实例类型">
         <option value="local">本机</option>
+        <option value="local-readonly">本机（只读，不连接）</option>
         <option value="remote">SSH 远程</option>
         <option value="codex">Codex（只读）</option>
+        <option value="workbuddy">WorkBuddy（只读）</option>
       </select>
       <input name="homePath" placeholder="${DSH_HOME_PLACEHOLDER}" required autocomplete="off">
       <input name="host" placeholder="SSH 主机（别名 / user@host）" autocomplete="off" hidden>
@@ -70,24 +113,26 @@ export function renderHomeForm() {
 // 原生校验直接拦下提交（submit 事件根本不触发）。
 export function applyHomeMode(form, mode) {
   const remote = mode === 'remote';
-  const codex = mode === 'codex'; // Codex：只读本机元数据，没有 host / 端口 / token 可言
+  // codex / workbuddy / local-readonly 都是「只读本地工具」：只有 homePath，
+  // 没有 host / 远端端口 / token / 接入端口可言。
+  const localTool = mode === 'codex' || mode === 'workbuddy' || mode === 'local-readonly';
   form.homePath.hidden = remote;
-  form.homePath.placeholder = codex ? CODEX_HOME_PLACEHOLDER : DSH_HOME_PLACEHOLDER;
+  form.homePath.placeholder = localTool ? localToolModeDefaults(mode).placeholder : DSH_HOME_PLACEHOLDER;
   form.host.hidden = !remote;
   form.remotePort.hidden = !remote;
   form.remoteHome.hidden = !remote;
   form.remoteCmd.hidden = !remote;
   form.remoteLog.hidden = !remote;
-  form.token.hidden = codex;        // 手填 token：仅 dsh 实例（本机/远程直连）需要
-  form.localPort.hidden = remote || codex;   // 本机直连端口：仅本机 dsh
+  form.token.hidden = localTool;              // 手填 token：仅可连接的 dsh 实例需要
+  form.localPort.hidden = remote || localTool; // 本机直连端口：仅可连接的本机 dsh
   form.accessPort.hidden = !remote;
   form.accessPort.disabled = !remote;
   form.homePath.required = !remote;
-  // Codex 的默认 home 就是 ~/.codex：切到 codex 时把空值补上，否则 required 会把
-  // 「直接点添加」拦在原生校验里（placeholder 不算值）。切回 dsh 时清掉这个默认值，
-  // 免得本机 dsh 表单里留着一个 ~/.codex 的假路径。
-  if (codex && !form.homePath.value) form.homePath.value = CODEX_HOME_PLACEHOLDER;
-  if (!codex && form.homePath.value === CODEX_HOME_PLACEHOLDER) form.homePath.value = '';
+  // 本地工具的默认 home 直接补上，否则 required 会把「直接点添加」拦在原生校验里
+  // （placeholder 不算值）。切模式时只清掉「别的模式留下的默认值」，用户手输的路径不动。
+  const defaultHome = localTool ? localToolModeDefaults(mode).home : null;
+  if (DEFAULT_HOMES.has(form.homePath.value) && form.homePath.value !== defaultHome) form.homePath.value = '';
+  if (defaultHome && !form.homePath.value) form.homePath.value = defaultHome;
   form.host.required = remote;
   form.remotePort.required = remote;
   return mode;
@@ -103,6 +148,12 @@ export function renderOnboarding(detected) {
   // Codex 是第二个 harness：检测到 ~/.codex 时额外给一个只读接入入口。它和 dsh 实例同构
   // （出现在 INSTANCES，项目/会话汇总进 RECENT 两栏），但**不启动、不连接任何进程**，
   // 只读 state_5.sqlite 与 .codex-global-state.json；data-harness 让 app.js 区分两种实例。
+  const detectDshReadOnly = detected?.exists
+    ? `<button data-action="add-detected" data-path="${esc(detected.path)}" data-readonly="true">
+         添加检测到的 ${esc(detected.path)}（只读，不连接）
+       </button>
+       <p class="hint">只读实例直接读本地 home 的索引，不需要 token；点会话时由 DSH 桌面端打开。可与下面的可连接实例并存。</p>`
+    : '';
   const codex = detected?.codex;
   const detectCodex = codex?.exists
     ? `<button class="primary" data-action="add-detected" data-path="${esc(codex.path)}" data-harness="codex">
@@ -110,14 +161,24 @@ export function renderOnboarding(detected) {
        </button>
        <p class="hint">Codex 实例只读接入本机元数据（项目 / 会话 / 累计 token），不连接任何进程。${codex.looksLikeCodexHome ? '' : '该目录缺少 state_5.sqlite 或 .codex-global-state.json —— 仍可添加，索引会标记 degraded。'}</p>`
     : '';
+  // WorkBuddy 是第三个本地工具 harness：检测到 ~/.workbuddy 时给同一个只读接入入口。
+  const workbuddy = detected?.workbuddy;
+  const detectWorkbuddy = workbuddy?.exists
+    ? `<button data-action="add-detected" data-path="${esc(workbuddy.path)}" data-harness="workbuddy">
+         添加检测到的 ${esc(workbuddy.path)}（WorkBuddy）
+       </button>
+       <p class="hint">WorkBuddy 实例只读接入 workbuddy.db 里的项目 / 会话元数据，不连接任何进程、不写库。${workbuddy.looksLikeWorkbuddy ? '' : '该目录缺少 workbuddy.db —— 仍可添加，索引会标记 degraded。'}</p>`
+    : '';
   return `
     <section class="onboarding">
       <h2>欢迎使用 hwb</h2>
       <p>hwb 读取 dsh home 目录（workspace / 会话投影 / 模型 tier / provider），构建本地索引并在此展示工作台。只读，不修改任何 dsh 文件。</p>
-      <p>也可以只读接入本机 Codex（ChatGPT 桌面版）的元数据，把它的项目与会话汇总到同一张工作台。</p>
+      <p>也可以只读接入本机 Codex（ChatGPT 桌面版）或 WorkBuddy 的元数据，把它们的项目与会话汇总到同一张工作台。</p>
       <p>先添加一个本地 dsh home，或通过 SSH 隧道接入远程 dsh 实例：</p>
       ${detect}
+      ${detectDshReadOnly}
       ${detectCodex}
+      ${detectWorkbuddy}
       ${renderHomeForm()}
     </section>`;
 }

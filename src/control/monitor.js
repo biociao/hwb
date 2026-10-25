@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { probeAlive } from './prober.js';
 import { InstanceRegistry } from './registry.js';
 import { logger } from '../lib/logger.js';
+import { isLocalToolHome } from '../lib/harnesses.js';
 
 const log = logger('monitor');
 
@@ -124,9 +125,11 @@ export class Monitor {
       this.#clearReconnect(homeId);
       return Promise.resolve(this.registry.get(homeId));
     }
-    // Codex 是只读数据源，没有可托管的进程/端口/隧道：不做 HTTP/SSH 探测，也不参与重连退避。
-    // 只要 home 目录还在就算「已就绪」（runtime=running），索引器负责读 SQLite/JSON。
-    if (home.harness === 'codex') {
+    // 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）是只读数据源，没有可托管的进程/端口/隧道：
+    // 不做 HTTP/SSH 探测，也不参与重连退避。只要 home 目录还在就算「已就绪」（runtime=running），
+    // 索引器负责读元数据。这样 Recent 的项目/会话无需「连接」就能展示。
+    // 判定收在 lib/harnesses.js 一处（契约 §2），这里不再写 harness === 'codex' 之类的分支。
+    if (isLocalToolHome(home)) {
       this.registry.seed(homeId);
       this.registry.set(homeId, {
         phase: this.exists(home.homePath) ? 'running' : 'gone',

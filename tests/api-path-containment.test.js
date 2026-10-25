@@ -6,10 +6,11 @@ import path from 'node:path';
 import { IndexStore } from '../src/dshhome/store.js';
 import { createApiServer } from '../src/api/server.js';
 
-// preview / download 两条路由的**路径围栏**：它们把 `?path=` 交给 file-preview 解析，
+// download 路由的**路径围栏**：它把 `?path=` 交给 file-preview 解析，
 // 而围栏（realpath + commonpath 校验、符号链接拒绝）是「用户项目目录之外的文件一道都读不到」
 // 的唯一保证。单元测试覆盖了解析函数，这里补上**路由级**的端到端验证 —— 路由的接线
 // （workspaceId/sessionId 的解析、400 的返回、正常的 200）只有真发 HTTP 才测得到。
+// （原先还有一条 /preview 路由走同一套围栏，那条路由已随 hwb 的预览侧栏一起删除。）
 //
 // 实测过的形态（都必须 400 且**一个字节都不回**）：相对越界、绝对路径、符号链接文件、
 // 符号链接目录、内嵌 `..`、URL 编码的 `..%2F`。正常工作区内文件必须 200。
@@ -52,7 +53,7 @@ async function withServer(fn) {
   finally { await new Promise((r) => server.close(r)); store.close(); rmSync(dir, { recursive: true, force: true }); }
 }
 
-test('preview/download: 工作区之外的路径与符号链接一律拒绝（路由级）', async () => {
+test('download: 工作区之外的路径与符号链接一律拒绝（路由级）', async () => {
   await withServer(async ({ base, homeId, dir }) => {
     const attempts = [
       ['相对越界', '../../SECRET.txt'],
@@ -63,12 +64,10 @@ test('preview/download: 工作区之外的路径与符号链接一律拒绝（�
       ['URL 编码 ..%2F', '..%2F..%2FSECRET.txt'],
     ];
     for (const [label, p] of attempts) {
-      for (const route of ['download', 'preview']) {
-        const res = await fetch(`${base}/api/homes/${homeId}/${route}?workspaceId=ws-1&path=${encodeURIComponent(p)}`);
-        const text = await res.text();
-        assert.equal(res.status, 400, `${label} 必须 400（实际 ${res.status}）`);
-        assert.doesNotMatch(text, /TOP SECRET|root:/, `${label} 泄漏了工作区外的内容`);
-      }
+      const res = await fetch(`${base}/api/homes/${homeId}/download?workspaceId=ws-1&path=${encodeURIComponent(p)}`);
+      const text = await res.text();
+      assert.equal(res.status, 400, `${label} 必须 400（实际 ${res.status}）`);
+      assert.doesNotMatch(text, /TOP SECRET|root:/, `${label} 泄漏了工作区外的内容`);
     }
     // 对照：工作区内的正常文件必须能读
     const ok = await fetch(`${base}/api/homes/${homeId}/download?workspaceId=ws-1&path=${encodeURIComponent('ok.txt')}`);
@@ -82,12 +81,10 @@ test('preview/download: 工作区之外的路径与符号链接一律拒绝（�
   });
 });
 
-test('preview/download: 未知 workspaceId 不泄漏任何文件内容', async () => {
+test('download: 未知 workspaceId 不泄漏任何文件内容', async () => {
   await withServer(async ({ base, homeId }) => {
-    for (const route of ['download', 'preview']) {
-      const res = await fetch(`${base}/api/homes/${homeId}/${route}?workspaceId=nope&path=${encodeURIComponent('ok.txt')}`);
-      assert.ok(res.status >= 400, `${route} 未知 workspace 必须报错（实际 ${res.status}）`);
-      assert.doesNotMatch(await res.text(), /TOP SECRET|ok\n/, `${route} 不该回文件内容`);
-    }
+    const res = await fetch(`${base}/api/homes/${homeId}/download?workspaceId=nope&path=${encodeURIComponent('ok.txt')}`);
+    assert.ok(res.status >= 400, `未知 workspace 必须报错（实际 ${res.status}）`);
+    assert.doesNotMatch(await res.text(), /TOP SECRET|ok\n/, '不该回文件内容');
   });
 });

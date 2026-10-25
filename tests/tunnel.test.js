@@ -75,7 +75,7 @@ exec sleep 30
 // 现在改为优先 `ssh -O forward` 把 -L 挂到既有 master 上 —— 完全不新建连接。
 //
 // 这组测试守的是「零新建连接」这个核心收益，以及合成句柄对 launcher 的子进程语义。
-async function fakeSshFixture({ checkPid = 4242, failAfter = -1, forwardListener = true } = {}) {
+async function fakeSshFixture({ checkPid = 4242, failAfter = -1, forwardListener = true, probeDelayS = 0, probeFail = false } = {}) {
   const { mkdtemp, mkdir, writeFile, chmod } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const path = (await import('node:path')).default;
@@ -92,6 +92,9 @@ async function fakeSshFixture({ checkPid = 4242, failAfter = -1, forwardListener
   //   真 ssh 会建这个监听，而巡检正是靠「这个口还能不能连上」判断 -L 有没有丢；模拟出监听，
   //   测试才跟线上同构（此前假 ssh 不建监听，于是「master 活着但转发已丢」这个真实故障
   //   在测试里根本复现不出来）。cancel 时把监听杀掉，避免测试泄漏进程。
+  // probeDelayS / probeFail：master 健康探测（`ssh … host true`）的假响应 —— 默认立刻成功
+  //   （= 健康的 master）；probeDelayS 让它变慢、probeFail 让它失败，两种都用于验证
+  //   「连续偏慢才回收」的自愈逻辑（见文件末尾那组用例）。
   await writeFile(fake, `#!/bin/bash
 { printf 'CALL'; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; } >> ${argsLog}
 SPEC=$(printf '%s\\n' "$@" | awk '/^-L$/{getline; print; exit}')
@@ -116,6 +119,16 @@ for a in "$@"; do
   fi
   if [ "$a" = "cancel" ]; then
     [ -f ${forwardPid} ] && kill "$(cat ${forwardPid})" 2>/dev/null; rm -f ${forwardPid}
+    exit 0
+  fi
+  if [ "$a" = "exit" ]; then
+    # 真 master 退出会连带杀掉它承载的所有 -L 监听，这里照做，免得测试泄漏进程。
+    [ -f ${forwardPid} ] && kill "$(cat ${forwardPid})" 2>/dev/null; rm -f ${forwardPid}
+    exit 0
+  fi
+  if [ "$a" = "true" ]; then
+    [ "${probeDelayS}" != "0" ] && sleep ${probeDelayS}
+    if [ "${probeFail}" = "true" ]; then echo "probe: master round trip failed" 1>&2; exit 255; fi
     exit 0
   fi
 done
@@ -146,7 +159,7 @@ async function waitForCall(argsLog, needle, timeoutMs = 4000) {
 }
 
 // 把 PATH / HWB_SSH_MUX_DIR / 巡检间隔换成假 ssh 环境，并在 t.after 还原。
-async function withFakeSsh(t, fx, { pollMs = '120' } = {}) {
+async function withFakeSsh(t, fx, { pollMs = '120', host = 'bot@example.invalid' } = {}) {
   const path = (await import('node:path')).default;
   const { mkdir, writeFile } = await import('node:fs/promises');
   const { muxPath } = await import('../src/control/ssh-opts.js');
@@ -167,7 +180,6 @@ async function withFakeSsh(t, fx, { pollMs = '120' } = {}) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   });
-  const host = 'bot@example.invalid';
   // 复用套接字「存在」是走 master 路径的前提（不存在时代码刻意跳过 -O check 以免等超时）。
   await writeFile(muxPath(host), '');
   return { host };
@@ -281,4 +293,99 @@ test('openTunnel: -O forward 假装成功但端口没监听时，同样判定为
   const deadline = Date.now() + 5000;
   while (tunnel.proc.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
   assert.equal(tunnel.proc.exitCode, 255, '转发没真正建立时必须立刻暴露，而不是伪装成健康');
+});
+
+// —— master 退化自愈（2026-09-19）——
+//
+// 复用 master 的代价是把吞吐押在**一条长命连接**上：实测同一个 master 后期能把单次请求拖到
+// 20s，而同刻新建一条 master 只要 0.5–0.8s（docs/dgx21-tun-access.md「残留风险：长命 master
+// 会退化」）。巡检原来看两件事（master 存活、转发口在监听），这两件都「在」时用户侧照样整页
+// 卡死、浏览器一路 `Reconnecting`（dsh 客户端的连接 generation 3s 告警、15s 判死）。
+// 现在补第三问「它现在还快吗」：连续 N 轮慢/失败 → 先 `ssh -O exit` 回收再 report exit，
+// 由 launcher 重建一条新的（先回收是必须的，否则重建会把 -L 挂回同一条坏连接）。
+
+async function waitForExit(tunnel, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (tunnel.proc.exitCode === null && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 25));
+  }
+  return tunnel.proc.exitCode;
+}
+
+async function withEnv(t, vars) {
+  const saved = new Map();
+  for (const [k, v] of Object.entries(vars)) {
+    saved.set(k, process.env[k]);
+    process.env[k] = v;
+  }
+  t.after(() => {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+test('openTunnel: master 往返连续偏慢时必须回收该 master 再报 exit（否则整页被一条坏连接拖死）', async (t) => {
+  const { openTunnel } = await import('../src/control/tunnel.js');
+
+  const fx = await fakeSshFixture();
+  const { host } = await withFakeSsh(t, fx, { host: 'bot@slow.invalid' });
+  // 阈值压到 1ms：假 ssh 的一次往返（十几毫秒）就算「偏慢」；streak 用默认 3（约 3 轮 × 120ms）。
+  await withEnv(t, { HWB_TUNNEL_MASTER_RTT_MS: '1' });
+
+  const tunnel = await openTunnel({ host, remotePort: 4321 });
+  t.after(() => { try { tunnel.proc.kill('SIGKILL'); } catch { /* 已退出 */ } });
+  assert.equal(tunnel.viaMaster, true, '有 master 时必须走复用路径');
+
+  assert.equal(await waitForExit(tunnel, 5000), 255, '连续偏慢后隧道必须报死，交给 launcher 重建');
+  assert.match(tunnel.stderr(), /健康探测偏慢/, '报错要说明是健康探测判定的，而不是「master 不见了」');
+  assert.match(tunnel.stderr(), /已回收/, '必须真的回收了那条 master，而不是只报死');
+
+  const recycled = await waitForCall(fx.argsLog, ' -O exit ');
+  assert.ok(!recycled.missing,
+    `自愈必须调用 ssh -O exit 回收 master（实际调用：${JSON.stringify(recycled.calls)}）`);
+});
+
+test('openTunnel: 单次偏慢不足以拆掉 master（streak 未满时必须保持原样）', async (t) => {
+  const { openTunnel } = await import('../src/control/tunnel.js');
+  const { readFile } = await import('node:fs/promises');
+
+  const fx = await fakeSshFixture();
+  const { host } = await withFakeSsh(t, fx, { host: 'bot@tolerant.invalid' });
+  await withEnv(t, { HWB_TUNNEL_MASTER_RTT_MS: '1', HWB_TUNNEL_MASTER_RTT_STREAK: '100' });
+
+  const tunnel = await openTunnel({ host, remotePort: 4321 });
+  t.after(() => { try { tunnel.proc.kill('SIGKILL'); } catch { /* 已退出 */ } });
+
+  // 等够 12 轮巡检（120ms/轮）——足以证明「慢」被记下了，但没到 streak 就不会拆。
+  await new Promise(r => setTimeout(r, 1500));
+  assert.equal(tunnel.proc.exitCode, null, 'streak 未满时不得拆 master（偏慢可能是链路整体慢）');
+  const calls = await readCalls(fx.argsLog);
+  assert.ok(!calls.some(c => c.includes(' -O exit ')), 'streak 未满时不应调用 -O exit');
+  // 顺带守住：探测本身走的是「只复用、不新建」——假 ssh 收到过带 ControlMaster=no 的 true。
+  assert.ok(calls.some(c => c.includes('ControlMaster=no') && c.trim().endsWith(' true')),
+    '健康探测必须明确 ControlMaster=no（只复用既存 master，绝不新建连接）');
+  assert.ok(await readFile(fx.forwardPid, 'utf8'), '这一轮里转发监听应当还活着');
+});
+
+test('openTunnel: 自愈带冷却期，链路整体慢时不会反复拆 master', async (t) => {
+  const { openTunnel } = await import('../src/control/tunnel.js');
+
+  const fx = await fakeSshFixture();
+  const { host } = await withFakeSsh(t, fx, { host: 'bot@cooldown.invalid' });
+  await withEnv(t, { HWB_TUNNEL_MASTER_RTT_MS: '1', HWB_TUNNEL_MASTER_RTT_STREAK: '2' });
+
+  const first = await openTunnel({ host, remotePort: 4321 });
+  t.after(() => { try { first.proc.kill('SIGKILL'); } catch { /* 已退出 */ } });
+  assert.equal(await waitForExit(first, 5000), 255, '第一轮自愈应当发生');
+  const exitsAfterFirst = (await readCalls(fx.argsLog)).filter(c => c.includes(' -O exit ')).length;
+  assert.equal(exitsAfterFirst, 1, '第一轮恰好回收一次');
+
+  // 同一主机紧接着再建一条：仍在冷却期内（默认 10 分钟），不该再拆一次。
+  const second = await openTunnel({ host, remotePort: 4322 });
+  t.after(() => { try { second.proc.kill('SIGKILL'); } catch { /* 已退出 */ } });
+  await new Promise(r => setTimeout(r, 1200));
+  assert.equal(second.proc.exitCode, null, '冷却期内不得重复回收（否则会把窄链路刷得更乱）');
+  const exitsNow = (await readCalls(fx.argsLog)).filter(c => c.includes(' -O exit ')).length;
+  assert.equal(exitsNow, exitsAfterFirst, '冷却期内不应再出现 -O exit');
 });

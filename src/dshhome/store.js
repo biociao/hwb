@@ -8,6 +8,12 @@ import { logger } from '../lib/logger.js';
 
 const log = logger('store');
 
+// 只读实例与可连接实例共享同一个 homePath，但必须是两个实例：用不同命名空间派生 homeId。
+// 追加分隔符而不是改 homeId 算法，保证已有实例的 id 一个都不变。
+function readOnlyIdentity(homePath, readOnly) {
+  return homeIdOf(readOnly ? `${homePath}\u0000readonly` : homePath);
+}
+
 // 每个 home 的子表（整表替换的粒度）。
 const CHILD_TABLES = ['sessions', 'workspaces', 'providers', 'model_tiers'];
 
@@ -31,7 +37,7 @@ function degradedTables(degraded) {
 }
 
 // listHomes 与 getHome 共用的实例基础查询：单实例点查只需在末尾拼一个 WHERE。
-const HOME_SELECT = `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.harness, h.status, h.lastIndexedAt, h.degraded,
+const HOME_SELECT = `SELECT h.homeId, h.homePath, h.alias, h.hostType, h.harness, h.readOnly, h.status, h.lastIndexedAt, h.degraded,
               h.endpoints, h.activeEndpointId, h.serverId, h.host, h.remotePort, h.localPort, h.accessPort, h.remoteHome, h.remoteCmd, h.remoteLog, h.token,
               (SELECT COUNT(*) FROM sessions s WHERE s.homeId = h.homeId) AS sessionCount,
               (SELECT COUNT(*) FROM workspaces w WHERE w.homeId = h.homeId) AS workspaceCount
@@ -46,6 +52,9 @@ CREATE TABLE IF NOT EXISTS homes (
   -- harness：这个实例是谁的数据源。'dsh'（默认）走进程/端口/隧道与 projection cache；
   -- 'codex' 是只读的 Codex 本地环境（~/.codex），没有进程可托管，索引器直接读 SQLite/JSON。
   harness TEXT NOT NULL DEFAULT 'dsh',
+  -- readOnly：本地 dsh 的「Codex 式只读实例」——没有进程/端口/token，直接读 home 索引；
+  -- 与同 homePath 的可连接实例**并存**（homeId 用不同命名空间区分）。
+  readOnly INTEGER NOT NULL DEFAULT 0,
   status TEXT DEFAULT 'unknown',
   lastIndexedAt TEXT,
   degraded TEXT DEFAULT '[]',
@@ -199,7 +208,17 @@ const TOK = {
 // Token 用量/趋势/按项目拆分只统计 dsh 实例：Codex 的 session 只带 totalTokens（没有
 // 输入/输出/缓存拆分），放进来会让「新增输入 / 输出 / 缓存命中率」失真，或者只提高会话数。
 // Recent Projects/Sessions 不受影响（那是跨实例聚合，Codex 应该出现）。
-const DSH_ONLY = "homeId IN (SELECT homeId FROM homes WHERE harness = 'dsh')";
+// 只读实例与可连接实例指向同一个 homePath，两边的 sessions 行内容相同 —— 用量只能取一份。
+// 规则：有可用的只读实例时以它为口径（它不需要连接、总是最新），否则用可连接实例。
+const DSH_ONLY = `homeId IN (
+  SELECT h.homeId FROM homes h
+  WHERE h.harness = 'dsh'
+    AND (h.readOnly = 1 OR NOT EXISTS (
+      SELECT 1 FROM homes r
+      WHERE r.homePath = h.homePath AND r.harness = 'dsh' AND r.hostType = 'local'
+        AND r.readOnly = 1 AND r.status IN ('ok', 'degraded')
+    ))
+)`;
 
 // 「实时写入活跃」的宽限期：该 home 在这个窗口内有过实时状态写入时，文件索引的整表替换不能把
 // status/lastActivity 一起带走（见 upsertRows）。比轮询间隔（3s）宽裕，又足够短：通道一停，
@@ -325,6 +344,9 @@ export class IndexStore {
     if (!homes.includes('harness')) {
       this.db.exec("ALTER TABLE homes ADD COLUMN harness TEXT NOT NULL DEFAULT 'dsh'");
     }
+    if (!homes.includes('readOnly')) {
+      this.db.exec('ALTER TABLE homes ADD COLUMN readOnly INTEGER NOT NULL DEFAULT 0');
+    }
     if (!homes.includes('sortIndex')) {
       this.db.exec('ALTER TABLE homes ADD COLUMN sortIndex INTEGER');
     }
@@ -414,11 +436,20 @@ export class IndexStore {
     this.db.close();
   }
 
-  registerHome({ homePath, alias = null, hostType = 'local', harness = 'dsh', host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null, serverId = null, endpoints, activeEndpointId, accessPort }) {
-    const homeId = homeIdOf(homePath);
-    if (harness !== 'codex' && harness !== 'dsh') throw new Error('未知的 harness');
-    // Codex 只有本机只读环境：没有 dsh 进程/端口，也不支持 SSH 远端。
-    if (harness === 'codex' && hostType !== 'local') throw new Error('Codex 实例只支持本机路径');
+  registerHome({ homePath, alias = null, hostType = 'local', harness = 'dsh', readOnly = false, host = null, remotePort = null, remoteHome = null, remoteCmd = null, remoteLog = null, token = null, localPort = null, serverId = null, endpoints, activeEndpointId, accessPort }) {
+    const readOnlyFlag = readOnly === true;
+    const homeId = readOnlyIdentity(homePath, readOnlyFlag);
+    // 本地工具 harness（Codex / WorkBuddy）与 dsh 是并列的数据来源；新增来源在
+    // src/lib/harnesses.js 的 LOCAL_TOOL_HARNESSES 里登记后还要同步到这里。
+    if (!['codex', 'workbuddy', 'dsh'].includes(harness)) throw new Error('未知的 harness');
+    // 本地工具只有本机只读环境：没有 dsh 进程/端口，也不支持 SSH 远端。
+    if (harness !== 'dsh' && hostType !== 'local') {
+      throw new Error(`${harness} 实例只支持本机路径`);
+    }
+    // readOnly 标记只用于 dsh：Codex/WorkBuddy 本身就是只读接入，不需要再叠一个标记。
+    if (readOnlyFlag && (harness !== 'dsh' || hostType !== 'local')) {
+      throw new Error('只读实例只支持本机 dsh home');
+    }
     if (hostType !== 'remote' && normalizeAccessPort(accessPort) !== null) throw new Error('本机实例直接使用 dsh 服务端口，无需本地接入端口');
     if (accessPort !== undefined) accessPort = this.#checkAccessPort(homeId, accessPort);
     const previous = this.getHome(homeId);
@@ -429,15 +460,15 @@ export class IndexStore {
     // 新 home 排在末尾；已存在（冲突）只更新路径/别名/远程配置，保留原 sortIndex。
     const { n } = this.db.prepare('SELECT COALESCE(MAX(sortIndex), -1) + 1 AS n FROM homes').get();
     this.db.prepare(
-      `INSERT INTO homes (homeId, homePath, alias, hostType, harness, status, sortIndex, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort)
-       VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO homes (homeId, homePath, alias, hostType, harness, readOnly, status, sortIndex, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort)
+       VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(homeId) DO UPDATE SET
          homePath = excluded.homePath, alias = excluded.alias,
-         hostType = excluded.hostType, harness = excluded.harness, host = excluded.host,
+         hostType = excluded.hostType, harness = excluded.harness, readOnly = excluded.readOnly, host = excluded.host,
          remotePort = excluded.remotePort, remoteHome = excluded.remoteHome,
          remoteCmd = excluded.remoteCmd, remoteLog = excluded.remoteLog,
          token = excluded.token, localPort = excluded.localPort`
-    ).run(homeId, homePath, alias, hostType, harness, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
+    ).run(homeId, homePath, alias, hostType, harness, readOnlyFlag ? 1 : 0, n, host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort);
     const choices = normalized ?? (previous?.endpoints?.length ? previous.endpoints.map((e) => e.id === previous.activeEndpointId ? { ...e, host, port: hostType === 'remote' ? remotePort : localPort, token } : e) : [legacyEndpoint({ homeId, hostType, host, remotePort, localPort, token })].filter(Boolean));
     if (choices.length || hostType === 'local') this.updateHomeConfig(homeId, { endpoints: choices, activeEndpointId: activeEndpointId || previous?.activeEndpointId || choices[0]?.id || null });
     if (serverId) this.db.prepare('UPDATE homes SET serverId = ? WHERE homeId = ?').run(serverId, homeId);
@@ -510,7 +541,7 @@ export class IndexStore {
 
     if (cur.hostType === 'local' && typeof patch.homePath === 'string' && patch.homePath.trim()) {
       const newPath = path.resolve(patch.homePath.trim());
-      const newHomeId = homeIdOf(newPath);
+      const newHomeId = readOnlyIdentity(newPath, cur.readOnly === true);
       if (newHomeId !== homeId) {
         if (this.getHome(newHomeId)) {
           throw new Error(`目标路径已注册为另一个实例: ${newPath}`);
@@ -946,6 +977,7 @@ export class IndexStore {
     );
     return {
       ...h,
+      readOnly: h.readOnly === 1 || h.readOnly === true,
       endpoints: safeJsonParse(h.endpoints, [], 'homes.endpoints'),
       degraded: safeJsonParse(h.degraded, [], 'homes.degraded'),
       providers: this.#providersStmt.all(h.homeId),
@@ -1168,7 +1200,7 @@ export class IndexStore {
               COALESCE(SUM(s.tokInput + s.tokOutput + s.tokCacheRead + s.tokCacheWrite), 0) AS tokens
        FROM sessions s
        WHERE s.lastActivity IS NOT NULL AND s.lastActivity >= ?
-         AND s.homeId IN (SELECT homeId FROM homes WHERE harness = 'dsh')
+         AND ${DSH_ONLY}
        GROUP BY h, grp
        ORDER BY h, tokens DESC`
     ).all(stepSec, endBucket, endBucket, startIso);

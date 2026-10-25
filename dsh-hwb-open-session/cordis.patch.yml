@@ -1,0 +1,12 @@
+# dsh-hwb-open-session 的 bundle patch：向 web 组合挂载本插件。
+#
+# Host 半（/api/hwb-open-session 只读路由）与 Client 半（__ModuleLoader__ UI）
+# 都由官方 bundle 流程解析；不需要手动双 entry。
+#
+# triggerPath 默认是 $DSH_HOME/hwb/open-session.json（未设 DSH_HOME 时 ~/.dsh/…）。
+# 自定义 home 时在这里显式覆盖：
+#   config:
+#     triggerPath: /path/to/.dsh/hwb/open-session.json
+- insert:
+    - id: dsh-hwb-open-session
+      name: dsh-hwb-open-session

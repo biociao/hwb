@@ -13,6 +13,7 @@
     "docs",
     "dsh-remote-index",
     "dsh-static-cache",
+    "dsh-hwb-open-session",
     "tests",
     "README.md",
     "CHANGELOG.md",

@@ -36,13 +36,30 @@ export class Indexer {
   //   对「运行中且可达」的 home 读取 dsh 实例实时状态索引前抓取，覆盖冻结投影缓存推导出的状态、
   //   并补插 projcache 里还没有的新会话。任何失败（不可达/token 无效/端点缺失）都返回 null，
   //   回退到投影缓存（绝不阻塞主索引）。
-  constructor({ store, homes, broadcast = () => {}, baseMs = 60_000, maxMs = 300_000, remoteExec, liveStatus = null, codex = null, concurrency = 3 }) {
+  constructor({ store, homes, broadcast = () => {}, baseMs = 60_000, maxMs = 300_000, remoteExec, liveStatus = null, codex = null, localTools = null, concurrency = 3 }) {
     this.store = store;
     this.homes = homes;
     this.broadcast = broadcast;
     this.remoteExec = remoteExec;
     this.liveStatus = liveStatus;
-    // Codex 数据源（{ readProjects }）：由 server.js 在版本预检之后动态注入（reader 依赖 node:sqlite）。
+    // 本地工具数据源（LOCAL_TOOL_SOURCES）：{ [harness]: { label, readSnapshot, indexRows } }。
+    // harness !== 'dsh' 的实例一律走它；由 server.js 在版本预检之后动态注入
+    // （reader 依赖 node:sqlite，不能进静态 import 图）。`codex` 参数保留一个版本做兼容：
+    // 老调用方只传 { readProjects } 时，这里把它适配成同一个描述符形状。
+    this.localTools = localTools ?? (codex?.readProjects ? {
+      codex: {
+        label: 'Codex',
+        // 索引口径是全量：不受 7 天窗口限制（窗口只在查询 Recent 时生效）。
+        readSnapshot: ({ home }) => codex.readProjects({
+          home: home.homePath,
+          days: 3650,
+          limit: 1000,
+          threadsPerProject: 100_000,
+          maxThreads: 20_000,
+        }),
+        indexRows: codexIndexRows,
+      },
+    } : {});
     this.codex = codex;
     this.baseMs = baseMs;
     this.maxMs = maxMs;
@@ -149,10 +166,16 @@ export class Indexer {
 
   // 索引单个 home，结果追加到 results；返回是否成功（供 per-home 退避）。
   async #indexHome(home, homeId, results) {
-    // Codex 是第二个 harness：没有进程/端口/隧道，直接读 ~/.codex 的元数据。
-    // 它走独立索引路径，但仍写同一套 homes/workspaces/sessions 行 —— RECENT PROJECTS /
-    // RECENT SESSIONS / 用量等既有面板因此天然生效。
-    if (home.harness === 'codex') return this.#indexCodexHome(home, homeId, results);
+    // 本地工具实例（Codex / WorkBuddy）：没有进程/端口/隧道，直接读各自的本地元数据。
+    // 它们走独立索引路径，但仍写同一套 homes/workspaces/sessions 行 —— RECENT PROJECTS /
+    // RECENT SESSIONS / 用量等既有面板因此天然生效。新增 harness 不再改这里，只在
+    // LOCAL_TOOL_SOURCES 里加一个描述符。
+    //
+    // 注意 `home.harness` 缺省 = dsh：老调用方（tests/indexer.test.js 的 fixture）与迁移前
+    // 的数据里没有这个字段，必须继续走 dsh 路径，不能当成「非 dsh 本地工具」。
+    // 本地 dsh 只读（harness='dsh' + readOnly）同样走 dsh 路径（它读的是 projection cache）。
+    const harness = home.harness ?? 'dsh';
+    if (harness !== 'dsh') return this.#indexLocalToolHome(home, homeId, results);
     try {
       // 实时状态：本地实例先读文件、**再**抓实时状态。这两步的顺序很要紧 —— 反过来的话，
       // 「实时快照被取到」与「落库」之间就夹着一次完整的文件读取（远程实例是 SSH，几秒到
@@ -174,6 +197,9 @@ export class Indexer {
       // 这里在抓取前后各读一次，端点变了就丢弃这份实时数据（文件快照来自磁盘，与端点无关）。
       const endpointBefore = this.store.getHome?.(homeId)?.activeEndpointId ?? null;
       const snapshot = readHomeSnapshot(home.homePath);
+      // 只读实例与可连接实例共享同一 homePath，但数据行必须落在各自的 homeId 下：
+      // reader 按 path 推导出的是「可连接实例」的 id，这里显式改写成只读实例的 id。
+      if (home.readOnly === true) snapshot.homeId = homeId;
       if (this.liveStatus) {
         // 抓实时状态要等一次 RPC（本机也可能几百毫秒），而 live-poller 每 3s 就在写同一批行。
         // 我们把「开始抓」的时间记下来：如果这期间轮询器已经写入更新的数据，就丢弃自己这份 ——
@@ -199,43 +225,38 @@ export class Indexer {
     }
   }
 
-  // Codex 实例的索引：读 ~/.codex 元数据 → 同构行 → upsertRows（与 dsh 完全同一条落库路径）。
-  // 这样实例卡、Recent Projects/Sessions、用量、搜索都不需要为它写第二套展示逻辑。
-  async #indexCodexHome(home, homeId, results) {
+  // 本地工具实例的索引：读本地元数据 → 同构行 → upsertRows（与 dsh 完全同一条落库路径）。
+  // 这样实例卡、Recent Projects/Sessions、用量、搜索都不需要为每个 harness 写第二套展示逻辑。
+  // readSnapshot 允许返回 Promise（reader 内部可以动态 import node:sqlite）。
+  async #indexLocalToolHome(home, homeId, results) {
+    const harness = home.harness;
     try {
-      if (!this.codex?.readProjects) throw new Error('Codex 数据源未启用');
-      const snapshot = this.codex.readProjects({
-        home: home.homePath,
-        // 索引口径是全量：不受 7 天窗口限制（窗口只在查询 Recent 时生效）。
-        days: 3650,
-        limit: 1000,
-        threadsPerProject: 100_000,
-        maxThreads: 20_000,
-      });
-      const rows = codexIndexRows(home, snapshot);
+      const source = this.localTools?.[harness];
+      if (!source?.readSnapshot || !source?.indexRows) throw new Error(`${harness} 数据源未启用`);
+      const snapshot = await source.readSnapshot({ home });
+      const rows = source.indexRows(home, snapshot);
       this.store.upsertRows(rows);
       this.lastFailure.delete(homeId);
-      const sessionCount = rows.filter((r) => r.type === 'session').length;
-      const workspaceCount = rows.filter((r) => r.type === 'workspace').length;
       const payload = {
         homeId,
         rowCount: rows.length,
-        sessionCount,
-        workspaceCount,
+        // 与 dsh 路径同口径：session/workspace 计数按落库行算（home 行除外）。
+        sessionCount: rows.filter((r) => r.type === 'session').length,
+        workspaceCount: rows.filter((r) => r.type === 'workspace').length,
         degraded: rows[0]?.degraded ?? [],
         indexedAt: snapshot.generatedAt,
-        harness: 'codex',
+        harness,
       };
       if (payload.degraded.length) {
-        log.warn('Codex 索引部分降级', { homeId, homePath: home.homePath, reasons: snapshot.reasons });
+        log.warn(`${source.label ?? harness} 索引部分降级`, { homeId, homePath: home.homePath, reasons: snapshot.reasons });
       }
       this.broadcast('index:updated', payload);
       results.push({ homeId, ok: true, ...payload });
       return true;
     } catch (e) {
       try { this.store.markHomeError(homeId, e.message); } catch { /* store 内部已记 */ }
-      logFailure.call(this, homeId, e, { harness: 'codex', homePath: home.homePath });
-      results.push({ homeId, ok: false, error: e.message });
+      logFailure.call(this, homeId, e, { harness, homePath: home.homePath });
+      results.push({ homeId, ok: false, error: e.message, harness });
       return false;
     }
   }

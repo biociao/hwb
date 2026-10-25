@@ -208,3 +208,61 @@ test('老库迁移：没有 harness 列时补列并默认 dsh，已注册的 Cod
   assert.equal(store.getHome(codexId).harness, 'codex');
   assert.equal(store.getHome('cd'.repeat(8)).harness, 'dsh');
 });
+
+// —— 通用本地工具索引路径（契约 §5：harness !== 'dsh' 一律走 #indexLocalToolHome）——
+
+test('Indexer 经 LOCAL_TOOL_SOURCES 索引本地工具：快照/同构行/harness 一并透传', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-local-tool-index-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new IndexStore(path.join(dir, 'hwb.db'));
+  t.after(() => store.close());
+
+  let received = null;
+  const events = [];
+  const indexer = new Indexer({
+    store,
+    homes: () => store.listHomes(),
+    broadcast: (event, data) => events.push({ event, data }),
+    // 数据面注入：新增 harness 不需要改 Indexer，只加一个描述符。
+    localTools: {
+      codex: {
+        label: 'Codex',
+        readSnapshot: async ({ home }) => { received = home; return snapshot(); },
+        indexRows: (home, snap) => codexIndexRows(home, snap),
+      },
+    },
+    baseMs: 100,
+  });
+
+  const homeId = store.registerHome({ homePath: CODEX_HOME, alias: 'Codex', hostType: 'local', harness: 'codex' });
+  const results = await indexer.reindexNow(homeId);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].harness, 'codex');
+  assert.equal(received.homePath, CODEX_HOME, 'readSnapshot 收到 home 行（不是裸路径）');
+  assert.equal(received.homeId, homeId);
+
+  const payload = events.find((e) => e.event === 'index:updated')?.data;
+  assert.equal(payload?.harness, 'codex', 'SSE payload 必须带 harness，前端按它区分来源');
+  assert.equal(store.recentSessions({ homeIds: [homeId] }).length, 1);
+});
+
+test('Indexer：老构造参数 codex:{readProjects} 保留兼容（一个版本）', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-codex-legacy-param-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new IndexStore(path.join(dir, 'hwb.db'));
+  t.after(() => store.close());
+  let received = null;
+  const indexer = new Indexer({
+    store,
+    homes: () => store.listHomes(),
+    broadcast: () => {},
+    codex: { readProjects: (options) => { received = options; return snapshot(); } },
+    baseMs: 100,
+  });
+  const homeId = store.registerHome({ homePath: CODEX_HOME, alias: 'Codex', hostType: 'local', harness: 'codex' });
+  const results = await indexer.reindexNow(homeId);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].harness, 'codex');
+  assert.equal(received.days, 3650, '兼容路径沿用全量索引口径');
+  assert.equal(store.recentSessions({ homeIds: [homeId] }).length, 1);
+});

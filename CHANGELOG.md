@@ -6,6 +6,307 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 本地工具实例统一：Codex / dsh 只读 / WorkBuddy
+
+**动机**：Instances 里的本地工具此前各写各的 —— Codex 卡有「已就绪」和「打开」却没有版本号；
+本地 dsh 只读卡有版本号，状态位却写着类型「只读」、也没有「打开」；两者的时间口径一个用
+`runtime.checkedAt`（心跳）、一个用 `lastIndexedAt`（索引）。同一类实例长成两张卡，用户没法用
+同一套心智去读；版本解析器还把 dsh 的版本号填进了 Codex 卡。
+
+- **统一卡语义**：本地工具（Codex / WorkBuddy / 本地 dsh 只读）共用一段模板 —— 身份 chip 是
+  `<label> <version>`，状态只有「已就绪 / 路径缺失」，时间统一为 `索引 <lastIndexedAt>`
+  （未索引过显示「尚未索引」），动作统一为 `打开 <工具>` / `重新索引` / `⚙ 设置`。
+  「只读」不再占状态位（只写进身份 chip 的 `title`）；`runtime.dshVersion` 只对 `dsh` 赋值，
+  新增归一化的 `runtime.toolLabel` / `runtime.toolVersion`（版本号过白名单，取不到就不显示）。
+- **统一打开入口 `POST /api/harness/open`**（body `{homeId, sessionId?, projectId?}`）：Codex →
+  `codex://threads/<uuid>`，WorkBuddy → `workbuddy://chat/<uuid>`，本地只读 dsh → 插件触发器；
+  无会话/插件缺失时聚焦或启动 DSH 桌面端（200 + `code:"app-focused"`）。未知 home 404、
+  非本地工具 400、非法会话 id 400（UUID 白名单 —— 无鉴权本机接口不能变成任意深链派发器）、
+  唤起失败 502（带可复制回退）。
+- **新增 WorkBuddy 只读实例**：`POST /api/homes` 接受 `{harness:"workbuddy", homePath?}`（默认
+  `~/.workbuddy`，`WORKBUDDY_HOME` 可覆盖；目录不存在 400），注册后立即索引 + 刷新 runtime。
+  只读 `workbuddy.db` 的 `workspaces` / `sessions`（`deleted_at IS NULL`）元数据，`cwd` 按最长
+  前缀归属项目；`deleted_at` 过滤、`last_activity_at` 回退 `updated_at`；`GET /api/homes/detect`
+  增加 `workbuddy` 段。库缺失/损坏只让该实例「⚠ workbuddy 降级」，不写库、不读正文；
+  `session_usage` 是上下文用量，本期不伪装成 token 拆分。
+- **边界收敛**：本地工具判定只存在于 `src/lib/harnesses.js`（后端）与 `src/web/store.js`（前端）
+  各一处；数据源统一由描述符表 `LOCAL_TOOL_SOURCES` 驱动（`codex` / `workbuddy`），索引器 /
+  路由 / monitor / 前端不再写 `harness === 'codex'` 之类的分支（新增工具 = 加一个描述符）。
+- **测试**：新增 `tests/harnesses.test.js`、`tests/tool-version.test.js`、`tests/harness-open.test.js`、
+  `tests/workbuddy-reader.test.js`、`tests/workbuddy-index.test.js`、`tests/workbuddy-index-rows.test.js`、
+  `tests/workbuddy-api.test.js`、`tests/local-tool-cards.test.js`，并更新 Codex / 本地 dsh 只读相关用例。
+
+### 界面：Projects 栏项目卡按「来源 app」用浅色底色区分
+
+- **底色即来源**：Recent Projects 的每张项目卡按该实例的数据源（harness）着色 ——
+  dsh 蓝、Codex 灰、Claude Code 橙、WorkBuddy 绿，未识别来源用中性紫；浅色/深色主题各一套
+  底色与描边，跟随系统主题时同样生效。
+- **语义分开**：项目徽标（monogram）与左侧竖轨仍是**项目身份色**（同一项目始终同色），
+  底色只表达「这条项目来自哪个 app」；卡片 `title` 补「来源 X」解释底色含义。
+- **实现**：`web/store.js` 新增 `sourceKind()`（harness → 白名单标识；`claude` / `claude-code` /
+  `claudecode`、`workbuddy` / `work buddy` 等别名归一化，未知值一律 `other`，不会把任意文本
+  带进属性）；`recent-projects.js` 输出 `data-source`；`index.html` 用 `--src-*` 变量与
+  `.project-card[data-source=…]` 落到 `--card-bg` / `--card-line`，hover 在来源底色上叠前景色。
+  新增来源 = `SOURCE_KINDS` 加一行 + CSS 加一条规则。
+- **测试**：来源属性与别名归一化、未知 harness 不注入、明暗两套 CSS 契约。
+
+### 新增：本地 dsh 只读实例（Codex 式，可与可连接实例并存）
+
+- **新实例类型**：`INSTANCES → ＋ 添加 → 本机（只读，不连接）`，或在 Add 表单顶部点
+  「检测到 ~/.dsh → 添加为只读实例」；首装引导也有入口。`POST /api/homes` 支持
+  `{homePath, readOnly:true}`。
+- **不连接、不需要 token**：monitor 对只读实例只判断 home 目录是否存在（在 = running），
+  不探测 HTTP/SSH、不参与重连；实例卡显示「只读」+ 计数 + 索引时间，没有连接/断开。
+- **与同 home 的可连接实例并存**：只读实例用独立 homeId（路径 + 只读命名空间），
+  旧实例（MBP 等）的配置、连接、token 全部不受影响。
+- **聚合去重**：Recent Projects/Sessions 在同一 home 的两种实例间只取只读实例一份；
+  `/api/usage` 的 `DSH_ONLY` 口径同样只统计一份，避免翻倍。
+- **跳转**：只读实例的会话/项目行仍走 `dsh-hwb-open-session` 插件；插件缺失时只提示安装，
+  不再回退去启动托管 dsh web。
+- 索引器对只读实例把 `snapshot.homeId` 改写为自己的 id，数据行落在各自实例下。
+- 新增 `tests/local-dsh-readonly.test.js`（store/monitor/API/去重/UI）。
+- 修复：`dsh-hwb-open-session` 的 Client 半改用 dsh 0.2.x 的 `ctx.uiWorkspace.openSession(sessionId)`
+  （`ctx.sessions.open()` 在 0.2.x 已被移除——视图选择不属于 sessions 服务；旧 `dsh-session-deeplink`
+  也因此失效）。保留旧版 `sessions.open()` 回退。
+
+### 新增：本地 dsh 会话点击 → 在 DSH 桌面端打开对应会话（可选插件）
+
+DSH 桌面端只注册了 `dsh://`，且 `open-url` 只处理精确的 `dsh://open`（仅聚焦），没有会话级
+深链；`dsh web` 也没有 `--session` 启动参数。上游不可改，因此用插件补一条**本地只读信使通道**：
+
+- **新增 `dsh-hwb-open-session/` 插件**（Host + Client 双半，零依赖）：Host 半注册只读路由
+  `/api/hwb-open-session` 返回触发器；Client 半每 1s 轮询并调用 `sessions.open(id)`。
+  触发器/过期/非法 id 全部按「无」处理；异步异常全部捕获（dsh 进程内插件未处理 rejection 会拖垮 App）。
+- **hwb 新增 `POST /api/homes/{homeId}/open-session`**：仅本地 dsh、仅 macOS；写
+  `<home>/hwb/open-session.json`（0600、120s 过期、每次点击新 id）后聚焦/启动 App。
+  插件未装返回 409 `plugin-missing`（带安装脚本命令），前端**静默回退**到原 iframe。
+- **前端**：点击本地 dsh 的会话/项目行先尝试桌面端打开；失败回退保持 Web 形态不变；
+  远程实例、浏览器 `dsh web` 形态行为不变。
+- **安装脚本 `scripts/install-dsh-open-session.mjs`**：desktop profile 由 Electron 独占，
+  `dsh plugin --profile desktop add` 会被 CLI 拒绝，脚本做等价的 link 安装（备份 package.json、
+  幂等、`--dry-run`/`--uninstall`）。
+- 测试：插件 Host/Client、安装器、hwb API 与编排共 20 项；真实 DSH 进程内已验证 Host 路由与
+  Client 轮询（`DshHome` 隔离实例）。
+
+
+**远程实例的实时轮询不再被低带宽链路拖垮：少一次往返、按实测链路自适应、不再重搬 129 KB。**
+
+背景（2026-09-22 实测 `dgx21.tun`）：远端 dsh **服务端**只要 1–5ms，但经隧道取一次
+`session.list` 要 **3.4–7.3s**（响应实测 **129 KB** / 179 个会话），链路约 **10–30 KB/s**、
+RTT 90–140ms、丢包 10–50%。hwb 原先的三处写法在这个组合下是自伤的，日志实测
+**3380 次失败 / 2135 次成功**（失败原因里 `auth timeout` 占 2215 次，`rpc timeout` 仅 226 次
+—— 大多数轮询**死在交接那一段**），实例长期 `degraded`，界面的「实时状态」几乎从不生效。
+
+- **`live-status.js`：token→cookie 交接改为按实例记忆（省掉一整段隧道往返）。**
+  原实现**每轮 RPC 都重做一次交接**（`GET /?token=` → `POST /api/…`），远程实例上就是
+  两个隧道往返。cookie 在 token/实例不变时是稳定的，现在按 `origin|token` 记忆（TTL 10 分钟），
+  常态下每轮只剩一次往返。记忆**挂在 reader 实例上而非模块级**：cookie 是某个 dsh 实例的凭据，
+  同一 origin 在不同 home 下可能对应不同 token，放模块级会让两个 home 串用凭据。
+  记忆失效（401/403）时清掉记忆并重做一次交接 —— 但**仅当这次用的是记忆里的 cookie**；
+  若刚用 `?token=` 换来的新 cookie 仍被拒，那是 token 本身无效，再交接只是白打一个往返
+  （沿用 `tests/live-status.test.js` 既有那条「401 不做第二次尝试」的语义）。
+- **`live-status.js`：keep-alive 连接池（`LIVE_AGENT`，maxSockets 2）。**
+  `fetch` 默认每次新建 TCP 连接，而远程实例的 origin 是隧道口 —— 一条新连接就是隧道里一次
+  新的 channel + 对端一次握手，在 90–140ms RTT 上每次都要重走慢启动。实测同一链路上
+  冷连接 1.86s、复用后 0.17s。`maxSockets` 刻意压到 2：这条链路的总吞吐上限在 VPN 核心，
+  并发只会互相抢带宽并推高丢包。
+- **`live-status.js`：RPC 预算按实测往返自适应（`timeoutFor`，上界 30s）。**
+  固定 4s 对远程实例是**必然失败**（一次要 3.4–7.3s）。而「远端服务端只要 1–5ms」说明
+  这些时间全是**链路属性**，属可测量量，不该用写死的常数去猜。现在按实例记成功往返的 EWMA，
+  预算取 `min(30s, max(配置值, EWMA×3 + 2s))` —— 本地实例（毫秒级）**行为完全不变**，
+  慢链路自动放宽。可用 `HWB_LIVE_RPC_TIMEOUT_MS` 覆盖，或 `adaptiveTimeout: false` 关掉。
+- **`live-poller.js`：轮询节奏自适应 + 失败退避（原为全局固定 3s）。**
+  固定 3s 对慢链路意味着下一轮在上一轮还没回来时就到点，单飞挡住了并发但每一轮都在
+  「刚超时」的状态下重新起跑。现在每实例按实测耗时排下一轮（成功 → 本轮耗时×2，
+  夹在 `[intervalMs, maxIntervalMs=30s]`），失败指数退避（6s→12s→24s→30s 封顶），
+  成功一次即复位。本地实例仍按 3s，**行为不变**。
+- **`proxy-cache.js`：慢链路上放宽 `session.list` 的 TTL（3s → 15s）。**
+  这是**省字节**的那一条：TTL 3s 意味着每一轮轮询都重搬整份 129 KB，而这份数据 3 秒内
+  几乎不可能变。判据用**实测的上游耗时**（`noteUpstreamLatency`，EWMA ≥1.5s 判为慢链路），
+  不是配置里的 hostType —— hwb 无从可靠区分「本地实例」与「快隧道」，而耗时是直接测出来的事实。
+  **只放宽非历史类 RPC**：历史类在「会话在跑/状态未知」时**必须**保持短窗口，因为事件流
+  没有游标（`/api/events.host` 开流 payload 为空），陈旧窗口补不回中间那段事件，
+  放宽 TTL 等于让界面出现静默的消息空洞 —— 那比慢更糟。
+- **测试**：新增 12 例 —— `tests/live-poller.test.js`（慢链路放慢、快链路不变、退避与上界、
+  没到点即跳过）、`tests/live-status.test.js`（交接只做一次、cookie 失效自愈、不同 token 不串用、
+  预算自适应与逃生舱）、`tests/proxy-cache.test.js`（慢链路放宽与收敛、历史类不放宽、
+  非法输入忽略）。全套 **984 通过 / 0 失败**。
+- **不改变的**：服务端 dsh、VPN 配置、远端主机都不动。链路的 ~1 Mbps 上限在 VPN 核心，
+  客户端无法提高 —— 这些改动只减少**往返次数**与**重传字节**，不假装能提速。
+
+**文件预览整个搬进 dsh 自己的侧边栏：hwb 不再弹自己的预览面板。**
+
+原先点会话里的文件路径（或 dsh 0.1.5 内置「文件」树的文件行）会被注入的桥接**拦下来**
+（`preventDefault` + `stopImmediatePropagation`），改用 hwb 右上角那个「文件预览」独立侧栏预览。
+问题是 dsh 自己就会把文件开进右侧 Sidebar 的文档预览（`chat.openFile` →
+`sidebarRight.openResource`，Markdown / 高亮代码 / 图片 / PDF / HTML / 纯文本都有），拦截反而把
+这条原生路径挡掉了 —— 于是 hwb 维护了一份重复且更弱的浏览/渲染 UI。现在拆掉拦截与那份 UI，
+预览、浏览、渲染**全部落回 dsh 侧边栏**；hwb 只把 dsh 缺的两件事注入到 dsh 侧栏自己身上：
+
+- **新增 `src/control/file-upload.js`**：反代改写 `dsh-client-ui-sidebar-files` bundle，给内置
+  「文件」树头部注入「上传到此处」按钮（重载按钮左侧）。按一下 → 选文件 →
+  `window.__hwbUploadFiles(state.root)` → 桥接把 **File 清单**（结构化克隆，不拷字节）转给 hwb
+  父页 → 走既有的 `/api/homes/:id/upload`（本机直写、远端经 SSH 分片）。进度与失败原因浮在 dsh
+  页面右下角；成功后替用户点一下 dsh 的「重新读取」，新文件立刻出现在树里。
+- **下载按钮保持原样**（`file-download.js`，documentpreview 头部），但不再需要「顺手把 hwb
+  侧栏亮出来」那套反馈 —— 下载由浏览器自己的下载条给出反馈。
+- **删掉 hwb 的独立预览侧栏**：`components/file-preview.js`（19 KB，浏览/下载/拖拽上传/图片查看/
+  HTML 渲染/工作区下拉）、`preview-image.js`、`preview-html.js`、`preview-resize.js`、
+  `file-preview.css`、顶栏的「文件预览」按钮与 `#preview-actions`，以及整条 `hwb:file-preview`
+  消息链路。顶栏不再有实例专属按钮。
+- **新增 `src/web/file-ops.js`**：父页真正发请求的那一层（下载 → Blob 落盘；上传 → 串行 XHR +
+  整批进度 + 逐条失败 + 本地 256 MiB 预筛）。它取代了原先长在侧栏组件里的同一段逻辑，
+  并且现在是**唯一**的文件动作实现。
+- **桥接瘦身**（`preview-bridge.js`：192 → 131 行）：不再解析点击目标（那套
+  `looksLikeFile`/`pathFromEvent`/原生打开兜底提示全部删除），只留四条腿 —— 会话上下文中报、
+  `open-workspace` 转交、`download-file` 转交、新增的 `upload-files` 转交与状态回传。
+- **服务端删掉两个没有调用方的端点**：`GET /api/homes/:id/preview`（目录/文本/图片 JSON）与
+  `GET /api/homes/:id/asset`（HTML 原字节渲染，带 CSP sandbox）——它们只服务于那个被删掉的侧栏。
+  `download` / `upload` 保留，`src/lib/file-preview.js` 这个读取引擎也保留（下载与「上传后目录
+  列举」仍在用它的其它分支）。
+- **为什么值得**：一处功能只有一份实现。以前「文件树里没有下载」要单独注入一个按钮，
+  「上传」却只有在 hwb 侧栏里才有 —— 两个入口能力不同、行为也不同；现在入口只有一个
+  （dsh 的侧栏），hwb 补的动作都贴在同一个地方。
+- **注入的样式类名改为从锚点捕获**（`file-download.js` 与新增的 `file-upload.js`）：两个补丁原先
+  都写死了 `TextPreview_module_css_default` / `FilesBody_module_css_default`。上游一旦改掉 CSS
+  module 的变量名，锚点仍会匹配、`node --check` 仍通过，但注入的按钮会在渲染时抛
+  ReferenceError 把整页（或整棵树）带崩 —— 这是**语法检查与「锚点还在吗」的契约测试都拦不住**
+  的失败形态。现在类名从锚点捕获后再写进注入文本，两个模块各有一条用例把「上游改名后仍引用
+  正确变量」钉住。
+- **测试**：新增 `tests/file-upload-inject.test.js`（注入位置/fail-closed/语法/真实 bundle/
+  类名跟随上游，6 例）、`tests/file-ops.test.js`（下载落盘与 objectURL 窗口、串行上传与整批进度、
+  改名/失败、256 MiB 分界，4 例）；`tests/file-download.test.js` 增加类名跟随用例（6 例）；
+  `tests/preview-bridge.test.js` 整体改写为「**不再拦截**点击 + 上传转交与
+  状态回传 + 未初始化不外发」（8 例）；`tests/file-preview-ui.test.js`（侧栏组件）随功能删除；
+  `tests/proxy-cache.test.js` 增加 sidebar-files 补丁的缓存语义用例，并把 combo 用例扩到
+  **三个**补丁同打；`tests/proxy.test.js` 的桥接契约断言改为「下载 + 上传两条腿都在」；
+  `tests/file-preview.test.js` / `tests/html-preview.test.js` 里针对已删端点的用例改为
+  download 护栏用例 / 删除，保留引擎侧覆盖；`tests/api-path-containment.test.js` 与
+  `tests/api-server-hardening.test.js` 的「真实流量」用例从 /preview 改到 /download。
+
+**代理层缓存瘦身：现网 354.9 MB → 18.1 MB（19.6×），并且 304/HEAD 不再读正文。**
+
+按现网 `~/.hwb/proxy-cache`（386 条 / 311.7 MB / 772 个文件）实测，问题集中且清晰：
+**38 个 ≥1 MB 的条目占 94% 体积**（其中 `session.history` 33 条就 182.0 MB）、
+**310 条（162.0 MB）早已死掉却因重启不修剪而留在盘上**、**235 个 <8 KB 的小条目
+（其中 227 条是 ttl≤60s 的只读 RPC）各占 2 个文件**。于是体积是「少数大条目」的事、
+条目数是「多数微条目」的事，分开处理：
+
+- **压缩落盘（C1）**：正文按 gzip 存（`HWB_PROXY_CACHE_CODEC=none` 可关）。**只影响磁盘，
+  不影响回给浏览器的字节**——ETag 仍按 identity 字节算、`content-length` 仍是 identity 长度、
+  回出去的仍是 identity（浏览器↔hwb 是 loopback，压了没有线上收益）。meta 里的 `codec`
+  缺省即 identity，故**老条目原样可读、无需强制作废重下**。真实数据实测：200.3 MB → **18.1 MB
+  （11.06×）**。
+- **元数据/正文分离（C2）**：新增 `readMeta()` / `readBody()`。原先 `serveCached` 第一行
+  无条件 `readFileSync` 整条 body，于是一次 10.8 MB combo 的 **304 校验要读 10.8 MB 磁盘**。
+  现在 304、HEAD、以及新鲜度判断都只读 meta —— 实测这三条路径的正文读取次数为 **0**。
+- **回源那一趟就流式下发**：原先静态响应要**攒完整个 body** 才 `writeHead`（一次 combo 实测
+  10.8 MB，慢链路上是分钟级，浏览器期间收不到一个字节）。现在立刻发头、边流边攒 ——
+  代价只是「第一趟没有 ETag」，而校验器从第二趟（本地命中）起就有，那一趟是本地秒回。
+- **大条目不驻留内存（C3）**：≥1 MB 的正文读完即弃（`HWB_PROXY_CACHE_RESIDENT_MAX_ENTRY_BYTES`），
+  常驻上限 32 MB（`HWB_PROXY_CACHE_MAX_RESIDENT_BYTES`）。原先 28 份 live history（~146 MB）
+  会全部常驻 hwb 进程；实测现在 18.07 MB 落盘只对应 **5.54 MB 常驻**。注意 `dir=null`
+  时一律驻留（没有磁盘可回退，否则等于丢缓存）。
+- **启动 + 每小时修剪（C4）**：只读 meta 扫一遍目录，清死条目与超预算的 LRU 尾部，**并按
+  整目录**（含本次会话没碰过的条目）裁到分区预算内。判定用**条目自己记录的 ttl/stale**，
+  所以历史上按旧策略（static 600s）写下的 116.7 MB 陈旧副本会被正常清掉，而不会被新版
+  「static 不过期」复活——这就是迁移安全的依据。真实数据实测一次修剪 **removed=338 /
+  freed=154.5 MB**。留至少一条：预算是「留住最有用的那部分」，不是「宁可清空」。
+- **微条目只留内存（C5）**：`ttl ≤ 60s 且 bytes < 8 KB` 不落盘（现网 227 条这样的条目，
+  合计 403 KB，却各占 2 个文件）。内存里仍然保留，「少一次隧道往返」的延迟收益不丢。
+- **历史限份数（C6）**：同一 `(scope, sessionId)` 最多留 2 份不同窗口
+  （`HWB_PROXY_CACHE_HISTORY_VARIANTS`）——实测三个会话各存了 2–3 份，白占 37.1 MB。
+- **分区预算（C7）**：static 32 MB / rpc 64 MB **各自独立 LRU**
+  （`HWB_PROXY_CACHE_STATIC_MAX_BYTES` / `_RPC_MAX_BYTES`）。一条 14.7 MB 的历史再也挤不掉
+  那份几 MB 的插件工作集（实测 live static 只有 3.4 MB）。显式传 `maxBytes` 仍走单池旧行为。
+- **static 按内容寻址 ⇒ 不再因时间过期**：URL 里的 `rev`/hash 本身就是强校验器，内容变则
+  URL 变。原先 static 有 600s TTL + 3600s 宽限，于是每 70 分钟就要重取一次 10.8 MB 的 combo、
+  陈旧命中还会触发一次后台整段重取。这与已经发给浏览器的 `immutable, 1 year` 本来就矛盾，
+  现在两边一致了。
+- **刻意不做**：不在本地把 combo 拆成 per-plugin 再重组（要逐字节复刻 dsh 的拼接与 sourcemap
+  section 偏移，跨版本必碎）；**不截断历史窗口后回放**（`/api/events.host` 开流 payload 是
+  `{}`、没有游标，截断会造成静默的消息空洞——比慢更糟）。「不必全量」在这里的正确形态是
+  增量补差，见 `HWB_HISTORY_DELTA`。
+- **旋钮**：`HWB_PROXY_CACHE_CODEC`（gzip/identity）、`_MAX_RESIDENT_BYTES`、
+  `_RESIDENT_MAX_ENTRY_BYTES`、`_STATIC_MAX_BYTES`、`_RPC_MAX_BYTES`、`_PERSIST_MIN_BYTES`、
+  `_PERSIST_MIN_TTL_MS`、`_HISTORY_VARIANTS`、`_PRUNE_INTERVAL_MS`、`_CODEC_LEVEL`。
+- **可观测**：`sharedProxyCache()` 启动即打一行 summary（`storedMegabytes` / `diskMegabytes` /
+  `residentMegabytes` / `prunedMegabytes` / `codec`），这是判断瘦身是否生效的最短路径。
+- **回归钉住的坑（两个都是在生产重启后才暴露的）**：
+  1. `codec` 一度只写进盘上的 `meta.json`、没写进内存 meta，于是**同进程回放会把 gzip 流
+     当原文发出去**（200 KB 正文变成 233 字节）——不报错、只静默给坏内容。
+  2. **`refreshInBackground` 的三处 write 漏了 `immortal`**：一个从旧格式升上来的 static
+     条目一旦命中 stale 被后台刷新，就会被「写回有限 TTL」，于是永远保持 stale、
+     每 600s 整段重取一次。生产实测：重启后首屏 46 个 bundle **全部** `immortal=false`，
+     按 3.32 MB / 10 分钟折算 ≈ **20 MB/小时**（25 KB/s 链路上约 14 分钟/小时）在替
+     证明不会变的内容跑隧道。已修并有用例（`immortal 抹掉`，走真实代理的 stale 分支）。
+- **观测到的架构性代价（未改，记录在案）**：preview 注入路径对**含待打补丁 bundle 的 batch**
+  必须标 `no-store`（内容按代理改过），本地实例实测是一个 **11.36 MB** 的 batch。
+  隧道侧只付第一次（命中本地缓存），但浏览器每次加载会重下这一段 —— 浏览器与 hwb 同机时
+  是 loopback 的 ~50ms，可接受；若将来把 hwb 当『局域网共享网关』，这段会变成真实网络开销。
+- **测试**：`tests/proxy-cache.test.js` 新增 18 例（压缩往返、codec 回归、304/HEAD 不读正文、
+  不驻留、无盘必驻留、启动修剪、immortal 不过期、微条目不落盘、历史限份数、分区预算、
+  整目录预算回收、覆盖写不漂移、回源流式下发、immortal 不被刷新抹掉、304 端到端）。
+  全套 **968 例（967 通过 / 1 skip / 0 失败）**。
+
+**内置文件浏览器里能下载了（远程实例）**—— 同一次改动里桥接也认了 dsh 0.1.5 的内置文件树。
+
+- **新增 `src/control/file-download.js`**：反代在本地改写 dsh 的
+  `dsh-client-ui-sidebar-documentpreview` bundle，给内置文档预览的头部注入一个
+  「下载到本机」工具按钮（与 dsh 自己的“重新读取”并排）。按一下 → 派发
+  `hwb:download-file` → 同页 `preview-bridge` 转给 hwb 父页 → 走既有的
+  `/api/homes/:id/download`（本机直读、远端经 SSH）。鉴权、工作区围栏、64 MiB 上限
+  全部留在 hwb 侧，注入的按钮不发任何请求。
+- **背景**：dsh 0.1.5 的内置预览只有「读」——没有下载；远端实例上「用宿主应用打开」
+  又被 `canOpenPath`/`isLoopback` 挡掉。hwb 本来就有能用的下载，但那条路在
+  「文件预览」侧栏里，从 dsh 的预览 tab 够不着。
+- **桥接也认内置文件树了**：dsh 0.1.5 的「文件」树的树行用 `data-files-entry` +
+  `data-files-path` 标记，旧桥接只认 `data-path`/`data-file-path`/`title`，于是点树的
+  文件行不会落到 hwb 预览。现在会（目录行仍留给 dsh 展开/折叠）。
+- **代理改动是通用的**：`proxy.js` 里原来的 `workspaceScript` 泛化成「收集所有命中的
+  bundle 补丁、按顺序全打上」，所以 workspace 菜单与下载按钮共用同一条「存原文 → 本地注入
+  → no-store → 不进共享缓存」的路径。**为什么必须是「所有」**：dsh 会把多个 plugin id
+  合并进一条 `/plugins/??a,b&rev=…` 的 combo 请求（上限 3 KiB），按 URL「挑一个」会让
+  第二个补丁静默失效。另外**锚点全失配时保持上游缓存策略**（内容与上游逐字节相同，
+  不该标成 no-store 让浏览器每次重下）。
+- **测试**：`tests/file-download.test.js`（注入/位置/fail-closed/语法/真实 bundle，
+  5 例）、`tests/proxy-cache.test.js`（第二个补丁的缓存语义、combo 双补丁、锚点失配不误标
+  no-store）、`tests/preview-bridge.test.js`（下载事件转发与未初始化不外发）、
+  `tests/file-preview-ui.test.js`（侧栏 `download()` 的绑定/反馈/无工作区兜底）。
+  全套 **950 例（949 通过 / 1 skip / 0 失败）**。
+
+### 远程实例的「总是 Reconnecting」：master 健康自愈 + 实时 RPC 预算可配
+
+现场是 `c4g.tun`（截图里 dsh 客户端那个橙色 `Reconnecting` pill，是**客户端自己的**网关状态：
+一次 connection generation 3s 未就绪就告警、**15s 未就绪即判失败并退避重连**）。核对后
+**远端机器与 dsh 都没问题**（256 核 load 17%、dsh web 连续运行 2d19h、隧道口 0.13s 稳定），
+问题在「hwb → c4g」这条链路上，且已被量化：本地日志里 c4g 的 `ssh 连接失败` 238 次
+（stderr 全是 `Connection closed by 10.8.0.12 port 22`）、`live-status` 失败 294 次
+（全是 `auth timeout`）；**今天 43 轮实时探测失败 21 轮（49%）**，日志每 7s 一跳。
+
+- **master 健康自愈（`src/control/tunnel.js`）**：复用 master 是绕过 sshd `MaxStartups` 的
+  最有效杠杆，代价是把吞吐押在**一条长命连接**上——实测同一 master 后期单次请求要 20s，
+  而同刻新建的连接只要 0.5–0.8s。原来巡检只问「master 活着吗 / 转发口还在吗」，
+  两问都答「在」时用户侧照样整页卡死。现在补第三问「它现在还快吗」：每轮经 ControlPath 跑
+  一条 `true` 并计时（`ControlMaster=no` = **只复用、绝不新建**，因此不经过未认证队列），
+  连续 N 轮慢/失败即判定退化，**先 `ssh -O exit` 回收再报死**，由 launcher 重建。
+  顺序是必须的：否则重建时仍会看到那条坏 master，把 `-L` 挂回同一连接，等于没自愈。
+  旋钮：`HWB_TUNNEL_MASTER_RTT_MS`（默认 3000）、`_RTT_TIMEOUT_MS`（8000）、
+  `_RTT_STREAK`（3）、`_HEAL_COOLDOWN_MS`（10 分钟）—— 冷却期是为了「整条链路都慢」时
+  不变成每 30s 拆一次 master，反而把窄链路刷得更乱。
+- **实时 RPC 预算可配（`src/dshhome/live-status.js`）**：`RPC_TIMEOUT_MS = 4000` 对本地实例
+  绰绰有余，但这条通道同样服务远程实例；同一条链路上实测有 1.4s / 3.6s / 6.0s 的秒级毛刺，
+  于是门槛被反复越过。默认值**不变**，新增 `HWB_LIVE_RPC_TIMEOUT_MS`（建议远程实例 8–12s）。
+  放宽是安全的：轮询器对同一实例单飞，慢一轮只会跳过下一轮。
+- **测试**：`tests/tunnel.test.js` 新增 3 例（连续偏慢必须回收并报 exit / streak 未满不得拆 /
+  自愈冷却不重复回收，并断言探测确实带 `ControlMaster=no`），`tests/live-status.test.js`
+  新增 1 例（环境变量覆盖 + 非法值回退 + 显式注入优先）。全套 **972 例（971 通过 / 1 skip /
+  0 失败）**。
+- **排查记录与远端处置**：新增 [`docs/c4g-tun-reconnect.md`](docs/c4g-tun-reconnect.md)，
+  含现场证据表、三层根因、**可直接 sudo 执行的 sshd drop-in**（`MaxStartups 100:30:300` +
+  `MaxSessions 50`，`sshd -t` 通过才 reload，附一条命令回滚）、验证判据与残留风险。
+  ⚠️ 本机无密码 sudo，drop-in 需人工在 c4g 上执行；且**必须重启 hwb** 才加载本次改动。
+
 **Codex 接入：作为 harness='codex' 的普通实例（INSTANCES 添加，会话进 RECENT）。**
 
 hwb 原先只服务 dsh；这次加上第二个 harness 数据源，且**不另起面板**——Codex 和 dsh 实例同构：

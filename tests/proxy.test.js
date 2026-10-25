@@ -104,7 +104,11 @@ test('preview proxy injects bridge only in authenticated HTML, preserves origina
     assert.match(htmlText, /__hwb\/dsh-theme\.js/);
     assert.equal(html.headers.get('cache-control'), 'no-store');
     const bridge = await fetch(`${prox.url}/__hwb/preview-bridge.js`);
-    assert.match(await bridge.text(), /hwb:file-preview/);
+    // 桥接不再接管点击（预览在 dsh 自己的侧栏里），它现在的契约是「转交两个 dsh 没有的动作」：
+    // 下载到本机与上传回工作区。这里钉住两条腿都在，漏掉任何一条都只会表现为「按钮点了没反应」。
+    const bridgeText = await bridge.text();
+    assert.match(bridgeText, /hwb:file-download/, '桥接要把注入按钮的下载请求转给父页');
+    assert.match(bridgeText, /__hwbUploadFiles/, '桥接要提供上传入口给注入按钮调用');
     const theme = await fetch(`${prox.url}/__hwb/dsh-theme.js`);
     assert.match(await theme.text(), /hwb:theme/);
     assert.equal(theme.headers.get('cache-control'), 'no-store', '主题脚本绝不能进浏览器缓存');

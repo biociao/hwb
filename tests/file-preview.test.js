@@ -78,7 +78,7 @@ for (const home of [local, remote]) {
   });
 }
 
-test('preview API requires a registered home and workspace; blocks cross-site reads', async (t) => {
+test('download API 解析工作区（sessionId / workspaceId）并挡住未登记实例、跨站与越界', async (t) => {
   const { root } = await fixture(t);
   const homeId = 'abcdef1234567890';
   const route = createRouter({ store: {
@@ -88,17 +88,17 @@ test('preview API requires a registered home and workspace; blocks cross-site re
   } });
   async function request(query, headers = {}, id = homeId) {
     let status, body;
-    const res = { setHeader() {}, writeHead(s) { status = s; }, end(b) { body = JSON.parse(b); } };
-    await route({ method: 'GET', headers }, res, new URL(`http://localhost/api/homes/${id}/preview?${query}`));
+    const res = { setHeader() {}, writeHead(s) { status = s; }, end(b) { body = b; } };
+    await route({ method: 'GET', headers }, res, new URL(`http://localhost/api/homes/${id}/download?${query}`));
     return { status, body };
   }
-  assert.equal((await request('workspaceId=w&path=dir')).body.kind, 'directory');
+  const file = encodeURIComponent('中文 file.txt');
+  assert.equal((await request(`workspaceId=w&path=${file}`)).status, 200, '显式 workspaceId');
+  assert.equal((await request(`sessionId=s&path=${file}`)).status, 200, '会话里没有 workspaceId 时按 project 找回工作区');
   assert.equal((await request('workspaceId=unregistered')).status, 400);
   assert.equal((await request('workspaceId=w', { 'sec-fetch-site': 'cross-site' })).status, 403);
   assert.equal((await request('workspaceId=w', {}, '0000000000000000')).status, 404);
   assert.equal((await request('workspaceId=w&path=../outside')).status, 400);
-  assert.equal((await request('sessionId=s&path=dir')).body.workspace.workspaceId, 'w');
-  assert.equal((await request('sessionId=s&path=../outside')).status, 400);
   assert.equal((await request('sessionId=unknown&workspaceId=w')).status, 400);
 });
 

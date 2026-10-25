@@ -110,8 +110,10 @@ export function ensureResponded(res, log, meta) {
   return true;
 }
 
-export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec, usageTtlMs, maxConcurrentUploads, themePreference, setThemePreference, dshVersion, codex = null }) {
-  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs, maxConcurrentUploads, themePreference, setThemePreference, dshVersion, codex });
+export function createApiServer({ store, indexer, hub, launcher, monitor, quota, logApi, webRoot, allowedHosts = [], remoteExec, usageTtlMs, maxConcurrentUploads, themePreference, setThemePreference, dshVersion, codex = null, localTools = undefined }) {
+  // localTools：本地工具数据源（LOCAL_TOOL_SOURCES）。server.js 在版本预检之后动态装配后传入；
+  // 缺省时 routes 用自己的描述符表默认值（单测/嵌入场景不必关心）。
+  const route = createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs, maxConcurrentUploads, themePreference, setThemePreference, dshVersion, codex, ...(localTools ? { localTools } : {}) });
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) {

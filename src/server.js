@@ -15,6 +15,11 @@ const { IndexStore } = await import('./dshhome/store.js');
 // 放在版本预检之后动态引入；否则 Node < 22.5 下会先炸在与根因无关的模块解析上。
 const { readCodexProjects, resolveJumpTarget, isThreadId } = await import('./codexhome/reader.js');
 const { openCodexThread } = await import('./codexhome/open.js');
+// 本地工具描述符（src/lib/harnesses.js）：LOCAL_TOOL_SOURCES 里装配了 Codex 与 WorkBuddy 的
+// reader/indexRows/open。描述符模块本身是纯的（静态依赖里没有 node:sqlite）——workbuddyhome/
+// reader.js 与 codexhome/reader.js 都只在**调用点**由描述符内部动态 import，所以这里（以及
+// routes/monitor 的静态图）都不会在 enforceNodeVersion() 之前求值 node:sqlite。
+const { LOCAL_TOOL_SOURCES, isLocalToolHome } = await import('./lib/harnesses.js');
 import { Indexer } from './dshhome/indexer.js';
 import { LiveStatusReader } from './dshhome/live-status.js';
 import { LiveStatusPoller } from './dshhome/live-poller.js';
@@ -185,6 +190,9 @@ const readLiveStatus = async (home) => {
     return null;
   }
 };
+// 本地工具数据源（Codex / WorkBuddy）：描述符表是唯一来源，索引器/路由不再为某个 harness 写分支。
+// 传引用而不是复制：将来新增 harness 只改 src/lib/harnesses.js 一处。
+const localTools = LOCAL_TOOL_SOURCES;
 const indexer = new Indexer({
   store,
   // 本地 + 远程都索引：本地走 fs，远程经 SSH 只读 cat（§4.6），让远程实例的
@@ -195,12 +203,14 @@ const indexer = new Indexer({
   // 读取源扩展：对「运行中且可直达」的实例，从 dsh web 的 /api RPC channel 读取实时会话状态，
   // 覆盖（可能冻结的）投影缓存推导出的状态。实例不可达 / token 无效 / 端点缺失一律回退（返回 null）。
   liveStatus: readLiveStatus,
-  // Codex 实例走 #indexCodexHome（读 ~/.codex + 同构行），不经过 dsh 的 projection cache。
+  // harness !== 'dsh' 的实例统一走 LOCAL_TOOL_SOURCES（Codex / WorkBuddy），不经过 dsh 的
+  // projection cache。`codex` 参数保留一个版本做兼容（老调用方/测试只传 readProjects）。
+  localTools,
   codex: { readProjects: readCodexProjects },
 });
 const livePoller = new LiveStatusPoller({
-  // 实时状态只对 dsh 有意义：Codex 没有 dsh web，也没有实时 RPC。
-  store, homes: () => store.listHomes().filter((h) => h.harness !== 'codex' && monitor.get(h.homeId).runtime === 'running'), read: readLiveStatus,
+  // 实时状态只对可连接的 dsh 有意义：本地工具实例没有 dsh web，也没有实时 RPC。
+  store, homes: () => store.listHomes().filter((h) => !isLocalToolHome(h) && monitor.get(h.homeId).runtime === 'running'), read: readLiveStatus,
   broadcast: (event, data) => hub.broadcast(event, data),
 });
 monitor.start();
@@ -225,6 +235,8 @@ const server = createApiServer({
   allowedHosts: allowedHostsFromEnv(),
   dshVersion,
   codex,
+  // 统一打开 API（POST /api/harness/open）用的本地工具数据源。
+  localTools,
 });
 server.listen(opts.port, '127.0.0.1', () => {
   globalThis.hwbServiceReady?.();

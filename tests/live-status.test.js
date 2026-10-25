@@ -197,3 +197,132 @@ test('live reader 只在 404 时换写法：超时/鉴权失败不做第二次�
   assert.equal(rows, null);
   assert.deepEqual(calls, ['/api/session/list'], '401 不是「写法不对」，不该再试第二种');
 });
+
+// —— 远程实例的实时 RPC 预算（2026-09-19）——
+//
+// 4000ms 对本地实例绰绰有余，但这条通道同样服务**远程**实例（经 SSH 隧道 / 低带宽 VPN）。
+// 实测 c4g.tun 当天 43 轮探测失败 21 轮（49%），原因全是 `auth timeout`：同一时刻稳定入口上
+// 0.07s 的请求里夹着 1.4s / 3.6s / 6.0s 的秒级停顿，把这个门槛反复越过 —— 日志于是每 7s
+// 一条成功一条失败，工作台在「实时 / 文件索引」之间横跳。
+// 修法：预算可配置，默认值**不变**（不改变本机与健康链路的既有行为）。
+test('live-status: RPC 预算可由 HWB_LIVE_RPC_TIMEOUT_MS 覆盖，默认仍是 4000', async () => {
+  const { defaultRpcTimeoutMs, LiveStatusReader } = await import('../src/dshhome/live-status.js');
+  assert.equal(defaultRpcTimeoutMs({}), 4000, '未配置时必须保持 4000');
+  assert.equal(defaultRpcTimeoutMs({ HWB_LIVE_RPC_TIMEOUT_MS: '12000' }), 12000, '配置必须生效');
+  // 非法值一律回退默认，绝不因为一个坏环境变量把预算变成 0/NaN（那会让每次探测都立刻超时）。
+  for (const bad of ['', 'abc', '0', '-5', 'NaN']) {
+    assert.equal(defaultRpcTimeoutMs({ HWB_LIVE_RPC_TIMEOUT_MS: bad }), 4000, `${bad} 应回退 4000`);
+  }
+  const saved = process.env.HWB_LIVE_RPC_TIMEOUT_MS;
+  process.env.HWB_LIVE_RPC_TIMEOUT_MS = '9000';
+  try {
+    assert.equal(new LiveStatusReader().timeoutMs, 9000, '读取器的默认值必须走环境变量');
+  } finally {
+    if (saved === undefined) delete process.env.HWB_LIVE_RPC_TIMEOUT_MS;
+    else process.env.HWB_LIVE_RPC_TIMEOUT_MS = saved;
+  }
+  // 显式注入仍然赢过环境变量（调用方与测试都能钉住自己的预算）。
+  assert.equal(new LiveStatusReader({ timeoutMs: 1500 }).timeoutMs, 1500);
+});
+
+// —— token→cookie 交接的记忆化（2026-09-22，dgx21.tun 实测）——
+//
+// 原实现每轮 RPC 都重做一次交接（GET ?token= → POST /api/…），在远程实例上就是
+// **两个隧道往返**。实测日志里 `auth timeout` 占失败原因 2215 次（远超 `rpc timeout` 226 次）
+// —— 大多数轮询死在交接那一段。这两条用例守住：**交接只做一次**，且**cookie 失效能自愈**。
+
+test('live reader: token→cookie 交接只做一次，后续轮询不再打 auth 腿', async (t) => {
+  const authCalls = [];
+  const rpcCalls = [];
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    if (opts.method !== 'POST') {
+      authCalls.push(new URL(url).pathname);
+      return new Response(null, { status: 303, headers: { 'Set-Cookie': 'auth=ok; HttpOnly' } });
+    }
+    rpcCalls.push(new URL(url).pathname);
+    return Response.json({ type: 'server-response', result: { value: { items: [{ sessionId: 's1', running: true }] } } });
+  });
+  const reader = new LiveStatusReader();
+  const url = 'http://localhost:3080/?token=secret';
+  await reader.read(url, { homeId: 'memo1' });
+  await reader.read(url, { homeId: 'memo1' });
+  await reader.read(url, { homeId: 'memo1' });
+  assert.equal(authCalls.length, 1, `交接只该发生一次（实际 ${authCalls.length} 次）`);
+  assert.equal(rpcCalls.length, 3, '每轮仍要真的取一次数据');
+});
+
+test('live reader: 记忆的 cookie 失效（401）时清掉记忆并重做一次交接', async (t) => {
+  let authCalls = 0;
+  let rpcCalls = 0;
+  let cookieValid = true;
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    if (opts.method !== 'POST') {
+      authCalls += 1;
+      return new Response(null, { status: 303, headers: { 'Set-Cookie': `auth=v${authCalls}; HttpOnly` } });
+    }
+    rpcCalls += 1;
+    if (!cookieValid) {
+      // 第一轮用旧 cookie → 401；服务端换了密钥后必须能自愈。
+      cookieValid = true;
+      return new Response('stale cookie', { status: 401 });
+    }
+    return Response.json({ type: 'server-response', result: { value: { items: [{ sessionId: 's1' }] } } });
+  });
+  const reader = new LiveStatusReader();
+  const url = 'http://localhost:3080/?token=secret';
+  // 第一轮：建立记忆
+  await reader.read(url, { homeId: 'memo2' });
+  assert.equal(authCalls, 1);
+  // 让记忆里的 cookie 失效，下一轮应 401 → 清记忆 → 重新交接 → 成功
+  cookieValid = false;
+  const rows = await reader.read(url, { homeId: 'memo2' });
+  assert.ok(rows && rows.length === 1, 'cookie 失效后必须自愈而不是一直失败');
+  assert.equal(authCalls, 2, '失效后应重做一次交接');
+});
+
+test('live reader: 同一 origin 的不同 token 不串用 cookie 记忆', async (t) => {
+  const seenCookies = [];
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    if (opts.method !== 'POST') {
+      const tok = new URL(url).searchParams.get('token');
+      return new Response(null, { status: 303, headers: { 'Set-Cookie': `auth=${tok}; HttpOnly` } });
+    }
+    seenCookies.push(opts.headers.Cookie);
+    return Response.json({ type: 'server-response', result: { value: { items: [{ sessionId: 's1' }] } } });
+  });
+  const reader = new LiveStatusReader();
+  await reader.read('http://localhost:3080/?token=A', { homeId: 'hA' });
+  await reader.read('http://localhost:3080/?token=B', { homeId: 'hB' });
+  assert.deepEqual(seenCookies, ['auth=A', 'auth=B'], '不同 token 必须各自交接，不能复用对方的 cookie');
+});
+
+// —— 链路自适应的 RPC 预算（2026-09-22）——
+//
+// 固定 4s 预算对远程实例是**必然失败**：实测经隧道取一次 session.list 要 3.4–7.3s。
+// 而远端 dsh 服务端只要 1–5ms ⇒ 这些时间全是链路属性，属可测量量，不该用写死的常数去猜。
+test('live reader: 超时预算随实测往返自适应，且本地快链路不受影响', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    if (opts.method !== 'POST') return new Response(null, { status: 303, headers: { 'Set-Cookie': 'auth=ok' } });
+    await new Promise((r) => setTimeout(r, 1200));   // 模拟慢链路的一次往返
+    return Response.json({ type: 'server-response', result: { value: { items: [{ sessionId: 's1' }] } } });
+  });
+  const reader = new LiveStatusReader({ timeoutMs: 4000 });
+  // 无观测时用配置值
+  assert.equal(reader.timeoutFor('k'), 4000);
+  await reader.read('http://localhost:3080/', { homeId: 'k' });
+  const ewma = reader.latencyOf('k');
+  assert.ok(ewma >= 1100, `应记下实测往返（实际 ${ewma}ms）`);
+  const budget = reader.timeoutFor('k');
+  assert.ok(budget > 4000, `慢链路应放宽预算（实际 ${budget}ms）`);
+  assert.ok(budget <= 30_000, '预算必须有上界，不能无限放宽');
+  // 本地快链路：往返只有毫秒级 ⇒ 预算不该被放宽（行为与改动前一致）
+  const fast = new LiveStatusReader({ timeoutMs: 4000 });
+  fast.latency.set('local', 2);
+  assert.equal(fast.timeoutFor('local'), 4000, '本地实例的预算必须保持 4000ms 不变');
+});
+
+test('live reader: adaptiveTimeout=false 时保持固定预算（逃生舱）', async () => {
+  const reader = new LiveStatusReader({ timeoutMs: 4000, adaptiveTimeout: false });
+  reader.latency.set('k', 9000);
+  assert.equal(reader.timeoutFor('k'), 4000, '关掉自适应后应严格用配置值');
+});

@@ -93,9 +93,9 @@
 - 工作台仪表盘**零 iframe**，从本地 SQLite 读元数据，渲染成本 O(索引行)。
 - 钻入单个实例/会话才懒建**唯一** iframe：
   - **本机**：**外部打开**走 `http://127.0.0.1:<dshPort>/?token=<x>`（同机直连，无代理）；
-    **钻入 iframe 走 hwb 的预览反代**（自动分配的本地端口，注入 `preview-bridge.js` 以便
-    工作区/文件点击与父页通信）—— `Launcher.#withPreview` 对本地实例同样会建代理，
-    只有「外部打开」这一条路径是直连。
+    **钻入 iframe 走 hwb 的预览反代**（自动分配的本地端口，注入 `preview-bridge.js`：上报会话
+    上下文，并把父页的下载/上传能力接回 dsh 自己的侧栏）—— `Launcher.#withPreview` 对本地实例
+    同样会建代理，只有「外部打开」这一条路径是直连。
   - **远程**：浏览器 → hwb 根路径 1:1 反代 `127.0.0.1:<proxyPort>` → `ssh -L` 隧道 → 远端 `:<remotePort>`。
     （代理不重写路径，`/plugins/*`、`/assets/*`、/api、WebSocket 全走通；鉴权 cookie 按 authority=Host 绑定。）
 

@@ -5,10 +5,12 @@ import assert from 'node:assert/strict';
 //
 // 用户纠正了产品设计：Codex 不再是独立面板，而是和 dsh 同构的一种 harness 实例 ——
 //   - 添加：INSTANCES 的「＋ 添加」表单里选 Codex（只读），或 onboarding 里的检测按钮；
-//   - 展示：INSTANCES 里一张 Codex 卡（已就绪 / 路径缺失、打开 Codex / 重新索引 / 设置）；
+//   - 展示：INSTANCES 里一张**统一的本地工具卡**（已就绪 / 路径缺失、索引时间、
+//     打开 Codex / 重新索引 / 设置）—— 与 dsh 只读、WorkBuddy 共用同一个模板
+//     （见 docs/local-tool-harness-alignment.md §3 与 tests/local-tool-cards.test.js）；
 //   - 汇总：Codex 的项目/会话混进 RECENT PROJECTS / RECENT SESSIONS，靠实例 chip 区分；
 //   - 点击：drill-in 带 data-session-id（thread）与 data-workspace-id（project），
-//     实例卡「打开 Codex」带 data-action="codex-open-home"，都由 app.js 调 POST /api/codex/open。
+//     实例卡「打开 Codex」带 data-action="local-tool-open"，都由 app.js 调 POST /api/harness/open。
 //
 // 这些属性名是与 app.js 的契约，改错不会让页面崩，只会让点击"没反应"，所以在这里钉住。
 // chipColor() 会读 document/window 判断深浅主题；其余组件都是纯字符串拼接。
@@ -33,7 +35,8 @@ function fakeForm() {
 
 const CODEX_HOME = {
   harness: 'codex', homeId: 'cccccccccccccccc', hostType: 'local', homePath: '/Users/test/.codex',
-  alias: 'Codex 本机', runtime: { runtime: 'running', checkedAt: new Date().toISOString() },
+  alias: 'Codex 本机', lastIndexedAt: new Date().toISOString(),
+  runtime: { runtime: 'running', checkedAt: new Date().toISOString(), toolLabel: 'Codex', toolVersion: '0.153.4' },
   workspaceCount: 51, sessionCount: 409, degraded: [], endpoints: [],
 };
 
@@ -105,27 +108,32 @@ test('renderSettingsForm(dsh)：远程实例的设置仍保留接入端口与端
   assert.match(html, /选择连接端点/);
 });
 
-// ── INSTANCES 卡片 ───────────────────────────────────────────────────
-test('instance-grid(Codex)：harness chip + 已就绪 + 三个动作，没有连接/通道/版本', () => {
+// ── INSTANCES 卡片（本地工具统一模板）──────────────────────────────
+test('instance-grid(Codex)：身份 chip 带版本 + 已就绪 + 索引时间 + 三个动作，没有连接/通道', () => {
   const html = renderInstanceGrid([CODEX_HOME]);
-  assert.match(html, /class="chip harness-codex" title="只读接入的 Codex 本地实例">Codex</);
+  assert.match(html, /class="chip harness-codex"[^>]*>Codex 0\.153\.4</, '身份 chip 文本 = <label> <version>');
+  assert.match(html, /title="只读接入的 Codex 本地实例（版本 0\.153\.4）"/, '「只读」只出现在 title 里，不占状态位');
   assert.match(html, /class="chip ok">已就绪</);
   assert.match(html, /51 projects/);
   assert.match(html, /409 sessions/);
-  assert.match(html, /检查 /);
-  assert.match(html, /class="primary" data-action="codex-open-home" data-home-id="cccccccccccccccc">打开 Codex</);
+  assert.match(html, /索引 /);
+  assert.doesNotMatch(html, /检查 /, '本地工具不再用 runtime.checkedAt 这个心跳口径');
+  assert.match(html, /class="primary" data-action="local-tool-open" data-home-id="cccccccccccccccc">打开 Codex</);
   assert.match(html, /data-action="reindex" data-home-id="cccccccccccccccc"/);
   assert.match(html, /data-action="settings" data-home-id="cccccccccccccccc"/);
   // 只读实例没有这些接入概念
-  assert.doesNotMatch(html, /data-action="(connect|disconnect|choose-channel)"/);
+  assert.doesNotMatch(html, /data-action="(connect|disconnect|choose-channel|codex-open-home)"/);
   assert.doesNotMatch(html, /当前通道|响应 \d* ?ms|dsh 0\./);
+  // 「只读」是类型说明，不能出现在状态 chip 的文本位置
+  assert.doesNotMatch(html, /class="chip [^"]*">只读</, '只读不能占状态位');
 });
 
-test('instance-grid(Codex)：路径缺失时状态 chip 为 bad，降级 chip 照常保留且转义', () => {
-  const missing = renderInstanceGrid([{ ...CODEX_HOME, runtime: { runtime: 'stopped', checkedAt: null } }]);
+test('instance-grid(Codex)：路径缺失时状态 chip 为 bad、未索引显示 尚未索引，降级 chip 照常保留且转义', () => {
+  const missing = renderInstanceGrid([{ ...CODEX_HOME, lastIndexedAt: null, runtime: { runtime: 'stopped', checkedAt: null } }]);
   assert.match(missing, /class="chip bad">路径缺失</);
   assert.doesNotMatch(missing, /已就绪/);
-  assert.match(missing, /检查 —/);
+  assert.match(missing, /尚未索引/, '没索引过时明确说明，不画一个空占位');
+  assert.doesNotMatch(missing, /检查 —/);
 
   const degraded = renderInstanceGrid([{ ...CODEX_HOME, degraded: [{ domain: 'codex-db', error: EVIL, degraded: true }] }]);
   assert.match(degraded, /codex-db 降级/);
@@ -144,7 +152,7 @@ test('instance-grid(dsh)：dsh 卡片行为完全不变', () => {
   assert.match(html, /当前通道：cms\.lo:3080/);
   assert.match(html, /响应 12 ms/);
   assert.match(html, /data-action="disconnect"/);
-  assert.doesNotMatch(html, /harness-codex|codex-open-home/);
+  assert.doesNotMatch(html, /harness-codex|local-tool-open/);
 });
 
 // ── RECENT PROJECTS ─────────────────────────────────────────────────
@@ -158,6 +166,7 @@ test('recent-projects：Codex 行带 data-workspace-id，并用 totalTokens 回�
   ], [{ homeId: 'cccccccccccccccc', harness: 'codex', homePath: '/Users/test/.codex', alias: 'Codex 本机' }]);
 
   assert.match(html, /data-workspace-id="local-86d51"/);
+  assert.match(html, /data-source="codex"/, 'Codex 项目卡按来源着灰底');
   assert.match(html, /total 717\.0M tokens/);
   assert.match(html, /title="Codex 只提供会话累计 token，无输入\/输出拆分"/);
   assert.doesNotMatch(html, /in 0|out 0/, 'Codex 没有输入/输出拆分，不能渲染成 0');

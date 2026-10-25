@@ -1,0 +1,42 @@
+{
+  "name": "dsh-hwb-open-session",
+  "version": "0.1.0",
+  "description": "hwb → DSH 的「打开指定会话」信使：Host 半暴露一个只读触发器路由，Client 半轮询并调用 sessions.open()。给 hwb 提供在桌面 App / Web UI 里按会话定位的能力（不改 dsh 上游）。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "session",
+    "deeplink",
+    "hwb"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.1.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "immediately": true
+    }
+  }
+}

@@ -1,75 +1,26 @@
 // Runs inside the proxied dsh document; the parent verifies both source and origin.
+//
+// 这个桥接**不再接管文件点击**。dsh 0.1.5 自己就把会话里的文件路径与右侧 Sidebar「文件」
+// 树的文件行开进 Sidebar 的文档预览（chat 的 `openFile` → `sidebarRight.openResource`），
+// 而 hwb 原先的拦截（preventDefault + 自己的文件预览侧栏）恰好把这条原生路径挡掉了。
+// 现在预览完全落在 dsh 自己的侧栏里，hwb 只补两件 dsh 没有的事：
+//   · 下载到本机（documentpreview 头部注入的按钮 → hwb:download-file）
+//   · 上传到工作区（sidebar-files 头部注入的按钮 → hwb:file-upload，见 window.__hwbUploadFiles）
+// 注入的控件都不自己发请求：它们只 dispatch/调用本文件里的钩子，由父页走 hwb 的
+// /api/homes/:id/*（本机直读、远端经 SSH）。鉴权、工作区围栏与大小上限全部留在 hwb 那一侧。
 (() => {
   if (window.parent === window) return;
   let parentOrigin;
   let lastSession;
-  // 磁盘路径形态（用于从 dsh 的失败提示里把路径抠出来）。只接受绝对路径，避免误抓普通文本。
-  const DISK_PATH = /(?:\/(?:[\w.@+-]+\/)*[\w.@+-]+\.[A-Za-z0-9]{1,12}|[A-Za-z]:\\[^\s"'“”]+)/g;
-  // dsh 的「打开」标签是 `打开 {name}` / `Open {name}`（名字里可能带路径）。不同版本/不同入口
-  // 的按钮文字会变（例如「打开文件」「打开此文件」），所以这里只要求以「打开/Open」开头，
-  // 再配合后面的「标签里含 title 的路径」与「title 看起来是文件」两个条件，避免误判到
-  // 「打开侧边栏」「打开目录」这类与本功能无关的按钮。
-  function looksLikeFile(title) {
-    if (typeof title !== 'string' || !title || title.length > 4096) return false;
-    if (/^[a-z][a-z\d+.-]*:/i.test(title) && !/^[A-Za-z]:[\\/]/.test(title)) return false; // 带协议的都不是本地路径（含 app://、http://）
-    if (title.includes('/') || title.includes('\\')) return true;
-    return /^[\w.@+-]+\.[A-Za-z0-9]{1,12}$/.test(title);
+
+  function currentSession() {
+    try { return new URL(location.href).searchParams.get('session'); } catch { return null; }
   }
-  function ariaLooksLikeOpen(element, title) {
-    const label = element?.getAttribute?.('aria-label');
-    if (!label) return false;
-    if (!label.startsWith('打开') && !label.startsWith('Open')) return false;
-    return typeof title !== 'string' || label.includes(title);
-  }
-  // 按钮可见文字（React 里 button 的 children 可能是 span）：用来判断「按钮显示的名字就是路径」。
-  function visibleText(element) {
-    let text = '';
-    for (const child of element?.childNodes || []) {
-      if (child.nodeType === 3) text += child.nodeValue || '';
-      else if (child.textContent) text += child.textContent;
-    }
-    return text.trim();
-  }
-  // 取「这个元素代表哪个文件路径」：覆盖 dsh 当前形态（title+aria 的按钮）与历史形态
-  // （data-path / a[href] / 裸 code 文本）。
-  function pathFromEvent(event) {
-    const target = event.target;
-    if (typeof target?.closest !== 'function') return null;
-    const button = target.closest('[data-path], [data-file-path], button[title], [title]');
-    if (button) {
-      const title = button.getAttribute?.('title');
-      const inProducedRow = typeof button.closest === 'function' ? button.closest('[data-produced-files-row]') : null;
-      // 三个条件任意满足其一才认：产物行里的 chip、aria 文案是「打开 <路径>」、
-      // 或按钮显示的名字本身就是这个路径。仅凭「有 title 且像路径」会误伤
-      // 「打开侧边栏」这类按钮（它的 title 恰好是一段普通文字）。
-      const namedByButton = typeof title === 'string' && looksLikeFile(title)
-        && (button.textContent?.trim() === title || visibleText(button) === title);
-      if (typeof title === 'string' && (inProducedRow || namedByButton || (looksLikeFile(title) && ariaLooksLikeOpen(button, title)))) {
-        return title;
-      }
-      const dataPath = button.dataset?.path || button.dataset?.filePath;
-      if (dataPath) return dataPath;
-    }
-    const el = target.closest('a[href], code');
-    if (!el || typeof el.matches !== 'function') return null;
-    if (el.matches('a')) {
-      const href = el.getAttribute('href');
-      if (!href || /^(?:https?:|mailto:|#|javascript:|data:)/i.test(href)) return null;
-      try {
-        const file = href.startsWith('file://') ? new URL(href).pathname : decodeURIComponent(href);
-        return /^[a-z][a-z\d+.-]*:/i.test(file) ? null : file;
-      } catch { return null; }
-    }
-    if (el.matches('code') && !(typeof el.closest === 'function' && el.closest('pre'))) {
-      const text = el.textContent.trim();
-      if (/^(?:\.{0,2}\/|[\w@.-]+\/)[^\n]+$/.test(text) || /^[\w.-]+\.[a-z\d]{1,12}$/i.test(text)) return text;
-    }
-    return null;
-  }
+
   function sendContext() {
     if (!parentOrigin) return;
     const href = location.href;
-    const sessionId = new URL(href).searchParams.get('session');
+    const sessionId = currentSession();
     if (sessionId === lastSession) return;
     lastSession = sessionId;
     // 同时带上完整 URL：当前这套 dsh 客户端不做任何 URL 导航（切换会话时 URL 不变），
@@ -77,10 +28,84 @@
     // 就无需再改这里，也便于排查「为什么读不到会话」。
     window.parent.postMessage({ type: 'hwb:preview-context', sessionId, href }, parentOrigin);
   }
+
   // dsh updates the session query through SPA navigation; the iframe itself
   // does not reload when the user changes conversations.
   new MutationObserver(sendContext).observe(document, { childList: true, subtree: true });
   window.addEventListener('popstate', sendContext);
+
+  // —— 上传：dsh 的「文件」树头部那个注入按钮调用这里 ——
+  //
+  // 为什么不在这里直接发请求：这个文档是从 hwb 的**反代端口**加载的，相对路径 /api/... 会
+  // 被反代原样转给 dsh 上游，根本到不了 hwb 的 API。所以走「桥接 → 父页 → hwb」这条老路：
+  // File 对象可以结构化克隆，父子同机，postMessage 传的是引用而不是再拷一份字节。
+  const UPLOAD_STATUS_ID = 'hwb-upload-status';
+  let statusTimer = null;
+
+  function showUploadStatus(text, tone) {
+    let box = document.getElementById(UPLOAD_STATUS_ID);
+    if (!box) {
+      box = document.createElement('div');
+      box.id = UPLOAD_STATUS_ID;
+      box.setAttribute('role', 'status');
+      box.setAttribute('aria-live', 'polite');
+      box.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483000;max-width:420px;'
+        + 'padding:9px 12px;border-radius:8px;background:#1f2430;color:#e8ecf3;'
+        + 'font:13px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 6px 24px #0006';
+      document.body.appendChild(box);
+    }
+    box.textContent = text;
+    if (tone === 'error') box.style.background = '#4a1f24';
+    else if (tone === 'ok') box.style.background = '#1f3a2a';
+    else box.style.background = '#1f2430';
+    clearTimeout(statusTimer);
+    // 失败信息留久一点：用户往往要看清是哪一条没上去；成功则很快让位。
+    if (tone === 'error') statusTimer = setTimeout(() => box.remove(), 20000);
+    else if (tone === 'ok') statusTimer = setTimeout(() => box.remove(), 8000);
+  }
+
+  function failUpload(text) {
+    if (parentOrigin) showUploadStatus(text, 'error');
+  }
+
+  window.__hwbUploadFiles = (dir) => {
+    if (!parentOrigin) return;
+    if (typeof dir !== 'string' || !dir || dir.length > 4096) { failUpload('上传失败：目标目录无效。'); return; }
+    let input = document.getElementById('hwb-upload-input');
+    if (!input) {
+      input = document.createElement('input');
+      input.id = 'hwb-upload-input';
+      input.type = 'file';
+      input.multiple = true;
+      input.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;opacity:0';
+      document.body.appendChild(input);
+    }
+    input.onchange = () => {
+      const files = Array.from(input.files || []);
+      input.value = ''; // 同一个文件连选两次也要能触发 change
+      if (!files.length) return;
+      window.parent.postMessage({ type: 'hwb:file-upload', dir, files,
+        sessionId: currentSession() }, parentOrigin);
+      showUploadStatus(`正在上传 ${files.length} 个文件…`);
+    };
+    input.click();
+  };
+
+  // 上传结果由父页回传（真正的请求在 hwb 父页/服务端，见 app.js）。
+  window.addEventListener('message', (event) => {
+    if (event.source !== window.parent || event.origin !== parentOrigin) return;
+    const data = event.data;
+    if (data?.type !== 'hwb:upload-status') return;
+    const text = typeof data.text === 'string' ? data.text.slice(0, 512) : '';
+    if (!text) return;
+    showUploadStatus(text, data.tone === 'ok' ? 'ok' : data.tone === 'error' ? 'error' : 'info');
+    // 传完了就让 dsh 的「文件」树重读一次：新文件应当立刻出现在树里，而不必用户手动刷新
+    // （树头部的重载按钮就是 dsh 自己的入口，这里只是替用户按一下）。
+    if (data.tone === 'ok' && data.reload === true) {
+      document.querySelector('[data-files-reload]')?.click();
+    }
+  });
+
   // Referrers may be stripped by the browser or an authentication redirect.
   // Accept initialization only from our actual parent, never a sibling frame.
   window.addEventListener('message', (event) => {
@@ -89,86 +114,18 @@
     lastSession = undefined;
     sendContext();
   });
+
   window.addEventListener('hwb:open-workspace', (event) => {
     if (parentOrigin && typeof event.detail === 'string') window.parent.postMessage({ type: 'hwb:open-workspace', workspaceId: event.detail }, parentOrigin);
   });
-  function handleFileClick(event) {
-    if (!parentOrigin) return;
-    if (event.defaultPrevented) return;
-    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    const target = event.target;
-    if (typeof target?.closest !== 'function') return;
-    if (target.closest('textarea, input, [contenteditable="true"]')) return;
-    let file = pathFromEvent(event);
-    if (!file || file.length > 4096) return;
-    const match = file.match(/^(.*?)(?::(\d+)(?::\d+)?|#L(\d+)(?:-L?\d+)?)$/);
-    const line = match ? Number(match[2] || match[3]) : null;
-    if (match) file = match[1];
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    window.parent.postMessage({ type: 'hwb:file-preview', path: file, line,
-      sessionId: new URL(location.href).searchParams.get('session') }, parentOrigin);
-  }
-  // 挂三个 capture 监听：window、document（拦截），以及一个「没拦住时才提示」的 document 监听。
-  // 过去只挂 window —— 实测同一份代码在 document 上能拦到、window 上那次没有，一旦漏拦，
-  // 事件就交给 dsh 的原生「用系统应用打开」，在远端 Linux 上只能得到 xdg-open 报错。
-  // 三个监听都在同一节点上的捕获阶段，顺序确定：前两个先处理，第三个只在 defaultPrevented
-  // 仍为 false（= 确实要交给原生打开）时才提示。
 
-  // 兜底：万一某个入口的点击仍漏给了 dsh 的原生「用宿主系统应用打开」（远端 Linux 上必然
-  // 失败 → `xdg-open: no method available`），不要往会话正文里插任何控件（那会污染对话）；
-  // 只在 iframe 角落浮一条自己会消失的小提示，给一个「在 hwb 预览里打开」的动作。
-  let toastTimer = null;
-  function showOpenNotice(path) {
+  // 内置文件预览头部那个「下载到本机」按钮（由 file-download.js 注入 bundle）按下时派发。
+  // 桥接只负责转交 —— 真正的读取与围栏都在 hwb 父页/服务端，注入的按钮不碰它们。
+  window.addEventListener('hwb:download-file', (event) => {
     if (!parentOrigin) return;
-    let toast = document.getElementById('hwb-preview-notice');
-    if (!toast) {
-      toast = document.createElement('div');
-      toast.id = 'hwb-preview-notice';
-      toast.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483000;display:flex;gap:10px;'
-        + 'align-items:center;max-width:420px;padding:10px 12px;border-radius:8px;background:#1f2430;color:#e8ecf3;'
-        + 'font:13px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 6px 24px #0006';
-      document.body.appendChild(toast);
-    }
-    toast.replaceChildren();
-    const text = document.createElement('span');
-    text.textContent = '本机没有可用的打开方式（远端 xdg-open 失败）。';
-    const action = document.createElement('button');
-    action.type = 'button';
-    action.textContent = '在 hwb 文件预览里打开';
-    action.style.cssText = 'flex:none;padding:4px 10px;font:inherit;cursor:pointer';
-    action.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      window.parent.postMessage({ type: 'hwb:file-preview', path, line: null,
-        sessionId: new URL(location.href).searchParams.get('session') }, parentOrigin);
-      toast.remove();
-    }, true);
-    const close = document.createElement('button');
-    close.type = 'button';
-    close.textContent = '×';
-    close.setAttribute('aria-label', '关闭提示');
-    close.style.cssText = 'flex:none;padding:0 6px;font:inherit;cursor:pointer;background:transparent;color:inherit;border:0';
-    close.addEventListener('click', () => toast.remove());
-    toast.append(text, action, close);
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toast.remove(), 20000);
-  }
-  window.addEventListener('click', handleFileClick, true);
-  document.addEventListener('click', handleFileClick, true);
-  document.addEventListener('click', handleNativeOpen, true);
-
-  // 走到这里说明这次点击**没被**上面拦下、即将交给 dsh 的原生打开。此时用一个更宽的判据
-  // 把路径找出来即可（宽松不会有副作用：只是多浮一条提示，而且提示本身也是可关闭的）。
-  function handleNativeOpen(event) {
-    if (!parentOrigin || event.defaultPrevented) return;
-    const target = event.target;
-    if (typeof target?.closest !== 'function') return;
-    if (target.closest('textarea, input, [contenteditable="true"]')) return;
-    const holder = typeof target.closest === 'function' ? (target.closest('[title]') || target) : target;
-    const title = holder?.getAttribute?.('title');
-    if (typeof title === 'string' && looksLikeFile(title)) { showOpenNotice(title); return; }
-    const path = pathFromEvent(event);
-    if (path && path.length <= 4096) showOpenNotice(path);
-  }
+    const detail = event.detail;
+    if (typeof detail !== 'string' || !detail || detail.length > 4096) return;
+    window.parent.postMessage({ type: 'hwb:file-download', path: detail,
+      sessionId: currentSession() }, parentOrigin);
+  });
 })();

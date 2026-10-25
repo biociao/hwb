@@ -9,6 +9,9 @@ import { parseMultipart } from '../lib/multipart.js';
 import { logger } from '../lib/logger.js';
 import { readFilePreview, resolveUploadDir, writeUpload, UPLOAD_BYTES, sessionWorkspace } from '../lib/file-preview.js';
 import { THEME_PREFERENCES, isThemePreference, readThemePreference } from '../lib/dsh-theme.js';
+import { openSessionInDsh, openDshApp as openDshAppDefault } from '../lib/open-session.js';
+import { LOCAL_TOOL_HARNESSES, LOCAL_TOOL_SOURCES, detectLocalTool, isLocalToolHome, localToolDefaultHome, localToolLabel } from '../lib/harnesses.js';
+import { resolveToolVersion } from '../lib/tool-version.js';
 
 // 实例对象出站前的整形：去掉 dsh 的 token。
 //
@@ -47,20 +50,6 @@ function mergeEndpointTokens(input, existing = []) {
     }
     return entry;
   });
-}
-
-// 预览资源（/asset）按扩展名给 Content-Type：HTML 必须是 text/html 浏览器才会渲染，
-// 其余按常见文本/图片类型；未知类型一律 application/octet-stream（配合 nosniff 不会被执行）。
-const PREVIEW_MIME = {
-  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8', '.xhtml': 'application/xhtml+xml',
-  '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/plain; charset=utf-8', '.csv': 'text/plain; charset=utf-8', '.xml': 'application/xml; charset=utf-8',
-  '.pdf': 'application/pdf', '.woff': 'font/woff', '.woff2': 'font/woff2',
-};
-function mimeFor(file) {
-  return PREVIEW_MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
 }
 
 function send(res, status, body) {
@@ -168,17 +157,35 @@ function dshHomeInfo(homePath) {
   };
 }
 
-// Codex home 的探测口径与 dsh 不同：没有 workspace.json，认的是元数据落盘文件。
-function codexHomeInfo(homePath) {
-  const exists = existsSync(homePath) && statSync(homePath).isDirectory();
-  return {
-    path: homePath,
-    exists,
-    looksLikeCodexHome: exists && (
-      existsSync(path.join(homePath, 'state_5.sqlite'))
-      || existsSync(path.join(homePath, '.codex-global-state.json'))
-    ),
-  };
+// 「目录不像该工具的 home」提示里要写的哨兵文件。探测判定本身由 lib/harnesses.js 的描述符
+// 负责（detectLocalTool），这里只补一句人话，不参与判定。
+const LOCAL_TOOL_SENTINELS = {
+  codex: 'state_5.sqlite / .codex-global-state.json',
+  workbuddy: 'workbuddy.db',
+};
+
+// detectLocalTool 的「像不像」字段名因 harness 而异（looksLikeCodexHome / looksLikeWorkbuddy）：
+// 取第一个 looksLike* 布尔值即可，不必在路由里按 harness 分支。
+function localToolLooksLike(info) {
+  if (!info || typeof info !== 'object') return false;
+  const key = Object.keys(info).find((name) => name.startsWith('looksLike'));
+  return key ? info[key] === true : false;
+}
+
+// 本地工具实例（Codex / WorkBuddy）的探测：路径与「像不像」都来自描述符。
+function localToolHomeInfo(harness, homePath) {
+  const info = detectLocalTool(harness, homePath);
+  // 描述符缺失（不该发生）时按「目录不存在」处理，宁可拒加也不静默建一个坏实例。
+  return info ?? { path: homePath, exists: false };
+}
+
+// 本地工具实例「打开」的目标解析：sessionId > projectId 的最近会话 > 实例最近一条会话。
+// 数据面（LOCAL_TOOL_SOURCES）负责前两级，最后一级（无参数时取最近一条）也在它内部实现。
+async function resolveLocalToolSession(source, home, { sessionId, projectId }) {
+  return source.resolveTarget(home, {
+    sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : undefined,
+    projectId: typeof projectId === 'string' && projectId.trim() ? projectId.trim() : undefined,
+  });
 }
 
 // 用户填的路径可以是 `~/.codex`（表单默认值），path.resolve('~/.codex') 会把它变成
@@ -194,12 +201,37 @@ function resolveUserPath(raw, fallback) {
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null, codex = null }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null, codex = null, localTools = LOCAL_TOOL_SOURCES, openSession = openSessionInDsh, openDshApp = openDshAppDefault }) {
   const connecting = new Set();
+  // 本地工具数据源（Codex / WorkBuddy）。默认直接用描述符表；server.js 也可以注入一份
+  // （同一形状）以便在版本预检之后才动态装配。调用点一律 await —— readSnapshot/resolveTarget/open
+  // 都是 async（内部按需动态 import node:sqlite 的 reader）。
+  const toolSources = localTools ?? {};
   // 实例上的 dsh 版本号（DshVersionResolver，见 lib/dsh-version.js）。可以缺省：本地实例同步
   // 读本机安装、远程实例后台 ssh 探测，两者都**不是**渲染实例列表的前置条件 —— 单测直接建
   // router 时不必关心它，那时 runtime.dshVersion 为 null，前端按「未知」处理（不画那个 chip）。
-  const runtimeOf = (home) => ({ ...monitor.get(home.homeId), dshVersion: dshVersion?.resolve?.(home) ?? null });
+  //
+  // runtime 的两个**已归一化**字段（契约 §4.1）：toolLabel / toolVersion。
+  //   · dsh（连接型与只读）→ label 'dsh'，版本走既有 DshVersionResolver；
+  //   · 本地工具 → label 来自描述符，版本走 resolveToolVersion（30 分钟缓存、版本号白名单）。
+  // runtime.dshVersion 保留（兼容旧前端/测试），但只对 harness === 'dsh' 赋值 ——
+  // 之前它被填给了 Codex 卡，于是 Codex 实例显示的是 dsh 的版本号。
+  const runtimeOf = (home) => {
+    const isDsh = home.harness === 'dsh';
+    const dshVersionValue = isDsh ? (dshVersion?.resolve?.(home) ?? null) : null;
+    let toolLabel = null;
+    let toolVersion = null;
+    if (isDsh) {
+      toolLabel = 'dsh';
+      toolVersion = dshVersionValue;
+    } else if (isLocalToolHome(home)) {
+      let resolved = null;
+      try { resolved = resolveToolVersion(home); } catch { resolved = null; }
+      toolLabel = resolved?.label ?? localToolLabel(home) ?? null;
+      toolVersion = resolved?.version ?? null;
+    }
+    return { ...monitor.get(home.homeId), dshVersion: dshVersionValue, toolLabel, toolVersion };
+  };
   // 主题：server.js 注入一个读写闭包（把偏好持久化进 hwb 自己的配置），这里只负责转发。
   // 默认实现是内存态 —— 单测直接建 router 时不必关心落盘，也不会写用户的 ~/.hwb。
   let themePreferenceState = null;
@@ -207,7 +239,24 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
   // 上传并发上限（见 upload 路由里的说明）。默认 1：最坏内存 ≈ 单次上限（256 MiB → ~1.1 GiB）。
   const MAX_CONCURRENT_UPLOADS = maxConcurrentUploads;
   let uploadsInFlight = 0;
-  // 预览族接口（preview/download/asset/upload）共用的「解析目标工作区」：
+  // 最近项目/会话的数据可见范围：
+  //   · 运行中的实例（Codex / 只读 dsh 由 monitor 标成 running）；
+  //   · 同 homePath 同时存在「只读实例 + 可连接实例」时，只取只读实例的数据，
+  //     避免同一批会话在列表里出现两遍（可连接实例仍保留，供 Web iframe 使用）。
+  const dataHomeIds = () => {
+    const homes = store.listHomes();
+    const running = new Set(homes.filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId));
+    const readOnlyPaths = new Set(homes
+      .filter((h) => h.readOnly === true && running.has(h.homeId)
+        && (h.status === 'ok' || h.status === 'degraded'))
+      .map((h) => h.homePath));
+    return homes
+      .filter((h) => running.has(h.homeId))
+      .filter((h) => !(h.harness === 'dsh' && h.hostType === 'local' && !h.readOnly && readOnlyPaths.has(h.homePath)))
+      .map((h) => h.homeId);
+  };
+
+  // download 与 upload 共用的「解析目标工作区」：
   // 优先按会话（sessionId）解析它所属的 project 工作区，否则按显式 workspaceId 解析。
   function resolveWorkspace(home, searchParams) {
     const workspaces = store.listWorkspaces({ homeId: home.homeId });
@@ -278,13 +327,16 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
 
-    // Codex 是只读数据源：没有「连接/重启/停止/切换端点」这些动作。统一挡在这里，
-    // 免得 UI 上出现一个永远失败的按钮（也会在 launcher 里留下无意义的进程状态）。
-    const codexAction = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(open|restart|stop|disconnect|switch)$/);
-    if (req.method === 'POST' && codexAction) {
-      const actionHome = store.getHome(codexAction[1]);
-      if (actionHome?.harness === 'codex') {
-        send(res, 400, { error: 'Codex 实例是只读数据源，无需连接/重启/停止' });
+    // 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）都是只读数据源：没有「连接/重启/停止/
+    // 切换端点」这些动作。统一挡在这里，免得 UI 上出现一个永远失败的按钮（也会在 launcher 里
+    // 留下无意义的进程状态）。判定收在 lib/harnesses.js 的 isLocalToolHome 一处。
+    const readOnlyAction = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(open|restart|stop|disconnect|switch)$/);
+    if (req.method === 'POST' && readOnlyAction) {
+      const actionHome = store.getHome(readOnlyAction[1]);
+      if (isLocalToolHome(actionHome)) {
+        send(res, 400, {
+          error: `${localToolLabel(actionHome)} 实例是只读数据源，无需连接/重启/停止；点「打开」即可跳到该工具的最近会话`,
+        });
         return;
       }
     }
@@ -302,45 +354,28 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
 
-    const preview = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/(preview|download|asset)$/);
-    if (req.method === 'GET' && preview) {
+    // 下载：把文件本体（完整字节）取回本机 —— 本机实例直读，远端实例经 SSH 传回。
+    // 驱动它的是 dsh 右侧 Sidebar 里注入的「下载到本机」按钮（见 src/control/file-download.js）：
+    // 预览本身已经落在 dsh 自己的侧栏里，hwb 只剩「取回字节」这一件事需要服务端帮忙。
+    const download = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/download$/);
+    if (req.method === 'GET' && download) {
       res.setHeader('Cache-Control', 'no-store');
       if (req.headers['sec-fetch-site'] === 'cross-site') {
         send(res, 403, { error: '不允许跨站读取文件' }); return;
       }
-      const home = store.getHome(preview[1]);
+      const home = store.getHome(download[1]);
       if (!home) { send(res, 404, { error: '实例不存在' }); return; }
       const workspace = resolveWorkspace(home, searchParams);
       if (!workspace?.path) { send(res, 400, { error: '尚未绑定可用的 project 工作区：请先在 dsh 中打开项目会话，或在上方选择工作区' }); return; }
       try {
-        if (preview[2] === 'asset') {
-          // HTML 渲染预览的「原字节」通道：按真实 MIME 返回，供 <iframe> 直接渲染。
-          // 仍是只读 + 工作区内 + 强制同源；并且 CSP sandbox 会禁掉脚本，
-          // 所以即使预览的是外部给的可疑 HTML，也拿不到 hwb 自己的 API。
-          const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { raw: true });
-          const bytes = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data, 'base64');
-          res.writeHead(200, { 'Content-Type': mimeFor(result.path), 'Content-Length': bytes.length,
-            'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
-            'Content-Security-Policy': "sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none'; img-src data: blob: 'self'; style-src 'unsafe-inline' 'self'; font-src data: 'self'",
-            'X-Frame-Options': 'SAMEORIGIN' });
-          res.end(bytes);
-          return;
-        }
-        if (preview[2] === 'download') {
-          const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { download: true });
-          const name = encodeURIComponent(path.basename(result.path)).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16));
-          // 本机下载回的是 Buffer（见 readLocalPreview：避免 base64 + JSON 的两层同尺寸副本），
-          // 远端下载经 ssh 传回，仍是 base64 字符串。两条路径都在这里收敛成响应用的字节。
-          const bytes = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data, 'base64');
-          res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
-            'Content-Disposition': `attachment; filename="download"; filename*=UTF-8''${name}`, 'X-Content-Type-Options': 'nosniff' });
-          res.end(bytes);
-          return;
-        }
-        // text=1：显式要文本（HTML 的「源码」视图），否则 .html 会走渲染预览那条路。
-        send(res, 200, { ...await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined,
-            { text: searchParams.get('text') === '1' }),
-          workspace: { workspaceId: workspace.workspaceId, title: workspace.title, path: workspace.path } });
+        const result = await readFilePreview(home, workspace.path, searchParams.get('path') || '.', undefined, { download: true });
+        const name = encodeURIComponent(path.basename(result.path)).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16));
+        // 本机下载回的是 Buffer（见 readLocalPreview：避免 base64 + JSON 的两层同尺寸副本），
+        // 远端下载经 ssh 传回，仍是 base64 字符串。两条路径都在这里收敛成响应用的字节。
+        const bytes = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data, 'base64');
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
+          'Content-Disposition': `attachment; filename="download"; filename*=UTF-8''${name}`, 'X-Content-Type-Options': 'nosniff' });
+        res.end(bytes);
       } catch (e) { send(res, 400, { error: e.message }); }
       return;
     }
@@ -426,35 +461,56 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
     if (req.method === 'GET' && pathname === '/api/homes/detect') {
+      const workbuddy = detectLocalTool('workbuddy');
       send(res, 200, {
         ...dshHomeInfo(path.join(homedir(), '.dsh')),
-        // 第二个 harness：Codex 的默认 home 与判定文件都和 dsh 不同，单独给一份。
-        codex: codexHomeInfo(path.join(homedir(), '.codex')),
+        // 本地工具各自的默认 home 与哨兵文件都不同，探测口径由描述符（lib/harnesses.js）
+        // 统一决定，这里只负责摆字段。codex 键名保持既有形状不变。
+        codex: detectLocalTool('codex'),
+        workbuddy,
       });
       return;
     }
     if (req.method === 'POST' && pathname === '/api/homes') {
       const body = await readJsonBodyOr400(req, res);
       if (body === BODY_HANDLED) return;
-      // —— Codex 实例（harness='codex'）：只读本地 ~/.codex，没有进程/端口/端点/token ——
-      if (body.harness === 'codex') {
+      // —— 本地工具实例（Codex / WorkBuddy）：只读本地元数据，没有进程/端口/端点/token ——
+      // 行为由描述符驱动：新增 harness 只需在 LOCAL_TOOL_HARNESSES 里加一项，这里不改。
+      if (LOCAL_TOOL_HARNESSES.includes(body.harness)) {
+        const harness = body.harness;
+        const label = localToolLabel({ harness });
+        // 本地工具只有本机 home：远端/SSH 字段没有意义，明确拒绝而不是静默丢字段
+        // （否则用户以为加了一台远端 WorkBuddy，实际却在读本机默认路径）。
+        if (body.hostType === 'remote' || body.host || body.remotePort) {
+          send(res, 400, { error: `${label} 实例只支持本机 home，不支持远端连接` });
+          return;
+        }
         const alias = typeof body.alias === 'string' && body.alias.trim() ? body.alias.trim() : null;
-        const homePath = resolveUserPath(body.homePath, path.join(homedir(), '.codex'));
-        const info = codexHomeInfo(homePath);
+        // 默认 home 走描述符（尊重 WORKBUDDY_HOME / CODEX_HOME）；用户填的路径允许 `~` 展开。
+        const homePath = resolveUserPath(body.homePath, localToolDefaultHome(harness));
+        const info = localToolHomeInfo(harness, homePath);
         if (!info.exists) { send(res, 400, { error: `not a directory: ${homePath}` }); return; }
-        const homeId = store.registerHome({ homePath, alias, hostType: 'local', harness: 'codex' });
-        // 立即索引一次，让新增的 Codex 实例马上出现在 Recent Projects/Sessions（不再等 60s 节拍）。
+        let homeId;
+        try {
+          homeId = store.registerHome({ homePath, alias, hostType: 'local', harness });
+        } catch (error) {
+          send(res, 400, { error: error.message });
+          return;
+        }
+        // 立即索引一次，让新增实例马上出现在 Recent Projects/Sessions（不再等 60s 节拍）。
         let result = null;
         try { result = (await indexer.reindexNow(homeId))[0] ?? null; } catch { /* 失败会写进实例状态，不阻断注册 */ }
-        // 紧接着刷新运行时：Codex 的 runtime 由 monitor 直接标 running，
+        // 紧接着刷新运行时：本地工具的 runtime 由 monitor 直接标 running，
         // 不刷新的话它要等下一次 30s 心跳才进入 connectedHomes —— 用户会看到实例卡「路径缺失」
         // 且 Recent 两栏为空，像是添加失败。
         try { await monitor.refresh(homeId); } catch { /* 运行时快照失败不阻断注册 */ }
         dropUsageMemo();
+        const missing = LOCAL_TOOL_SENTINELS[harness];
         send(res, 200, {
           homeId,
-          harness: 'codex',
-          warning: info.looksLikeCodexHome ? null : 'directory does not look like a Codex home (state_5.sqlite / .codex-global-state.json missing)',
+          harness,
+          warning: localToolLooksLike(info) ? null
+            : `directory does not look like a ${label} home${missing ? ` (${missing} missing)` : ''}`,
           result,
         });
         return;
@@ -475,6 +531,42 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       if (accessPort && store.listHomes().some(h => h.accessPort === accessPort)) {
         send(res, 409, { error: `本地端口 ${accessPort} 已被另一个实例保留` }); return;
+      }
+
+      // —— 本地 dsh 只读实例（Codex 式）：没有进程/端口/token，只读 home 索引并支持跳转 ——
+      // 与同 homePath 的可连接实例并存：homeId 用独立命名空间，互不覆盖。
+      if (body.readOnly === true) {
+        if ((body.harness && body.harness !== 'dsh') || body.hostType === 'remote') {
+          send(res, 400, { error: 'readOnly 只支持本机 dsh 实例' });
+          return;
+        }
+        const readOnlyPath = resolveUserPath(body.homePath, path.join(homedir(), '.dsh'));
+        if (!readOnlyPath) {
+          send(res, 400, { error: 'homePath is required' });
+          return;
+        }
+        const readOnlyInfo = dshHomeInfo(readOnlyPath);
+        if (!readOnlyInfo.exists) {
+          send(res, 400, { error: `not a directory: ${readOnlyPath}` });
+          return;
+        }
+        const readOnlyId = store.registerHome({
+          homePath: readOnlyPath,
+          alias: typeof body.alias === 'string' ? body.alias.trim() || null : null,
+          hostType: 'local',
+          harness: 'dsh',
+          readOnly: true,
+        });
+        const readOnlyResults = await indexer.reindexNow(readOnlyId);
+        await monitor.refresh(readOnlyId);
+        dropUsageMemo();
+        send(res, readOnlyInfo.looksLikeDshHome ? 200 : 202, {
+          homeId: readOnlyId,
+          readOnly: true,
+          warning: readOnlyInfo.looksLikeDshHome ? null : 'directory does not look like a dsh home (storages/workspace.json missing)',
+          result: readOnlyResults[0] ?? null,
+        });
+        return;
       }
 
       // SSH 远程实例：host + remotePort（远端 dsh web 监听端口）。
@@ -539,17 +631,19 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       const body = await readJsonBodyOr400(req, res);
       if (body === BODY_HANDLED) return;
-      // Codex 实例的配置面只有别名与 home 路径：没有端点/token/端口可改，也没有进程可冲突。
-      if (home.harness === 'codex') {
-        const codexPatch = {};
-        if (typeof body.alias === 'string') codexPatch.alias = body.alias.trim() || null;
+      // 本地工具实例的配置面只有别名与 home 路径：没有端点/token/端口可改，也没有进程可冲突。
+      // 判定收在 isLocalToolHome（Codex / WorkBuddy / 本地 dsh 只读），不再分两套分支。
+      if (isLocalToolHome(home)) {
+        const localPatch = {};
+        if (typeof body.alias === 'string') localPatch.alias = body.alias.trim() || null;
         if (typeof body.homePath === 'string' && body.homePath.trim()) {
           const hp = resolveUserPath(body.homePath, home.homePath);
-          const info = codexHomeInfo(hp);
-          if (!info.exists) { send(res, 400, { error: `not a directory: ${hp}` }); return; }
-          codexPatch.homePath = hp;
+          // dsh 只读仍按 dsh 的哨兵文件判定；Codex/WorkBuddy 走各自描述符。
+          const info = home.harness === 'dsh' ? dshHomeInfo(hp) : localToolHomeInfo(home.harness, hp);
+          if (!info?.exists) { send(res, 400, { error: `not a directory: ${hp}` }); return; }
+          localPatch.homePath = hp;
         }
-        const updated = store.updateHomeConfig(home.homeId, codexPatch);
+        const updated = store.updateHomeConfig(home.homeId, localPatch);
         try { await monitor.refresh(updated.homeId); } catch { /* 运行时快照刷新失败不影响保存 */ }
         reindexInBackground(updated.homeId);
         dropUsageMemo();
@@ -683,6 +777,159 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     //
     // 点击 Recent Projects / Recent Sessions / 实例卡上的 Codex 条目时调用。只接受
     // 「本机已注册的 Codex 实例 + UUID thread」：本 API 无鉴权，不能让任意 UUID 变成深链派发器。
+    // 本地 dsh：让已安装 dsh-hwb-open-session 插件的 DSH 桌面端切到指定会话。
+    // 插件缺失/平台不支持时返回 409/501 + code，前端据此静默回退到内嵌 iframe。
+    const openSessionMatch = pathname.match(/^\/api\/homes\/([0-9a-f]{16})\/open-session$/);
+    if (req.method === 'POST' && openSessionMatch) {
+      const home = store.getHome(openSessionMatch[1]);
+      if (!home) {
+        send(res, 404, { error: `unknown homeId ${openSessionMatch[1]}` });
+        return;
+      }
+      if (home.harness !== 'dsh' || home.hostType !== 'local') {
+        send(res, 400, { error: '只有本地 dsh 实例支持在 DSH 桌面端打开会话' });
+        return;
+      }
+      const body = await readJsonBodyOr400(req, res);
+      if (body === BODY_HANDLED) return;
+      const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+      try {
+        const result = await openSession({ home, sessionId });
+        const status = result.ok ? 200
+          : result.code === 'platform-unsupported' ? 501
+            : result.code === 'bad-session-id' || result.code === 'bad-home' ? 400
+              : 409;
+        send(res, status, result);
+      } catch (error) {
+        send(res, 500, { error: error.message });
+      }
+      return;
+    }
+
+    // —— 统一本地工具跳转（契约 §4.2）：Codex / WorkBuddy / 本地 dsh 只读 ——
+    //
+    // 前端只记这一个入口（data-action="local-tool-open"）。目标解析：显式 sessionId >
+    // projectId 的最近一条会话 > 该实例最近一条会话；都解析不到时：
+    //   · Codex / WorkBuddy → 400（它们只能靠深链落到具体会话）；
+    //   · 本地只读 dsh → 退化成「聚焦/启动 DSH 桌面端」，回 200 + code:'app-focused'。
+    //
+    // 安全：这是无鉴权的本机接口，**只**接受 store 里已注册的本地工具实例；深链里的会话 id
+    // 由数据面按 UUID 白名单校验（非法 id 抛错 → 400），不把任意输入拼进 URL。
+    if (req.method === 'POST' && pathname === '/api/harness/open') {
+      const body = await readJsonBodyOr400(req, res);
+      if (body === BODY_HANDLED) return;
+      const homeId = typeof body.homeId === 'string' ? body.homeId.trim() : '';
+      if (!homeId) { send(res, 400, { error: 'homeId is required' }); return; }
+      const home = store.getHome(homeId);
+      if (!home) { send(res, 404, { error: `unknown homeId ${homeId}` }); return; }
+      if (!isLocalToolHome(home)) {
+        send(res, 400, { error: '只有本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）支持统一打开' });
+        return;
+      }
+      const label = localToolLabel(home);
+
+      // —— 本地 dsh 只读：插件触发器；无会话/无插件时聚焦或启动桌面端 ——
+      if (home.harness === 'dsh') {
+        const explicit = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        let targetSessionId = explicit;
+        if (!targetSessionId && typeof body.projectId === 'string' && body.projectId.trim()) {
+          // projectId 对只读 dsh 是 workspaceId（或项目名）：用 Recent 聚合找出它的最近会话。
+          const projectId = body.projectId.trim();
+          const project = (store.recentProjects?.({ homeIds: [home.homeId], days: 3650, limit: 500 }) ?? [])
+            .find((p) => p.workspaceId === projectId || p.project === projectId);
+          targetSessionId = project?.sessionId ?? '';
+        }
+        if (!targetSessionId) targetSessionId = home.current?.sessionId ?? '';
+        if (targetSessionId) {
+          let result;
+          try {
+            result = await openSession({ home, sessionId: targetSessionId });
+          } catch (error) {
+            send(res, 502, { ok: false, homeId, harness: 'dsh', sessionId: targetSessionId, error: error.message });
+            return;
+          }
+          if (result.ok) {
+            send(res, 200, {
+              ok: true,
+              homeId,
+              harness: 'dsh',
+              sessionId: targetSessionId,
+              mode: result.mode ?? 'in-app',
+              focused: result.focused ?? false,
+              ...(result.trigger ? { trigger: result.trigger } : {}),
+              ...(result.warning ? { warning: result.warning } : {}),
+            });
+            return;
+          }
+          // 非法会话 id 一律 400（不能拿它当「聚焦 App」的借口绕过白名单校验）。
+          if (result.code === 'bad-session-id' || result.code === 'bad-home') {
+            send(res, 400, { ok: false, homeId, harness: 'dsh', ...result });
+            return;
+          }
+          // 插件缺失 / App 缺失：退化成「把 DSH 桌面端叫到前台」，仍是成功语义（200）。
+          if (result.code !== 'plugin-missing' && result.code !== 'app-missing') {
+            send(res, 502, { ok: false, homeId, harness: 'dsh', sessionId: targetSessionId, ...result });
+            return;
+          }
+        }
+        const appResult = await openDshApp();
+        if (!appResult.ok) {
+          send(res, 502, { ok: false, homeId, harness: 'dsh', sessionId: targetSessionId || null, ...appResult });
+          return;
+        }
+        send(res, 200, {
+          ok: true,
+          homeId,
+          harness: 'dsh',
+          sessionId: targetSessionId || null,
+          code: 'app-focused',
+          note: targetSessionId
+            ? 'DSH 桌面端未安装 dsh-hwb-open-session 插件，已聚焦 DSH 桌面端'
+            : '该实例还没有可跳转的会话，已聚焦 DSH 桌面端',
+          mode: appResult.mode,
+          focused: appResult.focused ?? false,
+        });
+        return;
+      }
+
+      // —— Codex / WorkBuddy：靠各自的深链落到具体会话 ——
+      const source = toolSources[home.harness];
+      if (!source?.resolveTarget || !source?.open) {
+        send(res, 503, { error: `${label} 数据源未启用` });
+        return;
+      }
+      let targetSessionId;
+      try {
+        targetSessionId = await resolveLocalToolSession(source, home, {
+          sessionId: body.sessionId,
+          projectId: body.projectId,
+        });
+      } catch (error) {
+        send(res, 400, { error: error.message });
+        return;
+      }
+      if (!targetSessionId) {
+        send(res, 400, { error: `缺少可跳转的 ${label} 会话（sessionId 或 projectId）` });
+        return;
+      }
+      try {
+        const result = await source.open(targetSessionId);
+        // 目标解析成功但本机没唤起 → 502（前端展示可复制的手动命令）；非法 id 由 open 抛错。
+        send(res, result?.ok ? 200 : 502, {
+          ok: Boolean(result?.ok),
+          homeId,
+          harness: home.harness,
+          sessionId: targetSessionId,
+          url: result?.url ?? null,
+          ...(result?.fallback ? { fallback: result.fallback } : {}),
+          ...(result?.error ? { error: result.error } : {}),
+        });
+      } catch (error) {
+        send(res, 400, { error: error.message });
+      }
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/api/codex/open') {
       if (!codex?.openThread || !codex?.resolveThreadId) { send(res, 503, { error: 'Codex 数据源未启用' }); return; }
       const body = await readJsonBodyOr400(req, res);
@@ -718,7 +965,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'GET' && pathname === '/api/projects/recent') {
       send(res, 200, {
         projects: store.recentProjects({
-          homeIds: store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId),
+          homeIds: dataHomeIds(),
           days: numParam(searchParams.get('days'), 7, 1, 3650),
           limit: numParam(searchParams.get('limit'), 20, 1, 200),
         }),
@@ -728,7 +975,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'GET' && pathname === '/api/sessions/recent') {
       send(res, 200, {
         sessions: store.recentSessions({
-          homeIds: store.listHomes().filter((h) => monitor.get(h.homeId).runtime === 'running').map((h) => h.homeId),
+          homeIds: dataHomeIds(),
           homeId: searchParams.get('homeId') || null,
           limit: numParam(searchParams.get('limit'), 50, 1, 500),
         }),

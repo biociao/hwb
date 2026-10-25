@@ -11,7 +11,15 @@ export async function api(path, { method = 'GET', body } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `${path}: ${res.status}`);
+  if (!res.ok) {
+    // 把服务端的 code/status 挂在 Error 上：调用方需要区分「插件没装 → 回退 iframe」
+    // 与真正的失败，而不是去解析错误文案（文案会变）。
+    const error = new Error(data.error || `${path}: ${res.status}`);
+    error.status = res.status;
+    error.code = data.code ?? null;
+    error.detail = data; // 需要展示安装命令等结构化信息时用（例如 plugin-missing 的 install）
+    throw error;
+  }
   return data;
 }
 
@@ -88,6 +96,114 @@ function isDarkTheme() {
   if (t === 'dark') return true;
   if (t === 'light') return false;
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
+}
+
+// —— 数据来源 app（实例的 harness）——
+// Projects 栏的项目卡用**来源底色**区分「这条项目来自哪个 app」（dsh 蓝 / Codex 灰 /
+// Claude Code 橙 / WorkBuddy 绿 / 其它紫）。颜色写在 index.html 的 CSS 变量里，这里只做
+// 「harness → 稳定标识」的归一化：
+//   · 返回白名单里的固定值，它会作为 data-source 属性进入 HTML —— 未知/恶意 harness
+//     一律归到 'other'，不可能把任意文本带进属性（也就不需要转义兜底）；
+//   · 别名归一化（claude / claude-code / claudecode 同色），未来新增来源在这里加一行。
+const SOURCE_KINDS = new Map([
+  ['dsh', 'dsh'],
+  ['deepseek-harness', 'dsh'],
+  ['deepseek', 'dsh'],
+  ['codex', 'codex'],
+  ['openai-codex', 'codex'],
+  ['chatgpt', 'codex'],
+  ['claude-code', 'claude-code'],
+  ['claudecode', 'claude-code'],
+  ['claude', 'claude-code'],
+  ['anthropic', 'claude-code'],
+  ['workbuddy', 'workbuddy'],
+  ['work-buddy', 'workbuddy'],
+]);
+
+const SOURCE_LABELS = {
+  dsh: 'dsh',
+  codex: 'Codex',
+  'claude-code': 'Claude Code',
+  workbuddy: 'WorkBuddy',
+  other: '未识别',
+};
+
+// harness 是数据库字段（注册时已限制为 dsh/codex/workbuddy），但老库/未来版本可能带来新值，
+// 所以这里仍按「不可信输入」处理：只做归一化，不做透传。
+export function sourceKind(harness) {
+  const key = String(harness ?? '').trim().toLowerCase().replace(/[_\s]+/g, '-');
+  return SOURCE_KINDS.get(key) ?? 'other';
+}
+
+// —— 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）——
+//
+// 这一类实例的共同点：**只读本地元数据**，没有进程 / 端口 / token / 隧道，也没有 Web 页面。
+// 判定只允许存在于这一处（契约 docs/local-tool-harness-alignment.md §2）；组件、instance-state、
+// app.js 都必须调用 isLocalToolHome()，不要再各自写 `harness === 'codex'` 之类的分支。
+//
+// 展示口径也集中在这里：
+//   · 身份 chip 文本 = `<label> <version>`，版本取不到就只显示 label（不画占位符）；
+//   · 「只读」是这类实例的**类型说明**，只进 chip 的 title，不占状态位；
+//   · 状态只有「已就绪 / 路径缺失」，索引时间只用 lastIndexedAt。
+const LOCAL_TOOL_KINDS = {
+  codex: { label: 'Codex', home: '~/.codex' },
+  workbuddy: { label: 'WorkBuddy', home: '~/.workbuddy' },
+  dsh: { label: 'dsh', home: '~/.dsh' },
+};
+
+export function localToolKind(home) {
+  const harness = sourceKind(home?.harness);
+  if (harness === 'codex' || harness === 'workbuddy') return harness;
+  return 'dsh'; // dsh 只读；也兜住「只带 readOnly 标记」的老数据
+}
+
+export function isLocalToolHome(home) {
+  if (!home) return false;
+  if (home.readOnly === true) return true;
+  const harness = sourceKind(home.harness);
+  return harness === 'codex' || harness === 'workbuddy';
+}
+
+// 卡片 / 按钮上的工具名：Codex | WorkBuddy | dsh（dsh 用小写，与版本 chip 的既有写法一致）。
+export function localToolLabel(home) {
+  return LOCAL_TOOL_KINDS[localToolKind(home)].label;
+}
+
+// 该 harness 的默认 home（添加表单的默认值；后端也持有一份，见契约 §5）。
+export function localToolDefaultHome(harness) {
+  return LOCAL_TOOL_KINDS[sourceKind(harness) === 'other' ? 'dsh' : sourceKind(harness)].home;
+}
+
+// 添加/设置表单里 homePath 输入框的占位提示。
+export function localToolHomePlaceholder(harness) {
+  return localToolDefaultHome(harness);
+}
+
+// 版本字面量：优先用服务端归一化后的 runtime.toolVersion；dsh 的版本历史上一直由
+// runtime.dshVersion 承载（服务端现在也只在 harness === 'dsh' 时赋值），保留它作为回退。
+// 其它 harness 绝不回退到 dshVersion —— 那正是「Codex 卡显示 dsh 版本」的老 bug。
+export function localToolVersion(home) {
+  const runtime = home?.runtime;
+  const normalized = cleanVersion(runtime?.toolVersion);
+  if (normalized) return normalized;
+  if (localToolKind(home) === 'dsh') return cleanVersion(runtime?.dshVersion);
+  return null;
+}
+
+// 普通可连接 dsh 卡的版本 chip：服务端新增 toolVersion 后优先用它，老后端仍只有 dshVersion。
+export function dshVersionOf(home) {
+  return cleanVersion(home?.runtime?.toolVersion) ?? cleanVersion(home?.runtime?.dshVersion);
+}
+
+function cleanVersion(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+// 来源的人类可读名（用于卡片 title，帮助理解底色含义）。
+export function sourceLabel(kind) {
+  return SOURCE_LABELS[kind] ?? SOURCE_LABELS.other;
 }
 
 // 全局颜色分配表：每个标识（实例 homeId / 项目名）首次出现时领取一个"空闲"的

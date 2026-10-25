@@ -388,7 +388,8 @@ hwb 连接机制的核心原则（已落地）：**dsh 实例以稳定运行为�
 > 不依赖 hwb 进程存活的反代入口）。
 > 但**内嵌 iframe 仍然经过反代**：`Launcher.#withPreview` 对**所有**实例（本地与远程）
 > 都会 `createProxy({ preview: true })`，本地实例自动分配端口，代理会注入 `preview-bridge.js`
-> 以便工作区/文件点击与 parent 通信。只有「外部打开」这一条路径是直连。
+> 以便把会话上下文上报给 parent、并把 parent 的下载/上传能力接回 dsh 侧栏（预览本身由 dsh
+> 自己的右侧 Sidebar 承担，hwb 不再截获文件点击）。只有「外部打开」这一条路径是直连。
 
 ```
 本地 home:  外部打开 ──(直连原始服务连接)──► 127.0.0.1:<dshPort>      √ 主机直接可达
@@ -535,7 +536,7 @@ hwb/
 │   │   ├── status.js         # 会话状态推导（纯函数）
 │   │   ├── time.js           # 毫秒时间戳 → ISO（越界降级）
 │   │   ├── node-version.js   # Node 版本门槛（单一事实来源）
-│   │   ├── file-preview.js   # 预览/下载/上传
+│   │   ├── file-preview.js   # 文件读取引擎（下载字节 + 上传后目录列举）
 │   │   ├── multipart.js      # 流式 multipart 解析
 │   │   ├── endpoints.js      # 连接端点规范化
 │   │   ├── access-port.js    # 本地接入端口校验
@@ -567,17 +568,17 @@ hwb/
 │       ├── index.html
 │       ├── app.js            # 路由 + 状态管理
 │       ├── store.js          # 前端数据缓存（SSE 订阅）
+│       ├── preview-bridge.js # 内嵌 dsh 页 → 父页：会话上报 + 下载/上传转交
+│       ├── file-ops.js       # 下载到本机 / 上传回工作区
 │       └── components/
 │           ├── workbench.js      # 仪表盘布局
 │           ├── recent-projects.js / recent-sessions.js / instance-grid.js
 │           ├── usage-card.js
 │           ├── add-home.js       # 添加/编辑实例表单
 │           ├── endpoint-editor.js
-│           ├── file-preview.js   # 预览/下载/上传侧栏
 │           ├── log-panel.js
 │           ├── form-draft.js     # 表单草稿存取
-│           ├── quota-card.js
-│           └── preview-image.js / preview-resize.js
+│           └── quota-card.js
 ├── scripts/                  # 远程 dsh web 冷启动/缓存/隧道脚本
 ├── dsh-remote-index/         # 多实例会话索引（独立工具）
 ├── dsh-static-cache/         # dsh 前端静态缓存插件

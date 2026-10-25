@@ -322,15 +322,20 @@ test('api: 路由返回但没写响应时，兜底网补一个 500（且不打�
 // 事件循环（SSE 最容易被改成这样），兜底网就会给一个**刚刚建立的长连接**补 500，把它掐掉 ——
 // 而单测 `ensureResponded` 三态仍然全绿（它只喂假 res）。所以这里在真 socket 上跑一遍
 // 真实路由集合（普通 JSON、SSE、文件预览），断言「一次兜底网都没触发」。
-test('api: 真实流量（JSON/SSE/预览）不会触发兜底网', async () => {
+test('api: 真实流量（JSON/SSE/文件下载）不会触发兜底网', async () => {
   const { initLogger, getLogs } = await import('../src/lib/logger.js');
   initLogger({ level: 'info', file: false, color: false, silent: true });
   const { tmpdir } = await import('node:os');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const path = await import('node:path');
+  // 文件下载要真的读到一个文件，所以给一个临时工作区（用完删掉）。
+  const workspace = mkdtempSync(path.join(tmpdir(), 'hwb-net-'));
+  writeFileSync(path.join(workspace, 'ok.txt'), 'ok\n');
   const server = createApiServer({
     store: {
       listHomes: () => [{ homeId: HOME_ID, hostType: 'local', homePath: '/tmp/.dsh', status: 'ok' }],
       getHome: (id) => (id === HOME_ID ? { homeId: id, hostType: 'local', homePath: '/tmp/.dsh' } : null),
-      listWorkspaces: () => [{ workspaceId: 'ws-1', title: 'w', path: tmpdir() }],
+      listWorkspaces: () => [{ workspaceId: 'ws-1', title: 'w', path: workspace }],
       getSession: () => null,
     },
     indexer: { reindexNow: async () => [] },
@@ -348,9 +353,9 @@ test('api: 真实流量（JSON/SSE/预览）不会触发兜底网', async () => 
     assert.equal(homes.status, 200);
     await homes.json();
 
-    const preview = await fetch(`${base}/api/homes/${HOME_ID}/preview?workspaceId=ws-1&path=.`);
-    assert.equal(preview.status, 200, `预览必须 200（实际 ${preview.status}）`);
-    await preview.json().catch(() => {});
+    const download = await fetch(`${base}/api/homes/${HOME_ID}/download?workspaceId=ws-1&path=ok.txt`);
+    assert.equal(download.status, 200, `文件下载必须 200（实际 ${download.status}）`);
+    await download.text();
 
     // SSE：拿到第一段数据就主动断开（模拟浏览器标签页关闭）。
     const ac = new AbortController();
@@ -363,5 +368,5 @@ test('api: 真实流量（JSON/SSE/预览）不会触发兜底网', async () => 
     // 兜底网的日志是同步写的（writeHead 之前），所以这里不需要等待。
     const bogus = getLogs({ limit: 200 }).filter((e) => String(e.message).includes('没有产生任何响应'));
     assert.deepEqual(bogus, [], `真实路由不该触发兜底网，出现 ${bogus.length} 次`);
-  } finally { await new Promise((r) => server.close(r)); }
+  } finally { await new Promise((r) => server.close(r)); rmSync(workspace, { recursive: true, force: true }); }
 });

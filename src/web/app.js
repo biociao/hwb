@@ -1,6 +1,6 @@
 import { endpointRow, readEndpoints, endpointSelector } from './components/endpoint-editor.js';
-import { attachFilePreview } from './components/file-preview.js';
-import { api, subscribe, esc } from './store.js';
+import { downloadFile, uploadFiles, partitionUploads, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES } from './file-ops.js';
+import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js';
 import { renderWorkbench } from './components/workbench.js';
 import { renderRecentProjects } from './components/recent-projects.js';
 import { renderRecentSessions } from './components/recent-sessions.js';
@@ -25,9 +25,9 @@ const note = createNote(document.getElementById('note'));
 const modalEl = document.getElementById('modal');
 const themeBtn = document.getElementById('theme-btn');
 const themeMenu = document.getElementById('theme-menu');
-
 let showAddForm = false;
 let lastHomes = [];
+let lastDetected = null; // 最近一次 /api/homes/detect 结果（Instances 添加表单的只读快捷入口用）
 let refreshSequence = 0;
 const endpointSwitching = new Set();
 // Token 用量趋势：当前按哪个维度堆叠（total|project|provider|model|instance）+ 最新 /api/usage 数据。
@@ -67,10 +67,21 @@ const panes = new Map();
 const MAX_LIVE_FRAMES = resolveMaxLiveFrames(window.location.search);
 let frameOrder = [];
 let frameReleased = 0; // 累计释放次数（只被 __hwbFrameBudget 读出用于排查/测量，不参与逻辑）
+// 内嵌 dsh 页面里由**注入控件**派发的两个文件动作：下载到本机、上传回工作区。
+// 预览与浏览本身不再经过 hwb —— 点击文件路径由 dsh 自己开进右侧 Sidebar 的文档预览
+// （chat 的 openFile → sidebarRight.openResource），桥接不再拦截；hwb 只补 dsh 缺的两件事：
+// 把文件本体取回本机（documentpreview 头部注入的按钮）与把本机文件写回工作区
+// （sidebar-files 头部注入的按钮）。真正的鉴权/围栏/上限全在服务端，见 file-ops.js。
 window.addEventListener('message', (event) => {
   const type = event.data?.type;
-  if (!['hwb:file-preview', 'hwb:preview-context', 'hwb:open-workspace'].includes(type)) return;
-  if (type === 'hwb:file-preview' && (typeof event.data.path !== 'string' || event.data.path.length > 4096)) return;
+  if (!['hwb:file-download', 'hwb:file-upload', 'hwb:preview-context', 'hwb:open-workspace'].includes(type)) return;
+  // 下载必须有真实路径：空串会被服务端解析成工作区根目录（目录是下载不了的，白跑一趟）。
+  if (type === 'hwb:file-download' && (typeof event.data.path !== 'string' || !event.data.path || event.data.path.length > 4096)) return;
+  // 上传：目标目录必须是绝对/相对路径串，文件清单必须是有限的 File 数组（File 经结构化克隆过来）。
+  if (type === 'hwb:file-upload') {
+    if (typeof event.data.dir !== 'string' || !event.data.dir || event.data.dir.length > 4096) return;
+    if (!Array.isArray(event.data.files) || event.data.files.length === 0 || event.data.files.length > MAX_UPLOAD_FILES) return;
+  }
   // 桥接会带上内嵌页的完整 URL；URL 里有 ?session= 时以它为准（比只信任桥接解析更稳），
   // 没有再退回桥接上报的 sessionId。当前 dsh 客户端不做 URL 导航，所以通常两者都为空。
   if (type === 'hwb:preview-context' && typeof event.data.href === 'string' && event.data.href.length <= 4096) {
@@ -78,23 +89,68 @@ window.addEventListener('message', (event) => {
   }
   if (event.data.sessionId != null && (typeof event.data.sessionId !== 'string' || event.data.sessionId.length > 512)) return;
   for (const [homeId, pane] of panes) {
-    if ((type === 'hwb:file-preview' && pane.el.hidden) || event.source !== pane.iframe?.contentWindow || !pane.url) continue;
+    if (event.source !== pane.iframe?.contentWindow || !pane.url) continue;
     if (event.origin !== new URL(pane.url).origin) continue;
     if (type === 'hwb:open-workspace') {
       if (pane.el.hidden || typeof event.data.workspaceId !== 'string') return;
       api(`/api/homes/${homeId}/open-workspace`, { method: 'POST', body: { workspaceId: event.data.workspaceId } }).catch((e) => alert(e.message));
     } else if (type === 'hwb:preview-context') {
-      pane.preview.context(event.data);
+      // 只用于跟踪「这个 iframe 现在是哪个会话」：标签、深链与上面的文件动作都靠它解析工作区。
       if (updatePaneSession(pane, event.data.sessionId) && view.kind === 'instance' && view.homeId === homeId) {
         view.sessionId = pane.sessionId;
         view.sessionTitle = null;
         view.project = null;
         saveView();
       }
-    } else pane.preview.receive(event.data);
+    } else if (pane.el.hidden) {
+      return; // 面板已隐藏（切走/被释放）：文件动作没有可归属的界面去反馈，直接丢弃
+    } else if (type === 'hwb:file-download') {
+      downloadFile(homeId, paneQuery(pane, event.data), event.data.path)
+        .catch((e) => note.set(`下载失败：${e.message}`, { sticky: true }));
+    } else {
+      uploadIntoPane(pane, homeId, event.data);
+    }
     break;
   }
 });
+// 文件动作归属哪个工作区：桥接上报的会话优先（用户刚切过去的那个），否则用面板跟踪到的会话。
+function paneQuery(pane, data) {
+  const sessionId = (typeof data?.sessionId === 'string' && data.sessionId) || pane.sessionId;
+  return sessionId ? { sessionId } : {};
+}
+function postUploadStatus(pane, text, tone, reload = false) {
+  if (!pane.url) return;
+  pane.iframe?.contentWindow?.postMessage({ type: 'hwb:upload-status', text, tone, reload }, new URL(pane.url).origin);
+}
+// 上传整批文件：进度与逐条失败原因回传到**注入按钮所在的那个侧栏**（而不是 hwb 自己的界面），
+// 因为用户的眼睛在那里；失败额外记一条 hwb 顶栏提示，免得浮层 20 秒后消失就再无线索。
+async function uploadIntoPane(pane, homeId, data) {
+  const { accepted, oversize } = partitionUploads(data.files);
+  // 超限的文件在本地就拦下（服务端也会挡，但没必要先把几百 MiB 传过去）；一并记在顶栏，
+  // 免得浮层 20 秒后消失就再无线索。
+  const skipped = oversize.length ? `已跳过 ${oversize.length} 个超过 ${MAX_UPLOAD_BYTES / (1024 * 1024)} MiB 的文件。` : '';
+  if (skipped) note.set(skipped, { sticky: true });
+  if (!accepted.length) { postUploadStatus(pane, skipped, 'error'); return; }
+  postUploadStatus(pane, `${skipped}正在上传 ${accepted.length} 个文件…`, 'info');
+  try {
+    const result = await uploadFiles(homeId, paneQuery(pane, data), data.dir, accepted, (percent) => {
+      postUploadStatus(pane, `${skipped}正在上传… ${percent}%`, 'info');
+    });
+    if (!result.uploaded) {
+      const why = `上传失败：${result.failed.join('；')}`;
+      postUploadStatus(pane, why, 'error');
+      note.set(why, { sticky: true });
+      return;
+    }
+    const renamed = result.renamed.length ? `；同名已改名：${result.renamed.join('，')}` : '';
+    const failed = result.failed.length ? `；${result.failed.length} 个失败：${result.failed.join('；')}` : '';
+    postUploadStatus(pane, `${skipped}已上传 ${result.uploaded} 个文件${renamed}${failed}`, result.failed.length ? 'error' : 'ok', !result.failed.length);
+    if (result.failed.length) note.set(`上传部分失败：${result.failed.join('；')}`, { sticky: true });
+  } catch (e) {
+    postUploadStatus(pane, `${skipped}上传失败：${e.message}`, 'error');
+    note.set(`上传失败：${e.message}`, { sticky: true });
+  }
+}
 // 拖拽排序后短暂抑制紧随其后的 click（避免拖完就切换实例）
 let suppressNavClick = false;
 let dragHomeId = null;
@@ -177,7 +233,6 @@ function showView() {
   if (activeId) frameOrder = touchFrameOrder(frameOrder, activeId);
   for (const [homeId, pane] of panes) {
     pane.el.hidden = homeId !== activeId;
-    if (pane.preview) pane.preview.toggle.hidden = pane.el.hidden;
   }
   enforceFrameBudget();
 }
@@ -219,6 +274,7 @@ async function renderDashboard(sequence = refreshSequence) {
     // 敲的字会被随后的重建覆盖掉（而「不让输入丢失」正是这个模块存在的理由）。
     // 所以顺序是：await → 确认这次渲染仍然有效 → 捕获 → 重建 → 恢复。
     const detected = await api('/api/homes/detect');
+    lastDetected = detected;
     if (sequence !== refreshSequence || view.kind !== 'dashboard') return;
     const onboardingDraft = captureAddFormDraft();
     dashboardEl.innerHTML = renderOnboarding(detected);
@@ -226,6 +282,11 @@ async function renderDashboard(sequence = refreshSequence) {
     return;
   }
   dashboardEl.dataset.layout = 'grid';
+  // Instances 的「添加」表单里也有「检测到 ~/.dsh → 添加为只读」快捷入口：
+  // 首次展开表单时补一次 detect（很便宜），之后复用。
+  if (showAddForm && lastDetected === null) {
+    try { lastDetected = await api('/api/homes/detect'); } catch { lastDetected = null; }
+  }
   // allSettled 而不是 all：任何一个端点失败（后端重启、单个查询 500）都不该把另外三栏一起清空。
   // 失败的栏目退化为空态渲染，并在顶部提示具体是哪个接口挂了。
   const [projectsRes, sessionsRes, usageRes] = await Promise.allSettled([
@@ -247,11 +308,16 @@ async function renderDashboard(sequence = refreshSequence) {
   lastUsage = usage;
   if (usage) lastUsageKey = usageKey(); // 与 fetchUsage 的缓存键同源（这里拿到的就是这个周期的数据）
   const connectedIds = new Set(connectedHomes(lastHomes).map((h) => h.homeId));
+  // 只渲染「已连接实例」的项目/会话；计数与渲染用同一份数组，避免分区头写着 12 但列表只有 5 行。
+  const visibleProjects = connectedIds.size ? projects.filter((p) => connectedIds.has(p.homeId)) : [];
+  const visibleSessions = connectedIds.size ? sessions.filter((s) => connectedIds.has(s.homeId)) : [];
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
   const draft = captureAddFormDraft();
   dashboardEl.innerHTML = renderWorkbench({
-    projects: connectedIds.size ? renderRecentProjects(projects.filter((p) => connectedIds.has(p.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
-    sessions: connectedIds.size ? renderRecentSessions(sessions.filter((s) => connectedIds.has(s.homeId)), lastHomes) : '<div class="empty">连接实例后显示对应会话</div>',
+    projects: connectedIds.size ? renderRecentProjects(visibleProjects, lastHomes) : '<div class="empty">连接实例后显示对应项目</div>',
+    sessions: connectedIds.size ? renderRecentSessions(visibleSessions, lastHomes) : '<div class="empty">连接实例后显示对应会话</div>',
+    projectCount: connectedIds.size ? visibleProjects.length : null,
+    sessionCount: connectedIds.size ? visibleSessions.length : null,
     homes: renderInstanceGrid(lastHomes),
     usage: renderUsageCard(usage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
@@ -259,10 +325,10 @@ async function renderDashboard(sequence = refreshSequence) {
   fitTrendLabels(dashboardEl); // X 轴标签按实测宽度收边/去重叠（见 usage-card.js）
   logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
   if (showAddForm) {
-    dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm());
+    dashboardEl.querySelector('section:nth-child(3) h2').insertAdjacentHTML('afterend', renderHomeForm(lastDetected));
     const form = dashboardEl.querySelector('#add-home');
     const restored = restoreFormDraft(form, draft); // 内部会重放模式（显隐/必填）
-    applyHomeMode(form, form.mode?.value === 'remote' ? 'remote' : form.mode?.value === 'codex' ? 'codex' : 'local');
+    applyHomeMode(form, form.mode?.value || 'local');
     if (!restored) form.querySelector('input[name=homePath]')?.focus();
   }
   hlProject = null; hlRow = null; hlKind = null; // 刷新后清除残留高亮状态
@@ -375,7 +441,6 @@ function paneFor(homeId) {
   // _cookieReady: 该实例 origin 是否已种下 dsh 鉴权 cookie(种过即可直达 ?session=, 少一次重载)
   // _iframed: 是否已挂载过 iframe(触发首次导航)  _navTarget/_navStep: 二段跳+遮罩的剩余状态
   pane = { el, iframe: null, url: null, sessionId: null, _iframed: false, _cookieReady: false, _navTarget: null, _navStep: 0 };
-  pane.preview = attachFilePreview(pane, homeId);
   panes.set(homeId, pane);
   return pane;
 }
@@ -421,13 +486,12 @@ function onFrameLoad(pane) {
 function destroyPane(homeId) {
   const pane = panes.get(homeId);
   if (!pane) return;
-  pane.preview?.dispose();
   pane.el.remove();
   panes.delete(homeId);
   frameOrder = frameOrder.filter((id) => id !== homeId);
 }
 
-// 释放一个面板的 iframe：**只拆 iframe 与预览侧栏**，标签页、入口 URL、会话 id 全部保留。
+// 释放一个面板的 iframe：**只拆 iframe**，标签页、入口 URL、会话 id 全部保留。
 // 这是超预算时的动作（见 frame-budget.js 与 enforceFrameBudget）——留着 iframe 的代价是一整个
 // dsh web SPA 常驻内存（实测单个可达数百 MB），而重新进入的代价只是一次重载（有 session 深链时
 // 还回到同一个会话）。故意不复位 _cookieReady：cookie 属于浏览器不属于 iframe，重新挂载时
@@ -437,10 +501,6 @@ function releasePaneFrame(homeId) {
   if (!pane?.iframe) return;
   pane.iframe.remove();        // 真正的回收点：iframe 一离开文档，它的 SPA/文档/JSScript 都能被回收
   pane.iframe = null;
-  pane.preview?.dispose();     // 释放预览侧栏持有的图片 objectURL / 拖拽监听
-  pane.preview = null;
-  pane.el.querySelector('.file-preview')?.remove();
-  pane.el.classList.remove('has-preview');
   pane._iframed = false;
   pane._navTarget = null;
   pane._navStep = 0;
@@ -486,12 +546,6 @@ function mountPane(homeId, url, sessionId, pane, force = false) {
     pane.iframe = iframe;
     iframe.addEventListener('load', () => onFrameLoad(pane));
     pane.released = false;
-    // 面板的预览侧栏是随 iframe 一起被 releasePaneFrame 拆掉的（它持有图片 objectURL 与
-    // 拖拽监听），重新挂载时必须重建 —— 否则「重新进入」后点会话里的文件路径会毫无反应。
-    if (!pane.preview) {
-      pane.preview = attachFilePreview(pane, homeId);
-      pane.preview.toggle.hidden = pane.el.hidden;
-    }
   }
 
   pane.url = url;
@@ -514,28 +568,72 @@ function mountPane(homeId, url, sessionId, pane, force = false) {
   enforceFrameBudget();
 }
 
-// 跳 Codex 是服务端的进程外动作（`open "codex://threads/<id>"`）：按钮/行做防连点，
-// 并把 502 里带的手动命令原样展示（非 macOS / 未装桌面端时这是唯一可操作的出路）。
-async function openCodexTarget({ homeId, threadId, projectId } = {}, btn = null) {
+// 打开本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）统一走 POST /api/harness/open。
+//
+// 这是服务端的进程外动作（`open "codex://…"` / `open "workbuddy://…"` / 插件信使）：
+// 服务端负责「打开哪个工具、落到哪条会话」，无会话或插件缺失时退化为聚焦/启动 App
+// （返回 code='app-focused'）。前端不再按 harness 分叉（此前 Codex 走 /api/codex/open、
+// dsh 只读走 /api/homes/{id}/open-session，两条路两套错误提示）。
+// 按钮/行做防连点，失败一律落到粘性 note（不静默）。
+async function openLocalTool(home, { sessionId = null, workspaceId = null } = {}, btn = null) {
+  if (!home) return null;
   if (btn?.dataset.busy === '1') return null;
   if (btn) { btn.dataset.busy = '1'; btn.disabled = true; }
+  const label = localToolLabel(home);
   try {
-    const result = await api('/api/codex/open', { method: 'POST', body: { homeId, threadId, projectId } });
-    note.set('已在 Codex 中打开对应会话');
+    const body = { homeId: home.homeId };
+    if (sessionId) body.sessionId = sessionId;
+    if (workspaceId) body.projectId = workspaceId;
+    const result = await api('/api/harness/open', { method: 'POST', body });
+    // app-focused：无会话 / 插件缺失时服务端把桌面端叫到前台，note 是它给出的解释。
+    // fallback：非 macOS 等场景下服务端只能返回可复制的深链命令，一并展示。
+    const base = result?.code === 'app-focused'
+      ? (result.note || `已聚焦 ${label} 应用`)
+      : (result?.warning || `已在 ${label} 中打开`);
+    note.set(result?.fallback ? `${base}（可手动执行：${result.fallback}）` : base);
     return result;
   } catch (error) {
-    note.set(`打开 Codex 失败：${error.message}`, { sticky: true });
+    // 502（无法唤起）/ 400（非法会话 id）/ 404（实例已不存在）都要让用户看见；
+    // 带 fallback 手动命令或安装指引时一并给出 —— 这是用户唯一可操作的出路。
+    const extra = error?.detail?.fallback || error?.detail?.install;
+    note.set(`打开 ${label} 失败：${error.message}${extra ? `（${extra}）` : ''}`, { sticky: true });
     return null;
   } finally {
     if (btn) { delete btn.dataset.busy; btn.disabled = false; }
   }
 }
 
+// 本地 dsh 的「像 Codex 一样在 App 里打开会话」：
+// 走服务端 open-session → 写触发器 → 已装 dsh-hwb-open-session 插件的 DSH 桌面端切过去。
+// 插件没装/平台不支持/没有会话 id 时返回 false，调用方回退到原来的内嵌 iframe（不破坏 Web 形态）。
+async function tryOpenDshSession(home, btn) {
+  const sessionId = btn?.dataset.sessionId || '';
+  if (sessionId === '') return false;
+  if (btn?.dataset.busy === '1') return true; // 防连点：视为已处理
+  if (btn) btn.dataset.busy = '1';
+  try {
+    const result = await api(`/api/homes/${home.homeId}/open-session`, { method: 'POST', body: { sessionId } });
+    note.set(result?.warning || '已在 DSH 中打开该会话');
+    return true;
+  } catch (error) {
+    // 只有「插件缺失」值得提示安装；其余（App 不在、平台不支持、会话失效）静默回退，
+    // 避免每次点击都弹一条用户无法处理的错误。
+    if (error?.code === 'plugin-missing') {
+      const install = error?.detail?.install ? `安装：${error.detail.install}` : '安装方式见 dsh-hwb-open-session/README.md';
+      note.set(`未安装 dsh-hwb-open-session 插件，已回退内嵌打开。${install}`, { sticky: true });
+    }
+    return false;
+  } finally {
+    if (btn) delete btn.dataset.busy;
+  }
+}
+
 async function enterInstance(homeId, extra = {}) {
-  // Codex 实例没有 dsh web 页面：任何「进入实例」都转成 codex:// 深链（含旧书签/恢复路径）。
+  // 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）没有 dsh web 页面：
+  // 任何「进入实例」都统一转成一次工具跳转（含旧书签/恢复路径）。
   const targetHome = lastHomes.find((h) => h.homeId === homeId);
-  if (targetHome?.harness === 'codex') {
-    await openCodexTarget({ homeId, threadId: extra.sessionId || undefined, projectId: extra.workspaceId || undefined });
+  if (isLocalToolHome(targetHome)) {
+    await openLocalTool(targetHome, { sessionId: extra.sessionId, workspaceId: extra.workspaceId });
     return;
   }
   const token = Symbol('view');
@@ -583,14 +681,14 @@ function closeModal() {
 function openSettings(homeId) {
   const home = lastHomes.find((h) => h.homeId === homeId);
   if (!home) return;
-  // Codex 只读实例没有进程可重启/停止，操作面只剩「重新索引 / 移除」。
-  const isCodex = home.harness === 'codex';
+  // 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）没有进程可重启/停止，操作面只剩「重新索引 / 移除」。
+  const isReadOnly = isLocalToolHome(home);
   modalEl.innerHTML = `
     <div class="modal-card">
       <h3>编辑实例：${esc(home.alias || home.homePath || homeId)}</h3>
       ${renderSettingsForm(home)}
       <div class="meta actions">
-        ${isCodex ? '' : `<button data-action="restart" data-home-id="${esc(homeId)}">重启实例</button>
+        ${isReadOnly ? '' : `<button data-action="restart" data-home-id="${esc(homeId)}">重启实例</button>
         <button data-action="stop" data-home-id="${esc(homeId)}">停止实例</button>`}
         <button data-action="reindex" data-home-id="${esc(homeId)}">重新索引</button>
         <button data-action="remove-home" data-home-id="${esc(homeId)}" data-name="${esc(home.alias || home.homePath)}">移除实例</button>
@@ -609,8 +707,8 @@ async function saveSettings(homeId) {
   const form = modalEl.querySelector('#settings-form');
   const home = lastHomes.find((h) => h.homeId === homeId);
   if (!form || !home) return;
-  // Codex 只读实例：只改别名与 home 路径，没有端点/token/端口字段可读。
-  if (home.harness === 'codex') {
+  // 本地工具实例：只改别名与 home 路径，没有端点/token/端口字段可读。
+  if (isLocalToolHome(home)) {
     await api(`/api/homes/${homeId}`, {
       method: 'PUT',
       body: { alias: form.alias.value.trim(), homePath: form.homePath.value.trim() },
@@ -641,19 +739,23 @@ async function saveSettings(homeId) {
   await refresh();
 }
 
-async function addHome({ homePath, alias, harness = 'dsh', hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort, accessPort }, form) {
-  // Codex 是第二个 harness：只带路径/别名，没有 host/端口/token。
-  const body = harness === 'codex'
-    ? { harness: 'codex', homePath, alias }
-    : hostType === 'remote'
-      ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, token: token || undefined, alias }
-      : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
-  if (harness !== 'codex' && hostType === 'remote' && accessPort !== undefined) body.accessPort = accessPort;
+async function addHome({ homePath, alias, harness = 'dsh', readOnly = false, hostType = 'local', host, remotePort, remoteHome, remoteCmd, remoteLog, token, localPort, accessPort }, form) {
+  // 本地工具 harness（codex / workbuddy）：只带路径/别名，没有 host/端口/token。
+  // 本地 dsh 只读实例：harness 仍是 dsh，只多一个 readOnly 标记；与可连接实例可并存。
+  const localTool = harness === 'codex' || harness === 'workbuddy';
+  const body = localTool
+    ? { harness, homePath, alias }
+    : readOnly
+      ? { harness: 'dsh', homePath, alias, readOnly: true }
+      : hostType === 'remote'
+        ? { hostType, host, remotePort, remoteHome: remoteHome || undefined, remoteCmd, remoteLog, token: token || undefined, alias }
+        : { homePath, alias, localPort: localPort || undefined, token: token || undefined };
+  if (!localTool && hostType === 'remote' && accessPort !== undefined) body.accessPort = accessPort;
   const data = await api('/api/homes', { method: 'POST', body });
-  // 前后端版本错位的逃生提示：旧后端不认识 harness，会把 Codex 路径当 dsh 处理。
+  // 前后端版本错位的逃生提示：旧后端不认识这个 harness，会把路径当 dsh 处理。
   // 正常情况下这条不会触发（服务端回 400 更早），但升级中途的混合状态值得给一句明确的话。
-  if (harness === 'codex' && data?.harness !== 'codex') {
-    throw new Error('当前 hwb 后端还不支持 Codex 实例，请先重启 hwb 再试');
+  if (localTool && data?.harness !== harness) {
+    throw new Error(`当前 hwb 后端还不支持 ${localToolLabel({ harness })} 实例，请先重启 hwb 再试`);
   }
   // warning 必须挂在**持久**的 #note 上：紧接着的 showAddForm = false; refresh() 会重建整个
   // dashboard 的 innerHTML（表单只在 showAddForm 为真时才重新插入），写进表单的消息会被直接抹掉
@@ -662,11 +764,13 @@ async function addHome({ homePath, alias, harness = 'dsh', hostType = 'local', h
   showAddForm = false;
   dropUsageCache();   // 新实例可能立刻带来一批历史会话，别让「按实例」图滞后 15s
   await refresh();
-  if (harness === 'codex') {
+  if (localTool || readOnly) {
     // 新卡片排在 Instances 列表末尾、且表单会立刻消失：滚动到它并闪一下。
     // 注意 dashboard 紧接着会被 monitor 的 SSE 刷新重建，所以要按「可能已被替换」重试几次。
+    // 三种本地工具卡的身份 chip 都是 .chip.harness-<codex|workbuddy|dsh>。
+    const chipSelector = `.chip.harness-${localTool ? harness : 'dsh'}`;
     const reveal = (attempt = 0) => {
-      const card = dashboardEl.querySelector('.chip.harness-codex')?.closest('.row');
+      const card = dashboardEl.querySelector(chipSelector)?.closest('.row');
       if (card) {
         card.scrollIntoView({ block: 'nearest' });
         card.classList.add('hl-project');
@@ -681,11 +785,13 @@ async function addHome({ homePath, alias, harness = 'dsh', hostType = 'local', h
     // 粘性：这类提示描述的是「需要你处理的事实」，不是「刚刚那一轮刷新失败了」，
     // 所以刷新与重连都不该把它撤掉（用户处理完之后再刷新页面即可）。
     note.set(`已添加，但注意：${warning}`, { sticky: true });
-  } else if (harness === 'codex') {
+  } else if (localTool || readOnly) {
     // 添加成功后表单立即消失、卡片排在列表末尾：给一句明确的成功反馈。
     // 用粘性 + 6s 定时清除：普通 note 会被紧接着的 SSE 刷新立刻清掉（实测 3s 内就没），
     // 而长期粘住又会挡住后续真实错误，所以只留几秒。
-    note.set('已添加 Codex 实例：项目与会话已汇总到 Recent Projects / Sessions', { sticky: true });
+    note.set(localTool
+      ? `已添加 ${localToolLabel({ harness })} 实例：项目与会话已汇总到 Recent Projects / Sessions`
+      : '已添加只读 dsh 实例：不需要连接/token；点会话会交给 DSH 桌面端打开', { sticky: true });
     setTimeout(() => note.clear(), 6000);
   }
 }
@@ -707,14 +813,19 @@ async function handleAction(e) {
         break;
       case 'drill-in': {
         const home = lastHomes.find((h) => h.homeId === btn.dataset.homeId);
-        // Codex 没有 iframe 页面：项目行/会话行直接跳桌面端（项目 → 最近会话，会话 → 自身）。
-        if (home?.harness === 'codex') {
-          await openCodexTarget({
-            homeId: home.homeId,
-            threadId: btn.dataset.sessionId || undefined,
-            projectId: btn.dataset.workspaceId || undefined,
+        // 本地工具没有 iframe 页面：项目行 / 会话行统一交给 /api/harness/open
+        // （项目 → 该项目最近会话，会话 → 自身；无会话时聚焦工具）。
+        if (isLocalToolHome(home)) {
+          await openLocalTool(home, {
+            sessionId: btn.dataset.sessionId || null,
+            workspaceId: btn.dataset.workspaceId || null,
           }, btn);
           break;
+        }
+        // 可连接的本地 dsh：先尝试交给 DSH 桌面端（插件信使），插件不可用时回退 iframe。
+        if (home?.harness === 'dsh' && home?.hostType === 'local') {
+          const opened = await tryOpenDshSession(home, btn);
+          if (opened) break;
         }
         await enterInstance(btn.dataset.homeId, {
           sessionId: btn.dataset.sessionId || null,
@@ -723,9 +834,11 @@ async function handleAction(e) {
         });
         break;
       }
-      case 'codex-open-home':
-        await openCodexTarget({ homeId: btn.dataset.homeId }, btn);
+      case 'local-tool-open': {
+        const home = lastHomes.find((h) => h.homeId === btn.dataset.homeId);
+        await openLocalTool(home, {}, btn);
         break;
+      }
       case 'popout':
         window.open(btn.dataset.url, '_blank');
         break;
@@ -733,12 +846,18 @@ async function handleAction(e) {
         showAddForm = !showAddForm;
         await refresh();
         break;
-      case 'add-detected':
+      case 'add-detected': {
+        // data-harness 只允许白名单值（codex / workbuddy）；dsh 只读走 readOnly 标记。
+        const detectedHarness = btn.dataset.harness === 'codex' || btn.dataset.harness === 'workbuddy'
+          ? btn.dataset.harness
+          : 'dsh';
         await addHome({
           homePath: btn.dataset.path,
-          harness: btn.dataset.harness === 'codex' ? 'codex' : 'dsh',
+          harness: detectedHarness,
+          readOnly: btn.dataset.readonly === 'true',
         });
         break;
+      }
       case 'add-endpoint': {
         const editor = btn.closest('.endpoint-editor');
         editor.querySelector('.endpoint-rows').insertAdjacentHTML('beforeend', endpointRow({}, editor.dataset.remote === 'true'));
@@ -1087,10 +1206,16 @@ main.addEventListener('submit', async (e) => {
   // 添加要等一次索引（Codex 本机 2k+ 会话约 1s）：没有 loading 时按钮看起来「点了没反应」。
   if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = '添加中…'; }
   try {
-    if (form.mode.value === 'codex') {
+    if (form.mode.value === 'codex' || form.mode.value === 'workbuddy') {
       await addHome({
-        harness: 'codex',
+        harness: form.mode.value,
         homePath: form.homePath.value.trim() || undefined,
+        alias,
+      }, form);
+    } else if (form.mode.value === 'local-readonly') {
+      await addHome({
+        readOnly: true,
+        homePath: form.homePath.value.trim(),
         alias,
       }, form);
     } else if (form.mode.value === 'remote') {
@@ -1152,7 +1277,7 @@ function restoreAddFormDraft(draft) {
   const form = dashboardEl.querySelector('#add-home');
   if (!form) return;
   // 先重放模式（显隐/必填），再恢复值/焦点：两者顺序无关，但模式必须在提交前是对的。
-  applyHomeMode(form, form.mode?.value === 'remote' ? 'remote' : 'local');
+  applyHomeMode(form, form.mode?.value || 'local');
   restoreFormDraft(form, draft);
 }
 

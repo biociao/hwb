@@ -1,3 +1,5 @@
+import { isLocalToolHome } from './store.js';
+
 // 服务器身份与 SSH 通道分离。未设置身份时保守地保留独立实例。
 export function instanceKey(home) {
   if (home.endpoints?.length) return home.homeId;
@@ -25,8 +27,8 @@ export function tabHomes(homes) {
   const runningKeys = new Set(connectedHomes(homes).map(instanceKey));
   const seen = new Set();
   return homes.filter((home) => {
-    // Codex 实例没有 dsh web 页面，不能开 iframe / 标签页；它的入口是 codex:// 深链。
-    if (home.harness === 'codex') return false;
+    // 本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）没有 dsh web 页面，不能开 iframe / 标签页。
+    if (isLocalToolHome(home)) return false;
     const key = instanceKey(home);
     const runtime = home.runtime;
     const retained = runtime?.runtime === 'unreachable' && runtime.url && !runningKeys.has(key);

@@ -1,4 +1,6 @@
 import { addWorkspaceFinderMenu } from './workspace-menu.js';
+import { addFileDownloadControl } from './file-download.js';
+import { addFileUploadControl } from './file-upload.js';
 import {
   classifyRpc, classifyStatic, createProxyCache, isHistoryRpc, rewriteRpcEnvelope, rpcIdOf, storableResponse,
   RPC_REQUEST_BODY_CAP,
@@ -101,7 +103,13 @@ const CACHE_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.H
 let sharedCache = null;
 export function sharedProxyCache() {
   if (!CACHE_ENABLED) return null;
-  sharedCache ||= createProxyCache();
+  if (!sharedCache) {
+    sharedCache = createProxyCache();
+    // 启动时把「落盘 / 常驻 / 已修剪」三个数打出来：这是判断体积极优化是否生效的最短路径
+    // （见 proxy-cache.js 顶部 2026-09-17 的实测依据），也让「修剪到底回收了多少」可被观测。
+    const s = sharedCache.summary();
+    log.info('代理缓存就绪', s);
+  }
   return sharedCache;
 }
 
@@ -216,11 +224,26 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
   // 去掉逐跳(hop-by-hop)头,避免连接语义混乱;Host 保留(浏览器访问代理的 Host)。
   for (const h of ['proxy-connection', 'keep-alive', 'connection']) delete headers[h];
 
-  const workspaceScript = preview && req.method === 'GET' && req.url.startsWith('/plugins/') && req.url.includes('dsh-client-ui-workspace');
+  // preview 链路上要就地改写的 dsh 客户端 bundle。dsh 会把**多个** plugin id 合并进一条
+  // `/plugins/??id1/client.js,id2/client.js&rev=…` 的 combo 请求（上限 3 KiB，够塞几十个包），
+  // 所以一条响应里可能同时包含两个待改写的 bundle —— 这里收集**所有命中**的补丁、按顺序全打上，
+  // 不能「按 URL 挑一个」（那样后一个会静默失效）。
+  // 「攒原文 → 本地注入 → 标 no-store → 不进共享缓存」这套流程对所有补丁都一样。
+  //   · dsh-client-ui-workspace：workspace 菜单加「在 Finder 中打开工作区」
+  //   · dsh-client-ui-sidebar-documentpreview：内置文件预览的头部加「下载到本机」
+  //   · dsh-client-ui-sidebar-files：内置「文件」树的头部加「上传到此处」
+  const bundlePatches = !preview || req.method !== 'GET' || !req.url.startsWith('/plugins/') ? []
+    : [
+      req.url.includes('dsh-client-ui-workspace') && addWorkspaceFinderMenu,
+      req.url.includes('dsh-client-ui-sidebar-documentpreview') && addFileDownloadControl,
+      req.url.includes('dsh-client-ui-sidebar-files') && addFileUploadControl,
+    ].filter((patch) => typeof patch === 'function');
+  /** 依次打上所有命中的补丁（每个都自带 fail-closed：锚点失配时原样返回）。 */
+  const applyPatches = (source) => bundlePatches.reduce((out, patch) => patch(out), source);
   const inject = preview && req.method === 'GET' && new URL(req.url, 'http://localhost').pathname === '/';
-  // 被注入改造过的响应（index.html、workspace bundle 菜单）不能进缓存：它们与 preview 绑定，
+  // 被注入改造过的响应（index.html、被打补丁的插件 bundle）不能进缓存：它们与 preview 绑定，
   // 而同一实例的普通代理拿到的应是**未注入**的原文。
-  const injectable = inject || workspaceScript;
+  const injectable = inject || bundlePatches.length > 0;
   if (injectable) {
     headers['accept-encoding'] = 'identity';
     delete headers['if-none-match'];
@@ -244,7 +267,7 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
   // （dgx21 上 workspace bundle 有 115 KB，每次都从远端取等于每次多等约 4 s）。
   const staticPlan = cache ? cachePlan(cache, cacheScope, classifyStatic(req.method, req.url)) : null;
   if (staticPlan && !injectable && serveCached(req, res, cache, staticPlan)) return;
-  if (staticPlan && workspaceScript && serveInjectedFromCache(req, res, cache, staticPlan)) return;
+  if (staticPlan && bundlePatches.length > 0 && serveInjectedFromCache(req, res, cache, staticPlan, applyPatches)) return;
 
   // 只读 RPC：键要等请求体到手才算得出来（信封里有 method/payload）。请求体超过上限时不缓存并透传。
   if (cache && !injectable && req.method === 'POST' && req.url.startsWith('/api/')) {
@@ -411,25 +434,35 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
   }
 
   // 缓存命中时把本地副本写出去。返回 true = 这个请求已经处理完。
+  //
+  // C2（2026-09-17）：先用 `readMeta()` 判新鲜度 —— **304、HEAD、以及过期判断都不需要正文**。
+  // 原先第一行 `store.read()` 会无条件 `readFileSync` 整条 body，于是一次 10.8 MB combo 的
+  // 304 校验要读 10.8 MB 磁盘、还把 10.8 MB 顶进 RSS。只有真要发正文时才 `readBody()`。
   function serveCached(clientReq, clientRes, store, plan, { rpcId = null } = {}) {
-    const entry = store.read(plan.key);
-    if (!entry) { store.noteMiss(); return false; }
-    const freshness = store.freshness(entry, plan.kind);
+    const meta = store.readMeta(plan.key);
+    if (!meta) { store.noteMiss(); return false; }
+    const freshness = store.freshness(meta, plan.kind);
     if (freshness === 'expired') { store.noteMiss(); return false; }
-    store.noteHit(entry, plan.kind, freshness === 'stale');
+    store.noteHit(meta, plan.kind, freshness === 'stale');
     // 陈旧但仍在宽限窗口内：先用本地副本回（用户不等），再去后台拉一次。
     if (freshness === 'stale') {
       const info = plan.body ? historyRequestOf(plan.body) : null;
-      const tryDelta = (historyDelta && isHistoryRpc(plan.rpcMethod) && info && entry)
-        ? () => fetchAndMergeDelta({
-          plan,
-          cached: windowOf(entry.body),
-          sessionId: info.sessionId,
-          maxMessages: info.maxMessages,
-          rpcId: info.rpcId ?? null,
-          template: entry.body,
-          scope: cacheScope || 'default',
-        }).then((merged) => merged?.body ?? null)
+      // 增量补差需要「本地窗口的正文」，但只有这条分支（陈旧 + 历史类 + 开了 delta）才需要 ——
+      // 所以在闭包里惰性读，未命中这条路时一个字节都不读（C2）。
+      const tryDelta = (historyDelta && isHistoryRpc(plan.rpcMethod) && info)
+        ? () => {
+          const cachedBody = store.readBody(meta);
+          if (!cachedBody) return null;
+          return fetchAndMergeDelta({
+            plan,
+            cached: windowOf(cachedBody),
+            sessionId: info.sessionId,
+            maxMessages: info.maxMessages,
+            rpcId: info.rpcId ?? null,
+            template: cachedBody,
+            scope: cacheScope || 'default',
+          }).then((merged) => merged?.body ?? null);
+        }
         : null;
       refreshInBackground(store, plan, { hostname, port, headers, method: clientReq.method, url: clientReq.url, body: plan.body ?? null, agent, requestTimeoutMs, tryDelta });
     }
@@ -439,14 +472,16 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
     }[plan.kind];
 
     if (plan.kind === 'rpc') {
-      const bodyOut = rewriteRpcEnvelope(entry.body, rpcId);
+      const body = store.readBody(meta);
+      if (!body) { store.noteMiss(); return false; }
+      const bodyOut = rewriteRpcEnvelope(body, rpcId);
       // 命中也要喂「会话是否在跑」这个索引：历史缓存的长 TTL 就靠它区分
       // 「已结束（不可变）」与「正在跑（会变）」。只喂写入路径的话，一次缓存命中就会让
       // 索引停在旧值上，于是一个已经恢复运行的会话仍被当成不可变。
       // 只有**新鲜**命中才刷新「是否在跑」的观测：陈旧副本里的状态不该冒充刚确认过。
       store.noteSessionList?.(bodyOut, { fresh: freshness === 'fresh' });
       clientRes.writeHead(200, {
-        'content-type': entry.contentType || 'application/json; charset=utf-8',
+        'content-type': meta.contentType || 'application/json; charset=utf-8',
         'content-length': String(bodyOut.length),
         'cache-control': 'no-store',
         'x-hwb-cache': hitHeader,
@@ -459,40 +494,58 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
     // 否则它下次仍然只能整包重下（这正是远端 dsh `no-cache` 且无校验器时的病根）。
     // 上游本来就给了 ETag 就直接沿用（`sourceEtag`），两种校验器都接受。
     const ttlSec = Math.max(1, Math.floor((plan.ttlMs ?? 600_000) / 1000));
-    const validators = new Set([entry.etag, entry.sourceEtag].filter(Boolean));
+    const validators = new Set([meta.etag, meta.sourceEtag].filter(Boolean));
     const inm = clientReq.headers['if-none-match'];
     if (inm && validators.has(inm)) {
-      const matched = inm === entry.sourceEtag ? entry.sourceEtag : entry.etag;
-      clientRes.writeHead(304, { etag: matched, 'cache-control': entry.cacheControl ?? `private, max-age=${ttlSec}`, 'x-hwb-cache': hitHeader });
+      const matched = inm === meta.sourceEtag ? meta.sourceEtag : meta.etag;
+      // **这一支完全不读正文** —— 内容寻址资源的重复访问绝大多数落在 304 上。
+      clientRes.writeHead(304, { etag: matched, 'cache-control': meta.cacheControl ?? `private, max-age=${ttlSec}`, 'x-hwb-cache': hitHeader });
       clientRes.end();
       return true;
     }
+    // HEAD 同样不需要正文（它只要元数据 + content-length）。
+    if (clientReq.method === 'HEAD') {
+      clientRes.writeHead(200, {
+        'content-type': meta.contentType || 'application/octet-stream',
+        'content-length': String(meta.bytes),
+        etag: meta.sourceEtag ?? meta.etag,
+        ...(meta.cacheControl ? { 'cache-control': meta.cacheControl } : {}),
+        'x-hwb-cache': hitHeader,
+      });
+      clientRes.end();
+      return true;
+    }
+    const body = store.readBody(meta);
+    if (!body) { store.noteMiss(); return false; }
     clientRes.writeHead(200, {
-      'content-type': entry.contentType || 'application/octet-stream',
-      'content-length': String(entry.body.length),
-      etag: entry.sourceEtag ?? entry.etag,
-      ...(entry.cacheControl ? { 'cache-control': entry.cacheControl } : {}),
+      'content-type': meta.contentType || 'application/octet-stream',
+      'content-length': String(body.length),
+      etag: meta.sourceEtag ?? meta.etag,
+      ...(meta.cacheControl ? { 'cache-control': meta.cacheControl } : {}),
       'x-hwb-cache': hitHeader,
     });
-    clientRes.end(clientReq.method === 'HEAD' ? undefined : entry.body);
+    clientRes.end(body);
     return true;
   }
 
   // 注入路径（preview 专属）的本地命中：拿缓存里的原文在本地注入后回出去。
-  // 这里**不能**直接把原文发给浏览器（那会丢掉「在 Finder 中打开工作区」菜单项），
+  // 这里**不能**直接把原文发给浏览器（那会丢掉菜单项/下载按钮），
   // 所以仍然标 no-store：它是按代理改过的内容，只属于这条 preview 链路。
-  function serveInjectedFromCache(clientReq, clientRes, store, plan) {
-    const entry = store.read(plan.key);
-    if (!entry) return false;
-    const freshness = store.freshness(entry, plan.kind);
+  function serveInjectedFromCache(clientReq, clientRes, store, plan, patch) {
+    const meta = store.readMeta(plan.key);
+    if (!meta) return false;
+    const freshness = store.freshness(meta, plan.kind);
     if (freshness === 'expired') return false;
-    store.noteHit(entry, plan.kind, freshness === 'stale');
+    // 注入必须拿到原文，所以这条路径天然要读正文（它本来就不是「不必要的全量读取」）。
+    const raw = store.readBody(meta);
+    if (!raw) return false;
+    store.noteHit(meta, plan.kind, freshness === 'stale');
     if (freshness === 'stale') {
       refreshInBackground(store, plan, { hostname, port, headers, method: clientReq.method, url: clientReq.url, body: null, agent, requestTimeoutMs });
     }
-    const injected = addWorkspaceFinderMenu(entry.body.toString('utf8'));
+    const injected = patch(raw.toString('utf8'));
     clientRes.writeHead(200, {
-      'content-type': entry.contentType || 'text/javascript; charset=utf-8',
+      'content-type': meta.contentType || 'text/javascript; charset=utf-8',
       'cache-control': 'no-store',
       'x-hwb-cache': freshness === 'stale' ? 'stale' : 'hit',
     });
@@ -505,6 +558,9 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
   function onCacheableResponse(plan) {
     return (upRes) => {
       clearTimeout(headerTimer);
+      // 上游耗时（从发起请求到响应体收完）：慢链路的判据。
+      // 只对可缓存的 RPC 记 —— 静态资源走 immutable，不参与 TTL 决策。
+      const upstreamStartedAt = Date.now();
       const upstreamHeaders = staticResponseHeaders(req, upRes);
       const keep = upRes.statusCode === 200
         && !upRes.headers['set-cookie']
@@ -555,6 +611,11 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
         upRes.on('end', () => {
           if (!rpcOverflow && rpcChunks.length) {
             const body = Buffer.concat(rpcChunks);
+            // 记下这条 key 的上游耗时：proxy-cache 用它判断「慢链路」并据此放宽 RPC 的 TTL。
+            // 只记非历史类 RPC —— 历史的 TTL 由「会话是否在跑」决定，与链路速度无关。
+            if (!isHistoryRpc(plan.rpcMethod)) {
+              cache.noteUpstreamLatency?.(plan.key, Date.now() - upstreamStartedAt);
+            }
             if (storableResponse(upRes.statusCode, upRes.headers, body)) {
               cache.write(plan.key, {
                 body,
@@ -573,42 +634,49 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
         return;
       }
 
+      // 静态（内容寻址）：**立刻发头、边流边攒**，与 RPC 同一条思路。
+      // 原先这里是「先攒完再发头」，为的是第一次响应就能带上 ETag。但 hwb 缓存存在之后，
+      // 那个理由已经不成立：浏览器下次的条件请求**永远由 hwb 自己回 304**（serveCached 的
+      // validators 分支），不需要上游参与。而代价是真实且昂贵的 —— 一次 10.8 MB 的 combo
+      // 要等整条传完（25–30 KB/s 的链路上是分钟级）浏览器才收到第一个字节，期间用户只能
+      // 看着空白页，还很容撞上浏览器/代理的空闲超时。
+      // 现在：字节立刻开始流动；ETag 仍在攒完后按同一份 identity 字节算好并存进缓存，
+      // 于是**后续**响应（本地命中）会带上它。浏览器因此只多了一次「本地秒回」的请求。
       const chunks = [];
       let size = 0;
       let overflowed = false;
+      writeHeaders(null, null);
       upRes.on('data', (chunk) => {
-        if (overflowed) { res.write(chunk); return; }
+        res.write(chunk);
+        if (overflowed) return;
         chunks.push(chunk);
         size += chunk.length;
         if (size > limit) {
-          // 超过缓存上限：放弃缓存，但**已经收到的字节一个都不能丢**（否则 content-length 对不上，
-          // 上游/客户端会一直等一个永远不来的结尾）。
+          // 超过缓存上限：放弃缓存（后面不再攒），但已经发出去的字节不受影响。
           overflowed = true;
-          writeHeaders(null, null);
-          for (const c of chunks) res.write(c);
           chunks.length = 0;
         }
       });
       upRes.on('end', () => {
-        if (overflowed) { res.end(); return; }
-        const body = Buffer.concat(chunks);
-        const storable = storableResponse(upRes.statusCode, upRes.headers, body);
-        const entry = storable
-          ? cache.write(plan.key, {
-            body,
-            contentType: upRes.headers['content-type'],
-            kind: plan.kind,
-            sourceEtag: upRes.headers.etag ?? null,
-            // 回放时要原样复述这次给浏览器的缓存策略（immutable / no-cache 都不能丢）。
-            cacheControl: upstreamHeaders['cache-control'] ?? null,
-            ttlMs: plan.ttlMs ?? null,
-            staleMs: plan.staleMs ?? null,
-            sessionId: plan.sessionId ?? null,
-            rpcMethod: plan.rpcMethod ?? null,
-          })
-          : null;
-        writeHeaders(entry?.etag ?? null, body.length);
-        res.end(req.method === 'HEAD' ? undefined : body);
+        if (!overflowed) {
+          const body = Buffer.concat(chunks);
+          if (storableResponse(upRes.statusCode, upRes.headers, body)) {
+            cache.write(plan.key, {
+              body,
+              contentType: upRes.headers['content-type'],
+              kind: plan.kind,
+              sourceEtag: upRes.headers.etag ?? null,
+              // 回放时要原样复述这次给浏览器的缓存策略（immutable / no-cache 都不能丢）。
+              cacheControl: upstreamHeaders['cache-control'] ?? null,
+              ttlMs: plan.ttlMs ?? null,
+              staleMs: plan.staleMs ?? null,
+              immortal: plan.immortal === true,
+              sessionId: plan.sessionId ?? null,
+              rpcMethod: plan.rpcMethod ?? null,
+            });
+          }
+        }
+        res.end();
       });
     };
   }
@@ -621,7 +689,7 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
       // Its lifetime remains tied to res.close, so detached streams are cleaned up.
       upRes.socket?.emit('agentRemove');
     }
-    if ((inject || workspaceScript) && upRes.statusCode === 200 && (inject ? /text\/html/i : /javascript/i).test(upRes.headers['content-type'] || '')) {
+    if ((inject || bundlePatches.length > 0) && upRes.statusCode === 200 && (inject ? /text\/html/i : /javascript/i).test(upRes.headers['content-type'] || '')) {
       const chunks = [];
       let size = 0;
       upRes.on('data', (chunk) => {
@@ -637,15 +705,17 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
           if (decode) body = decode(body, { maxOutputLength: 32 * 1024 * 1024 });
           // 先把**原文**存进缓存（注入是在本地做的，所以这份副本对普通代理同样有效）。
           if (staticPlan && storableResponse(200, upRes.headers, body)) {
-            cache.write(staticPlan.key, { body, contentType: upRes.headers['content-type'], kind: staticPlan.kind, sourceEtag: upRes.headers.etag ?? null, ttlMs: staticPlan.ttlMs ?? null, staleMs: staticPlan.staleMs ?? null });
+            cache.write(staticPlan.key, { body, contentType: upRes.headers['content-type'], kind: staticPlan.kind, sourceEtag: upRes.headers.etag ?? null, ttlMs: staticPlan.ttlMs ?? null, staleMs: staticPlan.staleMs ?? null, immortal: staticPlan.immortal === true });
           }
           // 两个注入脚本都用**同步** <script src>：preview-bridge 必须尽早挂上点击拦截，
           // dsh-theme-live 要在 dsh 首帧前拿到主题偏好（否则暗色下会先闪一下亮色）。
           const tag = '<script src="/__hwb/preview-bridge.js"></script>'
             + '<script src="/__hwb/dsh-theme.js"></script>';
           const html = body.toString('utf8');
-          const updated = workspaceScript ? addWorkspaceFinderMenu(html) : (/<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, '$&' + tag) : tag + html);
-          const outHeaders = workspaceScript && updated === html
+          const updated = bundlePatches.length > 0 ? applyPatches(html) : (/<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, '$&' + tag) : tag + html);
+          // 补丁没打上（上游锚点变了）时**保持上游原有的缓存策略**：内容与原文逐字节相同，
+          // 没有理由把它标成 no-store、让浏览器每次重下。
+          const outHeaders = bundlePatches.length > 0 && updated === html
             ? { ...staticResponseHeaders(req, upRes) }
             : { ...upRes.headers, 'cache-control': 'no-store' };
           for (const h of ['content-length', 'content-encoding', 'etag', 'last-modified', 'transfer-encoding']) delete outHeaders[h];
@@ -668,14 +738,18 @@ function forwardRequest(req, res, hostname, port, preview, agent = undefined, re
 // 注意用 homeId 而不是隧道端口 —— 远程实例每次重连都会换一个随机隧道口，用端口做键等于永不命中。
 function cachePlan(cache, scope, plan) {
   if (!plan) return null;
-  // 每条目自带 TTL：历史类（会话事件日志）在会话**已结束**时用长 TTL，正在跑则用短窗口。
-  const policy = cache?.policy?.({ kind: plan.kind, rpcMethod: plan.rpcMethod ?? null, sessionId: plan.sessionId ?? null })
+  const key = `${scope || 'default'}|${plan.key}`;
+  // 每条目自带 TTL：历史类（会话事件日志）在会话**已结束**时用长 TTL，正在跑则用短窗口；
+  // 其余 RPC 在**慢链路**上放宽（见 proxy-cache 的 SLOW_LINK_RPC_MS）——判据是这条 key
+  // 实测的上游耗时，所以要先把组合后的 key 传进去。
+  const policy = cache?.policy?.({ kind: plan.kind, rpcMethod: plan.rpcMethod ?? null, sessionId: plan.sessionId ?? null, key })
     ?? { ttlMs: cache?.ttlMs?.(plan.kind), staleMs: undefined };
   return {
     ...plan,
-    key: `${scope || 'default'}|${plan.key}`,
+    key,
     ttlMs: policy.ttlMs,
     staleMs: policy.staleMs,
+    immortal: policy.immortal === true,
     maxEntryBytes: cache?.maxEntryBytes,
   };
 }
@@ -757,6 +831,7 @@ function refreshInBackground(cache, plan, { hostname, port, headers, method, url
                 sourceEtag: upRes.headers.etag ?? null,
                 ttlMs: plan.ttlMs ?? null,
                 staleMs: plan.staleMs ?? null,
+                immortal: plan.immortal === true,
                 sessionId: plan.sessionId ?? null,
                 rpcMethod: plan.rpcMethod ?? null,
               });
@@ -783,6 +858,7 @@ function refreshInBackground(cache, plan, { hostname, port, headers, method, url
           kind: plan.kind,
           ttlMs: plan.ttlMs ?? null,
           staleMs: plan.staleMs ?? null,
+          immortal: plan.immortal === true,
           sessionId: plan.sessionId ?? null,
           rpcMethod: plan.rpcMethod ?? null,
         });
@@ -802,6 +878,7 @@ function refreshInBackground(cache, plan, { hostname, port, headers, method, url
         kind: plan.kind,
         ttlMs: plan.ttlMs ?? null,
         staleMs: plan.staleMs ?? null,
+        immortal: plan.immortal === true,
         sessionId: plan.sessionId ?? null,
         rpcMethod: plan.rpcMethod ?? null,
       });

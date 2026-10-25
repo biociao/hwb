@@ -13,6 +13,9 @@
 `hwb`会构建一份本地 SQLite 索引，在一个纯元数据仪表盘里跨实例展示**最近项目 / 会话 / 实例状态 / Token 用量**，并通过一个**控制平面**去启动、停止、重启 dsh web 进程（本机），或经 SSH 隧道接入**远端** dsh 实例。
 
 它**只读** dsh 的元数据文件，保持dsh独立运行，也**不会读取** `.zstd` 会话正文。
+（唯一例外：可选的「在 DSH 桌面端打开会话」插件开启后，hwb 会写 **一个** 控制触发器
+`<home>/hwb/open-session.json` 来传递「打开哪个会话」，见
+[在 DSH 桌面端打开会话](#在-dsh-桌面端打开会话可选插件)。）
 它也不会替代 dsh web——只一站式托管它、快速找到它、直达会话，让你在一处总揽所有实例的工作状态。
 
 > 设计文档（三平面架构、数据模型、控制状态机、里程碑）见
@@ -31,6 +34,9 @@
 - [工作台怎么用](#工作台怎么用)
 - [读取的 dsh home 文件](#读取的-dsh-home-文件)
 - [Codex 作为实例接入（可选数据源）](#codex-作为实例接入可选数据源)
+- [WorkBuddy 作为只读本地实例](#workbuddy-作为只读本地实例)
+- [本地 dsh 只读实例（Codex 式）](#本地-dsh-只读实例codex-式)
+- [在 DSH 桌面端打开会话（可选插件）](#在-dsh-桌面端打开会话可选插件)
 - [架构：三平面分离](#架构三平面分离)
 - [REST API](#rest-api)
 - [辅助工具包](#辅助工具包)
@@ -82,6 +88,8 @@
 | **Token 用量面板** | 汇总 + 分时堆叠趋势（自适应桶粒度）+ 按项目拆分 |
 | **会话深链** | 客户端装有 `dsh-session-deeplink` 插件时，可二段跳转直达单个会话，且有加载遮罩防白闪 |
 | **Codex 实例（只读）** | 在 INSTANCES 里添加 Codex（`harness=codex`），只读 `state_5.sqlite` + `.codex-global-state.json`；其项目/会话进入 RECENT PROJECTS/SESSIONS，点击经 `codex://` 深链跳回 Codex |
+| **WorkBuddy 实例（只读）** | 在 INSTANCES 里添加 WorkBuddy（`harness=workbuddy`），只读 `workbuddy.db` 的项目/会话元数据；点击经 `workbuddy://chat/<id>` 跳回 WorkBuddy |
+| **本地工具统一口径** | Codex / WorkBuddy / 本地 dsh 只读共用一张卡（`<label> <version>` 身份 chip、已就绪/路径缺失、`索引 lastIndexedAt`、打开/重新索引/设置）与一个打开入口 `POST /api/harness/open` |
 | **SSH 远程生命周期** | 远端点按钮即可启动 / 重启 / 关闭远端 dsh web（把 `dsh-remote-web.sh` 算法搬进 Node） |
 | **主题同步** | hwb 切主题单向下发给已连接的 dsh 实例：写其 `settings.yaml`（持久）+ 注入脚本即时换肤；逐实例报成功/失败，可在主题菜单里关闭 |
 
@@ -209,12 +217,23 @@ npm test           # 全量（含 tests/compat 版本兼容性契约）
 **工作台（仪表盘，纯元数据、零 iframe）** 分五块：
 
 1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击跳转到该项目最新会话所属实例。
+   **卡片底色按数据来源 app 区分**：dsh 蓝、Codex 灰、Claude Code 橙、WorkBuddy 绿，
+   未识别来源用中性紫（深/浅主题各一套底色）；项目徽标与左侧竖轨仍是项目自己的身份色，
+   两种语义分开 —— 「底色说来源，徽标说项目」。
 2. **Recent Sessions** —— 最近会话，带 token 用量 chip、上下文压力条、状态 chip（运行中/已完成/空闲）。
 3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip（已连接 / 连接不可达 / 未连接，域降级时另加
    「⚠ <域> 降级」chip）、**该实例上 dsh 的版本号**（`dsh 0.1.5-rc.1`；本地实例读本机安装、
    远程实例经 SSH `dsh --version` 探测，与远端启动共用同一份 PATH 补齐；取不到时不显示）、
    workspace/会话数，以及 **连接（连接到 / 必要时拉起 dsh web）** / **断开** /
    **切换**（配置了多个连接端点时）/ **⚙ 设置** 按钮。
+   **本地 dsh 还可以添加一个「只读实例」（Codex 式）**：不连接 dsh web、不需要 token，
+   直接读 home 索引；可与同一个 home 的可连接实例并存（见下面的专节）。
+   **本地工具实例（Codex / WorkBuddy / 本地 dsh 只读）共用同一张卡**：身份 chip 是
+   `<label> <version>`（`Codex 0.153.4` / `WorkBuddy 5.8.3` / `dsh 0.2.0-rc.2`；版本取不到就只显示
+   label、不画占位符），状态只有「已就绪 / 路径缺失」，时间统一为 `索引 <timeAgo(lastIndexedAt)>`
+   （未索引过显示 `尚未索引`），动作统一为 `打开 <工具>` / `重新索引` / `⚙ 设置`。
+   「只读」是这类实例的**类型说明**（写在版本身份 chip 的 `title` 里），不再占状态位；
+   统一口径与实现边界见 [`docs/local-tool-harness-alignment.md`](docs/local-tool-harness-alignment.md)。
    版本号在**未连接**的实例卡上也显示 —— 「这台上跑的是哪个 dsh」正是排查「连不上 / 数据变少 /
    域降级」时最先要看的一项；远程探测是后台做的，不拖慢仪表盘渲染。
    重启 / 停止 / 重新索引 / 移除 在 **⚙ 设置** 弹窗内（不在卡片上，避免误点）。
@@ -229,26 +248,33 @@ npm test           # 全量（含 tests/compat 版本兼容性契约）
 > **项目 ↔ 会话联动高亮**：把鼠标悬停在某个项目（或会话）上，会在两栏间同步高亮同名项目。
 
 **钻入某个实例 / 会话**：点实例 tab 或某项目/会话行，会懒创建一个 iframe 挂载该 dsh web
-（本地经预览代理，远端经 SSH 隧道 + 反代）。切走只隐藏；被预算释放过的实例再次进入时重新加载
-（dsh 支持会话深链时会回到同一个会话）。
+（本地经预览代理，远端经 SSH 隧道 + 反代）。本地 dsh 的会话/项目行会先尝试交给 DSH 桌面端
+（装了 `dsh-hwb-open-session` 插件时直接切到对应会话）；只读实例没有 Web 页面，不会创建 iframe。
+切走只隐藏；被预算释放过的实例再次进入时重新加载（dsh 支持会话深链时会回到同一个会话）。
 
 > **iframe 预算（前端内存的上界）**：每个实例 iframe 都是一整个 dsh web SPA（自己的实时通道、
 > 会话 DOM、插件脚本），隐藏的 iframe 并不会被冻结。原先「切走只 hidden、永不销毁」的代价是
 > 浏览器内存随**访问过的实例数**单调增长、且永不归还——2026-09-12 实测 Safari 的一个 WebKit
 > WebContent 进程 2.3 GB / 26% CPU 常驻 7 小时，Safari 以「此网页使用了大量内存」把页面重载。
-> 现在最多保留 **3** 个热 iframe（最近用过的），超出的按 LRU 释放：只拆 iframe 与预览侧栏，
+> 现在最多保留 **3** 个热 iframe（最近用过的），超出的按 LRU 释放：只拆 iframe，
 > 标签页、入口 URL、会话 id 全部保留，重新进入时按会话深链恢复；正在看的那个永不释放。
 > 释放过的标签在悬停提示里标出「已释放内存（重新进入时重新加载）」。
 > 用 `http://127.0.0.1:4310/?frames=N` 可以临时调整预算（N ≥ 1；低内存机器可调小，
 > `scripts/memory-check.mjs` 用它做对照实验）。
 
 **添加实例**（工作台 Instances 区块「＋ 添加」）：
-- **本机**：填 dsh home 路径，如 `~/.dsh`；可选填「本机 dsh web 端口」+「鉴权 token」直接接入
+- **本机（只读）**：类型选「本机（只读，不连接）」；Instances → ＋ 添加 顶部会给出
+  「检测到 ~/.dsh → 添加为只读实例」快捷入口。不需要端口/token，添加后立即从本地索引展示
+  项目/会话；点会话由 DSH 桌面端打开。
+- **本机（可连接）**：填 dsh home 路径，如 `~/.dsh`；可选填「本机 dsh web 端口」+「鉴权 token」直接接入
   已在跑的那台实例（**同机直连、无端口转发、不新拉起**；端口留空则按需拉起一台）。
 - **SSH 远程**：填 SSH 主机（别名 / `user@host`）+ 远端 dsh web 监听端口（**必填**；
   常见值是 `3080`，但以远端实际监听端口为准，留空会被服务端拒绝），
   可选填远端 home 路径、远端启动命令、token 日志路径，以及**鉴权 token**（填入则跳过远端抓取）。
   远程实例经 hwb 的 1:1 根路径反代接入（浏览器无法直达 ssh 隧道）。
+- **Codex / WorkBuddy（只读）**：类型分别选 `Codex（只读）` / `WorkBuddy（只读）`，home 默认
+  `~/.codex` / `~/.workbuddy`（`CODEX_HOME` / `WORKBUDDY_HOME` 可覆盖）。只读各自的元数据 /
+  状态库，不连接进程、不需要 token，也没有端口/端点；见下面两个专节。
 
 > **打开 = 连接（稳定第一）**：实例卡的默认动作是**连接**到已有实例——本地复用已在跑的进程，
 > 远程重建一条 ssh 隧道接入**已运行**的 dsh web；**绝不**因连接问题重启或杀掉一个健康实例。
@@ -306,31 +332,50 @@ dsh 自己设置里的主题改动不会回流到 hwb。
 
 ---
 
-## 文件预览侧边栏
+## 文件预览：在 dsh 自己的侧边栏里
 
-在 hwb 内打开本机或 SSH 远程 dsh 实例后，单击会话中的文件路径或“产物”文件按钮，即可在右侧预览（点击由注入的桥接脚本拦截，因此不会触发 dsh 原生「用宿主系统应用打开」——远端无 GUI 时那条路必然失败并提示 `xdg-open: no method available`；若某次点击仍漏过桥接，iframe 右下角会浮出一条会自动消失的小提示（不在会话正文里插入任何控件），提供「在 hwb 文件预览里打开」的动作）；单击目录可浏览其内容。也可以点击右上角主题切换按钮左侧的 **文件预览** 按钮，直接浏览当前会话的 project 工作区，或输入项目内的相对／绝对路径。侧栏自动跟随会话切换；若内嵌页没有上报会话，用标题栏下拉手选工作区（见下节）。侧栏提供上级、项目根目录、刷新和关闭操作。拖动侧栏左边缘可调整宽度（按实例记忆），双击分隔条恢复默认；聚焦分隔条后也可用左右方向键微调。Cmd/Ctrl 等组合点击保留原有行为。在外部浏览器直连本机 dsh 时，文件打开沿用 dsh 原有行为。
+**hwb 不再有自己的文件预览侧栏。** 预览、浏览与渲染都用 dsh 0.1.5 右侧 Sidebar 自带的
+「文件」树与文档预览（Markdown / 高亮代码 / 图片 / PDF / HTML / 纯文本）：点会话里的文件路径、
+「产物」按钮或树里的文件行，dsh 自己就把它开进右侧 Sidebar（`chat.openFile` →
+`sidebarRight.openResource`）。hwb 注入的桥接**不再拦截这些点击**——它只负责补两件 dsh 没有的事，
+两件都长在 dsh 的侧栏里：
+
+| hwb 补的动作 | 出现在哪 | 按一下发生什么 |
+|--------------|----------|----------------|
+| **下载到本机** | dsh 内置文档预览的头部（与 dsh 自己的「重新读取」并排） | 把该文件的**完整字节**取回本机（不受预览截断限制；单文件 ≤64 MiB） |
+| **上传到此处** | dsh 内置「文件」树的头部（重载按钮左侧） | 选一个或多个本机文件写进**当前会话的工作区根**（≤256 MiB/文件，同名自动改名） |
+
+两者走的是 hwb 的 `/api/homes/:id/download` 与 `/api/homes/:id/upload`（本机实例直读直写、
+远端实例经 SSH），所以远端实例同样能用；上传完成后会替用户按一下 dsh 的「重新读取」，
+新文件立刻出现在树里。**注入的按钮自己不发热请求**：它们只派发/调用桥接里的钩子，
+由 hwb 父页执行——鉴权、工作区围栏、大小上限与上传并发闸门全在 hwb 侧。
+反代在本地改写 `dsh-client-ui-sidebar-documentpreview` 与 `dsh-client-ui-sidebar-files` 两个 bundle；
+**锚点失配时原样返回**（宁可没有按钮，也不产出半截 JS 炸掉整个 web 应用），此时该 bundle 沿用上游缓存策略。
+
+上传的进度与失败原因浮在 dsh 页面右下角（上传过程中显示百分比），失败同时记一条 hwb 顶栏提示；
+**超 256 MiB 的文件在本地就被跳过**，不会白传一遍。
 
 首次更新此功能需要重启 **hwb 服务**，然后刷新整个 hwb 页面；仅切换实例标签不会重建热 iframe（超出预算的被释放后会在重新进入时加载，见上文的 **iframe 预算**）。重启 hwb 会终止它管理的 dsh 子进程，应等相关会话空闲后再操作；手填端口接入的已有本地 dsh 进程不由 hwb 终止。
 
-文件范围限制在已登记的项目目录内。文本显示行号，最多预览前 24 KiB；目录最多显示 200 项；SVG、PNG、ICO、JPEG、GIF、WebP 显示图片（最多 2 MiB）；其他二进制文件暂不展示正文。图片工具栏支持放大、缩小、100% 原尺寸、适应窗口和全屏预览，按 Esc 或点击“退出全屏”返回侧栏。**HTML 文件默认渲染显示**（按浏览器方式排版，最大 32 MiB），工具栏可切到「源码」（前 24 KiB，带行号）、在浏览器里打开或下载完整文件；渲染走 `/asset` 原字节，因此内联图表的报告不必再受文本预览 24 KiB 截断。为安全起见，渲染时不执行页面里的脚本与表单（服务端 CSP `sandbox` + 前端 iframe `sandbox`），静态排版、内联样式与图片正常显示。点击“下载文件”可将完整原文件保存到本地（单文件最多 64 MiB，暂不打包目录），不受文本预览截断限制；不支持预览的文件也可下载。远程实例通过 SSH 在远端读取，需要 Python 3。会话缺少 workspaceId 时，按 project 匹配唯一的已登记工作区；无法确定时显示关联错误，不猜测其他项目。外部浏览器直接打开 dsh 的页面仍使用 dsh 原有文件打开行为。
+在外部浏览器直连本机 dsh（不经过 hwb）时，只有 dsh 自己的预览，没有上面两个注入按钮。
 
-### 两种绑定方式：跟随会话 / 手选工作区
+### 会话是怎么被认出来的
 
-侧栏有两条并存的入口，任一条可用即可浏览、下载与上传：
+下载与上传都需要知道「这是哪个实例的哪个工作区」。内嵌页里的会话通过 `hwb:preview-context`
+上报会话 ID（dsh 切换会话是 SPA 导航，iframe 不重新加载，所以桥接同时挂 MutationObserver
+与 `popstate`），hwb 据此解析出该会话的 project 工作区。**路径围栏**：文件范围限制在已登记的
+项目目录内，越界（`../`、指向工作区外的符号链接）一律 400；会话缺少 workspaceId 时按 project
+匹配**唯一**的已登记工作区，无法确定时明确报错，不猜测其他项目。
 
-1. **跟随 dsh 会话（首选）**：内嵌页里的会话会通过 `hwb:preview-context` 上报会话 ID，侧栏据此解析出该会话的 project 工作区——这是「点会话里的文件路径就能预览」的来源。
-2. **手选工作区（兜底）**：侧栏标题栏的下拉列出该实例在 hwb 索引里的**全部工作区**（含远端路径）。内嵌页没有上报会话时（例如该 dsh 版本的 URL 不带 `?session=`、会话是文档内新建的、或上报链路被代理/浏览器策略打断），直接在下拉里选一个工作区即可；首次打开面板时若尚无会话上下文，会**自动绑定最近活跃会话所在的工作区**。
+### 上传的细节
 
-> 兜底存在的意义：会话上下文依赖内嵌页与侧栏的 postMessage 握手，任何一环（代理未注入桥接脚本、dsh 不用 `?session=` 导航）都会让它失效；工作区列表来自 hwb 自己的索引，不受该链路影响，因此文件预览不会因为握手失败而完全不可用。下拉选「（跟随 dsh 会话）」可随时切回自动跟随。
+上传是把选中文件写进**当前会话的工作区根**（dsh 的「文件」树没有「当前目录」这个概念；
+要放进子目录，上传后在树里展开确认，或改用 dsh 自己的终端/skill 写）。
 
-### 上传文件（拖拽）
-
-浏览到某个目录时，侧栏会显示上传区：把文件**拖到侧栏**即上传到**当前所在目录**，也可以点「选择文件上传」或直接拖到目录内容区域。多文件会逐个串行上传，进度条显示整批进度与当前文件名，完成后自动刷新目录列表（想传到子目录，先点进那个目录再拖）。
-
-- 单文件上限 **256 MiB**；超限文件在拖入时就被跳过并提示，不会白传一遍。
 - **同名不覆盖**：已存在 `data.csv` 时新文件自动落为 `data(1).csv`，上传完成后明确提示改名结果。
 - 先写隐藏临时文件、写满后才原子落名：中断只留下隐藏临时文件，不会出现“半截但看起来正常”的结果文件或临时残留。
 - 只接受「文件名」，落盘位置完全由服务端依据已登记工作区与当前目录决定；`..`、符号链接、工作区外路径一律拒绝，写请求校验同源（跨站写入返回 403）。
+- 多文件**逐个串行**上传（进度是整批语义）：同时开多条只会互相抢带宽、报错也难定位。
 - 远程实例经 SSH 在**远端**同名目录写入（同样需要 Python 3）：内容按 512 KiB 分片经命令行参数传输、远端先分片落盘到临时目录再合并，避开 stdin 与命令行长度限制；速度受链路带宽限制，大文件会比本机慢。
 
 
@@ -415,6 +460,120 @@ curl -s -X POST 'http://127.0.0.1:4310/api/codex/open' \
 
 ---
 
+## WorkBuddy 作为只读本地实例
+
+WorkBuddy 是第三个本地工具 harness（与 Codex / 本地 dsh 只读同一类实例），**不是单独的面板**：
+在 **INSTANCES → ＋ 添加** 里选「WorkBuddy（只读）」，或点检测到 `~/.workbuddy` 的一键添加按钮，
+之后它的项目与会话就和 dsh / Codex 实例一样出现在 **RECENT PROJECTS / RECENT SESSIONS** 里；
+实例卡与「打开」动作和 Codex 完全同构（统一卡语义见上文「工作台怎么用 → Instances」）。
+
+- **检测**：`GET /api/homes/detect` 返回 `workbuddy: { path, exists, looksLikeWorkbuddy }`，
+  哨兵文件是 `workbuddy.db`；默认 home 为 `~/.workbuddy`，环境变量 **`WORKBUDDY_HOME`** 可覆盖。
+- **不启动、不连接任何进程**：没有 token / 端口 / 隧道 / 端点；实例卡只有「已就绪 / 路径缺失」，
+  身份 chip 是 `WorkBuddy <version>`（版本取自 `startup-seed-version.json` 的 `appVersion`，
+  回退 `app/renderer-version.json` 的 `version`；取不到就不显示）。
+- **读什么（只读元数据，不读会话正文、不写库）**：`$WORKBUDDY_HOME/workbuddy.db`。
+
+  | 表 | 用作 | 口径 |
+  |---|---|---|
+  | `workspaces(path, last_opened_at)` | 项目 | `path` 即 WorkBuddy 自己的项目标识，`basename` 作为项目名 |
+  | `sessions(id, cwd, title, custom_title, status, created_at, updated_at, last_activity_at, model, project_id)` | 会话 | `deleted_at IS NULL`；`last_activity_at` 优先、回退 `updated_at`；`custom_title` 优先 |
+  | `session_usage(session_id, used, size)` | 上下文用量 | 只作原始值，**不**伪装成 input/output token（本期 `tokenUsage` / `contextPressure` 留空） |
+
+- **项目/会话口径**：会话的 `cwd` 按**最长前缀**匹配 `workspaces.path` 归属项目；匹配不到时按
+  `basename(cwd)` 归一化成项目（与 dsh / Codex 对未归属会话的口径一致）。状态只有 `completed`
+  →「已完成」，其余（terminated/error/failed/…）→「已保存」——只读元数据无法断言「正在运行」。
+- **跳转**：点会话/项目行，或实例卡「打开 WorkBuddy」→ `workbuddy://chat/<uuid>`（只接受 UUID
+  白名单，非法 id 一律 400）；目标解析：显式会话 > 该项目最近一条会话 > 该实例最近一条会话。
+  仅 macOS 自动唤起，其它平台或唤起失败时回退成可复制的命令（`open "workbuddy://chat/<id>"`）。
+- **只读与降级**：以 `readOnly` 打开 SQLite（WorkBuddy 退出、WAL 已 checkpoint 时自动改用
+  `immutable=1` 读主文件快照）——**绝不写 WorkBuddy 的库**。库缺失 / 损坏 / schema 变化只让
+  该实例标「⚠ workbuddy 降级」并在实例卡上给出原因，不影响其它实例。
+
+**手工验证（不经过 UI）：**
+
+```bash
+curl -s 'http://127.0.0.1:4310/api/homes/detect' | head -c 500   # workbuddy 段：path/exists/looksLikeWorkbuddy
+curl -s -X POST 'http://127.0.0.1:4310/api/homes' \
+  -H 'Content-Type: application/json' -d '{"harness":"workbuddy","homePath":"~/.workbuddy"}'
+curl -s -X POST 'http://127.0.0.1:4310/api/harness/open' \
+  -H 'Content-Type: application/json' -d '{"homeId":"<workbuddy homeId>"}'
+```
+
+> `WORKBUDDY_HOME` 会覆盖默认的 `~/.workbuddy`（与 WorkBuddy 自己的约定一致）。
+
+---
+
+## 本地 dsh 只读实例（Codex 式）
+
+Codex 实例是「只读本地元数据、不连接任何进程」的接入方式。现在本机 dsh 也能用同一种方式接入：
+
+- **怎么加**：`INSTANCES → ＋ 添加`，类型选 **本机（只读，不连接）**；或直接点表单顶部的
+  「检测到 ~/.dsh → 添加为只读实例」。也可以走首装引导里的只读按钮。
+- **不需要连接/token**：monitor 只判断 home 目录是否存在（在 = 已就绪），数据由索引器直接读
+  `~/.dsh` 的投影缓存；实例卡显示「只读」+ projects/sessions + 索引时间，没有「连接」按钮。
+- **与可连接实例并存**：同一个 `~/.dsh` 可以同时存在「MBP（可连接，用于 Web iframe）」和
+  「MBP 只读（数据 + 跳转）」。两者 homeId 独立，MBP 的配置/行为完全不变。
+- **数据不重复**：Recent Projects / Recent Sessions 在同一 home 的两种实例之间**只取只读实例的
+  一份**；`/api/usage` 也只统计一次（只读优先），不会因为两个实例而翻倍。
+- **跳转**：点只读实例的会话/项目行 → 走 `dsh-hwb-open-session` 插件，在 DSH 桌面端打开；
+  插件缺失时只提示安装，不会为了一个会话去启动托管 dsh web。
+- **注意**：同一 home 会被索引两遍（磁盘读取成本约 2×）；不再需要只读实例时，在设置里「移除实例」
+  即可，可连接实例的数据与配置不受影响。
+
+> 只读实例的数据可见性依赖 `readOnly` 标记；已经存在的实例（如旧版添加的 MBP）不会被自动改写。
+
+---
+
+## 在 DSH 桌面端打开会话（可选插件）
+
+**问题**：Codex 有 `codex://threads/<id>` 深链，点一下就能落到对应会话；DSH 桌面端只注册了
+`dsh://`，而它的 `open-url` 只处理精确的 `dsh://open`（仅聚焦窗口），没有会话级入口；
+`dsh web` 也没有 `--session` 启动参数。所以**外部进程无法直接让运行中的 DSH 切到某个会话**。
+
+**解法**：`dsh-hwb-open-session/` 插件在本机 DSH 进程内补一条只读信使通道，不改 dsh 上游：
+
+```
+hwb 点会话 ──写──► <DSH_HOME>/hwb/open-session.json
+                         │
+DSH 插件 Host 半 ──GET /api/hwb-open-session──► 返回未过期触发器
+                         │
+DSH 插件 Client 半 ──轮询 + sessions.open(id)──► UI 切到该会话
+```
+
+### 安装（一次性，需要重启 DSH）
+
+> 桌面 App 的 `desktop` profile 由 Electron 独占管理，`dsh plugin --profile desktop add`
+> 会被 dsh CLI 拒绝；请用下面的安装脚本（等价于一次 link 安装，写前备份 `package.json`）。
+
+```bash
+node scripts/install-dsh-open-session.mjs            # 装到 ~/.dsh/profiles/desktop
+node scripts/install-dsh-open-session.mjs --dry-run  # 只预览
+node scripts/install-dsh-open-session.mjs --uninstall
+# 然后完全退出并重新打开 DeepSeek Harness（插件在 App 启动时加载）
+```
+
+如果桌面端用的是非默认 `DSH_HOME`，加 `--home /path/to/.dsh`。插件的触发器路径默认 `$DSH_HOME/hwb/open-session.json`，可在
+`cordis.patch.yml` 里用 `triggerPath` 覆盖。详见
+[`dsh-hwb-open-session/README.md`](dsh-hwb-open-session/README.md)。
+
+### 行为与兼容
+
+| 场景 | 点击本地 dsh 的会话/项目行 |
+|------|--------------------------|
+| 插件已装、桌面 App 在跑 | 聚焦 App，并切到该会话 |
+| 插件已装、App 没跑 | 启动 App；它就绪后自动切到该会话（触发器 120s 有效） |
+| 插件没装 / 非 macOS / App 缺失 | **静默回退**到原来的内嵌 iframe（web 形态完全不受影响） |
+| 远程 dsh | 不变：仍走隧道 + 内嵌 iframe |
+| 浏览器 `dsh web` 形态 | 不变：仍走 `?session=` / 内嵌 iframe（该形态不依赖本插件） |
+
+- 触发器由 hwb **原子写入**（目录 0700 / 文件 0600，120s 过期，每次点击新 id），插件路由只读，
+  不接受写操作；`sessionId` 只接受白名单字符。
+- 卸载：`node scripts/install-dsh-open-session.mjs --uninstall` 并重启；hwb 会自动回到 iframe。
+- 这是一条**本地同用户**通道：不联网、不引入 token、不读 dsh 的会话正文。
+
+---
+
 ## 架构：三平面分离
 
 ```
@@ -455,14 +614,12 @@ curl -s -X POST 'http://127.0.0.1:4310/api/codex/open' \
 | Method | Path | 说明 |
 |--------|------|------|
 | `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `monitor:updated` / `quota:updated` / `log:event`） |
-| `GET` | `/api/homes/{homeId}/preview` | 预览文件/目录（`?sessionId=` 或 `?workspaceId=`，`&path=`），只读 |
-| `GET` | `/api/homes/{homeId}/asset` | 按真实 MIME 返回文件原字节（HTML 渲染预览用；带 CSP `sandbox`，只读、只限工作区内） |
-| `GET` | `/api/homes/{homeId}/download` | 下载单个文件（≤64 MiB，不打包目录） |
+| `GET` | `/api/homes/{homeId}/download` | 下载单个文件（`?sessionId=` 或 `?workspaceId=`，`&path=`；≤64 MiB，不打包目录） |
 | `PUT` | `/api/homes/{homeId}/upload` | 上传文件到当前目录（multipart；`?sessionId=`+`&dir=`，≤256 MiB/文件，同名自动改名，跨站拒绝） |
 | `GET` | `/api/homes` | 全部实例（含 runtime 状态） |
-| `GET` | `/api/homes/detect` | 检测默认 `~/.dsh` 是否存在 |
-| `POST` | `/api/homes` | 注册实例（本机 `homePath`；远程 `host`+`remotePort`） |
-| `PUT` | `/api/homes/{homeId}` | 编辑实例配置（alias / homePath / 远程参数） |
+| `GET` | `/api/homes/detect` | 检测默认 home：顶层 `~/.dsh`，加 `codex` 与 `workbuddy`（`{path, exists, looksLike…}`）段 |
+| `POST` | `/api/homes` | 注册实例（本机 `homePath`；远程 `host`+`remotePort`；`{homePath, readOnly:true}` 添加本地 dsh 只读实例，与同 path 的可连接实例并存） |
+| `PUT` | `/api/homes/{homeId}` | 编辑实例配置（alias / homePath / 远程参数；只读本地工具实例的配置面只有 alias + homePath） |
 | `DELETE` | `/api/homes/{homeId}` | 移除实例（只删 hwb 索引，不碰 dsh 文件） |
 | `POST` | `/api/homes/order` | 持久化拖拽排序 |
 | `POST` | `/api/homes/{homeId}/reindex` | 强制重新索引 |
@@ -472,8 +629,10 @@ curl -s -X POST 'http://127.0.0.1:4310/api/codex/open' \
 | `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
 | `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`） |
 | `GET` | `/api/workspaces` | 工作区列表 |
-| `POST` | `/api/homes` | 除 dsh 本机/远程外，`{harness:"codex", homePath}` 可注册只读 Codex 实例（默认 `~/.codex`，注册后立即索引并刷新运行时） |
+| `POST` | `/api/homes` | 除 dsh 本机/远程外，`{harness:"codex" \| "workbuddy", homePath, alias?}` 可注册只读本地工具实例（默认 `~/.codex` / `~/.workbuddy`，注册后立即索引并刷新运行时；目录不存在 400） |
+| `POST` | `/api/harness/open` | 统一打开本地工具实例（body `{homeId, sessionId?, projectId?}`）：Codex → `codex://threads/<uuid>`、WorkBuddy → `workbuddy://chat/<uuid>`、本地 dsh 只读 → 插件触发器，无会话/插件缺失时聚焦/启动 DSH 桌面端（200 `code:"app-focused"`）。未知 home 404、非本地工具 400、非法会话 id 400（UUID 白名单）、唤起失败 502 |
 | `POST` | `/api/codex/open` | 跳转到 Codex 会话/项目/实例（body `{homeId, threadId?}` 或 `{homeId, projectId?}`；解析成 `codex://threads/<id>` 深链，仅 macOS 自动打开） |
+| `POST` | `/api/homes/{homeId}/open-session` | 让已装 `dsh-hwb-open-session` 插件的 DSH 桌面端切到指定会话（body `{sessionId}`；本地 dsh、macOS；插件缺失/平台不支持返回 409/501，前端回退 iframe） |
 | `GET` | `/api/usage` | 用量汇总 + 趋势 + 按项目（`?days=30&hours=24`） |
 | `GET` | `/api/quota` | 额度列表（TTL 缓存；只读） |
 | `POST` | `/api/quota/refresh` | 强制刷新额度 |
@@ -491,7 +650,7 @@ curl -s -X POST 'http://127.0.0.1:4310/api/codex/open' \
 
 ## 辅助工具包
 
-仓库里除了主工作台，还带三组**运维 / 性能**辅助工具（各自带独立 README）：
+仓库里除了主工作台，还带四组**运维 / 性能 / 集成**辅助工具（各自带独立 README）：
 
 ### 1. `scripts/` — 远程 dsh web 冷启动与性能
 
@@ -518,6 +677,12 @@ curl -s -X POST 'http://127.0.0.1:4310/api/codex/open' \
 给前端静态资源加 `Cache-Control: immutable` + ETag/Last-Modified → 304，解决远程打开页面/实例慢。
 只接管 `/assets/*`，不影响 `/api`、WebSocket 与 index 注入。详见 `dsh-static-cache/README.md`。
 
+### 4. `dsh-hwb-open-session/` — 「在 DSH 里打开会话」插件（Cordis）
+
+Host 半注册只读路由 `/api/hwb-open-session`，Client 半轮询触发器并调用 `sessions.open(id)`；
+让 hwb 能把本地 dsh 的会话点击变成「在桌面 App 中定位到该会话」。详见
+`dsh-hwb-open-session/README.md` 与上文 [在 DSH 桌面端打开会话](#在-dsh-桌面端打开会话可选插件)。
+
 ---
 
 ## 项目结构
@@ -540,7 +705,11 @@ hwb/
 │   │   ├── node-version.js      # Node 版本门槛（engines / doctor / 启动预检 同源）
 │   │   ├── dsh-compat.js        # dsh 存储契约自检（doctor 用；从安装的 dsh 提取域版本）
 │   │   ├── dsh-version.js       # 每个实例的 dsh 版本号（本地读安装 / 远程 ssh --version，带 TTL 缓存）
-│   │   ├── file-preview.js      # 预览/下载/上传（本机 fs + 远端 python，含路径围栏）
+│   │   ├── harnesses.js         # 本地工具描述符唯一来源（isLocalToolHome / LOCAL_TOOL_SOURCES：Codex、WorkBuddy）
+│   │   ├── tool-version.js      # Codex / WorkBuddy 版本号解析（本地文件 + 30 min 缓存 + 版本白名单）
+│   │   ├── dsh-app.js           # DSH 桌面端的定位 / 是否在跑 / 聚焦 / 启动（app-focused 分支用）
+│   │   ├── open-session.js      # 本地 dsh 会话跳转：插件探测 + 原子写触发器 + 唤起/聚焦桌面端
+│   │   ├── file-preview.js      # 文件读取引擎（下载字节 + 上传后目录列举，本机 fs + 远端 python，含路径围栏）
 │   │   ├── multipart.js         # 流式 multipart 解析（线性扫描 + 边界保持）
 │   │   ├── endpoints.js         # 连接端点规范化（host/port/唯一 id）
 │   │   ├── access-port.js       # 本地接入端口校验
@@ -551,25 +720,31 @@ hwb/
 │   │   ├── reader.js            # 编排 read + normalize + store
 │   │   ├── remote-reader.js     # 远端只读索引（一次 ssh bash -s cat 元数据文件 + per-record 目录）
 │   │   ├── indexer.js           # 后台索引循环（60s debounce + 按实例退避）
-│   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC）
-│   │   ├── live-poller.js       # 实时状态轮询（3s，仅运行中的本机实例）
+│   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC；cookie 记忆 + keep-alive + 自适应预算）
+│   │   ├── live-poller.js       # 实时状态轮询（基线 3s，按实测链路自适应 + 失败退避）
 │   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目）
 │   │   └── quota.js             # 额度服务（TTL 缓存 60s，单 flight）
 │   ├── codexhome/               # 第二个 harness 数据源（Codex，只读；作为普通实例接入）
 │   │   ├── reader.js            # state_5.sqlite + .codex-global-state.json → 项目/会话快照（按 cwd 最长前缀归属）
 │   │   ├── index-rows.js        # Codex 快照 → 同构 workspace/session 行（复用 RECENT / 用量 / 搜索）
 │   │   └── open.js              # codex://threads/<id> 深链派发（仅 macOS；其它平台回退 codex resume 命令）
+│   ├── workbuddyhome/           # 第三个 harness 数据源（WorkBuddy，只读；与 Codex 同构的本地工具实例）
+│   │   ├── reader.js            # workbuddy.db（readOnly → immutable 回退）→ projects/sessions 快照，不写库
+│   │   ├── index-rows.js        # WorkBuddy 快照 → 同构 workspace/session 行（cwd 最长前缀归属）
+│   │   └── open.js              # workbuddy://chat/<uuid> 深链派发（UUID 白名单；仅 macOS，其它平台回退命令）
 │   ├── control/                 # 控制平面
 │   │   ├── registry.js          # 实例注册表（状态机 + 退避）
 │   │   ├── monitor.js           # 进程/端口探测（30s 循环）
 │   │   ├── launcher.js          # dsh web 启动/停止/重启 + token 抓取 + 深链探测 + 端点切换
 │   │   ├── tunnel.js            # ssh -L 按需隧道
 │   │   ├── ssh-opts.js          # SSH 参数统一（连接复用/压缩/跳板机）
-│   │   ├── proxy.js             # 根路径 1:1 反向代理（含 WebSocket 升级 + 预览注入）
+│   │   ├── proxy.js             # 根路径 1:1 反向代理（含 WebSocket 升级 + 侧栏补丁注入）
 │   │   ├── remote.js            # 远端 dsh web 启停 + 抓 token
 │   │   ├── prober.js            # HTTP/进程/SSH/远端路径探测（独立可测）
 │   │   ├── guard.js             # 进程指纹（防误杀）
-│   │   └── workspace-menu.js    # 预览页的工作区下拉菜单注入
+│   │   ├── workspace-menu.js    # dsh workspace 菜单的「在 Finder 中打开工作区」注入
+│   │   ├── file-download.js     # 内置文档预览头部的「下载到本机」按钮注入
+│   │   └── file-upload.js       # 内置「文件」树头部的「上传到此处」按钮注入
 │   ├── api/
 │   │   ├── server.js            # Node HTTP 服务器 + 静态资源 + /api 来源校验
 │   │   ├── routes.js            # REST 路由 + 跨站写保护 + 请求体上限
@@ -579,9 +754,9 @@ hwb/
 │       ├── app.js               # 路由 + 状态管理 + 持久 iframe
 │       ├── store.js             # 前端缓存（SSE 订阅 + 工具）
 │       ├── instance-navigation.js / instance-state.js   # 实例入口与实例键
-│       ├── preview-bridge.js    # 内嵌页 → 父页的工作区/会话上报
+│       ├── preview-bridge.js    # 内嵌 dsh 页 → 父页：会话上报 + 下载/上传转交
+│       ├── file-ops.js          # 下载到本机 / 上传回工作区（父页真正发请求的那一层）
 │       ├── dsh-theme-live.js    # 内嵌页主题即时换肤（接收父页 postMessage）
-│       ├── file-preview.css
 │       └── components/
 │           ├── workbench.js         # 仪表盘布局
 │           ├── recent-projects.js / recent-sessions.js / instance-grid.js
@@ -589,14 +764,13 @@ hwb/
 │           ├── quota-card.js        # 额度卡片（见「已知限制」）
 │           ├── add-home.js          # 添加/编辑实例表单 + onboarding
 │           ├── endpoint-editor.js   # 连接端点编辑器
-│           ├── file-preview.js      # 文件预览/下载/拖拽上传侧栏
-│           ├── preview-image.js / preview-resize.js  # 图片查看与侧栏拖拽
 │           ├── log-panel.js         # 运行日志面板
 │           └── form-draft.js        # 表单草稿存取（跨 SSE 重建保活）
 ├── scripts/                     # 远程 dsh web 冷启动/缓存/隧道运维脚本
 ├── dsh-remote-index/            # 多实例会话索引（独立工具）
 ├── dsh-static-cache/            # dsh 前端静态缓存插件
 ├── docs/topology.md             # 拓扑可视化附录（README/设计文档的可视化补充）
+├── docs/local-tool-harness-alignment.md   # 本地工具实例统一契约（Codex / WorkBuddy / dsh 只读）
 ├── tests/                       # 单元测试 + mock-home 夹具
 ├── images/                      # README 头图
 └── DSH_Workbench_Fusion_Architecture.md   # 设计文档（三平面/数据模型/里程碑）
@@ -682,9 +856,11 @@ dsh 0.1.5-rc.1 兼容 ✓
   实测 dsh 0.1.5-rc.1 里 `webServer` 存在、而 **`apiProxy` 不存在** ——
   即 `dsh-history-delta`（低带宽增量历史，**默认关闭**）在当前版本会走「不打补丁」分支。
   后果仅性能（代理层整段回退读取），不会错也不会崩。
-- **前端 bundle 注入锚点**（`workspace-menu.js` 给 dsh 的 workspace 菜单打补丁）
-  依赖压缩后的字面量子串。已纳入契约测试 F 组（拿真实 bundle 验证），但注入后的**浏览器行为**
-  无法在无浏览器环境断言。
+- **前端 bundle 注入锚点**（`workspace-menu.js` 给 dsh 的 workspace 菜单打补丁、
+  `file-download.js` 给 dsh 内置文档预览注入「下载到本机」、`file-upload.js` 给内置「文件」树
+  注入「上传到此处」）依赖压缩后的字面量子串。
+  三者都已纳入契约测试（拿真实 bundle 验证锚点仍匹配、注入后仍是合法 JS），但注入后的
+  **浏览器行为**无法在无浏览器环境断言。锚点失配一律 fail-closed（原样返回、不注入）。
 
 ## 已知限制
 
@@ -717,14 +893,32 @@ dsh 0.1.5-rc.1 兼容 ✓
   投影任一步失败（远端没有 python3、JSON 坏了）都**原文回退**，宁可多传也不少读；
   传输体积超过 2 MiB 时记一条 warn（低带宽链路上有 90 s ssh 超时风险）。
   远程不可达时该实例降级（`markHomeError`），**不会**阻塞其它实例索引，也不会去重启/杀实例。
-- **代理层本地缓存（`src/control/proxy-cache.js`）有 TTL，不是「永远最新」**：远程实例的插件 bundle、
-  前端资源、以及只读 RPC（会话列表/历史/描述类）会缓存在 `<HWB_DIR>/proxy-cache`，命中直接本地回。
+- **代理层本地缓存（`src/control/proxy-cache.js`）**：远程实例的插件 bundle、前端资源、
+  以及只读 RPC（会话列表/历史/描述类）会缓存在 `<HWB_DIR>/proxy-cache`，命中直接本地回。
   实测依据：远端 dsh 对插件 bundle 回 `no-cache` 且无校验器、会话列表走 POST RPC，浏览器侧**根本无法缓存**，
   于是每次打开页面都要在 25–30 KB/s 的链路上重下 3.3 MiB（≈2 分钟）。
-  代价是「上游在同一 URL 下改了内容」时最多陈旧一个 TTL（默认静态 600 s、只读 RPC 3 s / 宽限 60 s）；
-  内容寻址的 URL（`?rev=<hash>`、`-<hash8>.js`）本身不会原地变，所以这个窗口在实践中是空的。
   写/控制类 RPC（prompt/create/cancel/updateQueue/respond/upload…）、带 `set-cookie` 的响应、
   带 token 的 URL 一律不缓存。要关掉：`HWB_PROXY_CACHE=0`；换落盘位置：`HWB_PROXY_CACHE_DIR`。
+- **缓存体积与「不必全量读取」（2026-09-17 按现网 311.7 MB / 772 文件重做）**：
+  按实测，38 个 ≥1 MB 的条目占 94% 体积（`session.history` 33 条就 182 MB），而 235 个
+  <8 KB 的微条目合计只有 428 KB 却各占 2 个文件 —— 两者分开处理：
+  **正文按 gzip 落盘**（`HWB_PROXY_CACHE_CODEC=none` 可关；只影响磁盘，回给浏览器的仍是
+  identity，ETag/`content-length` 都按 identity 算，所以老条目原样可读）；
+  **≥1 MB 的正文不常驻内存**（`HWB_PROXY_CACHE_RESIDENT_MAX_ENTRY_BYTES` / `_MAX_RESIDENT_BYTES`）；
+  **`ttl≤60s 且 <8 KB` 的微条目不落盘**；**同一 `(scope, sessionId)` 的历史最多 2 份**
+  （`_HISTORY_VARIANTS`）；**static 与 rpc 各有一套预算与 LRU**
+  （`_STATIC_MAX_BYTES` 默认 32 MB / `_RPC_MAX_BYTES` 默认 64 MB），一条大历史挤不掉插件工作集。
+- **304、HEAD、以及新鲜度判断都不读正文**：`readMeta()` 只读 meta，只有真要发正文时才
+  `readBody()`。原先一次 10.8 MB combo 的 304 校验就要读 10.8 MB 磁盘（还把 10.8 MB 顶进内存）。
+- **启动与每小时修剪**（`HWB_PROXY_CACHE_PRUNE_INTERVAL_MS`）：清死条目 + 把**整目录**
+  （含本次会话没碰过的）裁到预算内。判定用条目**自己记录的** ttl/stale，所以按旧策略
+  （static 600 s）写下的陈旧副本会被正常清掉。启动日志里会打一行 summary
+  （`storedMegabytes` / `diskMegabytes` / `residentMegabytes` / `prunedMegabytes` / `codec`），
+  这是判断瘦身是否生效的最短路径。真实数据实测：一次修剪 freed 154.5 MB，重编码后
+  200.3 MB → 18.1 MB（11.06×）。
+- **内容寻址的静态（`?rev=<hash>` / `-<hash8>.js`）不因时间过期**：URL 里的 hash 本身就是
+  强校验器，内容变了 URL 必然变 —— 与已经发给浏览器的 `immutable, 1 year` 一致。
+  它只受自己那类预算的 LRU 淘汰，不受 TTL 影响。
 - **会话历史（`session.history`）按「会话是否在跑」分档**：它是**原始事件日志**，实测一个大会话
   50 条消息的窗口就有 8–10 MiB（经隧道首次 43 s）。已结束的会话历史不可变 → 长 TTL
   （默认 30 分钟新鲜 / 7 天宽限）；正在跑的会话仍用短窗口（3 s / 60 s），
@@ -735,9 +929,29 @@ dsh 0.1.5-rc.1 兼容 ✓
   `session.history` 只有 `beforeSeq`（往回翻）而没有 `afterSeq`（向前增量），事件流订阅也不带游标，
   所以一份陈旧窗口中间缺的那段事件补不回来。运行状态未知（没观测到 / 观测超过
   `HWB_PROXY_CACHE_RUNNING_TRUST_MS`，默认 5 分钟）同样按保守档处理。
+  > **不做「截断历史后回放」**：同一份无游标的事实决定了截断会造成静默的消息空洞 ——
+  > 那比慢更糟。「不必全量」在这里的正解是**增量补差**（装了 `dsh-history-delta` 时，
+  > 用 `HWB_HISTORY_DELTA=1` 打开）。
 - **dsh 的 RPC 端点有两代命名**：0.1.2 是 `session/list`，0.1.1-rc.2 是 `session.list`。
   实时会话同步（`src/dshhome/live-status.js`）与代理缓存都按形态/候选两种写法兼容；
   只写死一种时，旧版远端的表现是「实时状态从未生效」（每 3 秒一条 `rpc http 404`）。
+- **实时轮询按实测链路自适应，而不是写死节奏与预算**（2026-09-22，dgx21.tun 实测）。
+  远端 dsh **服务端**只要 1–5ms，但经隧道取一次 `session.list`（179 会话 = **129 KB**）
+  要 **3.4–7.3s**（链路约 10–30 KB/s / RTT 90–140ms / 丢包 10–50%）。固定 3s 节奏 + 4s 预算
+  在这个组合下必然失败（实测 3380 失败 / 2135 成功，`auth timeout` 占失败原因 2215 次）。
+  现在四处都跟着**实测值**走，本地实例行为完全不变：
+  - **cookie 交接只做一次**（按实例记忆，TTL 10 分钟）—— 省掉每轮一整段隧道往返；
+  - **keep-alive 连接池**（`LIVE_AGENT`，maxSockets 2）—— 避免每轮重走慢启动；
+  - **RPC 预算** = `min(30s, max(配置值, EWMA×3 + 2s))`；`HWB_LIVE_RPC_TIMEOUT_MS` 可覆盖，
+    `new LiveStatusReader({ adaptiveTimeout: false })` 可关掉；
+  - **轮询节奏** = 成功时「本轮耗时×2」（夹在 `[intervalMs, maxIntervalMs=30s]`），
+    失败指数退避（6s→12s→24s→30s 封顶），成功一次即复位；
+  - **慢链路上 `session.list` 的 TTL 放宽到 15s**（判据是实测上游耗时 ≥1.5s，见
+    `HWB_PROXY_CACHE_SLOW_LINK_MS` / `_SLOW_RPC_TTL_MS`），否则每轮都要重搬 129 KB。
+    **只放宽非历史类 RPC** —— 历史类在「会话在跑/状态未知」时必须保持短窗口，
+    否则会出现静默的消息空洞（见上一条）。
+  > 这些改动只减少**往返次数**与**重传字节**。链路约 1 Mbps 的上限在 VPN 核心，
+  > 客户端无法提高；`docs/dgx21-tun-access.md` 有完整的定量排查与「主机对主机」对照。
 - **仅 `deepseek`/`kimi` 有公开余额 API**：`zai`/`minimax` 无公开 balance endpoint，
   API 显式降级为「余额不可用」，不会静默失败。
 - **会话 deep-link 依赖客户端插件**：`dsh-session-deeplink` 需经
@@ -767,6 +981,9 @@ dsh 0.1.5-rc.1 兼容 ✓
   浏览器 authority 的反代访问，把该主机名加进 `HWB_ALLOWED_HOSTS`（逗号分隔）即可，
   例如 `HWB_ALLOWED_HOSTS=hwb.local hwb start`。放行等于允许该来源的页面访问本地 API，
   请只填自己控制的名字。
+- **唯一写入 dsh home 的文件**：仅在安装 `dsh-hwb-open-session` 且点击本地 dsh 会话时，hwb 写
+  `<home>/hwb/open-session.json`（控制触发器，0600、120s 过期、只含会话 id 与时间戳）。
+  它不含正文/token；不装插件就不会写。
 - **API key 永不越界**：`.credentials.yaml` 的 key 只用于服务端查余额，浏览器只收到
   `{ provider, remaining, currency }`（单测专门断言 key 不出现在列表里）。
 - **无鉴权 ≠ 只有你自己能用**：端口绑在回环上，但**同机的其他用户也能连**（回环不是访问控制）。
@@ -823,6 +1040,6 @@ dsh 0.1.5-rc.1 兼容 ✓
 
 首次升级会将同一服务器标识、同一远端 home 的旧通道配置合并为一个实例的多个端点（相对 home 还区分显式 SSH 用户）。已确认的 `cms.lo` / `cms.tun` 包括 `bot@` 前缀会归到 `cms`。保留首个实例 ID，合并唯一的索引记录并消除重复记录。以后请直接在一个实例中维护端点列表，界面只保留「实例名称」用于显示，不会因改名或切换端口生成新的实例。
 
-Instances 直接显示全部实例卡片，没有折叠层：未连接时显示「连接」，连接后显示「断开」，仅配置多个通道时增加「切换」按钮，用于选择连接通道。「连接」留在工作台；点击顶部选项卡进入实例页面。仅 Instances 区域的实例卡片显示当前连接通道，不默认展开其他通道列表；顶部导航栏只显示实例名称。连接状态每 30 秒检查。Projects 和 Sessions 仅查询已连接且可达的实例，过滤发生在汇总、跳转目标选择和分页之前；断开后隐藏其数据，保留索引供重新连接后展示。
+Instances 直接显示全部实例卡片，没有折叠层：本地 dsh 只读实例显示「只读」与「重新索引/设置」；其它实例未连接时显示「连接」，连接后显示「断开」，仅配置多个通道时增加「切换」按钮，用于选择连接通道。「连接」留在工作台；点击顶部选项卡进入实例页面。仅 Instances 区域的实例卡片显示当前连接通道，不默认展开其他通道列表；顶部导航栏只显示实例名称。连接状态每 30 秒检查。Projects 和 Sessions 查询已连接且可达的实例 + 只读 dsh 实例（monitor 把它们标成 running）；同一 home 同时有两种实例时只取只读实例的一份。过滤发生在汇总、跳转目标选择和分页之前；断开后隐藏其数据，保留索引供重新连接后展示。
 
 API：`PUT /api/homes/:homeId` 支持 `endpoints` 数组；`POST /api/homes/:homeId/switch` 接收 `{ "endpointId": "目标端点 ID" }`。切换成功后 `homeId`、会话及项目索引不变。旧的单主机／端口配置仍兼容。后端更改需重启 hwb 生效。

@@ -42,6 +42,29 @@ export function withoutForwardings(config) {
 const MASTER_CHECK_TIMEOUT_MS = () => envInt('HWB_TUNNEL_MASTER_CHECK_MS', 4000);
 const MASTER_POLL_MS = () => envInt('HWB_TUNNEL_MASTER_POLL_MS', 10_000);
 
+// —— master 退化自愈（2026-09-19）——
+//
+// 复用 master 是绕过 sshd `MaxStartups` 的关键，代价是把吞吐押在**一条长命连接**上：
+// 实测同一个 master 后期能把单次请求拖到 20s，而同刻新建一条 master 只要 0.5–0.8s
+// （docs/dgx21-tun-access.md「残留风险：长命 master 会退化」）。所以巡检不能只问
+// 「master 活着吗 / 转发口还在吗」—— 那两问都答「在」，用户侧照样整页卡住、
+// 浏览器一路 `Reconnecting`（dsh 客户端的连接 generation 3s 告警、15s 判死）。
+//
+// 于是补一问「它现在还快不快」：每轮经 ControlPath 跑一条 `true` 并计时 —— 走 master
+// （`ControlMaster=no` 明确「只许复用、不许新建」），因此不经过 sshd 的未认证队列，
+// 只占 master 上的一个 channel。连续 N 轮「慢或失败」即判定退化，**先 `ssh -O exit`
+// 回收这条 master，再 finish(255)**，由 launcher 重建一条新的。
+//
+// 「先回收再 finish」是必须的顺序：否则 launcher 立刻重建时 muxControlPath() 仍能看到
+// 存活的（已退化的）master，会把 -L 重新挂回同一条连接，等于没自愈。
+const MASTER_RTT_TIMEOUT_MS = () => envInt('HWB_TUNNEL_MASTER_RTT_TIMEOUT_MS', 8000);
+const MASTER_RTT_SLOW_MS = () => envInt('HWB_TUNNEL_MASTER_RTT_MS', 3000);
+const MASTER_RTT_STREAK = () => envInt('HWB_TUNNEL_MASTER_RTT_STREAK', 3);
+// 自愈冷却：如果**整条链路**就是慢的，重建一条 master 也一样慢 —— 没有冷却就会变成
+// 「每 30s 拆一次 master」，反而把这条窄链路刷得更乱。同一主机在该窗口内只自愈一次。
+const MASTER_SELF_HEAL_COOLDOWN_MS = () => envInt('HWB_TUNNEL_MASTER_HEAL_COOLDOWN_MS', 600_000);
+const lastSelfHealAt = new Map();
+
 function envInt(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -107,6 +130,38 @@ async function cancelForward({ host, controlPath, configFile, spec }) {
   }
 }
 
+// 经既存 master 的一次往返（`true`）并计时：master 健不健康，只有真的走它一趟才知道。
+// `ControlMaster=no` 是刻意的：它表示「只复用既存 master、绝不新建」—— 于是 master 已消失时
+// 这条探测只会**失败**，不会偷偷变出一条新连接来掩盖问题（那会给 sshd 的未认证队列加压，
+// 正是我们要避开的对象）。
+async function masterRtt({ host, controlPath, configFile }) {
+  const started = Date.now();
+  try {
+    await execFileAsync('ssh', [
+      ...controlArgs({ host, controlPath, configFile }),
+      '-o', 'ControlMaster=no',
+      '--', host, 'true',
+    ], { timeout: MASTER_RTT_TIMEOUT_MS(), maxBuffer: 64 * 1024 });
+    return { ok: true, ms: Date.now() - started, stderr: '' };
+  } catch (error) {
+    return { ok: false, ms: Date.now() - started, stderr: String(error?.stderr || error?.message || '').trim() };
+  }
+}
+
+// 回收一条退化的 master（连带其上的所有 -L）。fire-and-await：调用方要等它落定后再 finish，
+// 否则重建会挂回同一条连接（见 MASTER_SELF_HEAL_COOLDOWN_MS 上方的顺序说明）。
+async function exitMaster({ host, controlPath, configFile }) {
+  try {
+    await execFileAsync('ssh', [
+      ...controlArgs({ host, controlPath, configFile }),
+      '-O', 'exit', '--', host,
+    ], { timeout: 10_000, maxBuffer: 64 * 1024 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // 转发端口是否真的在监听（而不是只看 master 活着）。
 //
 // 为什么必须单独判：`ssh -O check` 只回答「master 进程还在不在」。而 -L 监听口挂在 master 上，
@@ -141,6 +196,10 @@ function masterTunnel({ host, controlPath, configFile, localPort, remotePort, pi
   const proc = new EventEmitter();
   let stderrText = '';
   let timer = null;
+  // 「慢或探测失败」的连续轮数，以及「正在自愈」的互斥位（自愈要 await 回收 master，
+  // 期间下一轮巡检可能已经触发，必须挡住）。
+  let unhealthyStreak = 0;
+  let healing = false;
 
   // 快照目录的清理必须**排在 `-O cancel` 之后**：cancel 用的是 `-F <configFile>`，
   // 若在 finish() 里立刻删目录，异步的 cancel 就会拿到一个已消失的配置文件而静默失败，
@@ -157,6 +216,7 @@ function masterTunnel({ host, controlPath, configFile, localPort, remotePort, pi
   };
 
   const poll = async () => {
+    if (healing) return;
     const r = await masterAlive({ host, controlPath, configFile });
     if (!r.alive) {
       stderrText += `master 已消失（${host}），依附其上的 -L 随之失效\n`;
@@ -169,7 +229,37 @@ function masterTunnel({ host, controlPath, configFile, localPort, remotePort, pi
       stderrText += `本地转发口 127.0.0.1:${localPort} 已不再监听（master ${r.pid ?? 'unknown'} 仍在，但 -L 已丢）\n`;
       finish(255, null);
       cleanupDir();
+      return;
     }
+
+    // —— 第三问：这条 master 现在还快吗 ——
+    const rtt = await masterRtt({ host, controlPath, configFile });
+    const slowMs = MASTER_RTT_SLOW_MS();
+    const unhealthy = !rtt.ok || rtt.ms > slowMs;
+    if (!unhealthy) { unhealthyStreak = 0; return; }
+    unhealthyStreak += 1;
+    if (unhealthyStreak < MASTER_RTT_STREAK()) return;
+
+    const detail = rtt.ok ? `往返 ${rtt.ms}ms > ${slowMs}ms` : `往返探测失败（${rtt.ms}ms）：${rtt.stderr || 'ssh 退出非 0'}`;
+    const last = lastSelfHealAt.get(host) ?? 0;
+    if (Date.now() - last < MASTER_SELF_HEAL_COOLDOWN_MS()) {
+      // 冷却期内不再拆：链路整体慢时重建也没用，反复拆只会把窄链路刷得更乱。
+      log.warn('master 健康探测连续偏慢，但处于自愈冷却期（不重复回收）', {
+        host, streak: unhealthyStreak, detail,
+      });
+      unhealthyStreak = 0;
+      return;
+    }
+    lastSelfHealAt.set(host, Date.now());
+    healing = true;
+    log.warn('master 健康探测连续偏慢，回收该 master 交由 launcher 重建', {
+      host, streak: unhealthyStreak, detail, thresholdMs: slowMs,
+    });
+    const recycled = await exitMaster({ host, controlPath, configFile });
+    stderrText += `master 连续 ${unhealthyStreak} 轮健康探测偏慢（${detail}），`
+      + `${recycled ? '已回收该 master' : '回收失败'}（${host}）；重建以恢复吞吐\n`;
+    finish(255, null);
+    cleanupDir();
   };
 
   Object.assign(proc, {
