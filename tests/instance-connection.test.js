@@ -56,16 +56,18 @@ test('legacy cms SSH aliases migrate to a shared server identity, including user
   assert.equal(store.getHome(a).serverId, 'override');
 });
 
-test('instance cards stay visible without folding or endpoint selectors; controls reflect connection state', () => {
+test('instance identity and connection controls stay visible; management details fold without endpoint selectors', () => {
   const offline = renderInstanceGrid([channel('cms.lo', { runtime: { runtime: 'stopped' } })]);
   assert.match(offline, /未连接/);
   assert.match(offline, /data-action="connect"/);
-  assert.doesNotMatch(offline, /<details|<summary|<select|data-action="switch-endpoint"/);
+  assert.doesNotMatch(offline, /<select|data-action="switch-endpoint"/);
+  assert.ok(offline.indexOf('data-action="connect"') < offline.indexOf('<details'), '连接按钮常驻，位于管理详情外');
   const online = renderInstanceGrid([channel('cms.lo')]);
   assert.match(online, /data-action="disconnect"/);
   assert.doesNotMatch(online, /data-action="choose-channel"/);
   assert.match(online, /当前通道：cms.lo:3080/);
-  assert.doesNotMatch(online, /<details|<select/);
+  assert.doesNotMatch(online, /<select/);
+  assert.ok(online.indexOf('data-action="disconnect"') < online.indexOf('<details'), '断开按钮不随管理详情折叠');
 });
 
 test('server identity persists through config edits without changing channel IDs', (t) => {

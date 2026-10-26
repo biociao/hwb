@@ -1,0 +1,13 @@
+import { esc, timeAgo } from '../store.js';
+import { sessionStatusChip } from './session-state.js';
+
+// 复用全库搜索结果，不再维护另一条取数路径。所有名字与 data-* 都来自不可信元数据。
+export function renderSearchResults({ projects = [], sessions = [], pending = false, failed = false, scope = null, selectedProject = null, truncated = false } = {}) {
+  const projectRows = projects.slice(0, 4).map((p) => `<button type="button" class="search-result" data-action="search-project" data-project="${esc(p.project)}" data-home-id="${esc(p.homeId)}" data-session-id="${esc(p.sessionId)}" data-workspace-id="${esc(p.workspaceId)}"><span class="search-result-name">${esc(p.project)}</span><span class="search-result-meta">查看项目会话</span></button>`).join('');
+  const sessionRows = sessions.slice(0, 6).map((s) => `<button type="button" class="search-result" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}" data-session-id="${esc(s.sessionId)}"><span class="search-result-body"><span class="search-result-name">${esc(s.title || s.workspaceTitle || s.project || s.sessionId)}</span><span class="search-result-meta">${esc(s.project || '未归类')} · ${timeAgo(s.lastActivity)}</span></span>${sessionStatusChip(s)}</button>`).join('');
+  return `<div class="search-result-heading"><span>${scope ? `项目：${esc(scope)}` : '全局搜索'}</span>${!scope && selectedProject ? `<button type="button" data-action="scope-search" data-project="${esc(selectedProject)}">仅搜索当前项目</button>` : ''}</div>
+    ${projectRows ? `<div class="search-result-group" role="group" aria-label="项目结果"><h3>项目</h3>${projectRows}</div>` : ''}
+    ${sessionRows ? `<div class="search-result-group" role="group" aria-label="会话结果"><h3>会话</h3>${sessionRows}</div>` : ''}
+    ${pending ? '<div class="search-result-note" role="status">正在检索全部索引…</div>' : failed ? '<div class="search-result-note" role="status">全库搜索暂不可用，仅显示最近列表内的匹配</div>' : !projects.length && !sessions.length ? '<div class="search-result-note" role="status">没有匹配的项目或会话</div>' : ''}
+    ${truncated || projects.length > 4 || sessions.length > 6 ? '<div class="search-result-note">更多结果见下方项目与会话列表</div>' : ''}`;
+}

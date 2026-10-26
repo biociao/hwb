@@ -42,7 +42,8 @@ test('cards show only current channel and expose switching only for multiple end
   const home = { homeId: 'abc', alias: 'CMS', hostType: 'remote', homePath: 'ssh://cms', runtime: { runtime: 'running' }, endpoints: [{ id: 'one', host: 'cms.lo', port: 3080 }, { id: 'two', host: 'cms.tun', port: 4080 }], activeEndpointId: 'one' };
   assert.match(renderInstanceGrid([home]), /当前通道：cms.lo:3080/);
   assert.match(renderInstanceGrid([home]), /data-action="choose-channel"/);
-  assert.doesNotMatch(renderInstanceGrid([home]), /cms.tun|<select|<details/);
+  assert.doesNotMatch(renderInstanceGrid([home]), /cms.tun|<select/);
+  assert.match(renderInstanceGrid([home]), /<details class="instance-details"[^>]*>[\s\S]*当前通道：cms.lo:3080[\s\S]*data-action="choose-channel"/);
   assert.doesNotMatch(renderInstanceGrid([{ ...home, endpoints: home.endpoints.slice(0, 1) }]), /data-action="choose-channel"/);
   assert.match(renderSettingsForm(home), /选择连接端点/);
   assert.match(renderSettingsForm(home), /cms.tun/);

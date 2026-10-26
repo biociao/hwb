@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 
 // 顶栏搜索的「接线」回归：过滤/合并逻辑本身在 search-filter.test.js，服务端检索在
 // store-search.test.js / api-search.test.js，这里守的是：
-// ① 输入框真的在顶栏右侧（红框标注的原空白处）且可访问；
+// ① 输入框在顶栏中间（与会话区对齐）且可访问；
 // ② 样式契约（聚焦可见、原生清除按钮不与自定义 ✕ 重复、隐藏态不占位、历史 chip 有样式）；
 // ③ app.js 的搜索路径：本地即时过滤（复用 lastLists）+ 停手后防抖请求 /api/search 补历史，
 //    并且全库结果必须经过 mergeSearchResults()、乱序响应必须被 seq 挡掉。
@@ -22,15 +22,17 @@ const { renderWorkbench } = await import('../src/web/components/workbench.js');
 const indexHtml = await readFile(new URL('../src/web/index.html', import.meta.url), 'utf8');
 const appJs = await readFile(new URL('../src/web/app.js', import.meta.url), 'utf8');
 
-const topbarRight = indexHtml.slice(indexHtml.indexOf('<div class="topbar-right">'), indexHtml.indexOf('</header>'));
+const topbarRight = indexHtml.slice(indexHtml.indexOf('<header id="topbar">'), indexHtml.indexOf('</header>'));
 
-test('顶栏搜索框：在主题按钮左侧、可访问、清除按钮默认隐藏', () => {
-  assert.ok(topbarRight.indexOf('id="search"') > 0, '顶栏右侧必须有搜索输入框');
+test('顶栏搜索框：位于独立中间列，可访问、清除按钮默认隐藏', () => {
+  assert.ok(topbarRight.indexOf('id="search"') > 0, '顶栏必须有搜索输入框');
   assert.ok(topbarRight.indexOf('class="theme-wrap"') > topbarRight.indexOf('id="search"'),
-    '搜索框在主题按钮左侧（原先的空白处）');
+    '搜索框在主题按钮左侧，作为中间网格列');
   assert.match(topbarRight, /role="search"/);
+  assert.match(topbarRight, /aria-controls="search-results"/);
+  assert.match(topbarRight, /id="search-scope"[^>]*data-action="clear-search-scope"/);
   assert.match(topbarRight, /type="search"/);
-  assert.match(topbarRight, /placeholder="搜索项目 \/ 会话名…"/);
+  assert.match(topbarRight, /placeholder="搜索项目或会话…"/);
   assert.match(topbarRight, /aria-label="[^"]*搜索[^"]*"/);
   assert.match(topbarRight, /id="search-clear"[^>]*hidden/, '清除按钮默认隐藏：没输入时不占位');
   assert.match(topbarRight, /id="search-clear"[^>]*data-action="clear-search"/,

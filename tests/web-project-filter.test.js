@@ -124,12 +124,12 @@ test('workbench：sessionFilter 插在 Sessions 分区头与列表之间（列�
 
 test('app.js：点击项目只设置筛选状态，不再调用 enterInstance/打开工具', () => {
   assert.match(appJs, /case 'filter-project': \{/);
-  assert.match(appJs, /if \(projectKey\(\) === project\) \{[\s\S]{0,80}setProjectFilter\(null\);/,
+  assert.match(appJs, /if \(projectKey\(\) === project && !wasSearching\) \{[\s\S]{0,80}setProjectFilter\(null\);/,
     '再点一次同一个项目 = 取消筛选');
   // filter-project 分支里不得出现跳转调用（否则又变回点击即跳）。
   const branch = appJs.slice(appJs.indexOf("case 'filter-project': {"), appJs.indexOf("case 'clear-project-filter':"));
   assert.doesNotMatch(branch, /enterInstance|openLocalTool|tryOpenDshSession/);
-  assert.match(appJs, /case 'clear-project-filter':\s*\n\s*setProjectFilter\(null\);/);
+  assert.match(appJs, /case 'clear-project-filter':[\s\S]{0,100}setProjectFilter\(null\);/);
 });
 
 test('app.js：按项目拉会话（精确 project 参数 + 独立 limit），且与全局最近 50 条分开保存', () => {
@@ -147,15 +147,17 @@ test('app.js：按项目拉会话（精确 project 参数 + 独立 limit），�
 
 test('app.js：paintDashboard 使用项目会话作为 Sessions 栏数据源，并把选中项目传给项目卡', () => {
   assert.match(appJs, /const proj = project \? \(projectSessions\.project === project \? projectSessions : null\) : null;/);
-  assert.match(appJs, /const baseSessions = project \? projSessions : sessions;/);
-  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: project, mutedProjects \}\)/);
+  assert.match(appJs, /const baseSessions = project \? \(searching \? filterExactProject\(sessions, project\) : projSessions\) : sessions;/);
+  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: searching \? null : project, mutedProjects \}\)/);
   assert.match(appJs, /renderSessionFilter\(\{/);
   assert.match(appJs, /sessionFilter,/);
   assert.match(appJs, /正在筛出「\$\{esc\(project\)\}」的会话…/, '切换瞬间要给出加载态');
   assert.match(appJs, /「\$\{esc\(project\)\}」还没有已索引的会话/, '空态要说清是「项目没有会话」');
 });
 
-test('app.js：搜索与项目筛选叠加——补搜请求带 project，筛选变化作废旧补搜结果', () => {
+test('app.js：默认全局搜索，显式项目范围才带 project；范围变化作废旧补搜结果', () => {
+  assert.match(appJs, /const project = searching \? searchScopeProject : projectKey\(\);/);
+  assert.match(appJs, /const project = searchScopeProject;\s*if \(project\) params\.set\('project', project\);/);
   const setFn = appJs.slice(appJs.indexOf('function setProjectFilter(next)'), appJs.indexOf('// 当前有效查询词'));
   assert.match(setFn, /resetSearchState\(\)/, '筛选一变，旧的全库命中就不能再合并进列表');
   assert.match(setFn, /if \(searchKey\(\)\) scheduleFullSearch\(\);/, '有搜索词时按新作用域重搜');

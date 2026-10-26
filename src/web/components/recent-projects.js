@@ -2,7 +2,7 @@ import { esc, fmtTokens, timeAgo, chipColor, sourceKind, sourceLabel } from '../
 
 // 项目卡与会话卡刻意长得不一样（用户反馈「两栏混在一起分不清」）：
 //   · 项目 = workspace 身份 → 左侧**项目色徽标（双字母 monogram）+ 竖轨**，右侧聚合统计；
-//     卡片**底色**另按「来源 app（实例 harness）」区分（见 index.html 的 --src-*）；
+//     来源 app 由小标签着色，卡片底色仅在选中/悬停时强调；
 //   · 会话 = 一次对话     → 左侧**状态竖轨**（运行/完成/空闲），右侧状态 chip + 时间。
 // 两种卡的「第一视觉锚点」不同（徽标 vs 竖轨），扫视时不会串栏。
 // 这里每个字段都来自 dsh home 元数据（不可信输入），一律 esc；来源标识走白名单归一化。
@@ -33,8 +33,7 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
     const muted = mutedSet.has(p.project);
     const inst = homeById.get(p.homeId);
     const instName = inst ? (inst.alias || inst.homePath) : null;
-    const instColor = inst ? chipColor(p.homeId) : null;
-    // 来源 app：项目卡底色按它区分（dsh 蓝 / Codex 灰 / Claude Code 橙 / WorkBuddy 绿）。
+    // 来源 app：项目卡的小标签按它着色。
     // 取「该项目最新会话所在实例」的 harness —— 与卡片跳转目标、实例 chip 同一口径。
     // sourceKind 只返回白名单标识，可以安全进 data-source 属性。
     const source = sourceKind(inst?.harness);
@@ -68,7 +67,7 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
           <span class="card-time">${timeAgo(p.lastActivity)}</span>
         </div>
         <div class="meta project-meta">
-          ${instName ? `<span class="chip home-chip" style="background:${instColor.bg};color:${instColor.fg}" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
+          ${instName ? `<span class="chip home-chip" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
           ${p.historical ? '<span class="chip hist-chip" title="不在最近 7 天列表里，来自全库检索">历史</span>' : ''}
           ${muted
             // 已隐藏 = 可点按钮（点一下恢复显示）；未隐藏 = hover 才出现的「隐藏」按钮。
@@ -78,6 +77,7 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
             : `<button type="button" class="chip card-mute" data-action="toggle-mute-project" data-project="${esc(p.project)}"
                 title="默认隐藏该项目的会话（不再出现在 Recent Sessions；可随时恢复）">隐藏</button>`}
           <span class="project-stat"><b>${p.sessionCount}</b> session${p.sessionCount === 1 ? '' : 's'}</span>
+          <span class="project-last-active">${timeAgo(p.lastActivity)}</span>
           ${tokenHtml}
           ${p.sessionId ? '' : '<span class="chip">no sessions</span>'}
         </div>

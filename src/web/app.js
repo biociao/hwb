@@ -4,6 +4,8 @@ import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js
 import { renderWorkbench } from './components/workbench.js';
 import { renderRecentProjects } from './components/recent-projects.js';
 import { renderRecentSessions, renderSessionFilter } from './components/recent-sessions.js';
+import { SESSION_FILTERS, filterSessionState, renderSessionStatusFilter } from './components/session-state.js';
+import { renderSearchResults } from './components/search-results.js';
 import { readMutedProjects, writeMutedProjects, toggleMutedProject, splitMutedSessions, mutedNoteSpec, renderMutedNote, renderMutedIdleNote, DEFAULT_MUTED_PROJECTS } from './components/session-mute.js';
 import { filterRecent, filterExactProject, searchEmptyHtml, searchPendingHtml, mergeSearchResults, normalizeQuery } from './components/search-filter.js';
 import { connectedHomes, tabHomes } from './instance-state.js';
@@ -36,6 +38,8 @@ const themeMenu = document.getElementById('theme-menu');
 const searchInput = document.getElementById('search');
 const searchClear = document.getElementById('search-clear');
 const searchWrap = document.getElementById('search-wrap');
+const searchResults = document.getElementById('search-results');
+const searchScope = document.getElementById('search-scope');
 
 let showAddForm = false;
 let lastHomes = [];
@@ -44,6 +48,10 @@ let refreshSequence = 0;
 // 顶栏搜索的原始输入。不持久化：它是「当下想找什么」，刷新后回到未过滤状态，
 // 免得用户下次打开面对一个自己忘了的隐藏过滤器（与 sessionStorage 里的视图位置是两种语义）。
 let searchQuery = '';
+let searchScopeProject = null; // 显式指定的搜索范围；选择项目导航不会自动限制全局搜索。
+let searchOpen = false;
+let lastSearchResults = { projects: [], sessions: [] };
+let sessionStatusFilter = 'all';
 // 最近一轮拉到的原始列表 + 已连接实例集合。按键过滤直接复用它们（见 paintDashboard）：
 // 过滤只改「显示哪些行」，不该每敲一个字就重新打一次 /api/projects|sessions|usage。
 let lastLists = { projects: [], sessions: [], connectedIds: new Set() };
@@ -295,6 +303,8 @@ function showView() {
   // 搜索只作用于工作台的列表：实例视图（整页 iframe）里放着它没有意义，还会让人以为
   // 它能过滤 dsh 页面。输入值保留，切回工作台时继续生效。
   if (searchWrap) searchWrap.hidden = view.kind !== 'dashboard' || lastHomes.length === 0;
+  if (view.kind !== 'dashboard') searchOpen = false;
+  paintSearchResults();
   const activeId = view.kind === 'instance' ? view.homeId : null;
   if (activeId) frameOrder = touchFrameOrder(frameOrder, activeId);
   for (const [homeId, pane] of panes) {
@@ -421,8 +431,7 @@ function projectSessionsUrl(project) {
 //   · 先同步状态并立刻重画：点击当帧就能看到「选中 + 正在筛出…」，不等网络往返；
 //   · 再 refresh() 拉这个项目的会话（renderDashboard 会带上 project 参数）；
 //   · 清掉筛选时先用 lastLists.sessions（最近 50 条）立刻画出来，再靠 refresh() 校正。
-// 搜索词与项目筛选是**叠加**关系：筛选变了以后全库补搜的会话作用域也必须跟着变，
-// 否则会把上一个项目的历史命中合并进新列表 —— 所以这里重置补搜状态并重新排一次。
+// 浏览项目与全局搜索独立。切换项目时清掉旧补搜，显式搜索范围由 searchScopeProject 管理。
 function setProjectFilter(next) {
   const nextProject = typeof next?.project === 'string' && next.project ? next.project : null;
   if (projectKey() === nextProject) return; // 同一项目重复点击由调用方处理成「取消」
@@ -464,14 +473,15 @@ function fullSearchPending() {
 // 计数、空态、过滤全部由 filterRecent() 决定，所以几条路径不可能画出不同的过滤结果。
 function paintDashboard() {
   const { projects, sessions, connectedIds } = lastLists;
-  const project = projectKey();
+  const searching = !!searchKey();
+  const project = searching ? searchScopeProject : projectKey();
   // 项目筛选下的数据源：只认「与当前项目配对」的那份；刚切换/还没回来时是 loading，
   // 不能拿上一轮的数组顶替（否则会先闪一段别的项目的会话，再被新数据换掉）。
   const proj = project ? (projectSessions.project === project ? projectSessions : null) : null;
-  const projectLoading = !!project && (!proj || proj.status === 'loading');
-  const projectErrored = !!project && proj?.status === 'error';
+  const projectLoading = !searching && !!project && (!proj || proj.status === 'loading');
+  const projectErrored = !searching && !!project && proj?.status === 'error';
   const projSessions = project && proj?.status === 'done' ? proj.sessions : [];
-  const baseSessions = project ? projSessions : sessions;
+  const baseSessions = project ? (searching ? filterExactProject(sessions, project) : projSessions) : sessions;
   const full = fullSearchResult();
   // 最近列表优先，全库结果只补「最近列表里没有的」历史行（见 mergeSearchResults 的注释）。
   const lists = full
@@ -479,6 +489,11 @@ function paintDashboard() {
     : { projects, sessions: baseSessions };
   // 只渲染「已连接实例」的项目/会话；计数与渲染用同一份数组，避免分区头写着 12 但列表只有 5 行。
   const filtered = filterRecent({ projects: lists.projects, sessions: lists.sessions, connectedIds, query: searchQuery });
+  if (searching && project) {
+    filtered.projects = filtered.projects.filter((p) => p.project === project);
+    filtered.sessions = filterExactProject(filtered.sessions, project);
+  }
+  lastSearchResults = { projects: filtered.projects, sessions: filterSessionState(filtered.sessions) };
   // 默认静音项目：最后一道展示层过滤。项目筛选是显式选择（点开被隐藏项目就是要看它），
   // 或用户点了「显示」时覆盖默认隐藏；hidden 行数用于画「已隐藏 N 条 · 显示」提示。
   const mute = splitMutedSessions(filtered.sessions, {
@@ -486,14 +501,14 @@ function paintDashboard() {
     showMuted: showMutedSessions,
     projectFilter: project,
   });
-  const shownSessions = mute.visible;
+  const shownSessions = filterSessionState(mute.visible, sessionStatusFilter);
   const pending = fullSearchPending();
   // 过滤到 0 条时给「清除搜索」的出路；全库补搜还在路上时先说明「正在检索」。
   const projectsHtml = !filtered.connected
     ? '<div class="empty">连接实例后显示对应项目</div>'
     : (filtered.filtering && !filtered.projects.length)
       ? (pending ? searchPendingHtml('项目', searchQuery) : searchEmptyHtml('项目', searchQuery))
-      : renderRecentProjects(filtered.projects, lastHomes, { selectedProject: project, mutedProjects });
+      : renderRecentProjects(filtered.projects, lastHomes, { selectedProject: searching ? null : project, mutedProjects });
   // Sessions 栏的空态有优先级：未连接 → 项目会话加载中 → 加载失败 → 该项目确实没有会话 →
   // 匹配到的会话全被默认隐藏，最后才是搜索的「0 命中 / 正在全库检索」。项目本来就没有会话时
   // 提示「清除搜索」是误导（搜索不是原因，清掉也还是没有）。
@@ -503,12 +518,14 @@ function paintDashboard() {
       ? `<div class="empty">正在筛出「${esc(project)}」的会话…</div>`
       : projectErrored
         ? '<div class="empty">项目会话加载失败；可清除筛选回到最近会话</div>'
-        : (project && !projSessions.length)
+        : (!searching && project && !projSessions.length)
           ? `<div class="empty">「${esc(project)}」还没有已索引的会话</div>`
-          : (mute.hidden.length > 0 && !shownSessions.length)
+          : (mute.hidden.length > 0 && !mute.visible.length)
             // 全部被默认隐藏：交给下面的 mutedNote 说明（它带「显示」按钮），
             // 这里再画一句「没有匹配」会让人以为真的搜不到。
             ? ''
+            : (sessionStatusFilter !== 'all' && mute.visible.length > 0 && !shownSessions.length)
+              ? '<div class="empty search-empty">该状态下没有会话<button type="button" data-action="filter-session-status" data-status-filter="all">显示全部状态</button></div>'
             : (filtered.filtering && !shownSessions.length)
               ? (pending ? searchPendingHtml('会话', searchQuery) : searchEmptyHtml('会话', searchQuery))
               : renderRecentSessions(shownSessions, lastHomes);
@@ -526,7 +543,7 @@ function paintDashboard() {
   const mutedIdleNote = project ? '' : renderMutedIdleNote({ mutedProjects });
   // 项目筛选条：只在筛选时画；count 只报筛出来的条数（不是搜索的「命中/总数」）。
   // muted：该项目是否在默认静音列表里（显式点开时仍显示会话，但给一个「取消隐藏」入口）。
-  const sessionFilter = project && filtered.connected
+  const sessionFilter = !searching && project && filtered.connected
     ? renderSessionFilter({
       project,
       homeId: projectFilter.homeId,
@@ -547,14 +564,21 @@ function paintDashboard() {
     ? `<div class="search-more">仅显示最近 ${SEARCH_SESSION_LIMIT} 条会话，可用更精确的关键词缩小范围</div>` : '';
   // 项目会话被 limit 截断：明确说「只显示了这么多」，并指出继续定位的路径（顶栏搜索会按
   // 项目作用域去全库补搜，不受这个 limit 限制）。
-  const projectMore = project && proj?.status === 'done' && proj.truncated
+  const projectMore = !searching && project && proj?.status === 'done' && proj.truncated
     ? `<div class="search-more">该项目会话较多，仅显示最近 ${PROJECT_SESSION_LIMIT} 条；可用顶栏搜索继续定位更早的会话</div>` : '';
   // 草稿必须在重建之前取：下面这行 innerHTML 会把旧表单连同用户输入一起丢掉。
   const draft = captureAddFormDraft();
+  const openDetails = new Set([...dashboardEl.querySelectorAll('[data-instance-details][open]')].map((el) => el.dataset.instanceDetails));
+  const focusedStatus = document.activeElement?.dataset?.statusFilter;
+  const focusedDetails = document.activeElement?.closest?.('[data-instance-details]')?.dataset.instanceDetails;
+  const focusedDetailsAction = document.activeElement?.dataset?.action;
+  const scrolls = [...dashboardEl.querySelectorAll('.pane > .rows, .session-list')].map((el) => el.scrollTop);
   dashboardEl.innerHTML = renderWorkbench({
     projects: projectsHtml + projectsMore,
     sessions: sessionsHtml + projectMore + sessionsMore + mutedNote + mutedIdleNote,
     sessionFilter,
+    statusFilter: filtered.connected ? renderSessionStatusFilter(mute.visible, sessionStatusFilter) : '',
+    searching,
     projectCount: filtered.connected ? count(filtered.projects.length, filtered.totalProjects) : null,
     // 会话计数用「屏上实际可见行数」：默认隐藏的会话数由 mutedNote 单独说明，不从计数里消失得无声无息。
     sessionCount: filtered.connected ? count(shownSessions.length, shownSessions.length) : null,
@@ -562,6 +586,15 @@ function paintDashboard() {
     usage: renderUsageCard(lastUsage, usageDim, lastUsageKey ?? usagePeriod.key),
     logs: logPanelHtml(),
   });
+  dashboardEl.querySelectorAll('[data-instance-details]').forEach((el) => { el.open = openDetails.has(el.dataset.instanceDetails); });
+  dashboardEl.querySelectorAll('.pane > .rows, .session-list').forEach((el, i) => { el.scrollTop = scrolls[i] ?? 0; });
+  if (SESSION_FILTERS.some(([key]) => key === focusedStatus)) dashboardEl.querySelector(`[data-status-filter="${focusedStatus}"]`)?.focus({ preventScroll: true });
+  if (focusedDetails) {
+    const details = [...dashboardEl.querySelectorAll('[data-instance-details]')].find((el) => el.dataset.instanceDetails === focusedDetails);
+    const target = focusedDetailsAction ? [...(details?.querySelectorAll('button') ?? [])].find((el) => el.dataset.action === focusedDetailsAction) : details?.querySelector('summary');
+    target?.focus({ preventScroll: true });
+  }
+  paintSearchResults();
   fitTrendLabels(dashboardEl); // X 轴标签按实测宽度收边/去重叠（见 usage-card.js）
   logRefresh(); // 日志面板：重绘 + 同步过滤/跟随按钮激活态
   if (showAddForm) {
@@ -581,6 +614,36 @@ function paintDashboard() {
 // /api/search（store.searchAll）。这里只负责 DOM 状态（清除按钮）与「什么时候重画/请求」。
 function syncSearchChrome() {
   if (searchClear) searchClear.hidden = searchQuery === '';
+  if (searchScope) {
+    searchScope.hidden = !searchScopeProject;
+    searchScope.textContent = searchScopeProject ? `项目：${searchScopeProject} ×` : '';
+    searchScope.title = searchScopeProject ? `搜索范围：${searchScopeProject}；点击恢复全局搜索` : '';
+  }
+  searchWrap?.classList.toggle('has-scope', !!searchScopeProject);
+}
+
+function paintSearchResults() {
+  if (!searchResults) return;
+  searchResults.hidden = !searchOpen || !searchKey() || view.kind !== 'dashboard' || !lastHomes.length;
+  if (searchResults.hidden) return;
+  const html = renderSearchResults({ ...lastSearchResults, pending: fullSearchPending(), failed: searchState.status === 'error',
+    scope: searchScopeProject, selectedProject: projectKey(), truncated: !!(fullSearchResult()?.truncated.sessions || fullSearchResult()?.truncated.projects) });
+  // SSE 刷新内容不变时不重建节点，保留键盘焦点。
+  if (searchResults.innerHTML !== html) {
+    const focused = document.activeElement?.closest?.('.search-result');
+    const key = focused ? [focused.dataset.action, focused.dataset.homeId, focused.dataset.sessionId, focused.dataset.project] : null;
+    searchResults.innerHTML = html;
+    if (key) [...searchResults.querySelectorAll('.search-result')].find((el) => [el.dataset.action, el.dataset.homeId, el.dataset.sessionId, el.dataset.project].every((value, i) => value === key[i]))?.focus({ preventScroll: true });
+  }
+}
+
+function setSearchScope(project) {
+  searchScopeProject = typeof project === 'string' && project ? project : null;
+  resetSearchState();
+  syncSearchChrome();
+  scheduleFullSearch();
+  paintDashboard();
+  searchInput?.focus();
 }
 
 // 在途请求作废 + 取消还没发出去的防抖定时器。清空搜索框、切换查询词都要走这里。
@@ -613,9 +676,8 @@ function requestFullSearch(key) {
     projectLimit: String(SEARCH_PROJECT_LIMIT),
     sessionLimit: String(SEARCH_SESSION_LIMIT),
   });
-  // 项目筛选下的补搜只在该项目内找会话（项目结果不受限，见 store.searchAll 的注释）。
-  // 筛选变化会走 resetSearchState() 把 seq 推进，所以这里不必再单独记 project。
-  const project = projectKey();
+  // 默认全局搜索；只有显式搜索范围才收窄会话。范围变化先作废旧请求。
+  const project = searchScopeProject;
   if (project) params.set('project', project);
   api(`/api/search?${params}`)
     .then((body) => {
@@ -646,6 +708,7 @@ function requestFullSearch(key) {
 function setSearchQuery(value, { repaint = true } = {}) {
   const next = String(value ?? '');
   searchQuery = next;
+  searchOpen = true;
   // Esc / ✕ 是程序化改值：input 自己不会收到 input 事件，得手动同步。
   if (searchInput && searchInput.value !== next) searchInput.value = next;
   syncSearchChrome();
@@ -1135,12 +1198,37 @@ async function handleAction(e) {
         setSearchQuery('');
         searchInput?.focus();
         break;
+      case 'filter-session-status':
+        if (SESSION_FILTERS.some(([key]) => key === btn.dataset.statusFilter)) {
+          sessionStatusFilter = btn.dataset.statusFilter;
+          paintDashboard();
+        }
+        break;
+      case 'scope-search':
+        setSearchScope(btn.dataset.project);
+        break;
+      case 'clear-search-scope':
+        setSearchScope(null);
+        break;
+      case 'search-project':
+        // 搜索结果中的项目进入普通项目视图；退出搜索，避免项目名继续过滤会话标题。
+        setSearchQuery('');
+        searchScopeProject = null;
+        syncSearchChrome();
+        searchOpen = false;
+        setProjectFilter({ project: btn.dataset.project, homeId: btn.dataset.homeId, sessionId: btn.dataset.sessionId, workspaceId: btn.dataset.workspaceId });
+        paintDashboard();
+        break;
       case 'filter-project': {
         // 项目卡的唯一动作：把 Sessions 栏筛到这个项目（不再直接跳转实例）。
         // 再点一次同一个项目 = 取消筛选；「打开项目」仍由筛选条里的按钮提供。
         const project = btn.dataset.project;
         if (!project) break;
-        if (projectKey() === project) {
+        const wasSearching = !!searchKey();
+        searchScopeProject = null;
+        syncSearchChrome();
+        if (wasSearching) { setSearchQuery(''); searchOpen = false; }
+        if (projectKey() === project && !wasSearching) {
           setProjectFilter(null);
         } else {
           setProjectFilter({
@@ -1153,6 +1241,8 @@ async function handleAction(e) {
         break;
       }
       case 'clear-project-filter':
+        searchScopeProject = null;
+        syncSearchChrome();
         setProjectFilter(null);
         break;
       case 'toggle-mute-project': {
@@ -1400,18 +1490,41 @@ searchInput?.addEventListener('input', (e) => {
 });
 // type=search 的原生清除（部分浏览器）走 search 事件：统一同步状态。
 searchInput?.addEventListener('search', (e) => setSearchQuery(e.target.value));
+searchWrap?.addEventListener('focusin', () => { searchOpen = true; paintSearchResults(); });
+searchWrap?.addEventListener('focusout', (e) => {
+  if (!searchWrap.contains(e.relatedTarget)) { searchOpen = false; paintSearchResults(); }
+});
+document.addEventListener('click', (e) => {
+  if (!searchWrap?.contains(e.target)) { searchOpen = false; paintSearchResults(); }
+});
+searchResults?.addEventListener('keydown', (e) => {
+  if (e.isComposing) return;
+  if (e.key === 'Escape') { e.preventDefault(); searchInput?.focus(); searchOpen = false; paintSearchResults(); return; }
+  if (!['ArrowDown', 'ArrowUp'].includes(e.key)) return;
+  const buttons = [...searchResults.querySelectorAll('button')];
+  const index = buttons.indexOf(document.activeElement);
+  e.preventDefault();
+  const next = index + (e.key === 'ArrowDown' ? 1 : -1);
+  if (next < 0 || next >= buttons.length) searchInput?.focus();
+  else buttons[next].focus();
+});
 searchInput?.addEventListener('keydown', (e) => {
+  if (e.isComposing) return;
+  if (e.key === 'ArrowDown' && searchKey()) {
+    e.preventDefault(); searchOpen = true; paintSearchResults(); searchResults?.querySelector('button')?.focus(); return;
+  }
   if (e.key !== 'Escape') return;
   // Esc 语义：有内容 → 清空（仍留在搜索框里）；已清空 → 失焦，把键盘交回页面。
   if (searchQuery !== '') { e.preventDefault(); setSearchQuery(''); return; }
   searchInput.blur();
 });
-// 全局「/」聚焦搜索（GitHub 式）。不接管 Cmd/Ctrl+K —— 那是浏览器地址栏的既有快捷键，
-// 抢过来会让人以为浏览器坏了。焦点已在输入控件里时不劫持（用户可能真的想输入「/」）。
+// ⌘/Ctrl+K 与 / 聚焦工作台搜索；输入框内的普通 / 保留输入语义。
 document.addEventListener('keydown', (e) => {
-  if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.isComposing || e.altKey) return;
+  const shortcut = e.key.toLowerCase() === 'k' && (e.metaKey || e.ctrlKey);
+  if (!shortcut && (e.key !== '/' || e.metaKey || e.ctrlKey)) return;
   const target = e.target;
-  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+  if (!shortcut && target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
   if (view.kind !== 'dashboard' || !searchInput || searchWrap?.hidden) return;
   if (!modalEl.hidden) return; // 设置弹层里按「/」不该把焦点抢到背后的搜索框
   e.preventDefault();

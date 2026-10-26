@@ -47,7 +47,7 @@ test('项目卡与会话卡的第一视觉锚点不同：项目=身份徽标，�
   assert.doesNotMatch(p, /session-card/);
 });
 
-test('项目卡底色按 app 来源（实例 harness）区分：dsh / Codex / Claude Code / WorkBuddy / 未知', () => {
+test('项目卡的来源标签按 app（实例 harness）区分：dsh / Codex / Claude Code / WorkBuddy / 未知', () => {
   const homes = [
     { homeId: 'h-dsh', harness: 'dsh', alias: 'bee' },
     { homeId: 'h-codex', harness: 'codex', alias: 'Codex' },
@@ -65,7 +65,7 @@ test('项目卡底色按 app 来源（实例 harness）区分：dsh / Codex / Cl
   assert.match(html, /title="数据来源：Codex · 点击筛选该项目会话"/, 'title 说明底色的来源含义 + 点击语义');
 });
 
-test('index.html：项目卡按来源着色的 CSS 契约（明/暗主题各一套底色）', async () => {
+test('index.html：来源标签有明暗配色，项目卡保持中性，选中态独立强调', async () => {
   const { readFile } = await import('node:fs/promises');
   const css = await readFile(new URL('../src/web/index.html', import.meta.url), 'utf8');
   const sources = {
@@ -90,9 +90,9 @@ test('index.html：项目卡按来源着色的 CSS 契约（明/暗主题各一�
       assert.match(block, new RegExp(`${varName}:\\s*#[0-9a-f]{6}`), `深色主题缺少 ${varName}`);
     }
   }
-  // 项目卡的底色不能再写死成 panel：否则来源着色只剩 hover 时才可见
-  assert.doesNotMatch(css, /\.pane-projects \.rows > \.row\.card \{[^}]*background: var\(--panel\)/,
-    '项目卡底色应取 --card-bg（按来源），不能写死 --panel');
+  assert.match(css, /\.pane-projects \.rows > \.row\.card \{[^}]*background: transparent/);
+  assert.match(css, /\.project-card \.chip\.home-chip \{[^}]*background: var\(--card-bg\)/);
+  assert.match(css, /\.pane-projects \.rows > \.row\.card\.selected \{[^}]*background: var\(--accent-soft\)/);
 });
 
 test('sourceKind：来源别名归一化，未知值不会进 data-source', async () => {
@@ -119,8 +119,8 @@ test('分区头带身份 class 与计数；未传计数时不画空胶囊', () =
   assert.match(withCounts, /class="pane pane-projects"/);
   assert.match(withCounts, /class="pane pane-sessions"/);
   assert.match(withCounts, /class="pane pane-instances"/);
-  assert.match(withCounts, /Recent Projects<\/span><span class="pane-count">14</);
-  assert.match(withCounts, /Recent Sessions<\/span><span class="pane-count">50</);
+  assert.match(withCounts, /项目<\/span><span class="pane-count">14</);
+  assert.match(withCounts, /最近会话<\/span><span class="pane-count">50</);
 
   const withoutCounts = renderWorkbench({ projects: '', sessions: '', homes: '', usage: '', logs: '' });
   assert.doesNotMatch(withoutCounts, /pane-count/, '旧调用没传计数时不能出现 0/undefined 胶囊');

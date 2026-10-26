@@ -35,9 +35,9 @@ function versionChip(runtime) {
 // 「只读」占了状态位、时间口径一个是 checkedAt 一个是 lastIndexedAt）—— 这里统一成一段模板：
 //
 //   name（alias || serverId || homePath）
-//     chips: [<label> <version>](chip harness-<id>) [已就绪|路径缺失] [⚠ 域降级]…
-//     meta:  N projects  M sessions  索引 <timeAgo(lastIndexedAt)|尚未索引>
-//     actions: [打开 <label>](primary, local-tool-open) [重新索引] [⚙ 设置]
+//     chips: [已就绪|路径缺失] [⚠ 域降级]…
+//     meta:  N projects  M sessions; actions: [打开 <label>]
+//     details: [<label> <version>] 索引时间 [重新索引] [⚙ 设置]
 //
 // 「只读」是这类实例的类型说明，只写进身份 chip 的 title，不再占状态位。
 // 身份 chip 的 class 由 harness 白名单决定（harness-codex / harness-workbuddy / harness-dsh），
@@ -58,7 +58,6 @@ function localToolCard(h) {
       <div class="t">
         <span class="name">${esc(h.alias || h.serverId || h.homePath)}</span>
         <span class="chips">
-          <span class="chip harness-${kind}" title="${title}">${identity}</span>
           <span class="chip ${ready ? 'ok' : 'bad'}">${ready ? '已就绪' : '路径缺失'}</span>
           ${degradedChips(h.degraded)}
         </span>
@@ -66,13 +65,17 @@ function localToolCard(h) {
       <div class="meta">
         <span>${Number(h.workspaceCount) || 0} projects</span>
         <span>${Number(h.sessionCount) || 0} sessions</span>
-        <span>${h.lastIndexedAt ? `索引 ${timeAgo(h.lastIndexedAt)}` : '尚未索引'}</span>
       </div>
       <div class="meta actions">
         <button class="primary" data-action="local-tool-open" data-home-id="${id}">打开 ${label}</button>
+      </div>
+      <details class="instance-details" data-instance-details="${id}"><summary>管理与详情</summary>
+        <div class="meta"><span class="chip harness-${kind}" title="${title}">${identity}</span><span>${h.lastIndexedAt ? `索引 ${timeAgo(h.lastIndexedAt)}` : '尚未索引'}</span></div>
+        <div class="meta actions">
         <button data-action="reindex" data-home-id="${id}">重新索引</button>
         <button data-action="settings" data-home-id="${id}" title="编辑实例配置">⚙ 设置</button>
-      </div>
+        </div>
+      </details>
     </div>`;
 }
 
@@ -86,17 +89,19 @@ export function renderInstanceGrid(homes) {
     return `<div class="row">
       <div class="t">
         <span class="name">${esc(h.alias || h.serverId || h.homePath)}</span>
-        <span class="chips">${versionChip(h.runtime)}<span class="chip ${running ? 'ok' : attached ? 'warn' : ''}">${running ? '已连接' : attached ? '连接不可达' : '未连接'}</span>${degradedChips(h.degraded)}</span>
+        <span class="chips"><span class="chip ${running ? 'ok' : attached ? 'warn' : ''}">${running ? '已连接' : attached ? '连接不可达' : '未连接'}</span>${degradedChips(h.degraded)}</span>
       </div>
-      ${attached ? `<div class="meta">当前通道：${esc(currentChannel(h))}</div>` : ''}
-      ${running ? `<div class="meta"><span>${h.workspaceCount} projects</span><span>${h.sessionCount} sessions</span><span>响应 ${h.runtime.latencyMs ?? '—'} ms</span><span>检查 ${timeAgo(h.runtime.checkedAt)}</span></div>` : ''}
       <div class="meta actions">
         ${attached
           ? `<button data-action="disconnect" data-home-id="${id}">断开</button>`
           : `<button class="primary" data-action="connect" data-home-id="${id}">连接</button>`}
-        ${(h.endpoints?.length || 0) > 1 ? `<button data-action="choose-channel" data-home-id="${id}">切换</button>` : ''}
-        <button data-action="settings" data-home-id="${id}" title="编辑实例配置">⚙ 设置</button>
       </div>
+      <details class="instance-details" data-instance-details="${id}"><summary>管理与详情</summary>
+        <div class="meta">${versionChip(h.runtime)}</div>
+        ${attached ? `<div class="meta">当前通道：${esc(currentChannel(h))}</div>` : ''}
+        ${running ? `<div class="meta"><span>${Number(h.workspaceCount) || 0} projects</span><span>${Number(h.sessionCount) || 0} sessions</span><span>响应 ${esc(h.runtime.latencyMs ?? '—')} ms</span><span>检查 ${timeAgo(h.runtime.checkedAt)}</span></div>` : ''}
+        <div class="meta actions">${(h.endpoints?.length || 0) > 1 ? `<button data-action="choose-channel" data-home-id="${id}">切换</button>` : ''}<button data-action="settings" data-home-id="${id}" title="编辑实例配置">⚙ 设置</button></div>
+      </details>
     </div>`;
   }).join('')}</div>`;
 }

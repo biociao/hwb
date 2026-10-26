@@ -212,7 +212,7 @@ test('recent-sessions：带 homes 时显示实例 chip（alias 优先，缺省�
 
   assert.match(html, /class="chip home-chip"[^>]*>Codex 本机</);
   assert.match(html, /class="chip home-chip"[^>]*>\/Users\/test\/\.dsh</);
-  assert.match(html, /class="chip status idle"[^>]*>Codex</, 'Codex 会话状态 chip 文本为 Codex');
+  assert.match(html, /class="chip status unknown"[^>]*>[\s\S]*?状态未知<\/span>/, 'Codex 保存记录不能证明运行状态');
   assert.match(html, /class="chip proj-chip"/);
 });
 

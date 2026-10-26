@@ -90,6 +90,7 @@ function skeleton(html) {
     .replace(/<span>\d+ sessions<\/span>/, '<span>M sessions</span>')
     .replace(/<span>索引 [^<]*<\/span>/, '<span>索引 TIME</span>')
     .replace(/data-home-id="[^"]*"/g, 'data-home-id="ID"')
+    .replace(/data-instance-details="[^"]*"/g, 'data-instance-details="ID"')
     .replace(/打开 (?:Codex|WorkBuddy|dsh)<\/button>/, '打开 TOOL</button>');
 }
 

@@ -86,7 +86,7 @@ test('app.js：从 localStorage 读默认静音列表，并把「显示已隐藏
 
 test('app.js：paintDashboard 在 filterRecent 之后切分隐藏行，计数只算可见行，提示条挂在列表底部', () => {
   assert.match(appJs, /const mute = splitMutedSessions\(filtered\.sessions, \{[\s\S]{0,160}?mutedProjects,[\s\S]{0,160}?showMuted: showMutedSessions,[\s\S]{0,160}?projectFilter: project,/);
-  assert.match(appJs, /const shownSessions = mute\.visible;/);
+  assert.match(appJs, /const shownSessions = filterSessionState\(mute\.visible, sessionStatusFilter\);/);
   assert.match(appJs, /renderRecentSessions\(shownSessions, lastHomes\)/);
   // 默认隐藏行不算进分区计数；隐藏了多少由 mutedNote 明说，不能无声消失。
   assert.match(appJs, /sessionCount: filtered\.connected \? count\(shownSessions\.length, shownSessions\.length\) : null/);
@@ -96,7 +96,7 @@ test('app.js：paintDashboard 在 filterRecent 之后切分隐藏行，计数只
   assert.match(appJs, /const mutedIdleNote = project \? '' : renderMutedIdleNote\(\{ mutedProjects \}\);/);
   assert.match(appJs, /sessions: sessionsHtml \+ projectMore \+ sessionsMore \+ mutedNote \+ mutedIdleNote/);
   // 全部被隐藏时不能再画「没有匹配」——那句会和提示条互相矛盾。
-  assert.match(appJs, /\(mute\.hidden\.length > 0 && !shownSessions\.length\)/);
+  assert.match(appJs, /\(mute\.hidden\.length > 0 && !mute\.visible\.length\)/);
 });
 
 test('app.js：隐藏项目在筛选视图里点隐藏会回到默认视图（否则显式视图必然显示全部会话，看起来没生效）', () => {
@@ -115,7 +115,7 @@ test('app.js：显示 / 恢复隐藏 / 恢复默认静音三个动作', () => {
 });
 
 test('app.js：项目卡拿到静音列表、筛选条拿到 muted 标记', () => {
-  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: project, mutedProjects \}\)/);
+  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: searching \? null : project, mutedProjects \}\)/);
   assert.match(appJs, /muted: mutedProjects\.includes\(project\)/);
 });
 
