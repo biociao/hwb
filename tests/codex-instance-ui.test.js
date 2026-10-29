@@ -156,7 +156,7 @@ test('instance-grid(dsh)：dsh 卡片行为完全不变', () => {
 });
 
 // ── RECENT PROJECTS ─────────────────────────────────────────────────
-test('recent-projects：Codex 行带 data-workspace-id，并用 totalTokens 回退（无 in/out 拆分）', () => {
+test('recent-projects：Codex 行保留 workspace 跳转与来源，不展示 token 用量', () => {
   const html = renderRecentProjects([
     {
       homeId: 'cccccccccccccccc', workspaceId: 'local-86d51', project: 'PUMCH-isowast',
@@ -167,21 +167,17 @@ test('recent-projects：Codex 行带 data-workspace-id，并用 totalTokens 回�
 
   assert.match(html, /data-workspace-id="local-86d51"/);
   assert.match(html, /data-source="codex"/, 'Codex 项目卡按来源着灰底');
-  assert.match(html, /total 717\.0M tokens/);
-  assert.match(html, /title="Codex 只提供会话累计 token，无输入\/输出拆分"/);
-  assert.doesNotMatch(html, /in 0|out 0/, 'Codex 没有输入/输出拆分，不能渲染成 0');
+  assert.doesNotMatch(html, /project-tokens|tokens|in 0|out 0/);
 });
 
-test('recent-projects：dsh 行维持 in/out；项目/workspaceId 文本一律转义', () => {
+test('recent-projects：dsh 行不展示 token；项目/workspaceId 文本一律转义', () => {
   const dsh = renderRecentProjects([
     {
       homeId: 'aaaaaaaaaaaaaaaa', workspaceId: 'w1', project: 'proj', sessionId: 's1', lastActivity: null,
       sessionCount: 2, inputTokens: 1500, outputTokens: 300, totalTokens: 0,
     },
   ]);
-  assert.match(dsh, /in 1\.5k/);
-  assert.match(dsh, /out 300/);
-  assert.doesNotMatch(dsh, /total .* tokens/);
+  assert.doesNotMatch(dsh, /project-tokens|tokens|in 1\.5k|out 300/);
 
   const evil = renderRecentProjects([
     {

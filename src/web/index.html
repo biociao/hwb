@@ -22,13 +22,13 @@
       --sunken: #efede8; --tooltip-bg: #fdfdfc; --scroll: #cfcbc2; --code-fg: #3a3f47;
       --proj-bg: #f3ecdd; --proj-fg: #7d6420; --overlay: rgba(28,26,22,.38);
       /* Projects 来源标签：按「数据来源 app」（实例 harness）区分 ——
-         dsh 蓝 / Codex 灰 / Claude Code 橙 / WorkBuddy 绿 / 未识别 紫。
+         dsh 蓝 / Codex 暖米 / Claude Code 橙 / WorkBuddy 绿 / 未识别 紫。
          浅色主题 = 极浅底 + 同色细描边；深色主题各自换一套。 */
-      --src-dsh: #e8eef8; --src-dsh-line: #d3dded;
-      --src-codex: #ececea; --src-codex-line: #dbdbd6;
-      --src-claude: #f8ecdf; --src-claude-line: #ecd8c3;
-      --src-workbuddy: #e7f1e7; --src-workbuddy-line: #d2e3d1;
-      --src-other: #efeaf4; --src-other-line: #ded4e8;
+      --src-dsh: #e1ecfb; --src-dsh-line: #b7cbed;
+      --src-codex: #f3eadb; --src-codex-line: #d9c6a8;
+      --src-claude: #f8e2d0; --src-claude-line: #e3bb99;
+      --src-workbuddy: #e0f0e3; --src-workbuddy-line: #accfb5;
+      --src-other: #eee3f5; --src-other-line: #cbb2dd;
       --log-scope: #3d7a6e; --log-warn-msg: #8f6d24; --log-error-msg: #96423a;
       --dot-ring: #fdfdfc; --seg-out: #5d8a72; --seg-hit: #5a8a94; --seg-write: #b08a3e;
       --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
@@ -43,11 +43,11 @@
       --ok: #6fae8f; --warn: #c9a35c; --bad: #c97b72;
       --sunken: #1e2026; --tooltip-bg: #22252c; --scroll: #3a3e48; --code-fg: #b3b0a8;
       --proj-bg: #34301f; --proj-fg: #c9b06a; --overlay: rgba(5,6,8,.62);
-      --src-dsh: #1f2734; --src-dsh-line: #2d394b;
-      --src-codex: #26272a; --src-codex-line: #35363a;
-      --src-claude: #2c241b; --src-claude-line: #3d3123;
-      --src-workbuddy: #1f2a20; --src-workbuddy-line: #2c3a2e;
-      --src-other: #262230; --src-other-line: #372f45;
+      --src-dsh: #202f47; --src-dsh-line: #3b567c;
+      --src-codex: #3a3126; --src-codex-line: #66543c;
+      --src-claude: #412e24; --src-claude-line: #73513b;
+      --src-workbuddy: #243b2c; --src-workbuddy-line: #40684d;
+      --src-other: #35293f; --src-other-line: #5f4475;
       --log-scope: #7fae9f; --log-warn-msg: #c9b184; --log-error-msg: #d3988f;
       --dot-ring: #1b1d22; --seg-out: #6f9a82; --seg-hit: #6f9aa4; --seg-write: #bfa05c;
     }
@@ -61,11 +61,11 @@
         --ok: #6fae8f; --warn: #c9a35c; --bad: #c97b72;
         --sunken: #1e2026; --tooltip-bg: #22252c; --scroll: #3a3e48; --code-fg: #b3b0a8;
         --proj-bg: #34301f; --proj-fg: #c9b06a; --overlay: rgba(5,6,8,.62);
-        --src-dsh: #1f2734; --src-dsh-line: #2d394b;
-        --src-codex: #26272a; --src-codex-line: #35363a;
-        --src-claude: #2c241b; --src-claude-line: #3d3123;
-        --src-workbuddy: #1f2a20; --src-workbuddy-line: #2c3a2e;
-        --src-other: #262230; --src-other-line: #372f45;
+        --src-dsh: #202f47; --src-dsh-line: #3b567c;
+        --src-codex: #3a3126; --src-codex-line: #66543c;
+        --src-claude: #412e24; --src-claude-line: #73513b;
+        --src-workbuddy: #243b2c; --src-workbuddy-line: #40684d;
+        --src-other: #35293f; --src-other-line: #5f4475;
         --log-scope: #7fae9f; --log-warn-msg: #c9b184; --log-error-msg: #d3988f;
         --dot-ring: #1b1d22; --seg-out: #6f9a82; --seg-hit: #6f9aa4; --seg-write: #bfa05c;
       }
@@ -205,7 +205,7 @@
     .card-time { flex: none; color: var(--dim); font-size: 11px; white-space: nowrap;
       font-variant-numeric: tabular-nums; }
 
-    /* 项目卡：徽标 + 聚合统计（会话数 / token）。项目名是粗体、单行；数字右对齐成「仪表页」。 */
+    /* 项目卡：身份徽标 + 全部来源标签 + 会话数，不展示 token 用量。 */
     .project-card { --card-accent: var(--proj-fg); --card-tint: var(--proj-bg); }
     /* 项目卡的小标签按数据来源 app（实例 harness）区分，徽标仍是项目身份色：
          dsh 蓝 · Codex 灰 · Claude Code 橙 · WorkBuddy 绿 · 未识别 紫。
@@ -226,26 +226,22 @@
     .project-stat { color: var(--dim); font-size: 11px; white-space: nowrap; }
     .project-stat b { color: var(--fg); font-weight: 600; font-size: 12px;
       font-variant-numeric: tabular-nums; }
-    .project-tokens { margin-left: auto; display: inline-flex; gap: 8px; color: var(--dim);
-      font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
-    /* —— Projects 列：每个项目一个独立 box（用户确认的方案 A）——
-       只作用于 Projects 栏；Sessions 保持连续列表 + 状态轨，两栏形态继续分化。
-       默认无大面积来源底色，以悬停和选中态表达导航位置。 */
-    .pane-projects .rows { padding: 6px 0; display: flex; flex-direction: column; gap: 4px; }
+    /* 项目用独立的身份底色和边界；来源标签与会话底色共用 app 配色。 */
+    .pane-projects .rows { padding: 6px 0; display: flex; flex-direction: column; gap: 7px; }
     .pane-projects .rows > .row.card { position: relative; overflow: hidden;
       /* 列表是「固定高度 + 滚动」的 flex 列：卡片必须不收缩，否则会被压扁（实测压到 22px），
          滚动交给容器。 */
       flex: 0 0 auto;
-      padding: 10px 12px 10px 15px;
-      border-color: transparent; border-radius: 8px;
-      background: transparent; box-shadow: none;
+      padding: 10px 12px;
+      border-color: color-mix(in srgb, var(--card-accent) 32%, var(--border)); border-radius: 8px;
+      background: var(--card-tint); box-shadow: none;
       transition: background .12s, border-color .12s; }
     /* 盒子之间由 gap 控制，不能叠加 .row.card + .row.card 的 margin-top */
     .pane-projects .rows > .row.card + .row.card { margin-top: 0; }
     /* 悬停与选中分别表达临时交互和当前项目。 */
     .pane-projects .rows > .row.card:hover {
-      background: var(--hover); border-color: var(--border); }
+      background: color-mix(in srgb, var(--card-tint) 90%, var(--fg)); border-color: var(--card-accent); }
     /* 竖轨贴住盒子左边缘：DOM 里那个 .card-rail 从内容流改为绝对定位（不新增元素） */
     .pane-projects .rows > .row.card > .card-rail { position: absolute; left: 0; top: 0; bottom: 0;
       width: 3px; border-radius: 8px 0 0 8px; opacity: 0; }
@@ -257,32 +253,38 @@
     /* 选中（正在筛选）的项目卡：常驻强调色描边 + 左侧竖轨变实，
        与 hover 的临时高亮区分开 —— 用户要能一眼看出「Sessions 栏是按哪个项目筛的」。 */
     .pane-projects .rows > .row.card.selected { border-color: var(--accent-line);
-      background: var(--accent-soft); box-shadow: none; }
+      background: var(--card-tint); box-shadow: inset 0 0 0 2px var(--accent); }
     .pane-projects .rows > .row.card.selected > .card-rail {
       background: var(--accent); opacity: 1; }
 
     /* 会话卡：左侧竖轨随状态变色；标题常规字重（运行中加粗），id 缩到尾部 6 位。 */
     .pane-sessions .rows { padding: 8px 12px; }
-    .row.session-card { padding: 14px 12px 14px 0; border-color: var(--border); border-radius: 8px; background: var(--panel); }
-    .row.session-card + .row.session-card { margin-top: 9px; }
+    .session-card[data-source="dsh"] { --session-bg: var(--src-dsh); --session-line: var(--src-dsh-line); }
+    .session-card[data-source="codex"] { --session-bg: var(--src-codex); --session-line: var(--src-codex-line); }
+    .session-card[data-source="claude-code"] { --session-bg: var(--src-claude); --session-line: var(--src-claude-line); }
+    .session-card[data-source="workbuddy"] { --session-bg: var(--src-workbuddy); --session-line: var(--src-workbuddy-line); }
+    .session-card[data-source="other"] { --session-bg: var(--src-other); --session-line: var(--src-other-line); }
+    .row.session-card { gap: 8px; padding: 8px 10px 8px 0; border-color: var(--session-line, var(--border)); border-radius: 7px; background: var(--session-bg, var(--panel)); }
+    .row.session-card + .row.session-card { margin-top: 6px; }
+    .row.session-card:hover, .row.session-card.hl-project { background: color-mix(in srgb, var(--session-bg, var(--panel)) 92%, var(--fg)); border-color: var(--accent-line); }
     .session-card > .card-rail { flex-basis: 4px; opacity: 1; border-radius: 4px; }
-    .row.session-card .t { align-items: flex-start; gap: 16px; }
+    .row.session-card .t { align-items: flex-start; gap: 10px; }
     .row.session-card .name { font-size: 14px; font-weight: 500; white-space: normal; overflow-wrap: anywhere;
-      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; line-height: 1.6; }
-    .session-card[data-status="running"] { background: color-mix(in srgb, var(--ok) 7%, var(--panel)); border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
+      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; line-height: 1.45; }
+    .session-card[data-status="running"] { border-left-color: var(--ok); }
     .session-card[data-status="running"] .name { font-weight: 650; }
     .session-card[data-status="running"] .card-rail { background: var(--ok); }
     .session-card[data-status="completed"] .card-rail { background: var(--accent); }
     .session-card[data-status="idle"] .card-rail, .session-card[data-status="unknown"] .card-rail { background: transparent; }
-    .session-card .meta { align-items: center; margin-top: 8px; padding-right: 4px; }
+    .session-card .meta { align-items: center; gap: 4px 8px; margin-top: 4px; padding-right: 0; }
     /* 会话卡里的实例 chip 降级为「描边弱提示」：项目色 chip 才是这一行要读的身份信息，
        与项目卡「实例是彩色 chip」形成又一处形态差异。 */
     .session-card .chip.home-chip { background: transparent; border: 1px solid var(--border);
       color: var(--dim); padding: 0 7px; }
     .sid { margin-left: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 10.5px; color: var(--dim); opacity: .85; white-space: nowrap; }
-    .context-usage { display: flex; align-items: center; gap: 8px; margin-top: 9px; color: var(--dim); font-size: 11px; }
-    .context-usage .pressure { width: 100px; max-width: 35%; height: 3px; margin: 0; }
+    .context-usage { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; white-space: nowrap; }
+    .context-usage .pressure { width: 44px; height: 3px; margin: 0; }
     .context-usage .pressure > i { background: var(--dim); }
     .context-usage.warn { color: var(--warn); } .context-usage.bad { color: var(--bad); }
     .session-secondary { color: var(--dim); font-size: 11px; }
@@ -291,9 +293,16 @@
     .session-status-filter button span { font-variant-numeric: tabular-nums; opacity: .8; }
     .session-status-filter button[aria-pressed="true"] { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
     .session-order { margin-left: auto; color: var(--dim); font-size: 11px; }
-    .project-card .chip.home-chip { background: var(--card-bg); border: 1px solid var(--card-line); color: var(--dim); }
-    .pane-projects .project-tokens { flex-basis: 100%; margin-left: 0; }
+    .chip.home-chip[data-source="dsh"] { --source-bg: var(--src-dsh); --source-line: var(--src-dsh-line); }
+    .chip.home-chip[data-source="codex"] { --source-bg: var(--src-codex); --source-line: var(--src-codex-line); }
+    .chip.home-chip[data-source="claude-code"] { --source-bg: var(--src-claude); --source-line: var(--src-claude-line); }
+    .chip.home-chip[data-source="workbuddy"] { --source-bg: var(--src-workbuddy); --source-line: var(--src-workbuddy-line); }
+    .chip.home-chip[data-source="other"] { --source-bg: var(--src-other); --source-line: var(--src-other-line); }
+    .project-card .chip.home-chip { background: var(--source-bg, var(--card-bg)); border: 1px solid var(--source-line, var(--card-line)); color: var(--fg); white-space: normal; overflow-wrap: anywhere; }
+    .project-sources { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
     .pane-projects .project-meta { gap: 5px 10px; }
+    .project-meta .project-last-active { order: 1; }
+    .project-meta button { order: 2; margin-left: auto; }
     .pane-projects .project-badge { width: 26px; height: 26px; font-size: 10px; }
     .pane-projects .card-time { display: none; }
     .pane-instances > .rows { padding: 0 6px; }
@@ -317,9 +326,9 @@
     .row .meta { color: var(--dim); font-size: 12px; margin-top: 2px;
                  display: flex; gap: 10px; flex-wrap: wrap; }
     /* 会话卡：状态 chip 与其下方的活跃时间组成右对齐列 */
-    .row .status-col { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 100px; }
-    .row .status-col .active-time { color: var(--dim); font-size: 11px; line-height: 1;
-                                    white-space: nowrap; }
+    .row .status-col { display: flex; align-items: flex-start; justify-content: flex-end; flex: 0 0 88px; }
+    .session-meta .active-time { color: var(--dim); font-size: 11px; white-space: nowrap; margin-left: auto; }
+    .session-meta .sid { margin-left: 0; }
     .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
             background: var(--panel-2); color: var(--accent); }
     .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--bad); }
@@ -327,7 +336,7 @@
     .chip.ver { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     /* 会话状态 chip：图标 + 文本，运行中为实心强调，未知为虚线描边。
        nowrap：RECENT SESSIONS 右侧是窄列，标签（如「已保存」）被折成两行会撑高整行。 */
-    .chip.status { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 4px 10px;
+    .chip.status { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 2px 8px;
       border-radius: 6px; font-size: 12px; font-weight: 650; white-space: nowrap; }
     .status-symbol { font-size: 11px; font-weight: 700; }
     .chip.status.run { color: var(--panel); background: var(--ok); }
@@ -504,8 +513,8 @@
       .session-order { display: none; }
     }
     @media (max-width: 420px) {
-      .row.session-card .t { flex-direction: column; gap: 8px; }
-      .row .status-col { flex: none; flex-direction: row; align-items: center; }
+      .row.session-card .t { gap: 8px; }
+      .row .status-col { flex: 0 0 auto; }
       .sid { display: none; }
     }
 

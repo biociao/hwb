@@ -1,4 +1,4 @@
-import { esc, timeAgo, chipColor } from '../store.js';
+import { esc, timeAgo, chipColor, sourceKind } from '../store.js';
 import { sessionState, sessionStatusChip } from './session-state.js';
 
 // 上下文用量是容量指标，不是任务完成进度。
@@ -72,7 +72,7 @@ export function renderRecentSessions(sessions, homes = []) {
     const status = sessionState(s);
     return `
     <div class="row clickable card session-card" role="button" tabindex="0" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}"
-         data-status="${status.kind}"
+         data-status="${status.kind}" data-source="${sourceKind(inst?.harness)}"
          data-session-id="${esc(s.sessionId)}" data-title="${esc(s.title || '')}" data-project="${esc(s.project ?? '')}"
          title="点击钻入该会话">
       <span class="card-rail" aria-hidden="true"></span>
@@ -81,18 +81,18 @@ export function renderRecentSessions(sessions, homes = []) {
           <span class="name session-title" title="${esc(s.title || s.workspaceTitle || s.project || s.sessionId)}">${esc(s.title || s.workspaceTitle || s.project || s.sessionId)}</span>
           <span class="status-col">
             ${sessionStatusChip(s)}
-            <span class="active-time" title="最近活动时间，并非状态观测时间">${timeAgo(s.lastActivity)}</span>
           </span>
         </div>
         <div class="meta session-meta">
           ${s.project ? `<span class="chip proj-chip" style="background:${projColor.bg};color:${projColor.fg}">${esc(s.project)}</span>` : '<span class="chip">unknown</span>'}
           ${instName ? `<span class="chip home-chip" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
           ${status.subagents > 0 ? `<span class="session-secondary">${status.subagents} 子agent</span>` : ''}
-          ${status.saved ? '<span class="session-secondary">已保存 · 仅索引信息</span>' : ''}
+          ${status.saved ? '<span class="session-secondary" title="仅索引信息，不能证明执行状态">已保存</span>' : ''}
           ${s.historical ? '<span class="chip hist-chip" title="不在最近 50 条会话里，来自全库检索">历史</span>' : ''}
+          ${pressureBar(s.contextPressure)}
+          <span class="active-time" title="最近活动时间，并非状态观测时间">${timeAgo(s.lastActivity)}</span>
           <span class="sid" title="session ${esc(s.sessionId)}">#${esc(shortSessionId(s.sessionId))}</span>
         </div>
-        ${pressureBar(s.contextPressure)}
       </div>
     </div>`;
   }).join('')}</div>`;

@@ -155,6 +155,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_home ON sessions(homeId);
 -- 期间**整个服务停住**（并发探针实测最大停顿 9,758ms）。加上它之后：35,340ms → 43ms、
 -- 整个查询 → 1,224ms。测试规模的对照（20k 会话 / 4k workspace）：368ms → 6ms。
 CREATE INDEX IF NOT EXISTS idx_sessions_home_ws ON sessions(homeId, workspaceId);
+CREATE INDEX IF NOT EXISTS idx_workspaces_project_home ON workspaces(project, homeId);
 `;
 
 // 把「N 天前」算成 ISO 时间戳。上限 100 年：既覆盖任何合理查询，也保证结果一定落在
@@ -1003,6 +1004,28 @@ export class IndexStore {
     };
   }
 
+  // 来源身份不受 Recent 的时间窗/条数限制：旧会话及尚无会话的活动 workspace 也能证明来源。
+  // 批量按项目查询，避免从最近 50 条会话猜来源、或逐卡发请求；仍受数据源作用域约束。
+  #withProjectHomes(projects, scope) {
+    if (!projects.length) return projects;
+    const names = JSON.stringify(projects.map((p) => p.project));
+    const rows = this.db.prepare(
+      `WITH wanted AS (SELECT value AS project FROM json_each(?))
+       SELECT s.project, s.homeId FROM sessions s JOIN wanted w ON w.project = s.project
+       WHERE (? IS NULL OR s.homeId IN (SELECT value FROM json_each(?)))
+       UNION
+       SELECT p.project, p.homeId FROM workspaces p JOIN wanted w ON w.project = p.project
+       WHERE p.archived = 0 AND (? IS NULL OR p.homeId IN (SELECT value FROM json_each(?)))
+       ORDER BY 1, 2`
+    ).all(names, scope, scope, scope, scope);
+    const byProject = new Map();
+    for (const row of rows) {
+      if (!byProject.has(row.project)) byProject.set(row.project, new Set());
+      byProject.get(row.project).add(row.homeId);
+    }
+    return projects.map((p) => ({ ...p, homeIds: [...new Set([p.homeId, ...(byProject.get(p.project) ?? [])])].filter(Boolean) }));
+  }
+
   // Recent projects: cross-instance, active within `days`, ordered by last activity (§7.1).
   // 每个 project 附带"它所属的实例 + 该 project 最新会话"，供点击直接跳转。
   //
@@ -1056,7 +1079,7 @@ export class IndexStore {
     for (const w of orphanWs) {
       if (!seen.has(w.project)) { seen.add(w.project); projects.push(w); }
     }
-    return projects.slice(0, int(limit, 20));
+    return this.#withProjectHomes(projects.slice(0, int(limit, 20)), scope);
   }
 
   getSession(homeId, sessionId) {
@@ -1174,7 +1197,7 @@ export class IndexStore {
     ).all(scope, scope, project, project, needleLower, needleLower, needleLower);
 
     return {
-      projects: projects.slice(0, pl),
+      projects: this.#withProjectHomes(projects.slice(0, pl), scope),
       sessions: sessionRows.slice(0, sl).map(hydrateSessionRow),
       truncated: { projects: projects.length > pl, sessions: sessionRows.length > sl },
     };

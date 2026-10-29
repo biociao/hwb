@@ -65,7 +65,7 @@ test('项目卡的来源标签按 app（实例 harness）区分：dsh / Codex / 
   assert.match(html, /title="数据来源：Codex · 点击筛选该项目会话"/, 'title 说明底色的来源含义 + 点击语义');
 });
 
-test('index.html：来源标签有明暗配色，项目卡保持中性，选中态独立强调', async () => {
+test('index.html：来源标签有明暗配色，项目卡有独立底色和选中轮廓', async () => {
   const { readFile } = await import('node:fs/promises');
   const css = await readFile(new URL('../src/web/index.html', import.meta.url), 'utf8');
   const sources = {
@@ -90,9 +90,9 @@ test('index.html：来源标签有明暗配色，项目卡保持中性，选中�
       assert.match(block, new RegExp(`${varName}:\\s*#[0-9a-f]{6}`), `深色主题缺少 ${varName}`);
     }
   }
-  assert.match(css, /\.pane-projects \.rows > \.row\.card \{[^}]*background: transparent/);
-  assert.match(css, /\.project-card \.chip\.home-chip \{[^}]*background: var\(--card-bg\)/);
-  assert.match(css, /\.pane-projects \.rows > \.row\.card\.selected \{[^}]*background: var\(--accent-soft\)/);
+  assert.match(css, /\.pane-projects \.rows > \.row\.card \{[^}]*background: var\(--card-tint\)/);
+  assert.match(css, /\.project-card \.chip\.home-chip \{[^}]*background: var\(--source-bg, var\(--card-bg\)\)/);
+  assert.match(css, /\.pane-projects \.rows > \.row\.card\.selected \{[^}]*box-shadow: inset 0 0 0 2px var\(--accent\)/);
 });
 
 test('sourceKind：来源别名归一化，未知值不会进 data-source', async () => {
@@ -152,13 +152,11 @@ test('新结构仍逐字段转义（徽标/monogram、短 id、title 属性都�
   assert.match(s, /&lt;script&gt;|&lt;img/, '恶意文本必须以转义形式可见');
 });
 
-test('项目/会话的计数与 token 文案保持原契约（Codex total 回退、dsh in/out）', () => {
+test('项目卡保留会话数，Codex 与 dsh 的 token 用量均移出项目导航', () => {
   const codex = renderRecentProjects([project({ inputTokens: 0, outputTokens: 0, totalTokens: 716_992_900 })]);
-  assert.match(codex, /total 717\.0M tokens/);
+  assert.doesNotMatch(codex, /project-tokens|tokens|717\.0M/);
   assert.match(codex, /<b>4<\/b> sessions/);
 
   const dsh = renderRecentProjects([project({ inputTokens: 1500, outputTokens: 300, totalTokens: 0 })]);
-  assert.match(dsh, /in 1\.5k/);
-  assert.match(dsh, /out 300/);
-  assert.doesNotMatch(dsh, /total .* tokens/);
+  assert.doesNotMatch(dsh, /project-tokens|tokens|in 1\.5k|out 300/);
 });

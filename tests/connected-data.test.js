@@ -27,6 +27,7 @@ test('API excludes disconnected data before aggregation, jump target selection a
   assert.equal(projects[0].homeId, online);
   assert.equal(projects[0].sessionId, 'visible');
   assert.equal(projects[0].sessionCount, 1);
+  assert.deepEqual(projects[0].homeIds, [online], '项目来源不得包含未连接实例');
   assert.equal(projects[0].outputTokens, 10);
   assert.deepEqual((await get('/api/sessions/recent?limit=1')).sessions.map((s) => s.sessionId), ['visible']);
   assert.deepEqual((await get(`/api/sessions/recent?homeId=${offline}`)).sessions, []);

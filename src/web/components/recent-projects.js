@@ -1,8 +1,8 @@
-import { esc, fmtTokens, timeAgo, chipColor, sourceKind, sourceLabel } from '../store.js';
+import { esc, timeAgo, chipColor, sourceKind, sourceLabel } from '../store.js';
 
 // 项目卡与会话卡刻意长得不一样（用户反馈「两栏混在一起分不清」）：
 //   · 项目 = workspace 身份 → 左侧**项目色徽标（双字母 monogram）+ 竖轨**，右侧聚合统计；
-//     来源 app 由小标签着色，卡片底色仅在选中/悬停时强调；
+//     卡片底色区分项目，完整来源集合由独立的小标签展示；
 //   · 会话 = 一次对话     → 左侧**状态竖轨**（运行/完成/空闲），右侧状态 chip + 时间。
 // 两种卡的「第一视觉锚点」不同（徽标 vs 竖轨），扫视时不会串栏。
 // 这里每个字段都来自 dsh home 元数据（不可信输入），一律 esc；来源标识走白名单归一化。
@@ -32,25 +32,22 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
     const selected = selectedProject !== null && p.project === selectedProject;
     const muted = mutedSet.has(p.project);
     const inst = homeById.get(p.homeId);
-    const instName = inst ? (inst.alias || inst.homePath) : null;
-    // 来源 app：项目卡的小标签按它着色。
-    // 取「该项目最新会话所在实例」的 harness —— 与卡片跳转目标、实例 chip 同一口径。
-    // sourceKind 只返回白名单标识，可以安全进 data-source 属性。
+    // homeId 仍是最新会话的跳转目标，homeIds 是项目的完整来源集合（旧后端回退单来源）。
+    const sourceHomes = [...new Set([p.homeId, ...(Array.isArray(p.homeIds) ? p.homeIds : [])])]
+      .map((id) => homeById.get(id)).filter(Boolean);
+    const labels = new Set();
+    const homeChips = sourceHomes.map((home) => {
+      const kind = sourceKind(home.harness);
+      const label = home.alias || home.homePath || sourceLabel(kind);
+      const key = `${kind}\u0000${label}`;
+      if (labels.has(key)) return '';
+      labels.add(key);
+      return `<span class="chip home-chip" data-source="${kind}" title="${esc(home.homePath || label)}">${esc(label)}</span>`;
+    }).join('');
     const source = sourceKind(inst?.harness);
+    const sourceNames = [...new Set(sourceHomes.map((home) => sourceLabel(sourceKind(home.harness))))].join(' / ') || sourceLabel(source);
     // 项目色：同一项目始终同色，作为徽标/竖轨的身份色（与会话卡的状态色是两套语义）。
     const projColor = chipColor(p.project);
-    // Codex 只提供「会话累计 token」这一个数，没有新增输入 / 输出拆分（dsh 才有）。
-    // 若按 in/out 渲染会变成 in 0 / out 0，看起来像「没用量」，所以回退到 total。
-    const input = Number(p.inputTokens) || 0;
-    const output = Number(p.outputTokens) || 0;
-    const total = Number(p.totalTokens) || 0;
-    const totalsOnly = total > 0 && input + output === 0;
-    const tokenHtml = totalsOnly
-      ? `<span class="project-tokens" title="Codex 只提供会话累计 token，无输入/输出拆分">total ${fmtTokens(total)} tokens</span>`
-      // 「入」在项目卡片里是**总输入**（新增输入 + 缓存读 + 缓存写），与用量卡片的
-      // 「新增输入」不是同一个口径：同一条会话实测 1950 vs 1000。数字本身没错（卡片按
-      // 总消耗排序），但只写 in/out 会让人以为两处应该相等，所以标签写全。
-      : `<span class="project-tokens" title="新增输入 + 缓存读 + 缓存写"><span>in ${fmtTokens(p.inputTokens)}</span><span>out ${fmtTokens(p.outputTokens)}</span></span>`;
     return `
     <div class="row clickable card project-card${selected ? ' selected' : ''}" role="button" tabindex="0" data-action="filter-project" data-kind="project" data-home-id="${esc(p.homeId)}"
          data-workspace-id="${esc(p.workspaceId ?? '')}"
@@ -58,16 +55,15 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
          data-source="${source}"
          aria-pressed="${selected ? 'true' : 'false'}"
          style="--card-accent:${projColor.fg};--card-tint:${projColor.bg}"
-         title="数据来源：${esc(sourceLabel(source))} · ${selected ? '再次点击取消筛选，回到最近会话' : '点击筛选该项目会话'}">
+         title="数据来源：${esc(sourceNames)} · ${selected ? '再次点击取消筛选，回到最近会话' : '点击筛选该项目会话'}">
       <span class="card-rail" aria-hidden="true"></span>
       <div class="card-body">
         <div class="t">
           <span class="project-badge" aria-hidden="true">${esc(monogramOf(p.project))}</span>
           <span class="name">${esc(p.project)}</span>
-          <span class="card-time">${timeAgo(p.lastActivity)}</span>
         </div>
+        ${homeChips ? `<div class="project-sources" aria-label="项目的 agent app 来源">${homeChips}</div>` : ''}
         <div class="meta project-meta">
-          ${instName ? `<span class="chip home-chip" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
           ${p.historical ? '<span class="chip hist-chip" title="不在最近 7 天列表里，来自全库检索">历史</span>' : ''}
           ${muted
             // 已隐藏 = 可点按钮（点一下恢复显示）；未隐藏 = hover 才出现的「隐藏」按钮。
@@ -78,7 +74,6 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
                 title="默认隐藏该项目的会话（不再出现在 Recent Sessions；可随时恢复）">隐藏</button>`}
           <span class="project-stat"><b>${p.sessionCount}</b> session${p.sessionCount === 1 ? '' : 's'}</span>
           <span class="project-last-active">${timeAgo(p.lastActivity)}</span>
-          ${tokenHtml}
           ${p.sessionId ? '' : '<span class="chip">no sessions</span>'}
         </div>
       </div>
