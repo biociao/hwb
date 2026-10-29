@@ -78,9 +78,11 @@
 | 能力 | 说明 |
 |------|------|
 | **多实例聚合** | 一张工作台看全本机 + 所有 SSH 远程 dsh 实例的项目 / 会话 / 用量 |
+| **项目范围（全部 / 最近）** | 项目栏默认显示**全部项目**（不设时间窗，上限 1000 条，含无会话的工作区），分区头一键切到「最近」（近 7 天有活动，上限 200 条）；偏好持久化。被上限截断时列表底部明确写「仅显示前 N 个」，不把被截断的数字当成项目总数（老版本固定 `LIMIT 20` 且无任何提示） |
 | **顶栏搜索** | 顶部中间的全局搜索，输入即过滤项目 / 会话，停手 200ms 补搜**全库历史**；下拉按项目 / 会话分组，保留会话状态。可显式限定当前项目并移除范围标签；`⌘K` / `Ctrl+K` / `/` 聚焦、方向键选择、`Esc` 或 ✕ 清空 |
 | **点项目筛会话** | 点 Recent Projects 的任意项目卡，Recent Sessions 只列**该项目名下的全部会话**（跨实例、按最后活动倒序，不受「最近 50 条」限制）；再点同一个项目或筛选条的 ✕ 取消。筛选条保留「打开项目」按钮，等价于原来的「点项目卡跳实例 / 桌面端」 |
-| **默认静音项目** | 批量/自动化项目（默认 `relic-distill-cwd`）的会话默认不显示在 Recent Sessions，底部「已按默认规则隐藏 N 条 · 显示」可临时展开；项目卡带「已隐藏」chip，显式点开该项目仍看全部，筛选条里「隐藏 / 取消隐藏」可调整并持久化到 localStorage |
+| **人工介入提示** | 会话卡直接标出**在等你操作**的会话：`等待审批`（dsh 弹出 Approve / 拒绝）、`计划待审`、`等待回答`。审批/计划审阅来自 dsh 的 **remote-events 实时通道**（`approval/request` / `user-questions/request`），等待回答另有**持久投影**兜底（`userQuestions.questions.active`，离线/远端实例也可见）。介入会话固定排最前、有「待介入」筛选与列表顶部提示条，SSE `intervention:updated` 实时刷新 —— 不再因为「看上去空闲」而漏掉卡住的任务 |
+| **隐藏项目** | 批量/自动化项目（默认 `relic-distill-cwd`）的项目卡**从项目列表移入栏底「已隐藏 N 个项目」折叠栏（默认收起，主动展开才可见）**，会话默认不显示在 Recent Sessions（底部「已按默认规则隐藏 N 条 · 显示」可临时展开）；显式点开该项目仍看全部，筛选条里「隐藏 / 取消隐藏」可调整并持久化到 localStorage |
 | **当前项目 / 当前会话** | 每个实例（本地 + 远程）缓存「最近活跃会话 + 其所属项目」的元数据与状态（标题 / 状态 chip / token / 上下文 / 最近活动），并在 Recent Projects / Recent Sessions 中跨实例聚合展示 |
 | **零 I/O 读取层** | 只读投影缓存 `session_projcache.json`（`projection cache` 层），**不下探 `.zstd`** |
 | **远程只读索引** | 经一次 `ssh host bash -s` 在远端 cat 出 dsh home 的 4 个元数据文件，与本地共用同一套 schema 验证 / 域降级——远程实例的当前项目/会话与本地同构 |
@@ -222,8 +224,8 @@ npm test           # 全量（含 tests/compat 版本兼容性契约）
 不参与，避免 UUID 公共前缀把「搜几个字母」变成全命中）。本地过滤是即时的（复用最近一轮数据，
 SSE 刷新后继续生效）；停手 200ms 后还会请求 `GET /api/search` 在**整个索引**上补搜一次，所以
 一个月前、早已不在 Recent 面板里的项目/会话也能被找到 —— 这些行带「历史」chip 标明来源
-（Recent Projects 只含近 7 天的项目，Recent Sessions 只含最近 50 条）。计数显示命中数；
-超过返回上限（项目 20 / 会话 50）时列表底部会说明。Token 用量 / Instances / 运行日志不受影响，
+（Recent Projects 默认列出**全部**项目，可切「最近 7 天」；Recent Sessions 只含最近 50 条）。
+计数显示命中数；超过返回上限（项目 20 / 会话 50）时列表底部会说明。Token 用量 / Instances / 运行日志不受影响，
 搜索框下方分组展示项目与会话结果，会话保留状态标签；方向键可进入结果，Enter 打开。
 没有命中时给出「清除搜索」的出路。`⌘K` / `Ctrl+K` / `/` 聚焦搜索框，`Esc` 清空（已空再按一次失焦），✕ 或空态里的
 「清除搜索」同效；切到实例 tab 时搜索框隐藏（它只作用于工作台）。
@@ -235,26 +237,60 @@ SSE 刷新后继续生效）；停手 200ms 后还会请求 `GET /api/search` �
 点击语义不变，仍会钻入该会话）。顶栏搜索默认仍搜索全局；在下拉里点“仅搜索当前项目”才收窄范围，
 框内显示可移除的项目范围标签。清空搜索后回到原来的项目浏览视图。
 
-**默认静音项目**：批量/自动化项目（内置默认 `relic-distill-cwd`，它会在 Recent Sessions 里持续
-产出成百上千条同名 "Distill durable knowledge from the" 会话）的会话默认不显示，列表底部会写明
-「已按默认规则隐藏 N 条」并给「显示」按钮；项目卡上有直接开关——未静音时 hover 出现「隐藏」，
-已静音时是常驻可点的「已隐藏」（点一下恢复显示）。点开被静音的项目仍能看到它的全部会话（显式
-选择覆盖默认隐藏），此时筛选条显示「已默认隐藏 · 取消默认隐藏」；在该筛选视图里点「默认隐藏」会
-自动退回默认视图，不会出现「点了没反应」。偏好存在 localStorage（`hwb:muted-projects`）：首次
-打开用内置默认，用户关掉后底部会出现「默认静音已关闭 · 恢复默认静音」把默认装回来；「显示」只是
-当前视图的临时开关，不写偏好。隐藏只发生在展示层——接口数据、项目卡上的会话数、搜索命中的原始行
-都不变，随时能看回来。
+**隐藏项目**：批量/自动化项目（内置默认 `relic-distill-cwd`，它会在 Recent Sessions 里持续
+产出成百上千条同名 "Distill durable knowledge from the" 会话）默认从工作台上移走：项目卡不再
+留在项目列表，而是收进项目栏底部的 **「已隐藏 N 个项目」折叠栏**（**默认收起** —— 收起时隐藏
+项目的卡与名字都不渲染，只有主动展开才可见；这正是「隐藏」区别于「原地加个已隐藏标记」的地方）。
+这些项目的会话同时默认不显示，列表底部写明「已按默认规则隐藏 N 条」并给「显示」按钮。项目卡上
+有直接开关：未隐藏时 hover 出现「隐藏」，隐藏后从折叠栏里点「取消隐藏」恢复。点开被隐藏的项目
+仍能看到它的全部会话（显式选择覆盖默认隐藏，项目卡会自动展开在折叠栏里），此时筛选条显示
+「已默认隐藏 · 取消默认隐藏」；在该筛选视图里点「默认隐藏」会自动退回默认视图，不会出现「点了
+没反应」。偏好存在 localStorage（`hwb:muted-projects`）：首次打开用内置默认，用户关掉后底部会
+出现「默认静音已关闭 · 恢复默认静音」把默认装回来；「显示已隐藏会话」与折叠栏展开都只是当前
+视图的临时开关，不写偏好，刷新后折叠栏回到收起。隐藏只发生在展示层——接口数据、项目卡上的
+会话数、搜索命中的原始行都不变，随时能看回来。
 
 **工作台（仪表盘，纯元数据、零 iframe）** 分五块：
 
-1. **Recent Projects** —— 近 7 天内活跃的项目，跨实例聚合；点击**筛选**该项目的会话（见上，
-   不再直接跳转实例；跳转走筛选条的「打开项目」）。被默认静音的项目卡带「已隐藏」chip。
-   卡片默认中性，来源通过小标签颜色辨识；选中项目单独高亮。三栏按约 23 / 55 / 22 分配宽度。
-2. **最近会话** —— 主要内容区，运行中优先，其余按最近活动排序；状态标签固定对齐，运行中绿色强调。
-   支持全部 / 运行中 / 已完成 / 其他筛选。“已保存”及缺失状态显示“状态未知”，不能据索引记录判断执行状态；
-   子 agent 数独立展示，上下文条标注容量百分比（不是任务进度）。
+1. **Recent Projects（项目）** —— 跨实例聚合；点击**筛选**该项目的会话（见上，不再直接跳转实例；
+   跳转走筛选条的「打开项目」）。被隐藏的项目不在主列表里，而是收进栏底的「已隐藏 N 个项目」
+   折叠栏（默认收起，展开后卡片可「取消隐藏」）。卡片底色与徽标区分项目，完整来源集合通过
+   独立的 app 标签展示；选中项目使用描边高亮，项目导航不展示 token 用量。三栏按约 23 / 55 / 22 分配宽度。
+   分区头有 **「最近 / 全部」范围切换**：默认「全部」= 索引里的**全部项目**（不设时间窗，上限
+   1000 条，含尚无会话的工作区），「最近」= 近 7 天有活动的项目（上限 200 条）；偏好存
+   localStorage（`hwb:projects-scope`）。列表被上限截断时底部会写明「仅显示前 N 个」并给「查看
+   全部项目」入口 —— 分区头的数字不会被误读成「项目总数」。
+2. **最近会话** —— 主要内容区，待介入、运行中、未读依次优先，其余按最近活动排序；
+   状态标签固定对齐，运行中绿色强调，会话底色区分来源 app。
+   支持待介入 / 全部 / 运行中 / **未读** / 已完成 / 其他筛选。“已保存”及缺失状态显示“状态未知”，不能据索引记录
+   判断执行状态；上下文条标注容量百分比（不是任务进度），**运行中的卡片**在上下文条右侧显示
+   「子代理 N（M 运行）」：N 是该会话 catalog 里的**历史子代理总数**（含已结束的），M 是其中
+   子会话行当前仍为「运行中」的个数；M 无法判定时只显示 N（缺键=未知，不是 0）。该计数与
+   「显示子代理」开关解耦 —— 开关只决定是否列出子代理会话卡。
+   **未读** = 任务已经跑完（或停止运行）、但你还没打开看过：它排在「运行中」之后、「空闲」之前，
+   不会直接沉成「空闲」被当成没事发生。通过 hwb 打开会话（本地 dsh → DSH 桌面端、Codex → `codex://`
+   跳转）即视为已读，标记立刻消失；服务端把「从运行中落到空闲/已完成」的跃迁记成未读
+   （投影陈旧导致的降级不算，首次索引的历史会话也不算），Codex 会话则直接读 Codex 自己的
+   `thread_read_receipts`（Codex 侧看过就清）。**为什么点掉之后不会立刻复活**：打开时会记下
+   `viewedAt`，之后每轮索引即使上游（Codex receipt）还在重复上报同一次未读，只要线程没有**新活动**
+   就保持已读；只有点击之后出现新 turn（活动时间晚于 `viewedAt`）才重新计未读。
+   **局限**：在 hwb 内嵌 iframe 里浏览（可连接实例）
+   无法被感知，这类会话的未读只能等下一次状态跃迁或 Codex/dsh 侧已读记录。
+   **需要你介入的会话**（等待审批 / 计划待审 / 等待回答）会排在最前（同类按优先级、再按最近活动），卡片左侧色轨与
+   状态区换成醒目的警示色 chip，鼠标悬停显示工具名与原因；分区筛选条最前面是「待介入」tab（带实时计数），
+   列表上方还有一条提示条「N 个会话需要你操作 · 只看待介入」。状态来源见下面「人工介入提示怎么来的」。
+   为什么必须有：一个正在等你点 Approve 的会话在 dsh 里**没有任何活动**，按「运行中/空闲」看它就是空闲，
+   于是很容易被当成没在跑而忽略 —— 任务就卡在审批上没人知道。
+   状态本身是**推导值**：投影里还有「进行中」信号、且投影快照文件本身还在更新（per-record 文件的 mtime
+   在 30 分钟内）→「运行中」；只有快照确实冻结了才降级「空闲」。所以跑了很久、中途没有新用户输入的
+   长任务不会再被误标成空闲（2026-10-27 实测：一条 3 小时会话从第 30 分钟起被显示为空闲，而它一直在
+   跑工具、2.5 小时后才弹审批）。
+   只读 / 离线实例没有实时通道，等待审批观察不到：这类实例卡上会标「无实时通道」，而列表上方的
+   提示条会在「待介入 0」旁边说明「N 个实例无实时通道（…），那里的等待审批看不到」——没有这条
+   说明时，0 才等于「没人需要你」。
    从项目卡进入筛选态时，这里换成**该项目的全部会话**，并在分区头下方显示项目筛选条（项目名 / 条数 /
-   ✕ / 隐藏 · 取消隐藏 / 打开项目）。默认静音项目的会话不出现，底部说明隐藏了多少并可一键显示。
+   ✕ / 隐藏 · 取消隐藏 / 打开项目）。默认静音项目的会话不出现，底部说明隐藏了多少并可一键显示；
+   这些项目的卡在项目栏底的「已隐藏」折叠栏里（默认收起），不占主列表。
 3. **Instances** —— 每个 dsh 实例的实例卡：状态 chip（已连接 / 连接不可达 / 未连接，域降级时另加
    「⚠ <域> 降级」chip）、**该实例上 dsh 的版本号**（`dsh 0.1.5-rc.1`；本地实例读本机安装、
    远程实例经 SSH `dsh --version` 探测，与远端启动共用同一份 PATH 补齐；取不到时不显示）、
@@ -421,7 +457,7 @@ Reader 读取以下文件，均为 schema-versioned：
 
 | 文件 | 内容 | 版本 | 关键规则 |
 |------|------|------|---------|
-| `storages/workspace.json` | 工作区列表、会话 ID 映射、归档状态 | 2 | 轻量，可频繁读 |
+| `storages/workspace.json` | 工作区列表、会话 ID 映射、归档状态 | 2 | 轻量，可频繁读；**项目名取 `title`**（dsh 里重命名即生效），title 空白/缺失时回退目录名；未 attach 但 cwd 正好等于该工作区 `path` 的会话也归到它的项目名 |
 | `storages/session_projcache/sessions/*.json` | 会话投影缓存（**per-record 布局**）：tokenUsage、contextPressure、status | 3–7 | **当前 dsh 的权威来源**；每个会话一个文件 |
 | `storages/session_projcache.json` | 同上，但是**单文件聚合**（遗留布局） | 3–7 | 只用于补齐 per-record 尚未覆盖的会话；dsh 已不再更新它 |
 | `model-tier.json` | 订阅方案、模型路由 tiers | 2 | 可选；缺失不判定 degraded |
@@ -456,20 +492,26 @@ hwb 支持第二个 harness：Codex（ChatGPT 桌面版 / codex-cli）。它**�
 - 不启动、不连接任何进程：没有 token / 端口 / 隧道 / 端点，实例卡状态只有「已就绪 / 路径缺失」。
 - 点会话 → `codex://threads/<id>` 跳到 Codex 桌面端；点项目 → 该项目最近一条会话；
   实例卡「打开 Codex」→ 该实例最近一条会话（仅 macOS 自动打开，其它平台给 `codex resume` 命令）。
-- Codex 只暴露每个 thread 的**累计 token**（没有输入/输出/缓存拆分）：项目行显示
-  `total X tokens`；Token 用量面板不包含 Codex，避免把总量伪造成某一类。
+- Codex 只暴露每个 thread 的**累计 token**（没有输入/输出/缓存拆分）：索引保留总量，
+  项目导航卡不展示 token；Token 用量面板不包含 Codex，避免把总量伪造成某一类。
 
 **读什么（只读元数据，不碰会话正文）：**
 
 | 文件 | 内容 |
 |------|------|
-| `$CODEX_HOME/state_5.sqlite`（默认 `~/.codex`） | `threads` 表：标题 / cwd / token / 活跃时间 / 归档 / git 分支；`projects` + `project_roots`（仅作兜底） |
+| `$CODEX_HOME/state_5.sqlite`（默认 `~/.codex`） | `threads` 表：会话名 `name`（Codex 列表里的标题；缺列时回退 `title`）/ cwd / token / 活跃时间 / 归档 / git 分支；`projects` + `project_roots`（仅作兜底）；`thread_read_receipts`：**未读**（Codex 只在有未读 turn 时留一行，看过即删） |
+| `$CODEX_HOME/thread_history_<N>.sqlite` | `thread_turns`：每个 thread 最新 turn 的 `status`（`inProgress`/`completed`/`interrupted`/`failed`）与起止时间 —— **运行态**；只读这张小表（实测 1.2 万行、2.5ms），绝不碰 `thread_items` 的会话正文 |
 | `$CODEX_HOME/.codex-global-state.json` | 桌面端项目模型：`local-projects`（名称 + 根路径）、`pinned-project-ids`、`project-order`、`thread-project-assignments` |
 
+- 会话状态：最新 turn 在跑且该 thread 3 分钟内有更新 →「运行中」；最新 turn 已收尾
+  （`completed`/`interrupted`/`failed`）→「空闲」；无 turn 记录 / 库缺失 / `inProgress` 但已陈旧
+  （Codex 被杀后 turn 永远不会收尾，实测本机 15 条、最老 105 天）→「已保存（状态未知）」。
+  **turn 完成 ≠ 会话目标完成**，所以不会显示「已完成」。未读直接取 Codex 的 read receipts。
 - 以 `readOnly` 打开 SQLite（Codex 退出、WAL 文件已 checkpoint 时自动改用 `immutable=1` 读快照）
   —— **绝不写 Codex 的状态库**，也不解压/读取 `rollout-*.jsonl(.zst)` 会话正文。
 - 项目归属：先看 `thread-project-assignments`，再用 cwd 的**最长根路径前缀**回退；仍未归属的
-  会话按 `basename(cwd)` 归一化成项目（与 dsh 对无 workspace 会话的口径一致）。
+  会话按 `basename(cwd)` 归一化成项目（dsh 侧同理，只是 dsh 会额外把 cwd **正好等于**工作区
+  `path` 的未 attach 会话算进那个工作区的项目名）。
 - 自动线程（`guardian_review` / `subagent`，本机占 82%）不进会话列表，否则 RECENT SESSIONS
   会被 0 token 的自动审查淹没；只有自动线程的项目也不会占位。
 - 读取失败（没装 Codex、库被锁、schema 变了）只让该实例 `degraded` 并在实例卡上给出原因，
@@ -639,6 +681,23 @@ node scripts/install-dsh-open-session.mjs --uninstall
 - 每个实例的 iframe 使用预览代理注入通信脚本；**本地**外部打开仍直连服务，**远程**经 hwb 的
   **根路径 1:1 反向代理**，因为它不重写路径，所以 `/plugins/*`、`/assets/*`、WebSocket 全部走通。
 - 状态刷新：控制循环 30s + 文件索引循环 60s（失败退避）；运行中实例的会话状态另以 3s 周期独立读取，不受 SSH 文件索引退避影响。连接后的定向索引会排队执行，不会被正在运行的批次吞掉。
+- **人工介入提示怎么来的**（两条通道，互为兜底）：
+  1. **实时（审批 / 计划审阅）**：`src/dshhome/pending-interactions.js` 对每个运行中的 dsh 实例开一条
+     `/api/remote.mux` WebSocket，打开内部逻辑流 `$events`，订阅 dsh 转发给浏览器的
+     `approval/request` 与 `user-questions/request` waterfall 事件；收到即记录到内存覆盖层，并**立刻**以
+     `{kind:'next'}` 把决定权交还 Host（观察者只围栏观察，绝不替人点 Approve、也不改变审批结果）。
+     断线后 Host 会重放仍挂起的 waterfall，所以重连即自愈；连接失败/旧版 dsh 不支持时静默降级，不影响仪表盘。
+  2. **持久（等待回答）**：dsh 的 `userQuestions` 投影里 `questions.active` 非空 = 会话在等你回答。它随
+     projcache 落盘，所以**离线 / SSH 远端**实例也能标出来。投影 schema 不含审批态（审批是瞬时交互），
+     也不含问题的 `intent`（分不出计划审阅），所以这条通道只报「等待回答」。
+  合并规则：`approval > plan-review > question`，同 kind 时实时覆盖投影（实时知道工具名与原因）。
+  实时连接每 2 秒会收到一个 WebSocket ping，必须回 pong —— 不回会被 dsh 约 10 秒后断开。
+  3. **观测盲区（必须说出来）**：只读本地实例（`{homePath, readOnly:true}`，没有进程/端口/token）
+     和当前不可达的实例**没有实时通道**，审批永远不会被观察到。`/api/homes` 的 `liveIntervention`
+     标明每个实例此刻有没有这条通道；实例卡显示「无实时通道」chip，列表上方的提示条会写明
+     「N 个实例无实时通道（…），那里的等待审批看不到」。「待介入 0」只在这条说明缺席时才等于
+     「没人需要你」——2026-10-27 实测：一条会话在只读实例上等 `danger-full-access` 审批，
+     仪表盘显示「空闲 / 待介入 0」，任务被晾了两个多小时。
 
 ---
 
@@ -649,7 +708,7 @@ node scripts/install-dsh-open-session.mjs --uninstall
 
 | Method | Path | 说明 |
 |--------|------|------|
-| `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `monitor:updated` / `quota:updated` / `log:event`） |
+| `GET` | `/api/events` | SSE 订阅（`index:updated` / `instance:status` / `monitor:updated` / `quota:updated` / `intervention:updated` / `log:event`） |
 | `GET` | `/api/homes/{homeId}/download` | 下载单个文件（`?sessionId=` 或 `?workspaceId=`，`&path=`；≤64 MiB，不打包目录） |
 | `PUT` | `/api/homes/{homeId}/upload` | 上传文件到当前目录（multipart；`?sessionId=`+`&dir=`，≤256 MiB/文件，同名自动改名，跨站拒绝） |
 | `GET` | `/api/homes` | 全部实例（含 runtime 状态） |
@@ -662,8 +721,8 @@ node scripts/install-dsh-open-session.mjs --uninstall
 | `POST` | `/api/homes/{homeId}/open` | 打开实例（本机拉起 / 远端建隧道）。**连接前会验证入口鉴权**：token 失效/填错时返回 500 并说明补救办法，而不是把 401 栅栏页记成「已连接」 |
 | `POST` | `/api/homes/{homeId}/restart` | 重启实例 |
 | `POST` | `/api/homes/{homeId}/stop` | 停止实例（远端同时停远端 dsh web）。**确认式**：SIGTERM→3s→SIGKILL→2s，只有进程真的退出才回 `{ok:true}`；收不掉则回 500（带 pid/端口）且保留句柄。远端停止失败时也会以 500 上报（本地连接仍已断开）。响应里的 `stopped` 表示**这次是否确实停掉了一个受管子进程**（直连已有实例时为 false） |
-| `GET` | `/api/projects/recent` | 最近项目（`?days=7&limit=20`） |
-| `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`）；`?project=<项目名>` 精确筛出该项目的全部会话（不设 7 天窗口，多取 1 行判断截断，响应带 `truncated`） |
+| `GET` | `/api/projects/recent` | 项目列表（`?days=7&limit=20`）；`?all=1` = **全部项目**（不设时间窗，`limit` 上限 2000）；多取 1 行判断截断，响应带 `truncated` |
+| `GET` | `/api/sessions/recent` | 最近会话（`?homeId=&limit=50`）；`?project=<项目名>` 精确筛出该项目的全部会话（不设 7 天窗口，多取 1 行判断截断，响应带 `truncated`）。会话行可能带 `intervention`（见「人工介入提示」） |
 | `GET` | `/api/search` | 全库搜索（`?q=&projectLimit=20&sessionLimit=50`；不受 7 天窗口 / Recent 条数上限限制，只搜运行中实例，返回 `{projects, sessions, truncated}`）。`?project=` 只把**会话**命中收在该项目内（项目筛选下的补搜），项目命中不受限 |
 | `GET` | `/api/workspaces` | 工作区列表 |
 | `POST` | `/api/homes` | 除 dsh 本机/远程外，`{harness:"codex" \| "workbuddy", homePath, alias?}` 可注册只读本地工具实例（默认 `~/.codex` / `~/.workbuddy`，注册后立即索引并刷新运行时；目录不存在 400） |
@@ -738,6 +797,7 @@ hwb/
 │   │   ├── read-home.js         # 本地读取 + 最小 YAML 解析（provider 名）
 │   │   ├── balance.js           # Provider 额度适配器（readCredentials/queryBalance）
 │   │   ├── status.js            # 会话工作状态推导（纯函数）
+│   │   ├── intervention.js      # 人工介入（等待审批/计划待审/等待回答）归一与合并（纯函数）
 │   │   ├── time.js              # 毫秒时间戳 → ISO（越界降级为 null）
 │   │   ├── node-version.js      # Node 版本门槛（engines / doctor / 启动预检 同源）
 │   │   ├── dsh-compat.js        # dsh 存储契约自检（doctor 用；从安装的 dsh 提取域版本）
@@ -759,6 +819,7 @@ hwb/
 │   │   ├── indexer.js           # 后台索引循环（60s debounce + 按实例退避）
 │   │   ├── live-status.js       # 直接读运行中 dsh 的实时会话状态（RPC；cookie 记忆 + keep-alive + 自适应预算）
 │   │   ├── live-poller.js       # 实时状态轮询（基线 3s，按实测链路自适应 + 失败退避）
+│   │   ├── pending-interactions.js # 实时人工介入观察器（/api/remote.mux $events + 最小 RFC6455 + probe 对账）
 │   │   ├── store.js             # node:sqlite 封装 + 查询（用量/趋势/项目/全库搜索）
 │   │   └── quota.js             # 额度服务（TTL 缓存 60s，单 flight）
 │   ├── codexhome/               # 第二个 harness 数据源（Codex，只读；作为普通实例接入）
@@ -809,6 +870,7 @@ hwb/
 ├── dsh-static-cache/            # dsh 前端静态缓存插件
 ├── docs/topology.md             # 拓扑可视化附录（README/设计文档的可视化补充）
 ├── docs/local-tool-harness-alignment.md   # 本地工具实例统一契约（Codex / WorkBuddy / dsh 只读）
+├── docs/intervention-approval-persistence.md # 审批态落盘（dsh 侧改动点，离线/只读实例可见的前提）
 ├── tests/                       # 单元测试 + mock-home 夹具
 ├── images/                      # README 头图
 └── DSH_Workbench_Fusion_Architecture.md   # 设计文档（三平面/数据模型/里程碑）
@@ -903,14 +965,41 @@ dsh 0.1.5-rc.1 兼容 ✓
 ## 已知限制
 
 > 这些是 v0.1.5 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
+- **人工介入提示的时效边界**：`等待审批` / `计划待审` 来自**运行中且已连接**的 dsh 实例的实时通道
+  （dsh 0.2.x 的 `/api/remote.mux` → `$events` → `approval/request` / `user-questions/request`）。
+  实例没在跑、旧版 dsh 没有这条通道、或 hwb 与实例之间的链路断开时，只能显示**投影来源**的
+  「等待回答」—— 审批不落盘，没有任何静态文件能事后证明「当时在等人批」。观察器重连时 dsh 会重放
+  仍挂起的审批，所以 hwb 短暂离线不会漏；但**在 hwb 离线期间已被别处处理掉**的审批不会留下痕迹
+  （与 dsh 自身行为一致：审批是瞬时交互，不是持久状态）。只读本地实例（Codex 式）没有运行中的
+  dsh web，因此只有投影来源的「等待回答」：这类实例上的审批**永远看不到**，实例卡会标
+  「无实时通道」、提示条会说明观测盲区（见「人工介入提示怎么来的」第 3 条）。让审批也落盘需要
+  dsh 侧配合，改动点见 [`docs/intervention-approval-persistence.md`](docs/intervention-approval-persistence.md)。
+
+- **会话状态的新鲜度口径**：投影里的「进行中」信号靠**投影文件 mtime**（`observedAt`）判断是否冻结，
+  不是靠 `lastActivity`（最后一条用户输入）。这样长任务不会因为中途没有新输入被降级；代价是
+  投影进程若在 30 分钟内崩溃，最后状态仍会显示「运行中」，超过新鲜度窗口后回落到「空闲」；实时通道另以实例上报状态为准。
+  远程 SSH 索引拿不到 mtime，仍沿用只看 `lastActivity` 的旧口径（远程实例通常有实时通道覆盖）。
+  实现上观察器对每个运行中实例保持一条 `$events` **answer 流**，因此 dsh 的 `hasLiveClient()`
+  会认为「有 Harness 页面在线」——它只用于 `cordis inspect` 查询的连接守卫，不影响审批与人机交互
+  语义；hwb 退出时这条流会正常关闭。
+
+- **子代理运行数的口径**：`status.subagents` 是 `subagentCatalog` 的条目数（历史总数，含已结束的
+  one-shot 子代理），不是并发数；`status.subagentsRunning` 是把 catalog 里的 childId 与**同一实例**
+  的子会话行 join 得到的（子会话 `kind === 'running'` 即视为在跑，与 dsh 会话头一致）。三条硬规则：
+  ① 只有父会话自己「运行中」才判（子代理运行在父 turn 内，父会话空闲时残留的 running 子行不算）；
+  ② catalog 里任一 childId 在本实例索引里找不到 → **不写键**（子会话可能没被索引/已归档，缺失 ≠ 没在跑）；
+  ③ 全部找到才写，包括 0（那是**已观测的 0**）。文件索引与实时通道两条路径共用
+  `lib/status.js` 的 `annotateSubagentRunning`，所以只读实例（没有实时通道）也能看到运行数；
+  离线实例看到的是最后一次索引的快照，同样受 30 分钟新鲜度闸门约束。
 
 - **Codex 侧没有版本化契约**：dsh 的元数据文件带 `unit.version`，hwb 能按主版本降级；Codex 的
   `state_5.sqlite` / `.codex-global-state.json` 没有等价版本号。Reader 用固定的列名/字段名读取，
   Codex 升级若改名，对应域会整体降级并在实例卡上给出原因（不会 5xx，也不会写坏 Codex 的库）。
   目前只覆盖本机 `local` 项目：远程 host 的 Codex 项目、云端任务不在读取范围内。
-- **Codex 只有累计 token**：thread 粒度只存 `tokens_used`，没有输入/输出/缓存拆分。项目行显示
-  `total X tokens`，Token 用量面板与用量趋势**不含 Codex**（避免伪造分项）；Codex 会话状态
-  只能标成「已保存」，桌面端是否正在跑该 thread 不在落盘元数据里。
+- **Codex 只有累计 token**：thread 粒度只存 `tokens_used`，没有输入/输出/缓存拆分。项目导航卡
+  不展示 token，Token 用量面板与用量趋势**不含 Codex**（避免伪造分项）。会话状态取自
+  `thread_history_<N>.sqlite` 的 `thread_turns` + `thread_read_receipts`（见「Codex 作为实例接入」）；
+  这两个库缺失/改名时退回「状态未知」，不会编造运行态。
 - **Codex 跳转依赖桌面端**：`codex://` scheme 由 ChatGPT/Codex 桌面 app 注册；只装了 `codex` CLI
   时按钮会返回回退命令（`codex resume <id>`），需要自己在终端执行。非 macOS 平台不做自动派发。
 - **上传的内存占用有界但不为零**：multipart 解析器是流式的，但上传路由目前会把整份文件先攒在内存
@@ -924,8 +1013,9 @@ dsh 0.1.5-rc.1 兼容 ✓
 - **远程索引读整份 projcache 走 SSH**：远程实例每次索引周期（60s 基线）经一次 `ssh cat` 抓回
   元数据文件 + **per-record projcache 目录**（每个会话一个文件）。
   per-record 是全量文件，所以远端会先做一次**投影**：只保留 hwb 用到的
-  ~10 个 projection（`title` / `tokenUsage` / `contextPressure` / `sessionStats` /
-  `goal` / `todos` / `subagent` / `plan` / `permissions` / `sessionListMetadata`），
+  ~12 个 projection（`title` / `tokenUsage` / `contextPressure` / `sessionStats` /
+  `goal` / `todos` / `subagent` / `subagentCatalog` / `plan` / `permissions` /
+  `userQuestions` / `sessionListMetadata`），
   丢掉 `titleInput` / `turnOutline` / `contextBreakdown` 等大头 ——
   实测本机 476 个会话 **4.07 MiB → 1.28 MiB（省 69%）**。
   投影任一步失败（远端没有 python3、JSON 坏了）都**原文回退**，宁可多传也不少读；
