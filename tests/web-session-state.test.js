@@ -26,11 +26,27 @@ test('状态筛选不改变输入，运行中优先，同状态按最近活动�
   assert.match(html, /data-status-filter="other" aria-pressed="false">其他<span>2<\/span>/);
 });
 
-test('状态徽标与子 agent 信息独立；恶意计数不会进入标记', () => {
-  const html = renderRecentSessions([row('s', { kind: 'running', subagents: 3 })]);
+test('运行中卡片的子代理计数与开关解耦；未知不写 0，恶意计数不会进入标记', () => {
+  const running = row('s', { kind: 'running', subagents: 3, subagentsRunning: 1 });
+  const html = renderRecentSessions([running]);
   assert.match(html, /class="chip status run"[^>]*><span[^>]*>●<\/span>运行中<\/span>/);
-  assert.match(html, /class="session-secondary">3 子agent<\/span>/);
-  assert.doesNotMatch(renderRecentSessions([row('s', { kind: 'idle', subagents: '"><img src=x>' })]), /<img/);
+  assert.match(html, /class="session-secondary agent-load"[^>]*>子代理 3（1 运行）<\/span>/);
+  // 「显示子代理」开关只管子代理会话卡，不再决定父会话上的计数
+  assert.match(renderRecentSessions([running], [], { showSubagents: true }), /子代理 3（1 运行）/);
+  // 运行数未知：只画历史总数，绝不写「0 运行」
+  const unknown = renderRecentSessions([row('u', { kind: 'running', subagents: 2 })]);
+  assert.match(unknown, /class="session-secondary agent-load"[^>]*>子代理 2<\/span>/);
+  assert.doesNotMatch(unknown, /0 运行/);
+  // 空闲 / 已完成卡片不画：历史计数不能冒充现状
+  for (const kind of ['idle', 'completed']) {
+    assert.doesNotMatch(renderRecentSessions([row('i', { kind, subagents: 3, subagentsRunning: 3 })]), /agent-load/);
+  }
+  // 没有子代理就不画「0 个子代理」
+  assert.doesNotMatch(renderRecentSessions([row('z', { kind: 'running', subagents: 0 })]), /agent-load/);
+  // 恶意计数：Number 守卫后不产生标记，更不会落 HTML
+  const evil = renderRecentSessions([row('s', { kind: 'running', subagents: '"><img src=x>', subagentsRunning: 2 })]);
+  assert.doesNotMatch(evil, /<img/);
+  assert.doesNotMatch(evil, /agent-load/);
 });
 
 test('上下文是有标签的容量比例，非法数值不产生 CSS 或假进度', () => {

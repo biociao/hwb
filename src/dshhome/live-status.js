@@ -1,7 +1,7 @@
 import { Agent } from 'node:http';
 import { logger } from '../lib/logger.js';
 import { msToIso } from '../lib/time.js';
-import { normalizeApproval } from '../lib/status.js';
+import { normalizeApproval, subagentStatus, subagentCatalogIds, annotateSubagentRunning } from '../lib/status.js';
 import { stripNul } from '../lib/normalize.js';
 
 const log = logger('live-status');
@@ -332,6 +332,7 @@ function toLiveRow(item) {
     todos: unwrapProjection(rawValues.todos),
     plan: unwrapProjection(rawValues.plan),
     subagent: unwrapProjection(rawValues.subagent),
+    subagentCatalog: unwrapProjection(rawValues.subagentCatalog),
     permissions: unwrapProjection(rawValues.permissions),
     sessionListMetadata: unwrapProjection(rawValues.sessionListMetadata) ?? {},
     title: unwrapProjection(rawValues.title),
@@ -349,8 +350,10 @@ function toLiveRow(item) {
   const isRunning = typeof item.running === 'boolean' ? item.running : !!inferredRunning;
   const kind = isRunning ? 'running' : (goalPhase === 'complete' || (todos.length > 0 && todos.every((t) => t && t.status === 'completed')) ? 'completed' : 'idle');
   const labels = { running: '运行中', completed: '已完成', idle: '空闲' };
-  const subagentRaw = values.subagent;
-  const subagents = subagentRaw && typeof subagentRaw === 'object' && !Array.isArray(subagentRaw) && !(subagentRaw instanceof Date) ? Object.keys(subagentRaw).length : 0;
+  const subagents = subagentStatus(values.subagent, values.subagentCatalog);
+  // 子代理 catalog 的 childId 列表：**临时字段**，只用于 extractLiveRows 的两遍 join
+  //（父会话 ↔ 同一批 session/list 里的子会话行）。不进 sessions.status，也不入库。
+  const childSessionIds = subagentCatalogIds(values.subagentCatalog);
   const meta = values.sessionListMetadata ?? {};
   const lastPromptAt = typeof meta.lastPromptAt === 'number' ? meta.lastPromptAt : (typeof item.updatedAt === 'number' ? item.updatedAt : null);
   return {
@@ -360,11 +363,14 @@ function toLiveRow(item) {
     status: {
       kind,
       label: labels[kind],
-      subagents,
+      ...subagents,
+      ...(item.origin === 'subagent' || (typeof item.parentSessionId === 'string' && item.parentSessionId.trim()) ? { isSubagent: true } : {}),
       // 与文件侧走同一套守卫（长字符串截断、非字符串丢弃）：实时值在宽限期内会**赢过**文件值，
       // 不守卫就等于把守卫整条绕过。
       approval: normalizeApproval(values.permissions?.approval),
     },
+    // 临时字段（不入库）：extractLiveRows 用它把「其中几个子代理在跑」join 出来。
+    ...(childSessionIds ? { childSessionIds } : {}),
     lastActivity: msToIso(lastPromptAt),
     tokenUsage: normalizeLiveTokenUsage(values.tokenUsage),
     title: typeof values.title === 'string' ? stripNul(values.title) : null,
@@ -379,6 +385,9 @@ function extractLiveRows(result) {
     : (result?.value?.items ?? result?.items ?? result?.sessions);
   if (!Array.isArray(list)) return null;
   const rows = list.map(toLiveRow).filter(Boolean);
+  // 第二遍：父会话的子代理运行数要和**同一批**实时行 join（子会话自己的 running 是权威信号）。
+  // 与文件索引共用 annotateSubagentRunning，所以两条路径的口径不会分叉。
+  annotateSubagentRunning(rows);
   return rows;
 }
 

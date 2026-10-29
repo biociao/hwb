@@ -6,6 +6,36 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 新增：运行中会话卡显示「子代理 N（M 运行）」，位置在上下文条右侧
+
+**问题**：hwb 的会话状态能看出「在跑」，但看不出这场会话还带了多少个子代理、其中几个正在跑；
+dsh 自己的会话头有这两个数字（截图「1 个子智能体」），hwb 却只在打开「显示子代理」开关时
+露出一行「N 子agent」，而且数字含义（历史总数 vs 并发数）没有交代。
+
+**口径**：`status.subagents` 是 `subagentCatalog` 的条目数 = **历史子代理总数**（含已结束的
+one-shot 子代理）；新增 `status.subagentsRunning` = 其中子会话行当前仍为「运行中」的个数
+（与 dsh `dsh-client-ui-subagent` 的 catalog join 口径一致）。三条硬规则：
+① 只有父会话自己 running 才判（子代理运行在父 turn 内，父会话空闲时残留的 running 子行不算）；
+② catalog 里任一 childId 在本实例索引里找不到 → **不写键**（缺失 ≠ 没在跑）；
+③ 全部找到才写，包括 0（已观测的 0）。缺键在 UI 上表现为只显示总数，**绝不写 0**。
+
+**改动**：
+- `src/lib/status.js`：新增 `subagentCatalogIds()`（wire 数组 / 磁盘 `head.values[].childId` 链接
+  两种形态、去重、上限 64）与 `annotateSubagentRunning()`（跨会话 join，原地写
+  `status.subagentsRunning`）。
+- `src/lib/schema.js`：`projcacheRecordToSession` 从 `subagentCatalog` 折出**临时**字段
+  `childSessionIds`（`normalize` 只拷贝已知字段，不会入库/出 API）。
+- `src/lib/read-home.js`：per-record 与聚合两种来源合并完成后统一 annotate —— 因此**只读实例
+  （没有实时通道）也能看到运行数**，这是本机最容易踩空的场景。
+- `src/dshhome/live-status.js`：`session/list` 实时行第二遍 join（`item.running` 是权威信号），
+  与文件路径共用同一个 annotate 函数，口径不分叉。
+- `src/web/components/recent-sessions.js` + `session-state.js` + `index.html`：运行中卡片在
+  「上下文 N%」右侧显示 `子代理 N（M 运行）`；M 未知时只显示 N；空闲/已完成卡片不画
+  （历史计数不能冒充现状）；计数与「显示子代理」开关解耦（开关只管子代理会话卡，title 已改）。
+- 测试：新增 `tests/agent-load.test.js`（catalog 两形态、三条 join 规则、渲染位置/未知语义、
+  per-record 端到端 + `childSessionIds` 不入库）；`tests/subagent-visibility.test.js` 增加实时
+  通道 join 用例并改写开关用例；`tests/web-session-state.test.js` 改为断言新 slot。
+
 ### 修复：项目「已隐藏」却还在列表里 —— 改为移入栏底折叠栏（默认收起）
 
 **问题**：截图反馈「项目显示『已隐藏』为什么还能看到？」。上一版把「隐藏」只做成了**会话层过滤**：

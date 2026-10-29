@@ -1,4 +1,4 @@
-import { deriveSessionStatus } from './status.js';
+import { deriveSessionStatus, subagentCatalogIds } from './status.js';
 import { msToIso } from './time.js';
 
 // 每个域**允许**的版本清单（不是「唯一版本」）。依据来自 dsh 自己的域声明，而不是猜：
@@ -106,12 +106,20 @@ function projcacheRecordToSession(sessionId, s) {
       contextWindow: num(cp.contextWindow),
     };
   }
+  // 子代理 catalog 的 childId 列表：**临时字段**，只用于把「其中几个在跑」与本 home 的子会话行
+  // join（read-home.js 聚合完全部会话后调 annotateSubagentRunning）。normalize 只拷贝已知字段，
+  // 所以它不会入库、不会出现在 API 响应里。缺 catalog / 超上限一律不挂这个键（= 不可判定），
+  // 与「catalog 为空」区分开。
+  const childSessionIds = subagentCatalogIds(rows.subagentCatalog?.val);
+  if (childSessionIds) meta.childSessionIds = childSessionIds;
   // 折叠状态类投影 → 会话工作状态（running / completed / idle）。
   meta.status = deriveSessionStatus({
     sessionStats: rows.sessionStats?.val,
     goal: rows.goal?.val,
     todos: rows.todos?.val,
     subagent: rows.subagent?.val,
+    subagentCatalog: rows.subagentCatalog?.val,
+    inheritedEventCount: s.identity?.inheritedEventCount,
     plan: rows.plan?.val,
     permissions: rows.permissions?.val,
     // 投影缓存是**快照**：进程被杀/机器休眠/会话被放弃时，里面那些「进行中」的信号会永远

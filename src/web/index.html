@@ -308,10 +308,15 @@
     .context-usage .pressure > i { background: var(--dim); }
     .context-usage.warn { color: var(--warn); } .context-usage.bad { color: var(--bad); }
     .session-secondary { color: var(--dim); font-size: 11px; }
+    /* 子代理负载（上下文右侧）：数字等宽，避免计数从 9→10 时整行抖动。 */
+    .agent-load { font-variant-numeric: tabular-nums; white-space: nowrap; }
     .session-status-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 16px 12px; border-bottom: 1px solid var(--border); }
     .session-status-filter button { display: inline-flex; gap: 6px; padding: 5px 9px; font-size: 12px; background: transparent; }
     .session-status-filter button span { font-variant-numeric: tabular-nums; opacity: .8; }
     .session-status-filter button[aria-pressed="true"] { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+    .session-status-filter .subagent-toggle { margin-left: auto; }
+    .session-status-filter .subagent-toggle + .session-order { margin-left: 2px; }
+    .chip.subagent-chip { color: var(--dim); background: transparent; border: 1px dashed var(--border); }
     .session-order { margin-left: auto; color: var(--dim); font-size: 11px; }
     .chip.home-chip[data-source="dsh"] { --source-bg: var(--src-dsh); --source-line: var(--src-dsh-line); }
     .chip.home-chip[data-source="codex"] { --source-bg: var(--src-codex); --source-line: var(--src-codex-line); }

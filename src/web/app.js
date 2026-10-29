@@ -6,6 +6,7 @@ import { renderRecentProjects, renderProjectsMore, splitHiddenProjects } from '.
 import { renderRecentSessions, renderSessionFilter } from './components/recent-sessions.js';
 import { SESSION_FILTERS, filterSessionState, renderSessionStatusFilter } from './components/session-state.js';
 import { renderSearchResults } from './components/search-results.js';
+import { splitSubagentSessions } from './components/subagent-visibility.js';
 import { readMutedProjects, writeMutedProjects, toggleMutedProject, splitMutedSessions, mutedNoteSpec, renderMutedNote, renderMutedIdleNote, DEFAULT_MUTED_PROJECTS } from './components/session-mute.js';
 import { filterRecent, filterExactProject, searchEmptyHtml, searchPendingHtml, mergeSearchResults, normalizeQuery } from './components/search-filter.js';
 import { connectedHomes, tabHomes } from './instance-state.js';
@@ -52,6 +53,7 @@ let searchScopeProject = null; // 显式指定的搜索范围；选择项目导�
 let searchOpen = false;
 let lastSearchResults = { projects: [], sessions: [] };
 let sessionStatusFilter = 'all';
+let showSubagents = false; // 默认隐藏；当前页面可临时展开，SSE 刷新保留。
 // 最近一轮拉到的原始列表 + 已连接实例集合。按键过滤直接复用它们（见 paintDashboard）：
 // 过滤只改「显示哪些行」，不该每敲一个字就重新打一次 /api/projects|sessions|usage。
 let lastLists = { projects: [], sessions: [], connectedIds: new Set() };
@@ -553,7 +555,7 @@ function paintDashboard() {
     filtered.projects = filtered.projects.filter((p) => p.project === project);
     filtered.sessions = filterExactProject(filtered.sessions, project);
   }
-  lastSearchResults = { projects: filtered.projects, sessions: filterSessionState(filtered.sessions) };
+  lastSearchResults = { projects: filtered.projects, sessions: filterSessionState(splitSubagentSessions(filtered.sessions, showSubagents).visible) };
   // 默认静音项目：最后一道展示层过滤。项目筛选是显式选择（点开被隐藏项目就是要看它），
   // 或用户点了「显示」时覆盖默认隐藏；hidden 行数用于画「已隐藏 N 条 · 显示」提示。
   const mute = splitMutedSessions(filtered.sessions, {
@@ -561,7 +563,8 @@ function paintDashboard() {
     showMuted: showMutedSessions,
     projectFilter: project,
   });
-  const shownSessions = filterSessionState(mute.visible, sessionStatusFilter);
+  const agents = splitSubagentSessions(mute.visible, showSubagents);
+  const shownSessions = filterSessionState(agents.visible, sessionStatusFilter);
   const pending = fullSearchPending();
   // 已隐藏项目：从主列表移入栏底折叠区（见 recent-projects.js 的 splitHiddenProjects）。
   // 计数只用主列表上的卡片数（和屏上一致）；隐藏了多少由折叠条自己写明 —— 默认收起时，
@@ -589,11 +592,13 @@ function paintDashboard() {
             // 全部被默认隐藏：交给下面的 mutedNote 说明（它带「显示」按钮），
             // 这里再画一句「没有匹配」会让人以为真的搜不到。
             ? ''
-            : (sessionStatusFilter !== 'all' && mute.visible.length > 0 && !shownSessions.length)
+            : (agents.total > 0 && !agents.visible.length)
+              ? `<div class="empty search-empty">默认隐藏了 ${agents.total} 条子代理会话<button type="button" data-action="toggle-subagents">显示子代理</button></div>`
+            : (sessionStatusFilter !== 'all' && agents.visible.length > 0 && !shownSessions.length)
               ? '<div class="empty search-empty">该状态下没有会话<button type="button" data-action="filter-session-status" data-status-filter="all">显示全部状态</button></div>'
             : (filtered.filtering && !shownSessions.length)
               ? (pending ? searchPendingHtml('会话', searchQuery) : searchEmptyHtml('会话', searchQuery))
-              : renderRecentSessions(shownSessions, lastHomes);
+              : renderRecentSessions(shownSessions, lastHomes, { showSubagents });
   // 默认隐藏的提示条：始终说明「少了的是被默认规则藏起来的」，并把「显示/恢复隐藏」放在原地。
   // 入参用 mutedNoteSpec() 合成：它用的是 split.muted（按规则本该隐藏的全部行），而不是
   // split.hidden（当前真的藏起来的行）—— 点「显示」后 hidden 为空，用后者会让「恢复隐藏」入口
@@ -647,6 +652,7 @@ function paintDashboard() {
   const draft = captureAddFormDraft();
   const openDetails = new Set([...dashboardEl.querySelectorAll('[data-instance-details][open]')].map((el) => el.dataset.instanceDetails));
   const focusedStatus = document.activeElement?.dataset?.statusFilter;
+  const focusedSubagents = document.activeElement?.dataset?.action === 'toggle-subagents';
   const focusedHiddenProjects = document.activeElement?.dataset?.action === 'toggle-hidden-projects';
   const focusedDetails = document.activeElement?.closest?.('[data-instance-details]')?.dataset.instanceDetails;
   const focusedDetailsAction = document.activeElement?.dataset?.action;
@@ -655,7 +661,7 @@ function paintDashboard() {
     projects: projectsHtml + projectsMore + projectsScopeNote,
     sessions: sessionsHtml + projectMore + sessionsMore + mutedNote + mutedIdleNote,
     sessionFilter,
-    statusFilter: filtered.connected ? renderSessionStatusFilter(mute.visible, sessionStatusFilter) : '',
+    statusFilter: filtered.connected ? renderSessionStatusFilter(agents.visible, sessionStatusFilter, { showSubagents, subagentCount: agents.total }) : '',
     searching,
     projectScope: projectsScope,
     projectCount: filtered.connected
@@ -671,6 +677,7 @@ function paintDashboard() {
   dashboardEl.querySelectorAll('[data-instance-details]').forEach((el) => { el.open = openDetails.has(el.dataset.instanceDetails); });
   dashboardEl.querySelectorAll('.pane > .rows, .session-list').forEach((el, i) => { el.scrollTop = scrolls[i] ?? 0; });
   if (SESSION_FILTERS.some(([key]) => key === focusedStatus)) dashboardEl.querySelector(`[data-status-filter="${focusedStatus}"]`)?.focus({ preventScroll: true });
+  if (focusedSubagents) dashboardEl.querySelector('[data-action="toggle-subagents"]')?.focus({ preventScroll: true });
   // 折叠条的展开/收起会重建整个仪表盘：键盘用户点一次 Space 后焦点不能丢到 body。
   if (focusedHiddenProjects) dashboardEl.querySelector('[data-action="toggle-hidden-projects"]')?.focus({ preventScroll: true });
   if (focusedDetails) {
@@ -1287,6 +1294,10 @@ async function handleAction(e) {
           sessionStatusFilter = btn.dataset.statusFilter;
           paintDashboard();
         }
+        break;
+      case 'toggle-subagents':
+        showSubagents = !showSubagents;
+        paintDashboard();
         break;
       case 'scope-search':
         setSearchScope(btn.dataset.project);

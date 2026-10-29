@@ -8,6 +8,7 @@ import {
   validateModelTierJson,
   validateCredentials,
 } from './schema.js';
+import { annotateSubagentRunning } from './status.js';
 
 const PROVIDER_ALIASES = {
   kimi_code: 'kimi',
@@ -213,6 +214,10 @@ export function buildSnapshot({ homePath, readText, exists, listDir = null }) {
   if (projSessions.size > 0) {
     snapshot.pcVersion = pcVersion;
     snapshot.sessions = [...projSessions.values()];
+    // 「其中几个子代理在跑」要跨会话 join：父会话的 catalog childId ↔ 同一 home 的子会话行
+    //（per-record 与聚合两种来源合并**之后**才算，否则会漏掉只存在于另一侧的子会话）。
+    // 判据与实时通道共用 lib/status.js 的 annotateSubagentRunning；不可判定时保持缺键（未知）。
+    annotateSubagentRunning(snapshot.sessions);
     // **部分**文件读失败时，不能把错误悄悄丢掉。
     //
     // 之前这里只统计成功数，失败的文件连一条记录都没有：一个 home 里 476 个会话文件、

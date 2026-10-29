@@ -1,5 +1,6 @@
 import { esc, timeAgo, chipColor, sourceKind } from '../store.js';
 import { sessionState, sessionStatusChip } from './session-state.js';
+import { isSubagentSession } from './subagent-visibility.js';
 
 // 上下文用量是容量指标，不是任务完成进度。
 function pressureBar(cp) {
@@ -7,6 +8,28 @@ function pressureBar(cp) {
   const pct = Math.max(0, Math.min(100, Math.round((cp.pressureTokens / cp.contextWindow) * 100)));
   const cls = pct >= 85 ? 'bad' : pct >= 65 ? 'warn' : '';
   return `<div class="context-usage ${cls}"><span>上下文 ${pct}%</span><div class="pressure" role="meter" aria-label="上下文用量" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%;${cls ? `background:var(--${cls})` : ''}"></i></div></div>`;
+}
+
+// 子代理负载：紧跟在「上下文 N%」右侧的一行小字，只在**运行中**的卡片上画。
+//
+// 口径与 dsh 自己的会话头一致（dsh-client-ui-subagent 的 CatalogDropdown）：
+//   · `status.subagents` = catalog 条目数，**历史总数**（含已结束的 one-shot 子代理）；
+//   · `status.subagentsRunning` = 其中几个现在的子会话行是 running（文件索引或实时通道 join，
+//     两条路径共用 lib/status.js 的 annotateSubagentRunning）。
+//
+// 两个数字含义不同，所以文案把「运行」单独标出来，避免被读成并发数；
+// 运行数缺键（不可判定：子会话没被索引、实例离线等）时只画总数 —— 绝不把「不知道」写成 0，
+// 也绝不在没有子代理时画一个「子代理 0」。返回空串时整个 span 不出现（连分隔点都不出现）。
+function agentLoadSlot(state) {
+  if (state.kind !== 'running' || !state.subagentsKnown || state.subagents <= 0) return '';
+  const running = state.subagentsRunning;
+  const label = running == null
+    ? `子代理 ${state.subagents}`
+    : `子代理 ${state.subagents}（${running} 运行）`;
+  const hint = running == null
+    ? `子代理 ${state.subagents} 个（含已结束的）；其中几个在跑暂不可判定（缺少子会话索引）`
+    : `子代理 ${state.subagents} 个（含已结束的）；当前 ${running} 个在跑`;
+  return `<span class="session-secondary agent-load" title="${esc(hint)}">${label}</span>`;
 }
 
 // 会话 id 对用户几乎无用（UUID 前缀都一样），但在排查时唯一：默认只显示尾部 6 位，
@@ -62,7 +85,8 @@ export function renderSessionFilter({ project, homeId = null, sessionId = null, 
 
 // homes 用于在会话行里标出「属于哪个实例」：dsh 与 Codex 会话现在都汇总进同一栏，
 // 没有实例 chip 时 Codex 会话和 dsh 会话长得一模一样。缺实例信息时不画 chip（旧调用兼容）。
-export function renderRecentSessions(sessions, homes = []) {
+export function renderRecentSessions(sessions, homes = [], { showSubagents = false } = {}) {
+  if (!showSubagents) sessions = sessions.filter((s) => !isSubagentSession(s));
   if (!sessions.length) return '<div class="empty">no sessions indexed yet</div>';
   const homeById = new Map((Array.isArray(homes) ? homes : []).map((h) => [h.homeId, h]));
   return `<div class="rows">${sessions.map((s) => {
@@ -73,6 +97,7 @@ export function renderRecentSessions(sessions, homes = []) {
     return `
     <div class="row clickable card session-card" role="button" tabindex="0" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}"
          data-status="${status.kind}" data-source="${sourceKind(inst?.harness)}"
+         data-subagent="${isSubagentSession(s)}"
          data-session-id="${esc(s.sessionId)}" data-title="${esc(s.title || '')}" data-project="${esc(s.project ?? '')}"
          title="点击钻入该会话">
       <span class="card-rail" aria-hidden="true"></span>
@@ -86,10 +111,11 @@ export function renderRecentSessions(sessions, homes = []) {
         <div class="meta session-meta">
           ${s.project ? `<span class="chip proj-chip" style="background:${projColor.bg};color:${projColor.fg}">${esc(s.project)}</span>` : '<span class="chip">unknown</span>'}
           ${instName ? `<span class="chip home-chip" title="${esc(inst?.homePath ?? instName)}">${esc(instName)}</span>` : ''}
-          ${status.subagents > 0 ? `<span class="session-secondary">${status.subagents} 子agent</span>` : ''}
+          ${showSubagents && isSubagentSession(s) ? '<span class="chip subagent-chip">子代理</span>' : ''}
           ${status.saved ? '<span class="session-secondary" title="仅索引信息，不能证明执行状态">已保存</span>' : ''}
           ${s.historical ? '<span class="chip hist-chip" title="不在最近 50 条会话里，来自全库检索">历史</span>' : ''}
           ${pressureBar(s.contextPressure)}
+          ${agentLoadSlot(status)}
           <span class="active-time" title="最近活动时间，并非状态观测时间">${timeAgo(s.lastActivity)}</span>
           <span class="sid" title="session ${esc(s.sessionId)}">#${esc(shortSessionId(s.sessionId))}</span>
         </div>
