@@ -2,7 +2,7 @@ import { endpointRow, readEndpoints, endpointSelector } from './components/endpo
 import { downloadFile, uploadFiles, partitionUploads, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES } from './file-ops.js';
 import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js';
 import { renderWorkbench } from './components/workbench.js';
-import { renderRecentProjects, renderProjectsMore } from './components/recent-projects.js';
+import { renderRecentProjects, renderProjectsMore, splitHiddenProjects } from './components/recent-projects.js';
 import { renderRecentSessions, renderSessionFilter } from './components/recent-sessions.js';
 import { SESSION_FILTERS, filterSessionState, renderSessionStatusFilter } from './components/session-state.js';
 import { renderSearchResults } from './components/search-results.js';
@@ -75,6 +75,10 @@ const browserStorage = (() => {
 let mutedProjects = readMutedProjects(browserStorage);
 // 「显示已隐藏」只是当前视图的临时开关（不写偏好）：点一次看全部，刷新/恢复默认后仍按默认隐藏。
 let showMutedSessions = false;
+// 项目栏的「已隐藏」栏是否展开。默认收起 —— 被隐藏的项目连名字都不该出现在默认视图里，
+// 只有用户主动点开才可见（这正是「隐藏」区别于「加个已隐藏标记」的地方）。
+// 同样是内存态、不写偏好：刷新后回到收起，隐藏的持久语义只有「哪些项目被隐藏」。
+let showHiddenProjects = false;
 // —— 项目栏的范围偏好：全部项目 / 最近 7 天 ——
 //
 // 背景：项目栏原先固定拉 `/api/projects/recent`（不传 limit → 服务端默认 20），被截断时
@@ -486,6 +490,7 @@ function projectSessionsUrl(project) {
 function setProjectFilter(next) {
   const nextProject = typeof next?.project === 'string' && next.project ? next.project : null;
   if (projectKey() === nextProject) return; // 同一项目重复点击由调用方处理成「取消」
+  const prev = projectFilter;
   projectFilter = nextProject === null ? null : {
     project: nextProject,
     homeId: next.homeId || null,
@@ -495,6 +500,10 @@ function setProjectFilter(next) {
   projectSessions = projectFilter
     ? { project: projectFilter.project, status: 'loading', sessions: [], truncated: false }
     : { project: null, status: 'idle', sessions: [], truncated: false };
+  // 选中的项目若在「已隐藏」栏里，顺手展开它 —— 否则用户点了一个项目，卡片却不在列表里，
+  // 只剩 Sessions 栏的筛选条能证明「选中了」。离开这个显式视图时再收回（隐藏栏不是常驻展示）。
+  if (projectFilter && mutedProjects.includes(projectFilter.project)) showHiddenProjects = true;
+  else if (!projectFilter && prev && mutedProjects.includes(prev.project)) showHiddenProjects = false;
   resetSearchState();
   if (searchKey()) scheduleFullSearch();
   paintDashboard();
@@ -554,12 +563,17 @@ function paintDashboard() {
   });
   const shownSessions = filterSessionState(mute.visible, sessionStatusFilter);
   const pending = fullSearchPending();
+  // 已隐藏项目：从主列表移入栏底折叠区（见 recent-projects.js 的 splitHiddenProjects）。
+  // 计数只用主列表上的卡片数（和屏上一致）；隐藏了多少由折叠条自己写明 —— 默认收起时，
+  // 用户唯一能看到的「被藏起来」的信号就是这条「已隐藏 N 个项目」。
+  const projectMute = splitHiddenProjects(filtered.projects, { hiddenProjects: mutedProjects });
+  const hiddenProjectCount = projectMute.hidden.length;
   // 过滤到 0 条时给「清除搜索」的出路；全库补搜还在路上时先说明「正在检索」。
   const projectsHtml = !filtered.connected
     ? '<div class="empty">连接实例后显示对应项目</div>'
     : (filtered.filtering && !filtered.projects.length)
       ? (pending ? searchPendingHtml('项目', searchQuery) : searchEmptyHtml('项目', searchQuery))
-      : renderRecentProjects(filtered.projects, lastHomes, { selectedProject: searching ? null : project, mutedProjects });
+      : renderRecentProjects(filtered.projects, lastHomes, { selectedProject: searching ? null : project, mutedProjects, showHiddenProjects });
   // Sessions 栏的空态有优先级：未连接 → 项目会话加载中 → 加载失败 → 该项目确实没有会话 →
   // 匹配到的会话全被默认隐藏，最后才是搜索的「0 命中 / 正在全库检索」。项目本来就没有会话时
   // 提示「清除搜索」是误导（搜索不是原因，清掉也还是没有）。
@@ -633,6 +647,7 @@ function paintDashboard() {
   const draft = captureAddFormDraft();
   const openDetails = new Set([...dashboardEl.querySelectorAll('[data-instance-details][open]')].map((el) => el.dataset.instanceDetails));
   const focusedStatus = document.activeElement?.dataset?.statusFilter;
+  const focusedHiddenProjects = document.activeElement?.dataset?.action === 'toggle-hidden-projects';
   const focusedDetails = document.activeElement?.closest?.('[data-instance-details]')?.dataset.instanceDetails;
   const focusedDetailsAction = document.activeElement?.dataset?.action;
   const scrolls = [...dashboardEl.querySelectorAll('.pane > .rows, .session-list')].map((el) => el.scrollTop);
@@ -643,7 +658,10 @@ function paintDashboard() {
     statusFilter: filtered.connected ? renderSessionStatusFilter(mute.visible, sessionStatusFilter) : '',
     searching,
     projectScope: projectsScope,
-    projectCount: filtered.connected ? count(filtered.projects.length, filtered.totalProjects) : null,
+    projectCount: filtered.connected
+      // 屏上主列表的卡片数 = 范围内总数 − 已隐藏数；隐藏数由折叠条单独写明（不能无声消失）。
+      ? count(Math.max(0, filtered.projects.length - hiddenProjectCount), Math.max(0, filtered.totalProjects - hiddenProjectCount))
+      : null,
     // 会话计数用「屏上实际可见行数」：默认隐藏的会话数由 mutedNote 单独说明，不从计数里消失得无声无息。
     sessionCount: filtered.connected ? count(shownSessions.length, shownSessions.length) : null,
     homes: renderInstanceGrid(lastHomes),
@@ -653,6 +671,8 @@ function paintDashboard() {
   dashboardEl.querySelectorAll('[data-instance-details]').forEach((el) => { el.open = openDetails.has(el.dataset.instanceDetails); });
   dashboardEl.querySelectorAll('.pane > .rows, .session-list').forEach((el, i) => { el.scrollTop = scrolls[i] ?? 0; });
   if (SESSION_FILTERS.some(([key]) => key === focusedStatus)) dashboardEl.querySelector(`[data-status-filter="${focusedStatus}"]`)?.focus({ preventScroll: true });
+  // 折叠条的展开/收起会重建整个仪表盘：键盘用户点一次 Space 后焦点不能丢到 body。
+  if (focusedHiddenProjects) dashboardEl.querySelector('[data-action="toggle-hidden-projects"]')?.focus({ preventScroll: true });
   if (focusedDetails) {
     const details = [...dashboardEl.querySelectorAll('[data-instance-details]')].find((el) => el.dataset.instanceDetails === focusedDetails);
     const target = focusedDetailsAction ? [...(details?.querySelectorAll('button') ?? [])].find((el) => el.dataset.action === focusedDetailsAction) : details?.querySelector('summary');
@@ -1321,8 +1341,15 @@ async function handleAction(e) {
         await refresh();
         break;
       }
+      case 'toggle-hidden-projects':
+        // 「已隐藏」栏的展开/收起：纯视图动作，不写偏好（隐藏了哪些项目才是偏好）。
+        // 收起后卡片连名字都不渲染，所以这是唯一「看见被隐藏项目」的入口。
+        showHiddenProjects = !showHiddenProjects;
+        paintDashboard();
+        break;
       case 'toggle-mute-project': {
-        // 默认静音开关（项目卡上的「隐藏 / 已隐藏」或筛选条里的「默认隐藏 / 取消默认隐藏」）。
+        // 隐藏开关（项目卡上的「隐藏」、隐藏栏里的「取消隐藏」、筛选条里的「默认隐藏 / 取消默认隐藏」）。
+        // 语义是**两处一起变**：项目卡移入/移出「已隐藏」栏，会话从 Recent Sessions 默认视图移走/恢复。
         // 持久化到 localStorage，刷新后仍生效。
         const project = btn.dataset.project;
         if (!project) break;
@@ -1330,21 +1357,25 @@ async function handleAction(e) {
         mutedProjects = toggleMutedProject(mutedProjects, project);
         writeMutedProjects(browserStorage, mutedProjects);
         if (wasMuted) {
-          flashNote(`已恢复显示「${project}」的会话（关闭了默认静音）`);
+          // 取消隐藏：卡片回主列表。隐藏栏空了就收起，别留一条「已隐藏 0 个项目」。
+          if (!mutedProjects.length) showHiddenProjects = false;
+          flashNote(`已恢复显示「${project}」：项目回到项目列表，会话回到 Recent Sessions`);
           paintDashboard();
           break;
         }
         // 刚点了「隐藏」却还处于「显示已隐藏」临时态，会看起来像没生效 —— 顺手收回临时态。
         showMutedSessions = false;
+        // 新隐藏的项目默认收进折叠栏（而不是留在原地加标记）：这正是用户要的「隐藏」。
+        showHiddenProjects = false;
         // 在**该项目的筛选视图**里点隐藏：显式视图按定义会显示它的全部会话，停在这里会看起来
-        // 完全没生效。回到默认视图，让「会话消失 + 底部说明 + 卡片已隐藏」立刻可见。
+        // 完全没生效。回到默认视图，让「卡片移入折叠栏 + 会话消失 + 底部说明」立刻可见。
         if (projectFilter?.project === project) {
           setProjectFilter(null);
-          flashNote(`已默认隐藏「${project}」的会话；Recent Sessions 底部可临时「显示」`);
+          flashNote(`已隐藏「${project}」：已移入项目栏底部「已隐藏」栏，会话也不再默认显示`);
           break;
         }
         paintDashboard();
-        flashNote(`已默认隐藏「${project}」的会话；Recent Sessions 底部可临时「显示」`);
+        flashNote(`已隐藏「${project}」：已移入项目栏底部「已隐藏」栏，会话也不再默认显示`);
         break;
       }
       case 'reset-muted-projects':
@@ -1352,6 +1383,7 @@ async function handleAction(e) {
         mutedProjects = [...DEFAULT_MUTED_PROJECTS];
         writeMutedProjects(browserStorage, mutedProjects);
         showMutedSessions = false;
+        showHiddenProjects = false;
         paintDashboard();
         break;
       case 'show-muted-sessions':

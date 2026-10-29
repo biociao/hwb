@@ -148,7 +148,7 @@ test('app.js：按项目拉会话（精确 project 参数 + 独立 limit），�
 test('app.js：paintDashboard 使用项目会话作为 Sessions 栏数据源，并把选中项目传给项目卡', () => {
   assert.match(appJs, /const proj = project \? \(projectSessions\.project === project \? projectSessions : null\) : null;/);
   assert.match(appJs, /const baseSessions = project \? \(searching \? filterExactProject\(sessions, project\) : projSessions\) : sessions;/);
-  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: searching \? null : project, mutedProjects \}\)/);
+  assert.match(appJs, /renderRecentProjects\(filtered\.projects, lastHomes, \{ selectedProject: searching \? null : project, mutedProjects, showHiddenProjects \}\)/);
   assert.match(appJs, /renderSessionFilter\(\{/);
   assert.match(appJs, /sessionFilter,/);
   assert.match(appJs, /正在筛出「\$\{esc\(project\)\}」的会话…/, '切换瞬间要给出加载态');

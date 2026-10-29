@@ -189,6 +189,26 @@
     .muted-note.muted-idle { border-top-style: dotted; opacity: .9; }
     .muted-note b { color: var(--fg); font-variant-numeric: tabular-nums; }
     .muted-note button { padding: 0 8px; font-size: 11px; }
+    /* —— 项目「已隐藏」栏 ——
+       被隐藏的项目不再留在项目列表里（原先只在卡上画「已隐藏」chip，看起来像隐藏没生效）；
+       它们被收进栏底这条折叠栏，默认收起 —— 被隐藏的东西默认不可见，只有主动展开才显示。
+       折叠条挂在 .rows 滚动区之外：项目多的时候要翻很久才到底，而它是「列表里少了东西」的
+       唯一说明入口，必须常驻可见。展开内容画在折叠条**上方**（抽屉向上展开），折叠条始终钉底。 */
+    .projects-hidden { flex: 0 0 auto; border-top: 1px dashed var(--border); }
+    .projects-hidden-toggle { display: flex; align-items: center; gap: 6px; width: 100%;
+      padding: 7px 10px; border: 0; border-radius: 0; background: transparent; color: var(--dim);
+      font: inherit; font-size: 11.5px; text-align: left; cursor: pointer; }
+    .projects-hidden-toggle:hover, .projects-hidden-toggle:focus-visible {
+      background: var(--hover); color: var(--fg); }
+    .projects-hidden-toggle b { color: var(--fg); font-variant-numeric: tabular-nums; }
+    .projects-hidden-toggle .ph-caret { flex: none; width: 10px; opacity: .75; }
+    .projects-hidden-panel { border-bottom: 1px dashed var(--border);
+      background: color-mix(in srgb, var(--panel-2) 45%, transparent); }
+    .projects-hidden-note { padding: 7px 10px 0; color: var(--dim); font-size: 11px; }
+    /* 隐藏的项目可能很多：给面板自己的滚动区，别把整个项目栏撑出视口。 */
+    .projects-hidden-panel .rows { max-height: min(36vh, 340px); overflow-y: auto; }
+    .row.hidden-project { opacity: .88; }
+    .row.hidden-project .card-rail { opacity: .45; }
 
     /* —— 两种卡的第一视觉锚点不同：项目 = 身份徽标（左），会话 = 状态竖轨（左）——
        这样即使两栏并排、行高相近，扫视时也不会把「项目」看成「会话」。 */
