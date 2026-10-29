@@ -23,10 +23,39 @@
 > 拓扑可视化附录见 [`docs/topology.md`](docs/topology.md)。
 > 变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
+## 界面预览
+
+以下截图由 **v0.2.0 的真实前端**渲染，使用合成演示数据；项目、会话、实例和用量均为示例。
+
+**多工具会话总览** — 在一处查看 dsh、Codex、WorkBuddy 的项目与会话，区分待介入、运行中、未读和已完成状态；运行中的父会话显示子代理负载。
+
+![hwb 会话总览：项目、会话状态和多工具实例](images/screenshots/overview.png)
+
+<details>
+<summary>展开功能截图：待介入提醒、项目搜索与 Token 用量</summary>
+
+**待介入提醒** — 一键筛出等待审批、计划待审和等待回答的会话，优先处理需要你操作的任务。
+
+![hwb 待介入筛选：等待审批、计划待审和等待回答](images/screenshots/interventions.png)
+
+**项目筛选与搜索** — 从项目卡进入会话列表，再将搜索范围限定到当前项目，快速定位相关记录。
+
+![hwb 项目搜索：限定 Atlas Web 项目并检索会话](images/screenshots/project-search.png)
+
+**Token 用量与深色主题** — 切换统计周期与分组维度，查看输入、输出、缓存构成及按项目拆分的趋势。
+
+![hwb 深色主题下的 Token 汇总与项目用量趋势](images/screenshots/usage-dark.png)
+
+</details>
+
+截图可通过 [`scripts/readme-screenshots.mjs`](scripts/readme-screenshots.mjs) 重新生成：
+`node scripts/readme-screenshots.mjs`（需要 Chrome；Linux 可用 `CHROME_PATH` 指定可执行文件）。
+
 ---
 
 ## 目录
 
+- [界面预览](#界面预览)
 - [它做什么 / 不做什么](#它做什么--不做什么)
 - [核心能力](#核心能力)
 - [环境要求](#环境要求)
