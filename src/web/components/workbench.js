@@ -1,5 +1,34 @@
 import { esc } from '../store.js';
 
+// 介入提示条：列表上方的「N 个会话需要你操作」。
+//
+// 为什么卡片上的橙色 chip 还不够：chip 只在「你正好扫到那一行」时起作用，而列表会滚动、
+// 会被状态筛选切掉一部分。把计数放在列表入口处，才保证打开仪表盘就能看到「有人在等你」，
+// 按钮则提供一步到位的收敛视图（切到「待介入」筛选）。
+// 计数 ≤ 0 / 非法时返回空字符串 —— 没有介入就绝不画这条（否则会变成常驻噪音）。
+// unobserved：屏上会话所属实例里「没有实时通道」的名字。这些实例只有落盘元数据，
+// 等待审批 / 计划待审 / 等待回答**永远观察不到** —— 所以「0 个需要你操作」不能当成「没事」，
+// 必须把观测盲区说出来（2026-10-27 实测事故：只读实例上一条会话在等审批，界面显示待介入 0）。
+export function renderInterventionBanner(count, { active = false, unobserved = [] } = {}) {
+  const n = Number(count);
+  const blind = (Array.isArray(unobserved) ? unobserved : []).filter((x) => typeof x === 'string' && x.trim());
+  const coverage = blind.length
+    ? `<span class="iv-coverage" title="这些实例只有落盘元数据、没有实时通道：等待审批 / 计划待审 / 等待回答不会出现在「待介入」里">${blind.length} 个实例无实时通道（${blind.map((x) => esc(x)).join('、')}），那里的等待审批看不到</span>`
+    : '';
+  if (!Number.isFinite(n) || n <= 0) {
+    // 没有可见介入 + 没有观测盲区 → 不画（旧的「没有介入不画提示条」语义保持不变）。
+    return coverage ? `<div class="intervention-banner coverage" role="status">${coverage}</div>` : '';
+  }
+  const total = Math.max(1, Math.floor(n));
+  return `<div class="intervention-banner" role="status" aria-live="polite">
+      <span class="iv-dot" aria-hidden="true"></span>
+      <span class="iv-text"><b>${total}</b> 个会话需要你操作</span>
+      ${coverage}
+      <button type="button" data-action="filter-session-status" data-status-filter="intervention"
+        aria-pressed="${active === true}" title="只看正在等你审批 / 审计划 / 回答的会话">只看待介入</button>
+    </div>`;
+}
+
 // 三栏的「分区身份」：Projects 用项目色（赭石），Sessions 用强调色（墨蓝），Instances 中性。
 // 分区的颜色 + 图标 + 计数，配合两种卡不同的第一视觉锚点（项目徽标 / 会话状态轨），
 // 让两栏在扫视时不会串。计数由调用方传入（缺省不画，保持旧调用兼容）。
@@ -7,12 +36,15 @@ import { esc } from '../store.js';
 // （搜索过滤中：命中/总数）—— 两种形态都走同一条 esc → innerHTML 路径。
 // sessionFilter：项目筛选条（见 recent-sessions.js 的 renderSessionFilter）。它放在 h2 与
 // 列表之间、不属于滚动区（.rows），所以筛选中时它会一直留在分区顶部，不被列表滚走。
-// projectScope：项目栏范围；缺省 null 时保持旧调用行为。
-export function renderWorkbench({ projects, sessions, homes, usage, logs, projectCount = null, sessionCount = null, sessionFilter = '', statusFilter = '', searching = false, projectScope = null }) {
+// interventionBanner：列表上方的介入提示（见 renderInterventionBanner）。同样留在滚动区外，
+// 缺省空字符串 = 不画。
+// projectScope：项目栏的范围（'recent' = 最近 7 天，'all' = 全部项目）。见 projectsScopeHtml。
+// 缺省 null = 不画切换控件，旧调用方（只渲染列表的测试/片段）行为不变。
+export function renderWorkbench({ projects, sessions, homes, usage, logs, projectCount = null, sessionCount = null, sessionFilter = '', statusFilter = '', interventionBanner = '', searching = false, projectScope = null }) {
   const count = (n) => (n == null || n === '' ? '' : `<span class="pane-count">${esc(n)}</span>`);
   return `
     <section class="pane pane-projects"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">▦</span>项目</span>${projectsScopeHtml(projectScope)}${count(projectCount)}</h2>${projects}</section>
-    <section class="pane pane-sessions"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">◍</span>${searching ? '会话搜索结果' : '最近会话'}</span>${count(sessionCount)}</h2>${sessionFilter}${statusFilter}<div class="session-list">${sessions}</div></section>
+    <section class="pane pane-sessions"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">◍</span>${searching ? '会话搜索结果' : '最近会话'}</span>${count(sessionCount)}</h2>${sessionFilter}${statusFilter}${interventionBanner}<div class="session-list">${sessions}</div></section>
     <section class="pane pane-instances"><h2><span class="pane-title"><span class="pane-mark" aria-hidden="true">▣</span>实例与连接</span><button class="add" data-action="toggle-add-form">＋ 添加</button></h2>${homes}</section>
     <section class="usage"><h2>Token 用量</h2><div id="usage-card">${usage}</div></section>
     ${logs || ''}

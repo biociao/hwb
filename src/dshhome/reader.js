@@ -32,6 +32,26 @@ function mergeTokenUsage(existing, liveUsage) {
   return JSON.stringify({ ...base, ...patch });
 }
 
+// 实时状态的 status 是**整块**覆盖的（运行中/完成/空闲由实时通道权威判定）。唯一需要
+// 「实时没报就保留文件侧」的字段是 `intervention`：它的一条来源是 dsh 的 `userQuestions` 投影，
+// 而**旧版 dsh 的 `/api/session/list` 可能根本不带这个 projection**。整块替换的话，那些
+// 「文件索引已推导出在等回答、实时行却没这个字段」的会话会每 3s 被清一次标记（在等回答的
+// 标记会闪，甚至一直不出现）。
+// 判定口径（与 live-status.toLiveRow 约定）：实时 status **自带** `intervention` 键（含显式
+// null）就是权威——null 表示「实时确认没有在等」；没有这个键才沿用文件侧的值。
+function mergeLiveStatusJson(existing, live) {
+  let base = null;
+  if (typeof existing === 'string' && existing) {
+    try { base = JSON.parse(existing); } catch { base = null; } // 坏 JSON 当成没有基线
+  }
+  if (!base || typeof base !== 'object' || Array.isArray(base)) return JSON.stringify(live);
+  if (Object.hasOwn(live, 'intervention') || !Object.hasOwn(base, 'intervention')) {
+    return JSON.stringify({ ...base, ...live });
+  }
+  const { intervention, ...rest } = base;
+  return JSON.stringify({ ...rest, ...live, intervention });
+}
+
 // 把「实时状态」合并进 normalize 出来的会话行（两个方向）：
 //   1. 覆盖：live 里已有的会话覆盖从（可能冻结的）投影缓存推导出的状态/活跃时间/用量/标题；
 //   2. 补插：live 里有、投影缓存里还没有的会话（冻结期间新产生的）补成新的 session 行——
@@ -56,7 +76,7 @@ export function mergeLiveStatus(rows, live, { homeId, generatedAt }) {
     known.add(row.sessionId);
     const l = bySession.get(row.sessionId);
     if (!l) continue;
-    if (l.status) row.status = JSON.stringify(l.status);
+    if (l.status) row.status = mergeLiveStatusJson(row.status, l.status);
     if (l.lastActivity) row.lastActivity = l.lastActivity;
     if (l.tokenUsage) row.tokenUsage = mergeTokenUsage(row.tokenUsage, l.tokenUsage);
     if (l.title) row.title = l.title;

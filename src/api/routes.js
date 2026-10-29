@@ -211,12 +211,36 @@ function resolveUserPath(raw, fallback) {
 // remoteExec：远端实例的 ssh 执行器，缺省用真实的 sshBash。抽成依赖是为了让「远端实例上传」
 // 这条链路能在测试里被真正走一遍 —— 它此前从未被路由级测试覆盖，于是藏着一个让整条远端
 // 上传通道（分片 + 远端合并）完全不可达的缺陷（见下面的注释）。
-export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null, codex = null, localTools = LOCAL_TOOL_SOURCES, openSession = openSessionInDsh, openDshApp = openDshAppDefault }) {
+export function createRouter({ store, indexer, hub, launcher, monitor, quota, logApi, remoteExec, usageTtlMs = 10_000, maxConcurrentUploads = 1, themePreference = () => 'system', setThemePreference = () => {}, dshVersion = null, codex = null, localTools = LOCAL_TOOL_SOURCES, openSession = openSessionInDsh, openDshApp = openDshAppDefault, interventions = null, liveIntervention = null }) {
   const connecting = new Set();
   // 本地工具数据源（Codex / WorkBuddy）。默认直接用描述符表；server.js 也可以注入一份
   // （同一形状）以便在版本预检之后才动态装配。调用点一律 await —— readSnapshot/resolveTarget/open
   // 都是 async（内部按需动态 import node:sqlite 的 reader）。
   const toolSources = localTools ?? {};
+  // 实时介入覆盖层（可选依赖）：server.js 注入 live-approval-observer 的 PendingInteractionWatcher
+  // （`apply(sessions)` 返回合入 intervention 的新数组，见 dshhome/pending-interactions.js）。
+  //
+  // 三条约定，缺一条都会让「附加信息」变成主链路的故障源：
+  //   · **可选**：单测/嵌入场景直接建 router 时不传 —— 此时行为与没有这个特性时逐字节相同；
+  //   · **不改形状**：只给行加/覆盖 `intervention` 字段，不增删行、不改顺序，
+  //     所以 truncated / limit 的语义与不带覆盖层时完全一致；
+  //   · **失败只降级**：合并抛错时记一条 warn 并返回原行。介入标记是锦上添花，
+  //     它坏了就该「显示为没有待介入」，绝不能让整个仪表盘 500（列表是首屏主视图）。
+  const withInterventions = (rows) => {
+    if (!Array.isArray(rows) || typeof interventions?.apply !== 'function') return rows;
+    try {
+      const merged = interventions.apply(rows);
+      // apply 的契约是返回新数组；防御性地忽略任何非数组返回值（宁可少标记，不要坏响应）。
+      return Array.isArray(merged) ? merged : rows;
+    } catch (error) {
+      // 记 warn 便于排查，但错误文本里可能带实例 URL（token 由 logger 统一脱敏，URL 在这里擦掉）——
+      // 日志不落任何实时通道地址，否则排查时会顺手把凭据位置写进文件。
+      logger('api').warn('合并实时介入状态失败，已降级为未标记的会话行', {
+        err: String(error?.message ?? error).replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>'),
+      });
+      return rows;
+    }
+  };
   // 实例上的 dsh 版本号（DshVersionResolver，见 lib/dsh-version.js）。可以缺省：本地实例同步
   // 读本机安装、远程实例后台 ssh 探测，两者都**不是**渲染实例列表的前置条件 —— 单测直接建
   // router 时不必关心它，那时 runtime.dshVersion 为 null，前端按「未知」处理（不画那个 chip）。
@@ -467,7 +491,20 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       const homes = store.listHomes();
       // 版本缓存里已移除实例的条目顺手清掉：否则反复增删实例会让那张表单调增长。
       dshVersion?.prune?.(homes.map((h) => h.homeId));
-      send(res, 200, { homes: homes.map((h) => ({ ...publicHome(h), runtime: runtimeOf(h) })) });
+      // liveIntervention：该实例此刻有没有可用的实时介入通道（= 能观察到 approval/request）。
+      // false/null 的实例上「待介入」是**未观测**而不是「确实没有」—— 前端必须能区分，
+      // 否则只读/离线实例上的等待审批会被当成「没人需要你」（2026-10-27 实测事故）。
+      send(res, 200, {
+        homes: homes.map((h) => ({
+          ...publicHome(h),
+          runtime: runtimeOf(h),
+          // 只对 dsh 有意义：审批/计划审阅是 dsh 的交互概念（Codex / WorkBuddy 没有），
+          // 它们的实例返回 null（不适用），避免前端把「没有审批概念」误报成「观测盲区」。
+          liveIntervention: typeof liveIntervention === 'function' && h.harness === 'dsh'
+            ? Boolean(liveIntervention(h))
+            : null,
+        })),
+      });
       return;
     }
     if (req.method === 'GET' && pathname === '/api/homes/detect') {
@@ -999,15 +1036,18 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     if (req.method === 'GET' && pathname === '/api/sessions/recent') {
       const project = textParam(searchParams.get('project'));
       const limit = numParam(searchParams.get('limit'), 50, 1, 500);
-      const rows = store.recentSessions({
+      // 查询**只发一次**：覆盖层是行级合并，不改变条数与顺序，所以截断判断仍用同一次查询结果。
+      // （先取行 → 再合入实时介入 → 最后切 limit，truncated 只看原始行数。）
+      const rawRows = store.recentSessions({
         homeIds: dataHomeIds(),
         homeId: searchParams.get('homeId') || null,
         project,
         limit: project ? limit + 1 : limit,
       });
+      const rows = withInterventions(rawRows);
       send(res, 200, {
         sessions: project ? rows.slice(0, limit) : rows,
-        truncated: project ? rows.length > limit : false,
+        truncated: project ? rawRows.length > limit : false,
       });
       return;
     }
@@ -1018,13 +1058,15 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
     // 搜索是给人定位用的，不是导出；超出上限由 truncated 标志告诉前端「还有更多」。
     // project（可选）只把**会话**结果收在该项目内（项目筛选下的补搜），项目结果不受它限制。
     if (req.method === 'GET' && pathname === '/api/search') {
-      send(res, 200, store.searchAll({
+      const result = store.searchAll({
         q: searchParams.get('q') ?? '',
         homeIds: dataHomeIds(),
         projectLimit: numParam(searchParams.get('projectLimit'), 20, 1, 100),
         sessionLimit: numParam(searchParams.get('sessionLimit'), 50, 1, 200),
         project: textParam(searchParams.get('project')),
-      }));
+      });
+      // 只覆盖 sessions：projects / truncated 原样透出（搜索结果的条数与截断不受介入标记影响）。
+      send(res, 200, { ...result, sessions: withInterventions(result.sessions) });
       return;
     }
     if (req.method === 'GET' && pathname === '/api/workspaces') {

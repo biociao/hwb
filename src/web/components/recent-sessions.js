@@ -1,5 +1,5 @@
 import { esc, timeAgo, chipColor, sourceKind } from '../store.js';
-import { sessionState, sessionStatusChip } from './session-state.js';
+import { sessionState, sessionStatusChip, interventionState, interventionChip } from './session-state.js';
 import { isSubagentSession } from './subagent-visibility.js';
 
 // 上下文用量是容量指标，不是任务完成进度。
@@ -94,18 +94,23 @@ export function renderRecentSessions(sessions, homes = [], { showSubagents = fal
     const inst = homeById.get(s.homeId);
     const instName = inst ? (inst.alias || inst.homePath) : null;
     const status = sessionState(s);
+    // 介入（等待审批/计划待审/等待回答）是这个卡片最该被先看到的信息：
+    // 根节点 data-intervention 让整卡换警示描边 + 竖轨，状态列里再加一颗前置 chip。
+    // 没有介入时**不输出**该属性（空的 data-intervention="" 也会命中 CSS 的 [data-intervention]）。
+    const intervention = interventionState(s);
     return `
     <div class="row clickable card session-card" role="button" tabindex="0" data-action="drill-in" data-kind="session" data-home-id="${esc(s.homeId)}"
          data-status="${status.kind}" data-source="${sourceKind(inst?.harness)}"
-         data-subagent="${isSubagentSession(s)}"
+         data-subagent="${isSubagentSession(s)}"${intervention ? ` data-intervention="${intervention.kind}"` : ''}
          data-session-id="${esc(s.sessionId)}" data-title="${esc(s.title || '')}" data-project="${esc(s.project ?? '')}"
          title="点击钻入该会话">
-      <span class="card-rail" aria-hidden="true"></span>
+      <span class="card-rail${intervention ? ' warn' : ''}" aria-hidden="true"></span>
       <div class="card-body">
         <div class="t">
           <span class="name session-title" title="${esc(s.title || s.workspaceTitle || s.project || s.sessionId)}">${esc(s.title || s.workspaceTitle || s.project || s.sessionId)}</span>
           <span class="status-col">
-            ${sessionStatusChip(s)}
+            ${interventionChip(s)}
+            ${sessionStatusChip(s, { unobserved: inst?.liveIntervention === false })}
           </span>
         </div>
         <div class="meta session-meta">

@@ -20,6 +20,10 @@ const { openCodexThread } = await import('./codexhome/open.js');
 // reader.js 与 codexhome/reader.js 都只在**调用点**由描述符内部动态 import，所以这里（以及
 // routes/monitor 的静态图）都不会在 enforceNodeVersion() 之前求值 node:sqlite。
 const { LOCAL_TOOL_SOURCES, isLocalToolHome } = await import('./lib/harnesses.js');
+// 实时人工介入观察器（dsh remote-events WS 的 approval/request、user-questions/request 帧）。
+// 和 store.js 一样走「版本预检之后」的动态引入：静态 import 会在 enforceNodeVersion() 之前
+// 被求值，把将来可能出现的 node:sqlite 依赖提前炸在与根因无关的解析错误上。
+const { PendingInteractionWatcher } = await import('./dshhome/pending-interactions.js');
 import { Indexer } from './dshhome/indexer.js';
 import { LiveStatusReader } from './dshhome/live-status.js';
 import { LiveStatusPoller } from './dshhome/live-poller.js';
@@ -173,16 +177,24 @@ const codex = {
   openThread: (threadId) => openCodexThread(threadId),
 };
 const liveStatusReader = new LiveStatusReader();
-const readLiveStatus = async (home) => {
-  const rt = monitor.get(home.homeId);
-  if (!rt || rt.runtime !== 'running') return null;
+// 实例的实时通道 URL（本地实例用 home 配置里的最新 token + localPort；远程实例用隧道反代 URL）。
+// 抽成函数是因为现在有**两条**实时通道（状态轮询 + 人工介入观察）要用同一个 URL：
+// 各写一份的话，「本地 token 刚改过就立即生效」这类行为迟早会只修在一条链路上。
+// 返回 null 表示该实例没有可用的实时通道（调用方按「不可观察」处理，而不是拼一个坏 URL）。
+function liveStatusUrl(home, rt) {
   // 本地实例：直接用 home 配置里的最新 token + localPort 拼实时 URL（不依赖可能过期的 rt.url，
   // 用户刚在配置里填了新 token 也能立即生效）。远程实例：经隧道反代的 rt.url。
-  let url = rt.url;
+  let url = rt?.url;
   if (home.hostType === 'local' && home.localPort) {
     const base = `http://127.0.0.1:${home.localPort}`;
     url = home.token ? `${base}/?token=${encodeURIComponent(home.token)}` : base;
   }
+  return url || null;
+}
+const readLiveStatus = async (home) => {
+  const rt = monitor.get(home.homeId);
+  if (!rt || rt.runtime !== 'running') return null;
+  const url = liveStatusUrl(home, rt);
   if (!url) return null;
   try {
     return await liveStatusReader.read(url, { homeId: home.homeId, host: home.host });
@@ -190,6 +202,19 @@ const readLiveStatus = async (home) => {
     return null;
   }
 };
+// 该实例是否有**可用的实时介入通道**（能观察到 approval/request 的那条 WS）。
+//
+// 为什么必须单独抽出来给 API 用：本地只读 dsh 实例（readOnly）由 monitor 标成 running
+// （只看目录在不在），但没有 localPort/token → 没有 URL → watcher 永远连不上，
+// 「等待审批」永远看不到。仪表盘如果仍把「待介入 0」当成「没人需要你」，就是假阴性
+// （2026-10-27 实测：一条 3 小时会话在只读实例上弹审批，hwb 显示「空闲 / 待介入 0」）。
+// 判定必须与 interventionTargets / LiveStatusPoller 完全同口径，否则又会出现割裂。
+function liveInterventionUrl(home) {
+  if (isLocalToolHome(home)) return null;
+  const rt = monitor.get(home.homeId);
+  if (rt?.runtime !== 'running') return null;
+  return liveStatusUrl(home, rt);
+}
 // 本地工具数据源（Codex / WorkBuddy）：描述符表是唯一来源，索引器/路由不再为某个 harness 写分支。
 // 传引用而不是复制：将来新增 harness 只改 src/lib/harnesses.js 一处。
 const localTools = LOCAL_TOOL_SOURCES;
@@ -213,9 +238,48 @@ const livePoller = new LiveStatusPoller({
   store, homes: () => store.listHomes().filter((h) => !isLocalToolHome(h) && monitor.get(h.homeId).runtime === 'running'), read: readLiveStatus,
   broadcast: (event, data) => hub.broadcast(event, data),
 });
+
+// —— 实时人工介入（等待审批 / 计划待审 / 等待回答）——
+// 审批是**瞬时交互态**，不落投影缓存：一个正在等 Approve 的会话在投影里看起来就是「空闲」。
+// 所以这条信息只能来自实时通道，watcher 自己维护 homeId→sessionId→intervention 的覆盖层，
+// 由 API 层（routes.js 的 withInterventions）在返回 session 行时合入。
+// 变更时它自己 broadcast('intervention:updated', { homeId })，前端据此重画。
+const interventions = new PendingInteractionWatcher({ broadcast: (event, data) => hub.broadcast(event, data) });
+// 观察目标必须和 LiveStatusPoller **完全同口径**（非本地工具实例 + 运行中 + 有可用 URL），
+// 否则会出现「状态在实时刷新、审批却永远标不出来」的割裂。
+const interventionTargets = () => {
+  const targets = [];
+  for (const home of store.listHomes()) {
+    const url = liveInterventionUrl(home);
+    // url 缺失的实例直接跳过：没有实时通道就没有实时介入，不能拼一个坏地址去连。
+    if (url) targets.push({ homeId: home.homeId, url });
+  }
+  return targets;
+};
+// 5s 一轮：sync() 是幂等的「按 homeId 增删/重连」，不是轮询帧本身（帧走 watcher 内部的长连接）。
+// 它只负责跟上「实例启动/停止/换端口」这些低频变化。
+// 日志安全：错误信息里可能出现 URL/token（传输层抛错时常见），落日志前统一擦掉。
+const scrub = (text) => String(text)
+  .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+  .replace(/token=[^\s&]+/gi, 'token=***');
+const syncInterventions = () => {
+  try {
+    interventions.sync(interventionTargets());
+  } catch (error) {
+    // 同步失败只是「这一轮没跟上实例变化」：保留上一轮的观察结果，绝不能让进程/仪表盘受影响。
+    log.warn('同步实时介入观察目标失败（已跳过本轮）', { err: scrub(error?.message ?? error) });
+  }
+};
+
 monitor.start();
 indexer.start();
 livePoller.start();
+// 立即同步一次（让已经在跑的实例第一时间被观察），之后每 5s 跟上「启动/停止/换端口」这些
+// 低频变化。放在 monitor.start() 之后：否则首次同步时 monitor 还没有运行时状态，白跑一轮。
+syncInterventions();
+const interventionTimer = setInterval(syncInterventions, 5000);
+// unref：这个定时器不该成为「进程为什么退不掉」的原因（与 SSEHub 心跳同样的处理）。
+interventionTimer.unref?.();
 
 const server = createApiServer({
   store,
@@ -237,6 +301,11 @@ const server = createApiServer({
   codex,
   // 统一打开 API（POST /api/harness/open）用的本地工具数据源。
   localTools,
+  // 实时介入覆盖层：/api/sessions/recent 与 /api/search 的 session 行合入 intervention 字段。
+  interventions,
+  // 每个实例是否具备实时介入通道：/api/homes 用它给前端一个诚实的「未观测」标记
+  // （只读/离线实例没有实时通道，审批不可能被看到）。
+  liveIntervention: (home) => Boolean(liveInterventionUrl(home)),
 });
 server.listen(opts.port, '127.0.0.1', () => {
   globalThis.hwbServiceReady?.();
@@ -268,6 +337,14 @@ async function shutdown(reason = 'signal') {
   shuttingDown = true;
   log.info(`shutdown (${reason})`);
   livePoller.stop();
+  // 先停同步循环再停 watcher：反过来的话，正在被 stop() 拆掉的 watcher 可能又被 sync 一下
+  // （虽然 sync 幂等，但那会让退出时序变得难推理）。两者都必须走完，否则退出会残留 WS/定时器句柄。
+  clearInterval(interventionTimer);
+  try {
+    interventions.stop();
+  } catch (error) {
+    log.warn('停止实时介入观察器失败', { err: error?.message ?? String(error) });
+  }
   indexer.stop();
   monitor.stop();
   hub.close(); // 清掉 SSE 心跳定时器并断开所有客户端，避免退出时残留句柄

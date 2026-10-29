@@ -83,7 +83,7 @@ export function validateWorkspaceJson(data) {
  * 抽出来是为了保证两条读取路径永远产出同一组字段 —— 否则「per-record 会话缺 status」
  * 这类分歧会以「有些会话不显示状态」的形式悄悄出现，且只在部分数据上复现。
  */
-function projcacheRecordToSession(sessionId, s) {
+function projcacheRecordToSession(sessionId, s, observedAt = null) {
   const rows = s.rows ?? {};
   const totals = rows.tokenUsage?.val?.totals ?? {};
   const cp = rows.contextPressure?.val;
@@ -122,15 +122,23 @@ function projcacheRecordToSession(sessionId, s) {
     inheritedEventCount: s.identity?.inheritedEventCount,
     plan: rows.plan?.val,
     permissions: rows.permissions?.val,
+    // 待回答的提问（「人工介入」的持久来源）。投影里没有审批态——审批不落盘，
+    // 只能由实时通道合成，见 lib/intervention.js 的文件头。
+    userQuestions: rows.userQuestions?.val,
     // 投影缓存是**快照**：进程被杀/机器休眠/会话被放弃时，里面那些「进行中」的信号会永远
     // 冻结在那里。不断言新鲜度的话，几周前的会话会一直显示「运行中」（实测真实 home：
     // 179 个会话里 18 个被判 running，全部空闲 7–28 天，0 个在 10 分钟内）。
+    // lastActivity 只是「最后一条用户输入」：长任务中途没有新输入时它会停在几小时前，
+    // 拿它单独判冻结会把在跑的会话误标成空闲（见 lib/status.js 新鲜度注释）。
+    // observedAt 是**投影文件 mtime**（per-record 布局下由 read-home.js 提供），
+    // 它回答「这份快照是什么时候写的」；缺失时退回只看 lastActivity。
     lastActivity: meta.lastActivity,
+    observedAt,
   });
   return meta;
 }
 
-export function validateProjcacheJson(data) {
+export function validateProjcacheJson(data, { observedAt = null } = {}) {
   const u = unitVersion(data, 'session_projcache.json');
   if (u.error) return fail(u.error);
   if (!SUPPORTED_VERSIONS.projcache.includes(u.version)) {
@@ -143,7 +151,7 @@ export function validateProjcacheJson(data) {
   const sessions = [];
   for (const [sessionId, s] of Object.entries(table)) {
     if (!s || typeof s !== 'object') continue;
-    sessions.push(projcacheRecordToSession(sessionId, s));
+    sessions.push(projcacheRecordToSession(sessionId, s, observedAt));
   }
   return { ok: true, version: u.version, sessions };
 }
@@ -162,7 +170,7 @@ export function validateProjcacheJson(data) {
  * 因为 dsh 用会话 id 作为 per-record 的 key（`SAFE_KEY_RE=[a-zA-Z0-9_-]+`，会话 id 恰好合法）；
  * 与聚合路径的 `table` 键语义一致（那里也是会话 id）。
  */
-export function validateProjcacheRecord(data, fileName = 'per-record') {
+export function validateProjcacheRecord(data, fileName = 'per-record', { observedAt = null } = {}) {
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     return fail(`${fileName}: root must be an object`);
   }
@@ -180,7 +188,7 @@ export function validateProjcacheRecord(data, fileName = 'per-record') {
   // 会话 id：文件名去 .json。`session-<uuid>.json` / `<uuid>.json` 都是合法形态
   // （实测两种都存在：带 `session-` 前缀的是新版，纯 uuid 来自更早的写法）。
   const base = String(fileName).split('/').pop().replace(/\.json$/, '');
-  return { ok: true, version: v, session: projcacheRecordToSession(base, record) };
+  return { ok: true, version: v, session: projcacheRecordToSession(base, record, observedAt) };
 }
 
 export function validateModelTierJson(data) {

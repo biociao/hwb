@@ -1,6 +1,6 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { readHome, homeIdOf, parseCredentialsYaml, buildSnapshot, STORAGE_PATHS } from '../src/lib/read-home.js';
@@ -478,4 +478,44 @@ test('buildSnapshot: .bak 备份文件既不算会话、也不算读取错误', 
   assert.equal(snap.sessions.length, 1, '只有 good.json 是会话');
   assert.equal(snap.pcLayout.skipped, undefined, '.bak 不该计入 skipped（它们本就是被挪走的坏记录）');
   assert.deepEqual(snap.degraded, []);
+});
+
+// observedAt 必须来自**投影文件 mtime**，而不是 lastActivity（最后一条用户输入）：
+// 长任务中途没有新用户输入时，只用 lastActivity 会把真在跑的会话误判成冻结快照。
+test('readHome: per-record 布局把投影文件 mtime 作为 observedAt（长任务不再翻空闲）', () => {
+  const dir = 'storages/session_projcache/sessions';
+  const home = mkdtempSync(path.join(tmpdir(), 'dsh-observed-'));
+  try {
+    mkdirSync(path.join(home, dir), { recursive: true });
+    writeFileSync(path.join(home, 'storages/workspace.json'), WS_JSON);
+    const now = Date.now();
+    // 3 小时前有用户输入、之后一直有工具调用（pendingCalls 仍在）→ 投影说 running
+    const rec = JSON.stringify({
+      version: 7,
+      record: {
+        identity: { createdAt: 1, cwd: '/p' },
+        rows: {
+          title: { ver: 1, seq: 1, val: '长任务' },
+          sessionStats: { ver: 1, seq: 1, val: { turns: 1, steps: 120, pendingCalls: { call_1: now - 60_000 } } },
+          sessionListMetadata: { ver: 1, seq: 1, val: { lastPromptAt: now - 3 * 3600_000 } },
+        },
+      },
+    });
+    const file = path.join(home, dir, 'session-long.json');
+    writeFileSync(file, rec);
+
+    // ① 投影文件刚被重写（running 信号可信）→ 运行中
+    utimesSync(file, new Date(now), new Date(now));
+    const fresh = readHome(home).sessions.find((s) => s.sessionId === 'session-long');
+    assert.equal(fresh.status.kind, 'running');
+    assert.ok(fresh.status.observedAt, 'status 必须带上 observedAt，供 UI 说明观测时间');
+
+    // ② 投影文件两天没动（冻结快照）→ 空闲（旧的 lastActivity 判定继续兜底）
+    const twoDaysAgo = new Date(now - 2 * 24 * 3600_000);
+    utimesSync(file, twoDaysAgo, twoDaysAgo);
+    const frozen = readHome(home).sessions.find((s) => s.sessionId === 'session-long');
+    assert.equal(frozen.status.kind, 'idle');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

@@ -59,6 +59,34 @@ Recent Sessions 里的会话没了，但项目卡仍留在项目列表，只是�
 **取舍**：偏好仍只存项目名（localStorage，跨设备不同步）；折叠栏展开态刻意不持久化 —— 否则
 「隐藏」下次打开又会被看见。
 
+### 修复：长任务被误标「空闲」，只读实例的「待介入 0」是假阴性
+
+**问题**：一条 3 小时的会话（`session-c8d2fca7`，cc-switch-ciao-science）在 14:37 收到用户输入后一直
+在跑工具，17:38 弹出 `danger-full-access` 审批。hwb 从 **15:07** 起就把它显示成「空闲」，「待介入」也一直
+是 0 —— 任务被晾了两个多小时（截图与现场数据均已核对）。
+
+**根因**（两层叠加）：
+1. **状态新鲜度用错了字段**：`deriveSessionStatus` 把 `sessionListMetadata.lastPromptAt`（最后一条
+   **用户输入**）当作「投影快照是否冻结」的判据。长任务中途没有新用户输入，30 分钟后就被降级成
+   「空闲」；而实例一旦没有实时通道（本地只读 / 当前不可达），没有任何东西能覆盖这个错误结论。
+2. **只读实例没有实时通道**：审批是 dsh 的 waterfall 瞬时事件，不落投影缓存，hwb 只能从
+   `/api/remote.mux` 的 `$events` 观察；`readOnly` 实例没有端口/token，观察器永远连不上，
+   「待介入」恒为 0，而 UI 把它当成「没人需要你」。
+
+**改动**：
+- `read-home.js` 给 per-record projcache 记录带上**文件 mtime**（`observedAt`），`schema.js` 把它传进
+  `deriveSessionStatus`；`status.js` 改为**lastActivity 与 observedAt 都陈旧才降级**（缺省 observedAt 时
+  保持旧行为）。远程 SSH 索引没有 mtime，继续走旧口径。
+- `/api/homes` 增加 `liveIntervention`（该实例此刻有没有实时介入通道）；实例卡给只读 dsh 标
+  「无实时通道」；列表上方的提示条在「待介入 0」时说明观测盲区（`N 个实例无实时通道（…）`），
+  待介入按钮的 title 与状态 chip 的 tooltip 同步说明。
+- 单测：`status.test.js`（observedAt 新鲜/双陈旧/缺省/坏值）、`read-home.test.js`（真实文件 mtime 驱动
+  长任务判 running、冻结后判 idle）、`live-channel-coverage.test.js`（`/api/homes` 契约 + 三处 UI 文案与
+  转义）、`web-intervention.test.js` 的接线断言同步更新。
+
+**取舍**：投影进程在 30 分钟内崩溃时，最后状态仍会显示「运行中」，之后回落「空闲」；只读实例上的
+审批**仍然看不到**（需要 dsh 侧把审批态落盘，改动点见 `docs/intervention-approval-persistence.md`）。
+
 ### 修复：dsh 里重命名项目后工作台不更新（项目名改按 `workspace.title`）
 
 **问题**：在 dsh 里给项目改名后，工作台的 Recent Projects 仍显示旧名字（截图：把
@@ -90,6 +118,66 @@ Codex / WorkBuddy 的口径对齐）；title 为空白或缺失时仍回退目�
 workspace 行必须同名 / cwd 等于 workspace.path 的未归属会话取工作区项目名但不伪造 workspaceId /
 子目录不算该工作区」用例，并把 NUL 用例扩展到 `project`；`tests/store.test.js`、`tests/
 store-degraded.test.js` 的 normalize 夹具随之对齐（降级用例仍保留 title 与目录名不同的情形）。
+
+### 新增：会话卡直接标出「在等你操作」（等待审批 / 计划待审 / 等待回答）
+
+**问题**：截图反馈 —— 工作台的 Recent Sessions 看不出哪个会话在等人点 Approve。一个正在等审批的
+会话在 dsh 里**没有任何活动**：状态推导看它就是「空闲」，于是被当成没在跑而忽略，任务就卡在审批上
+没人知道（人一离开，那个 turn 会一直挂着）。这不是「状态不准」，是缺了一类**根本不在执行状态里**的信息。
+
+**根因**：审批（`approval/request`）与提问（`user-questions/request`）在 dsh 里是 **waterfall 事件**，
+既不在 `/api/session/list` 的投影里，也不落 projcache。唯一能及时看到它们的通道是 dsh web 自己用的
+`/api/remote.mux` WebSocket 上的 `$events` 逻辑流。另外「在等用户回答」虽然落在 `userQuestions`
+投影里（离线可读），但 hwb 原先**完全没读**这个 projection。
+
+- **实时通道（审批 / 计划审阅）**：新增 `src/dshhome/pending-interactions.js` —— 对每个运行中的 dsh
+  实例开一条 `/api/remote.mux` WebSocket，打开内部逻辑流 `$events`，订阅 dsh 转发给浏览器的
+  `approval/request` / `user-questions/request` waterfall，维护 homeId→sessionId→intervention 内存覆盖层。
+  两个关键语义都实测过（dsh 0.2.0-rc.2）：
+  - **只观察、不抢决定**：每帧立刻以 `{kind:'next'}` 委托回 Host（waterfall 语义里 = 交给下一个监听器，
+    浏览器 UI 才是最终应答者）。实测 Host 侧 `next` 只移除本连接自己的 delivery，不会替用户批准。
+  - **结算信号**：Host 只在自己中止请求时发 `cancel`；请求被别人答掉后不会再通知本连接，所以只靠
+    `cancel` 会留下「幽灵等待审批」。补两条：`api-session/status(running=false)` / `removed` emit 快路径；
+    以及每 5s 用一条**短寿命 probe 流**对账 —— Host 会把**仍挂起**的 waterfall 全量重放到新流且
+    eventId 不变（实测），因此「重放集合 = 仍挂起集合」，probe 未重放到的旧 eventId 即视为已结算。
+    真实 dsh 上实测：审批出现后 ~1s 界面带出标记；批准后 **7s 内**标记消失（最坏 ≈ 5s 对账 + 1.2s 窗口）。
+  - **链路健壮性**：dsh 每 2s 发 WebSocket ping，**必须回 pong**，否则约 10s 后被断开（实测）；自行实现
+    最小 RFC6455（node:http upgrade 带 Cookie——全局 WebSocket 无法自定义请求头），支持分片/pong/close、
+    1 MiB 帧上限；断流清空覆盖层并按指数退避+抖动重连（Host 重连时会重放仍挂起的请求，重连即自愈）；
+    单连接预算 10s（远程隧道的 90–140ms RTT 抖动下，5s 会把健康链路误判为挂掉）；所有失败只 warn
+    （同因一次），日志绝不含 URL/token/cookie。
+- **持久通道（等待回答）**：`userQuestions` 投影的 `questions.active` 非空 = 会话在等你回答。
+  `lib/status.js` / `lib/schema.js` / `dshhome/live-status.js` 把它折叠成 `status.intervention`，随会话入库；
+  所以**离线 / SSH 远端 / 只读本地实例**也能标出「等待回答」（审批不落盘，这些实例只能看到这一种）。
+  远端索引的 projection KEEP 清单同步加上 `userQuestions`（否则会出现「本地有值、远程为空」，
+  由 `tests/compat` 的 G2 契约测试盯着）。
+- **合并规则**：`approval(3) > plan-review(2) > question(1)`，同 kind 时实时覆盖投影（实时知道工具名与
+  更贴近用户的原因）。审批最高，因为它是唯一会让 agent 完全停住、只等一个二选一决定的交互。
+  `request.displayReason` 实测是 locale 映射对象（`{en,zh}`）而不是字符串，服务端按 `zh → en → 任意
+  非空值 → request.reason` 归一成字符串再截断（≤160 字符），`tool` 只对审批保留（≤64）。
+- **界面**：会话卡状态区在状态 chip **之前**加橙色介入 chip（⏳ 等待审批 / ⚠ 计划待审 / ⏳ 等待回答，
+  悬停显示工具名、原因、来源、已等待时长），卡片换成警示色轨 + 描边；排序改为「待介入优先」（同类按
+  优先级，再按最近活动）；状态筛选最前面加「待介入」tab（带计数）；列表上方加提示条
+  「N 个会话需要你操作 · 只看待介入」（`role="status"`，带轻微呼吸点，尊重 `prefers-reduced-motion`）；
+  全局搜索结果里的会话行也标出介入。SSE 新增 `intervention:updated`，变更即时重画。
+- **接口**：`GET /api/sessions/recent`（含 `?project=`）与 `GET /api/search` 的 session 行新增**可选**
+  `intervention` 字段（`{kind,label,source,since,tool,reason,count}`）；没有介入的行不加键；未注入
+  watcher（单测/嵌入）时响应形状与旧版逐字节相同；合入失败只降级为未标记行，绝不让首屏列表 500。
+- **可观测性**：观察目标与 LiveStatusPoller 同口径（非本地工具实例 + `runtime==='running'` + 有可用 URL），
+  每 5s 幂等 `sync()` 跟上实例启停/换端口；`shutdown` 里 `clearInterval` + `watcher.stop()`（WS/定时器
+  全部 unref，实测 SIGTERM 干净退出）。
+
+**验证**：新增 61 个用例 —— `tests/intervention.test.js`（10，投影/合并/归一/实时与文件侧合并）、
+`tests/pending-interactions.test.js` + `tests/pending-interactions-ws.test.js`（31，注入 transport 驱动
+帧 + 真 socket 握手/分片/ping-pong/应答/对账）、`tests/api-intervention.test.js`（9，API 合入与降级）、
+`tests/web-intervention.test.js`（11，卡片/筛选/排序/提示条/搜索/转义/SSE/CSS 契约）。全量
+`npm test`：1344 tests，仅剩 3 个**基线已知**的「真实安装 dsh 的域清单/注入锚点」兼容性失败
+（与本特性无关，改动前后一致）。真机 E2E（临时 dsh home + 真实 `dsh web`）：审批挂起时 hwb API 在 1s 内
+带出 `{kind:'approval', source:'live', tool:'bash', reason:'允许本次操作使用 danger-full-access…'}` 并通过
+SSE 推送；模拟浏览器批准后 7s 内标记消失；期间 hwb 观察器每帧都回了 `next`，审批结果未被改变。
+
+**边界**（已写入 README「已知限制」）：旧版 dsh 没有 `/api/remote.mux` 时静默降级为「只有投影来源的
+等待回答」；审批是瞬时交互、不落盘，hwb 离线期间被别处处理掉的审批不会留下痕迹（与 dsh 行为一致）。
 
 ### 修复：「项目」栏只显示 20 个项目（现在默认显示全部，可切「最近」）
 

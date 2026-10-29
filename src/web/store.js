@@ -29,6 +29,9 @@ export function subscribe(cb, onState, onLog) {
   es.addEventListener('instance:status', () => cb());
   es.addEventListener('monitor:updated', () => cb());
   es.addEventListener('quota:updated', () => cb());
+  // 介入状态是瞬时的（审批出现/消失都不改索引），不走 index:updated；服务端 watcher 单独广播，
+  // 这里必须监听，否则要等下一轮索引刷新才能看到「有人在等你」。
+  es.addEventListener('intervention:updated', () => cb());
   es.addEventListener('log:event', (e) => {
     try { onLog?.(JSON.parse(e.data)); } catch { /* 忽略无法解析的日志事件 */ }
   });

@@ -118,3 +118,29 @@ test('deriveSessionStatus: 未来的 lastActivity 不再关掉陈旧闸门（按
   // 以及既有的取舍：没有时间信息时不判断
   assert.equal(deriveSessionStatus({ sessionStats: { openStep: 3 } }).kind, 'running');
 });
+
+// observedAt 是**投影文件 mtime**（read-home 提供）。修的是：长任务中途没有新用户输入时，
+// lastActivity 会停在几小时前，只看它会把真在跑的会话误判成冻结快照 —— 实测 2026-10-27 一条
+// 3 小时会话从 15:07 起被显示成「空闲」，而它一直有工具调用、17:38 才弹审批。
+test('deriveSessionStatus: observedAt 新鲜时不因 lastActivity 陈旧而降级（长任务）', () => {
+  const now = Date.now();
+  const at = (ms) => new Date(now - ms).toISOString();
+  const MIN = 60_000;
+  const runningShape = { sessionStats: { pendingCalls: { call_1: now - MIN } } };
+
+  // 3 小时没有新用户输入，但投影文件 1 分钟前刚被重写 → 快照不是冻结的
+  const live = deriveSessionStatus({ ...runningShape, lastActivity: at(180 * MIN), observedAt: at(1 * MIN) });
+  assert.equal(live.kind, 'running');
+  assert.equal(live.label, '运行中');
+  assert.equal(live.observedAt, at(1 * MIN), 'observedAt 原样回传（ISO）');
+
+  // 两个时间信号都陈旧 → 仍降级为 idle（冻结快照，与旧行为一致）
+  assert.equal(deriveSessionStatus({ ...runningShape, lastActivity: at(20 * 24 * 60 * MIN), observedAt: at(20 * 24 * 60 * MIN) }).kind, 'idle');
+
+  // 没有 observedAt（远程 cat / 聚合布局 / 实时通道）→ 退回只看 lastActivity
+  assert.equal(deriveSessionStatus({ ...runningShape, lastActivity: at(20 * 24 * 60 * MIN) }).kind, 'idle');
+  // 坏值不参与判断（isStale 对无法解析的字符串返回 false）
+  assert.equal(deriveSessionStatus({ ...runningShape, lastActivity: at(20 * 24 * 60 * MIN), observedAt: 'garbage' }).kind, 'idle');
+  // 没有 observedAt 时 status 里不出现该键（不撑大入库 JSON / API 载荷）
+  assert.equal(Object.hasOwn(deriveSessionStatus({ ...runningShape, lastActivity: at(MIN) }), 'observedAt'), false);
+});

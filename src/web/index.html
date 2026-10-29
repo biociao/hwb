@@ -318,6 +318,40 @@
     .session-status-filter .subagent-toggle + .session-order { margin-left: 2px; }
     .chip.subagent-chip { color: var(--dim); background: transparent; border: 1px dashed var(--border); }
     .session-order { margin-left: auto; color: var(--dim); font-size: 11px; }
+
+    /* —— 需要人工介入（等待审批 / 计划待审 / 等待回答）——
+       橙色表达「在等你」，不是失败（--bad 才是失败）；所有颜色都派生自 --warn，
+       浅/深两套主题自动跟随，不新增写死的色值。视觉上有三层锚点，保证不会漏看：
+         ① 卡片描边 + 竖轨换成 warn；② 状态列最前面那颗 warn chip；③ 列表顶部提示条。 */
+    .chip.status.warn.intervention { color: var(--warn);
+      background: color-mix(in srgb, var(--warn) 13%, transparent);
+      border: 1px solid color-mix(in srgb, var(--warn) 42%, transparent);
+      /* label 可能来自服务端（最长 24 字符），允许换行而不是撑出 88px 的状态列。 */
+      max-width: 100%; white-space: normal; text-align: center; overflow-wrap: anywhere; line-height: 1.35; }
+    /* 两个 chip 时允许换行：右列只有 88px，硬挤会把「等待审批」压出格子。 */
+    .session-card .status-col { flex-wrap: wrap; row-gap: 4px; }
+    .session-card[data-intervention] { border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+      background: color-mix(in srgb, var(--warn) 7%, var(--session-bg, var(--panel))); }
+    .session-card[data-intervention]:hover { border-color: var(--warn); }
+    .session-card[data-intervention] > .card-rail { background: var(--warn); }
+    /* 提示条：留在滚动区外（.session-list 之前），列表滚走也一直可见。 */
+    .intervention-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin: 8px 12px 0; padding: 7px 10px; border-radius: 7px; font-size: 12px; color: var(--fg);
+      background: color-mix(in srgb, var(--warn) 11%, var(--panel));
+      border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border)); }
+    .intervention-banner .iv-dot { flex: none; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 16%, transparent);
+      animation: iv-breathe 2.4s ease-in-out infinite; }
+    .intervention-banner .iv-text b { color: var(--warn); font-variant-numeric: tabular-nums; }
+    .intervention-banner button { margin-left: auto; padding: 2px 9px; font-size: 11px; }
+    /* 呼吸点：只改透明度、2.4s 一次，避免「重动画」抢注意力；系统要求减少动态时关闭。 */
+    @keyframes iv-breathe { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) { .intervention-banner .iv-dot { animation: none; } }
+    /* 观测盲区说明：只读/离线实例没有实时通道，「待介入 0」不等于「没事」。
+       弱化成虚线中性条，不和真正待介入的警示条抢注意力。 */
+    .intervention-banner.coverage { background: var(--panel); border-style: dashed; border-color: var(--border); color: var(--dim); }
+    .intervention-banner .iv-coverage { color: var(--dim); font-size: 11px; }
+    .intervention-banner .iv-coverage::before { content: '⚠ '; }
     .chip.home-chip[data-source="dsh"] { --source-bg: var(--src-dsh); --source-line: var(--src-dsh-line); }
     .chip.home-chip[data-source="codex"] { --source-bg: var(--src-codex); --source-line: var(--src-codex-line); }
     .chip.home-chip[data-source="claude-code"] { --source-bg: var(--src-claude); --source-line: var(--src-claude-line); }

@@ -42,6 +42,17 @@ function versionChip(runtime) {
 // 「只读」是这类实例的类型说明，只写进身份 chip 的 title，不再占状态位。
 // 身份 chip 的 class 由 harness 白名单决定（harness-codex / harness-workbuddy / harness-dsh），
 // 不从 label 拼 —— label 来自服务端，只能进文本节点。
+// 「观测能力」说明：只读 dsh 实例（readOnly）没有进程 / 端口 / token / 隧道，
+// monitor 仍然把它标成 running（目录在就算就绪），但它**没有实时通道**：
+// 等待审批（approval/request）永远观察不到，「待介入」在这类实例上是「未观测」而不是「没有」。
+// 不显式说出来，用户会把 0 当成「没人需要你」——2026-10-27 实测：一条 3 小时会话在只读实例上
+// 弹审批，仪表盘显示「空闲 / 待介入 0」，任务被晾着。
+function liveChannelChip(h) {
+  if (h?.harness !== 'dsh' || h.readOnly !== true) return '';
+  if (h.liveIntervention !== false) return '';
+  return '<span class="chip" title="只读接入：没有实时通道，等待审批 / 计划待审 / 等待回答不会出现在「待介入」里">无实时通道</span>';
+}
+
 function localToolCard(h) {
   const id = esc(h.homeId);
   const runtime = h.runtime;
@@ -59,6 +70,7 @@ function localToolCard(h) {
         <span class="name">${esc(h.alias || h.serverId || h.homePath)}</span>
         <span class="chips">
           <span class="chip ${ready ? 'ok' : 'bad'}">${ready ? '已就绪' : '路径缺失'}</span>
+          ${liveChannelChip(h)}
           ${degradedChips(h.degraded)}
         </span>
       </div>

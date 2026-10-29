@@ -47,9 +47,10 @@ ${emitLines}
 
 # —— per-record projcache（dsh 的 layout:'per-record'）——
 #
-# **远端投影**：hwb 只用到每条记录里 21 个 projection 中的约 10 个
+# **远端投影**：hwb 只用到每条记录里 21 个 projection 中的约 12 个
 # （title / tokenUsage / contextPressure / sessionStats / goal / todos / subagent /
-#   plan / permissions / sessionListMetadata），其余（titleInput、turnOutline、
+#   subagentCatalog / plan / permissions / userQuestions / sessionListMetadata），
+# 其余（titleInput、turnOutline、
 # contextBreakdown 等）往往是大头。实测本机 476 个会话：全量 3.40 MiB → 投影后 0.58 MiB
 # （**省 83%**）。在 25–30 KB/s 的链路上这是「能跑」与「超时」的差别。
 #
@@ -65,7 +66,7 @@ if [ -d "$home/$d" ]; then
     printf '__DSH_FILE_BEGIN__:%s/%s\n' "$d" "$n"
     if command -v python3 >/dev/null 2>&1; then
       python3 -c 'import json,sys
-KEEP={"title","tokenUsage","contextPressure","sessionStats","goal","todos","subagent","plan","permissions","sessionListMetadata"}
+KEEP={"title","tokenUsage","contextPressure","sessionStats","goal","todos","subagent","subagentCatalog","plan","permissions","userQuestions","sessionListMetadata"}
 try:
     with open(sys.argv[1],encoding="utf-8",errors="replace") as fh: d=json.load(fh)
     rec=d.get("record")

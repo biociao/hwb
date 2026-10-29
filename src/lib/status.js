@@ -2,10 +2,15 @@
 //（sessionStats / goal / todos / subagent / plan / permissions）折叠成一个
 // 给 UI 展示的状态对象。它不读任何文件，只消费一组原始投影值，便于单测。
 //
-// 说明：projcache 是 DSH 的持久化投影快照，能可靠地反映「是否处于进行中 / 是否完成」，
-// 但「正在等待用户审批（approval pending）」属于运行时交互态，不落在投影缓存里——
-// 因此这里只输出 running / completed / idle 三态；审批策略（permissions.approval）
-// 作为附带信息给出，UI 可酌情用作次级提示。
+// 说明：projcache 是 DSH 的持久化投影快照，能可靠地反映「是否处于进行中 / 是否完成」。
+// 「正在等待用户**审批**（approval pending）」属于运行时交互态，不落在投影缓存里——那部分
+// 只能靠实时通道（dshhome/pending-interactions.js 观察 remote-events 的 approval/request），
+// 由 API 层合入 `session.intervention`。但「在等用户**回答**」是持久投影（`userQuestions`
+// 的 questions.active），会随快照一起落盘，所以这里额外输出 `intervention`：
+// 它让离线/远端实例也能标出「等待回答」，UI 不必分辨数据来自哪条通道。
+// 审批策略（permissions.approval）仍是附带信息，仅作次级提示。
+import { deriveProjectionIntervention } from './intervention.js';
+
 // 「仍在进行中」的最长无活动时间。超过就认为那条快照已经冻结。
 const RUNNING_STALE_MS = 30 * 60_000;
 
@@ -22,6 +27,14 @@ function isStale(lastActivity) {
   // 本机时钟无法判断「未来的时刻有多新」，按本项目一贯的取舍降级为 idle —— 真正在跑的实例
   // 另有实时通道（3s 轮询）覆盖状态。
   return age < 0 || age > RUNNING_STALE_MS;
+}
+
+// 观测时间归一：只接受能解析的 ISO 字符串，其余（缺省/坏值/未来由 isStale 处理）返回 null。
+// 它是**投影快照文件**的 mtime（见 read-home.js 的 statMtime），不是「用户上次说话的时间」。
+function observedAtIso(value) {
+  if (typeof value !== 'string') return null;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? new Date(at).toISOString() : null;
 }
 
 // 审批策略：只保留字符串，并限制长度（超长直接截断 —— 它只是一个展示用的次级提示）。
@@ -190,10 +203,19 @@ export function deriveSessionStatus(src = {}) {
   // 新鲜度门限：以上信号全部来自**投影缓存快照**。进程被杀、机器休眠、会话被放弃之后，
   // 那些「进行中」的标记会永久冻结在缓存里 —— 不断言新鲜度的话，几周前的会话会一直显示
   // 「运行中」。实测真实 home：179 个会话里 18 个被判 running，全部空闲 7–28 天，0 个在 10 分钟内。
-  // 极少数「长时间没有新输入」的真跑任务会被误判成空闲，这是刻意选择的取舍：
-  // 本机实例另有 3s 的实时通道（live-status 的 `running` 布尔是权威信号）会覆盖这里的结论，
-  // 而远端/离线实例只能靠文件索引，宁可保守显示「空闲」，也不能把几周前的会话标成在跑。
-  if (kind === 'running' && isStale(src.lastActivity)) kind = 'idle';
+  //
+  // **两个时间信号，都陈旧才降级**。只看 lastActivity 是错的：它是
+  // `sessionListMetadata.lastPromptAt`（最后一条**用户输入**），一个跑了 3 小时、中途没有
+  // 新用户输入的长任务会让它停在 3 小时前，于是真在跑的会话被误判成冻结快照、翻成「空闲」。
+  // 实测（2026-10-27）：一条 3 小时会话从 15:07 起被显示为空闲，而它一直有工具调用、17:38 才弹审批。
+  // observedAt 是投影文件自己的 mtime（dsh 每写一条投影就会重写该文件），它才回答
+  // 「这份快照是什么时候的」。缺省 observedAt（远程/聚合/实时通道）时退回只看 lastActivity。
+  const observedAt = observedAtIso(src.observedAt);
+  const stale = observedAt ? (isStale(src.lastActivity) && isStale(observedAt)) : isStale(src.lastActivity);
+  if (kind === 'running' && stale) kind = 'idle';
+
+  // 一次推导、两处使用（状态对象与后续可能的日志/测试）：避免调用两次拿到不同 since。
+  const projectedIntervention = deriveProjectionIntervention({ userQuestions: src.userQuestions });
 
   const labels = {
     running: '运行中',
@@ -205,10 +227,17 @@ export function deriveSessionStatus(src = {}) {
     kind,
     label: labels[kind],
     ...subagents,
+    // 状态观测时间（投影快照 mtime）：有它时 UI 能说明「状态观测于 N 分钟前」，也是排查
+    // 「为什么显示运行中」的证据。缺省（实时通道/远程）时不写这个键，保持旧形状。
+    ...(observedAt ? { observedAt } : {}),
     // approval 是**自由文本**，来源是 dsh 元数据（projcache 的 permissions.val / 实时 RPC）。
     // 它会被展示在状态 chip 上，因此这里做一层兜底：只接受字符串、并限制长度。
     // 注意这不是「转义」的替代品（转义在渲染层做，且必须做），而是防止一个畸长的值
     // 把整行状态 JSON 撑大、以及把非字符串（对象/数组）塞进本来是标量的字段。
     approval: normalizeApproval(src.permissions?.approval),
+    // 投影来源的人工介入（当前只有「等待回答」）：审批/计划审阅需要实时通道，见文件头。
+    // **没有介入时不写这个键**（而不是写 null）：status JSON 会入库、进 API、进 SSE 广播，
+    // 绝大多数会话没有介入，一个恒为 null 的键只是把每行的载荷和每个 deepEqual 断言都撑大。
+    ...(projectedIntervention ? { intervention: projectedIntervention } : {}),
   };
 }

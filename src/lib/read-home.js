@@ -87,7 +87,7 @@ export function parseCredentialsYaml(text) {
 // `listDir(relPath)`（可选）列出目录下**文件名**（不含路径），目录不存在返回 null ——
 // 供 per-record 布局读取用（见 readProjcache 的说明）。缺失时该能力整体降级为「只认聚合文件」。
 // 它们共同决定哪个域的 degraded 判定与本地逐文件读取行为完全一致（§4.2/4.3）。
-export function buildSnapshot({ homePath, readText, exists, listDir = null }) {
+export function buildSnapshot({ homePath, readText, exists, listDir = null, statMtime = null }) {
   const degraded = [];
   const snapshot = {
     homeId: homeIdOf(homePath),
@@ -168,7 +168,15 @@ export function buildSnapshot({ homePath, readText, exists, listDir = null }) {
         pcErrors.push(`${rel}: ${e.message}`);
         continue;
       }
-      const v = validateProjcacheRecord(doc, rel);
+      // 这份投影文件最后一次被 dsh 重写的时间 = 「状态观测时间」。状态新鲜度必须用它，
+      // 而不是 lastActivity（最后一条用户输入）：长任务中途没有新输入时 lastActivity 会停在
+      // 几小时前，把真在跑的会话误判成冻结快照（2026-10-27 实测：3 小时会话被显示成「空闲」）。
+      // 注入式（statMtime 缺省 null）：远程 cat 路径没有 mtime，保持旧的 lastActivity 判定。
+      let observedAt = null;
+      if (typeof statMtime === 'function') {
+        try { observedAt = new Date(statMtime(rel)).toISOString(); } catch { observedAt = null; }
+      }
+      const v = validateProjcacheRecord(doc, rel, { observedAt });
       if (!v.ok) {
         pcErrors.push(v.error);
         continue;
@@ -361,5 +369,8 @@ export function readHome(homePath) {
     readText: (rel) => readMetadataFile(homePath, rel),
     exists: (rel) => existsSync(path.join(homePath, rel)),
     listDir: (rel) => listMetadataDir(homePath, rel),
+    // 投影文件的 mtime：状态新鲜度的**观测时间**来源（见 buildSnapshot 里的说明）。
+    // 用 lstat：与 readMetadataFile 一样不跟随符号链接；失败由调用方降级为 null。
+    statMtime: (rel) => lstatSync(path.join(homePath, rel)).mtimeMs,
   });
 }

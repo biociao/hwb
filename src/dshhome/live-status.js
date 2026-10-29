@@ -2,6 +2,7 @@ import { Agent } from 'node:http';
 import { logger } from '../lib/logger.js';
 import { msToIso } from '../lib/time.js';
 import { normalizeApproval, subagentStatus, subagentCatalogIds, annotateSubagentRunning } from '../lib/status.js';
+import { deriveProjectionIntervention } from '../lib/intervention.js';
 import { stripNul } from '../lib/normalize.js';
 
 const log = logger('live-status');
@@ -77,7 +78,7 @@ export function liveAgent() {
 }
 
 // 从带 `?token=` 的 URL 拆出 origin 与 token。兼容 `http://host:port/?token=x` 与裸 origin。
-function splitAuthUrl(url) {
+export function splitAuthUrl(url) {
   let u;
   try {
     u = new URL(url);
@@ -115,7 +116,7 @@ function memoKey(origin, token) {
 // token→cookie 交接：GET `origin/?token=<t>`（manual redirect），
 // 成功(303)时带回 set-cookie 供后续 RPC 使用。返回 cookie 的 `name=value` 片段。
 // `memo` 是调用方（reader 实例）持有的记忆表；命中时零往返。
-async function acquireCookie(origin, token, timeoutMs, memo = null) {
+export async function acquireCookie(origin, token, timeoutMs, memo = null) {
   const key = memoKey(origin, token);
   if (memo) {
     const hit = memo.get(key);
@@ -201,7 +202,7 @@ async function readJsonBounded(res, maxBytes = MAX_RPC_BYTES) {
 
 // POST 一次 RPC 到 `/api/<endpoint>`，返回 result（或 null）。
 // args 是端点参数；dsh 的 RPC 信封要求 payload 形如 { args: <object> }。
-async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS, maxBytes = MAX_RPC_BYTES, memo = null) {
+export async function rpc(url, endpoint, args = {}, timeoutMs = RPC_TIMEOUT_MS, maxBytes = MAX_RPC_BYTES, memo = null) {
   const { origin, token } = splitAuthUrl(url);
   const body = JSON.stringify({
     type: 'client-request',
@@ -334,6 +335,7 @@ function toLiveRow(item) {
     subagent: unwrapProjection(rawValues.subagent),
     subagentCatalog: unwrapProjection(rawValues.subagentCatalog),
     permissions: unwrapProjection(rawValues.permissions),
+    userQuestions: unwrapProjection(rawValues.userQuestions),
     sessionListMetadata: unwrapProjection(rawValues.sessionListMetadata) ?? {},
     title: unwrapProjection(rawValues.title),
   };
@@ -354,6 +356,11 @@ function toLiveRow(item) {
   // 子代理 catalog 的 childId 列表：**临时字段**，只用于 extractLiveRows 的两遍 join
   //（父会话 ↔ 同一批 session/list 里的子会话行）。不进 sessions.status，也不入库。
   const childSessionIds = subagentCatalogIds(values.subagentCatalog);
+  const intervention = deriveProjectionIntervention({ userQuestions: values.userQuestions });
+  // 投影**存在但为空**时也要显式写 `intervention: null`（而不是省略键）：写入侧
+  // （reader.mergeLiveStatusJson）据此区分「实时确认没有在等」与「旧版 dsh 没报这个投影」，
+  // 后者不该把文件索引推导出的「等待回答」冲掉。undefined = 这条 dsh 没给该投影。
+  const projectionReported = values.userQuestions !== undefined && values.userQuestions !== null;
   const meta = values.sessionListMetadata ?? {};
   const lastPromptAt = typeof meta.lastPromptAt === 'number' ? meta.lastPromptAt : (typeof item.updatedAt === 'number' ? item.updatedAt : null);
   return {
@@ -368,6 +375,10 @@ function toLiveRow(item) {
       // 与文件侧走同一套守卫（长字符串截断、非字符串丢弃）：实时值在宽限期内会**赢过**文件值，
       // 不守卫就等于把守卫整条绕过。
       approval: normalizeApproval(values.permissions?.approval),
+      // 与文件侧一致：投影里能看出的「等待回答」随实时行一起带出（审批由 remote-events 观察器补）。
+      // 键的有无是**语义信号**（见上面 projectionReported 的注释），所以这里判断的是投影是否被上报，
+      // 而不是 intervention 是否为 null。
+      ...(projectionReported ? { intervention } : {}),
     },
     // 临时字段（不入库）：extractLiveRows 用它把「其中几个子代理在跑」join 出来。
     ...(childSessionIds ? { childSessionIds } : {}),

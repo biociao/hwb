@@ -1,10 +1,10 @@
 import { endpointRow, readEndpoints, endpointSelector } from './components/endpoint-editor.js';
 import { downloadFile, uploadFiles, partitionUploads, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES } from './file-ops.js';
 import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js';
-import { renderWorkbench } from './components/workbench.js';
+import { renderWorkbench, renderInterventionBanner } from './components/workbench.js';
 import { renderRecentProjects, renderProjectsMore, splitHiddenProjects } from './components/recent-projects.js';
 import { renderRecentSessions, renderSessionFilter } from './components/recent-sessions.js';
-import { SESSION_FILTERS, filterSessionState, renderSessionStatusFilter } from './components/session-state.js';
+import { SESSION_FILTERS, filterSessionState, renderSessionStatusFilter, interventionState } from './components/session-state.js';
 import { renderSearchResults } from './components/search-results.js';
 import { splitSubagentSessions } from './components/subagent-visibility.js';
 import { readMutedProjects, writeMutedProjects, toggleMutedProject, splitMutedSessions, mutedNoteSpec, renderMutedNote, renderMutedIdleNote, DEFAULT_MUTED_PROJECTS } from './components/session-mute.js';
@@ -565,6 +565,18 @@ function paintDashboard() {
   });
   const agents = splitSubagentSessions(mute.visible, showSubagents);
   const shownSessions = filterSessionState(agents.visible, sessionStatusFilter);
+  // 介入提示条只统计「屏上可见」的会话：被状态筛选排除的行不该在提示条里继续喊，
+  // 否则提示条会和列表内容互相矛盾（说有人等，列表里却看不到）。
+  const interventionCount = shownSessions.filter((s) => interventionState(s)).length;
+  // 观测盲区：屏上会话所属实例里没有实时通道的那些（只读 dsh / 当前不可达的实例）。
+  // 「待介入 0」只有在没有盲区时才等于「没人需要你」——见 workbench.renderInterventionBanner。
+  const homeById = new Map((Array.isArray(lastHomes) ? lastHomes : []).map((h) => [h.homeId, h]));
+  // 只看 dsh 实例：审批是 dsh 的概念，Codex / WorkBuddy 的 liveIntervention 是 null（不适用），
+  // 把它们算进盲区会让提示条变成常驻噪音。
+  const unobservedHomeNames = [...new Set(shownSessions
+    .map((s) => homeById.get(s.homeId))
+    .filter((h) => h && h.harness === 'dsh' && h.liveIntervention === false)
+    .map((h) => h.alias || h.homePath))];
   const pending = fullSearchPending();
   // 已隐藏项目：从主列表移入栏底折叠区（见 recent-projects.js 的 splitHiddenProjects）。
   // 计数只用主列表上的卡片数（和屏上一致）；隐藏了多少由折叠条自己写明 —— 默认收起时，
@@ -661,7 +673,8 @@ function paintDashboard() {
     projects: projectsHtml + projectsMore + projectsScopeNote,
     sessions: sessionsHtml + projectMore + sessionsMore + mutedNote + mutedIdleNote,
     sessionFilter,
-    statusFilter: filtered.connected ? renderSessionStatusFilter(agents.visible, sessionStatusFilter, { showSubagents, subagentCount: agents.total }) : '',
+    statusFilter: filtered.connected ? renderSessionStatusFilter(agents.visible, sessionStatusFilter, { showSubagents, subagentCount: agents.total, unobserved: unobservedHomeNames.length }) : '',
+    interventionBanner: filtered.connected ? renderInterventionBanner(interventionCount, { active: sessionStatusFilter === 'intervention', unobserved: unobservedHomeNames }) : '',
     searching,
     projectScope: projectsScope,
     projectCount: filtered.connected
