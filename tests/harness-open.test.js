@@ -34,7 +34,7 @@ function readOnlyDshHome(overrides = {}) {
   };
 }
 
-function makeRouter({ store = {}, localTools, openSession, openDshApp, dshVersion = null } = {}) {
+function makeRouter({ store = {}, localTools, openSession, openDshApp, dshVersion = null, hub = null } = {}) {
   return createRouter({
     store: {
       getHome: () => null,
@@ -46,7 +46,7 @@ function makeRouter({ store = {}, localTools, openSession, openDshApp, dshVersio
       ...store,
     },
     indexer: { reindexNow: async () => [{}] },
-    hub: { broadcast() {} },
+    hub: hub ?? { broadcast() {} },
     launcher: { disconnect: async () => {} },
     monitor: { get: () => ({ runtime: 'running' }), refresh: async () => ({}) },
     quota: { list: () => [], refresh: async () => [] },
@@ -148,6 +148,38 @@ test('POST /api/harness/open：Codex 由数据面解析 sessionId 并派发深�
   });
   assert.equal(byProject.status, 200);
   assert.equal(byProject.body.sessionId, THREAD);
+});
+
+test('POST /api/harness/open：成功打开 Codex 即清未读并广播；唤起失败不清', async () => {
+  const home = localToolHome('codex');
+  const viewed = [];
+  const broadcasts = [];
+  let openOk = true;
+  const { source } = fakeSource({
+    resolveTarget: (_home, { sessionId }) => sessionId,
+    open: async (sessionId) => ({ ok: openOk, sessionId, url: `codex://threads/${sessionId}` }),
+  });
+  const route = makeRouter({
+    store: {
+      getHome: () => home,
+      markSessionViewed: (homeId, sessionId) => { viewed.push([homeId, sessionId]); return true; },
+    },
+    localTools: { codex: source },
+    hub: { broadcast: (event, data) => broadcasts.push([event, data]) },
+  });
+
+  const ok = await request(route, 'POST', '/api/harness/open', { body: { homeId: home.homeId, sessionId: THREAD } });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(viewed, [[home.homeId, THREAD]], '打开成功 = 已读');
+  assert.deepEqual(broadcasts, [['index:updated', { homeId: home.homeId, reason: 'session-viewed' }]],
+    '必须广播刷新，否则前端要等下一次索引才掉「未读」');
+
+  // 唤起失败（502）：不能把没看到的会话标成已读，也不该广播。
+  openOk = false;
+  const failed = await request(route, 'POST', '/api/harness/open', { body: { homeId: home.homeId, sessionId: THREAD } });
+  assert.equal(failed.status, 502);
+  assert.equal(viewed.length, 1, '唤起失败不标记已读');
+  assert.equal(broadcasts.length, 1);
 });
 
 test('POST /api/harness/open：非法会话 id 400 且绝不调用 open（深链白名单）', async () => {

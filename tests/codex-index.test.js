@@ -266,3 +266,25 @@ test('Indexer：老构造参数 codex:{readProjects} 保留兼容（一个版本
   assert.equal(received.days, 3650, '兼容路径沿用全量索引口径');
   assert.equal(store.recentSessions({ homeIds: [homeId] }).length, 1);
 });
+
+// Codex 的运行态来自 thread_turns（reader 已折算成 turnState），未读来自 read_receipts。
+// 这里只验证纯映射层：running → 运行中、ended → 空闲、无 turn → 已保存（状态未知）、unread 原样带上。
+test('Codex 运行态/未读映射：不把「turn 完成」伪装成「会话目标完成」', () => {
+  const make = (patch) => {
+    const snap = snapshot();
+    snap.projects[0].threads[0] = { ...snap.projects[0].threads[0], ...patch };
+    return codexIndexRows(codexHome(), snap, { now: NOW }).find((r) => r.type === 'session' && r.sessionId === THREAD_USER);
+  };
+  const running = make({ turnState: 'running', unread: false });
+  assert.deepEqual(JSON.parse(running.status), { kind: 'running', label: '运行中', subagents: 0 });
+  assert.equal(running.unread, 0, '显式 unread=0 是契约的一部分（store 以它为准）');
+
+  const ended = make({ turnState: 'ended', unread: true });
+  assert.deepEqual(JSON.parse(ended.status), { kind: 'idle', label: '空闲', subagents: 0 },
+    'turn 完成 ≠ 会话完成：只能进「空闲」，不能进「已完成」');
+  assert.equal(ended.unread, 1);
+
+  const unknown = make({ turnState: null, unread: true });
+  assert.deepEqual(JSON.parse(unknown.status), { kind: 'idle', label: '已保存', subagents: 0 },
+    '没有 turn 记录时不编造运行态（前端显示状态未知），但未读仍可展示');
+});

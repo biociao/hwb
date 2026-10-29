@@ -18,7 +18,7 @@ const T_OLD = '01a15e47-78cc-7120-8b80-36e027d46eb4';
 const T_ARCHIVED = '01a162f4-a293-7af0-84b1-1df845aa0190';
 const T_ORPHAN = '01a15000-0000-7000-8000-000000000000';
 
-function makeHome(t, { global = null, threads = [], legacyProjects = null } = {}) {
+function makeHome(t, { global = null, threads = [], legacyProjects = null, turnRows = null, unreadThreads = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-codex-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   if (global) fs.writeFileSync(path.join(dir, '.codex-global-state.json'), JSON.stringify(global));
@@ -61,7 +61,32 @@ function makeHome(t, { global = null, threads = [], legacyProjects = null } = {}
       }
     }
   }
+  if (Array.isArray(unreadThreads) && unreadThreads.length) {
+    // Codex 只在「有未读 turn」时留一行 read receipt（用户看过就删）。
+    db.exec(`CREATE TABLE thread_read_receipts (
+      thread_id TEXT PRIMARY KEY NOT NULL, first_unread_turn TEXT, revision TEXT NOT NULL, last_published_turn TEXT)`);
+    const ins = db.prepare('INSERT INTO thread_read_receipts (thread_id, first_unread_turn, revision, last_published_turn) VALUES (?, ?, ?, ?)');
+    for (const id of unreadThreads) ins.run(id, 'turn-x', 'rev-1', 'turn-x');
+  }
   db.close();
+
+  if (Array.isArray(turnRows) && turnRows.length) {
+    // thread_history_<N>.sqlite：运行态投影（turn 开始 ~1s 内可见、结束同理）。
+    const hdb = new DatabaseSync(path.join(dir, 'thread_history_1.sqlite'));
+    hdb.exec(`CREATE TABLE thread_turns (
+      thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL,
+      status TEXT NOT NULL, error_json TEXT, started_at INTEGER, completed_at INTEGER,
+      duration_ms INTEGER, first_user_item_id TEXT, final_agent_item_id TEXT,
+      rollout_byte_offset INTEGER, rollout_end_ordinal INTEGER, rollout_end_byte_offset INTEGER,
+      root_turn_id TEXT, PRIMARY KEY (thread_id, turn_id))`);
+    const insTurn = hdb.prepare(`INSERT INTO thread_turns
+      (thread_id, turn_id, rollout_ordinal, status, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)`);
+    for (const [index, row] of turnRows.entries()) {
+      insTurn.run(row.id, row.turn ?? `turn-${index}`, row.ordinal ?? index, row.status,
+        Math.floor((row.started ?? NOW) / 1000), row.completed ? Math.floor(row.completed / 1000) : null);
+    }
+    hdb.close();
+  }
   return dir;
 }
 
@@ -362,4 +387,36 @@ test('macOS 用 open(1) 派发 codex:// 深链；失败时带手写命令回退'
   assert.equal(failed.ok, false);
   assert.match(failed.error, /Unable to find application/);
   assert.match(failed.fallback, /codex resume/);
+});
+
+// 运行态 + 未读来自 Codex 自己的两张投影表（thread_turns / thread_read_receipts）：
+//   · inProgress 且线程在 3 分钟内有更新 → running（写入延迟实测 ~1s）；
+//   · inProgress 但线程已陈旧 → 僵尸 turn（实测本机 15 条、最老 105 天）→ 状态未知，不能报运行中；
+//   · completed/interrupted/failed → ended；
+//   · read receipt 存在 = Codex 侧还有没看的 turn。
+test('Codex 运行态与未读：thread_turns / read_receipts 映射到 turnState/unread', (t) => {
+  const dir = makeHome(t, {
+    threads: [
+      { id: T_RECENT, at: NOW - 60_000 },
+      { id: T_OLD, at: NOW - 6 * 60_000 },
+      { id: T_ORPHAN, at: NOW - 120_000 },
+    ],
+    turnRows: [
+      { id: T_RECENT, status: 'inProgress', started: NOW - 60_000 },
+      { id: T_OLD, status: 'inProgress', started: NOW - 10 * 60_000 },
+      { id: T_ORPHAN, status: 'completed', started: NOW - 300_000, completed: NOW - 120_000 },
+    ],
+    unreadThreads: [T_ORPHAN],
+  });
+  const snap = readCodexProjects({ home: dir, now: NOW, days: 3650, limit: 100, threadsPerProject: 100 });
+  const all = [...snap.projects.flatMap((p) => p.threads), ...snap.unassigned];
+  const find = (id) => all.find((x) => x.id === id);
+  assert.equal(find(T_RECENT).turnState, 'running');
+  assert.equal(find(T_RECENT).unread, false);
+  assert.equal(find(T_OLD).turnState, null, 'inProgress 但 6 分钟没更新 = 僵尸，不能报运行中');
+  assert.equal(find(T_ORPHAN).turnState, 'ended');
+  assert.equal(find(T_ORPHAN).unread, true, 'read receipt 存在 = 未读');
+  // 缺 thread_history 的 home（老版本 Codex）→ 全部未知，不编造运行态。
+  const legacy = readCodexProjects({ home: makeHome(t, { threads: [{ id: T_RECENT, at: NOW }] }), now: NOW, days: 3650, limit: 100 });
+  assert.equal([...legacy.projects.flatMap((p) => p.threads), ...legacy.unassigned][0].turnState, null);
 });

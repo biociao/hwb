@@ -241,6 +241,17 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return rows;
     }
   };
+  // 打开会话 = 已读：清掉 hwb 侧的未读标记并广播一次，前端收到 index:updated 会立刻重绘。
+  // 只做附加动作：失败（只读库 / 迁移中）绝不影响「打开」本身。
+  const markSessionViewed = (homeId, sessionId) => {
+    if (!homeId || !sessionId || typeof store.markSessionViewed !== 'function') return;
+    try {
+      if (store.markSessionViewed(homeId, sessionId)) {
+        hub?.broadcast?.('index:updated', { homeId, reason: 'session-viewed' });
+      }
+    } catch { /* 锦上添花，失败静默 */ }
+  };
+
   // 实例上的 dsh 版本号（DshVersionResolver，见 lib/dsh-version.js）。可以缺省：本地实例同步
   // 读本机安装、远程实例后台 ssh 探测，两者都**不是**渲染实例列表的前置条件 —— 单测直接建
   // router 时不必关心它，那时 runtime.dshVersion 为 null，前端按「未知」处理（不画那个 chip）。
@@ -842,6 +853,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
       try {
         const result = await openSession({ home, sessionId });
+        if (result.ok) markSessionViewed(home.homeId, sessionId);
         const status = result.ok ? 200
           : result.code === 'platform-unsupported' ? 501
             : result.code === 'bad-session-id' || result.code === 'bad-home' ? 400
@@ -896,6 +908,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
             return;
           }
           if (result.ok) {
+            markSessionViewed(homeId, targetSessionId);
             send(res, 200, {
               ok: true,
               homeId,
@@ -961,6 +974,7 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       }
       try {
         const result = await source.open(targetSessionId);
+        if (result?.ok) markSessionViewed(homeId, targetSessionId);
         // 目标解析成功但本机没唤起 → 502（前端展示可复制的手动命令）；非法 id 由 open 抛错。
         send(res, result?.ok ? 200 : 502, {
           ok: Boolean(result?.ok),
@@ -1001,6 +1015,9 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       if (!threadId) { send(res, 400, { error: '缺少可跳转的 Codex 会话（threadId 或 projectId）' }); return; }
       try {
         const result = await codex.openThread(threadId);
+        // 打开即已读：Codex 自己的 read receipt 稍后也会清，但 hwb 先把本地标记清掉，
+        // 避免用户点开之后还要等一个索引周期才从「未读」变成「空闲」。
+        if (result.ok) markSessionViewed(home.homeId, threadId);
         // ok=false 用 502：目标解析到了，只是本机没能唤起 Codex；前端展示可复制的手动命令。
         send(res, result.ok ? 200 : 502, result);
       } catch (error) {

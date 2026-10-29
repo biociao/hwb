@@ -6,6 +6,26 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 修复：点开未读会话后「未读」又冒回来（Codex read receipt 被下一轮索引重新读成未读）
+
+**问题**：在 hwb 里点击一条「未读」会话、跳到对应 App 之后，卡片过一会儿又变回「未读」。
+复现（本机真实数据副本）：`markSessionViewed` 把 `unread` 清 0 后，下一轮索引（≤60s）从 Codex
+`thread_read_receipts` 里又把同一行读成 `unread=1` —— hwb 每轮都无条件以 receipt 为准。
+Codex 的 receipt 不保证在点开瞬间消失（点开的是 App 侧视图，receipt 由 Codex 自己稍后/在特定
+交互后才清），于是「打开即已读」被下一轮索引原地推翻。
+
+**改动**（`src/dshhome/store.js`）：
+- `sessions` 新增 `viewedAt INTEGER`（老库自动迁移，NULL = 没在 hwb 里打开过）：
+  `markSessionViewed` 清未读时记录打开时刻。
+- `nextUnread` 的上游显式未读分支增加抑制：`explicit=true` 时，若本地已是已读、且上游给的
+  `lastActivity` **不晚于** `viewedAt`（= 还是同一次未读，没有新活动），保持已读；只有点击之后
+  线程又有新活动才重新置未读。整表替换时 `viewedAt` 从上一版回填（`upsertRows` 先 DELETE 再
+  INSERT，不处理就会被抹掉）。
+- 顺带补一条 API 契约测试：`/api/harness/open` 唤起成功必须「清未读 + 广播 `index:updated`」，
+  唤起失败（502）**不能**标已读。
+- 测试：`tests/unread-state.test.js` 新增「点开过的 Codex 未读不会被下一轮索引的上游 receipt
+  原地复活」；`tests/harness-open.test.js` 新增打开成功/失败两条断言。
+
 ### 新增：运行中会话卡显示「子代理 N（M 运行）」，位置在上下文条右侧
 
 **问题**：hwb 的会话状态能看出「在跑」，但看不出这场会话还带了多少个子代理、其中几个正在跑；
@@ -35,6 +55,29 @@ one-shot 子代理）；新增 `status.subagentsRunning` = 其中子会话行当
 - 测试：新增 `tests/agent-load.test.js`（catalog 两形态、三条 join 规则、渲染位置/未知语义、
   per-record 端到端 + `childSessionIds` 不入库）；`tests/subagent-visibility.test.js` 增加实时
   通道 join 用例并改写开关用例；`tests/web-session-state.test.js` 改为断言新 slot。
+
+### 新增：Codex 会话状态（运行中 / 空闲）与「未读」状态
+
+**问题**：Codex 会话在「最近会话」里一律显示「状态未知」（截图：PMAID-PUMCH 下面 6 条 Codex 会话
+全是「? 状态未知」），而它们其实刚跑完；同时任何跑完的会话都直接落到「空闲」，看不出「刚跑完、
+还没看过」。
+
+**改动**：
+- **Codex 运行态**：`codexhome/reader.js` 读 `$CODEX_HOME/thread_history_<N>.sqlite` 的
+  `thread_turns`（只碰这张小表，实测 1.2 万行 / 2.5ms；绝不扫 `thread_items` 正文）与
+  `state_5.sqlite` 的 `thread_read_receipts`（Codex 只在有未读 turn 时留一行）。最新 turn 在跑且
+  thread 3 分钟内有更新 →「运行中」；已收尾（completed/interrupted/failed）→「空闲」；无记录 /
+  `inProgress` 但陈旧（实测 15 条僵尸、最老 105 天）→ 仍「已保存（状态未知）」。**不映射「已完成」**
+  —— Codex 的 turn 完成 ≠ 会话目标完成。
+- **未读**：`sessions` 表新增 `unread` 列（老库迁移为全 0，不会一次冒出几百条未读）；服务端在
+  「running → idle/completed」跃迁时置 1（Codex 以 read receipts 为准），用户在 hwb 里打开会话
+  （`/api/harness/open`、`/api/codex/open`、`/api/homes/{id}/open-session`）即清 0 并广播刷新。
+- **UI**：新增「未读」chip（✦，强调色实心）与筛选 tab；排序变成 待介入 > 运行中 > 未读 > 其它，
+  未读不再直接沉成「空闲」；tooltip 说明「点击打开后标记为已读」。Codex 的未读行即使没有 turn
+  记录也会显示「未读」。
+- 测试：`tests/unread-state.test.js`（store 状态机 + 前端 chip/筛选/排序）、`tests/codex-reader.test.js`
+  （thread_turns / receipts 夹具，含僵尸 inProgress）、`tests/codex-index.test.js`（映射层不把 turn
+  完成伪装成会话完成）。
 
 ### 修复：项目「已隐藏」却还在列表里 —— 改为移入栏底折叠栏（默认收起）
 

@@ -1,6 +1,11 @@
 import { esc } from '../store.js';
 
 // 保存记录不代表执行状态。保持索引协议不变，在展示层区分 unknown 与真正的 idle。
+//
+// unread（服务端算好、随会话行返回）：任务跑完后还没被查看。
+// 它不能替换 running（正在跑说明你还在用），但**要压过 idle/completed** ——
+// 「跑完了，你没看」和「闲着没事」是两回事，直接显示「空闲」会让人以为没事发生。
+//
 // 计数字段归一：非数字 / 负数 / 空串一律 null（未知），而不是 0 —— 「不知道」与「已知是 0」
 // 在 UI 上必须长得不一样（见 lib/intervention.js 的键存在约定）。
 function countOf(value) {
@@ -14,16 +19,18 @@ function countOf(value) {
 export function sessionState(session) {
   const status = session?.status;
   const saved = status?.label === '已保存' || status?.label === 'Codex';
-  const kind = !saved && ['running', 'completed', 'idle'].includes(status?.kind) ? status.kind : 'unknown';
-  const labels = { running: '运行中', completed: '已完成', idle: '空闲', unknown: '状态未知' };
-  const icons = { running: '●', completed: '✓', idle: 'Ⅱ', unknown: '?' };
+  const base = !saved && ['running', 'completed', 'idle'].includes(status?.kind) ? status.kind : 'unknown';
+  const unread = session?.unread === true && base !== 'running';
+  const kind = unread ? 'unread' : base;
+  const labels = { running: '运行中', completed: '已完成', idle: '空闲', unknown: '状态未知', unread: '未读' };
+  const icons = { running: '●', completed: '✓', idle: 'Ⅱ', unknown: '?', unread: '✦' };
   const total = countOf(status?.subagents);
   // 「其中几个在跑」：缺键 = 未知（null），与「已观测的 0」不同。两个数都做取整钳制；
   // running 不可能大于历史总数（annotate 保证），但外部/未来数据源可能不守约，展示层再兜一层。
   const running = countOf(status?.subagentsRunning);
   return {
-    kind, saved,
-    label: kind === 'unknown' ? labels.unknown : status.label || labels[kind],
+    kind, saved: saved && !unread, unread,
+    label: kind === 'unread' ? labels.unread : (kind === 'unknown' ? labels.unknown : status.label || labels[kind]),
     icon: icons[kind],
     subagents: total ?? 0,
     subagentsKnown: total !== null,
@@ -150,7 +157,7 @@ export function interventionState(session) {
 
 // 「待介入」放在最前：它是列表的第一优先级，用户打开仪表盘第一眼就该看到。
 export const SESSION_FILTERS = [
-  ['intervention', '待介入'], ['all', '全部'], ['running', '运行中'], ['completed', '已完成'], ['other', '其他'],
+  ['intervention', '待介入'], ['all', '全部'], ['running', '运行中'], ['unread', '未读'], ['completed', '已完成'], ['other', '其他'],
 ];
 
 // 排序权重：有介入的最前（kind 越急越靠前），其次运行中，再次「未读」，其余按最近活动。
@@ -160,6 +167,7 @@ function sortPriority(session) {
   if (intervention) return 100 + intervention.rank;
   const { kind } = sessionState(session);
   if (kind === 'running') return 50;
+  if (kind === 'unread') return 30;   // 跑完了没看：排在运行中之后、其它之前
   return 0;
 }
 
@@ -193,12 +201,14 @@ export function renderSessionStatusFilter(sessions, active = 'all', { showSubage
 // 只能改 tooltip 说明，不能改状态文案（没有证据时不能凭空造一个状态）。
 export function sessionStatusChip(session, { unobserved = false } = {}) {
   const state = sessionState(session);
-  const cls = { running: 'run', completed: 'done', idle: 'idle', unknown: 'unknown' }[state.kind];
+  const cls = { running: 'run', completed: 'done', idle: 'idle', unknown: 'unknown', unread: 'unread' }[state.kind];
   const approval = session?.status?.approval ? ` · 审批 ${session.status.approval}` : '';
   const coverage = unobserved ? '；该实例无实时通道，等待审批 / 提问可能看不到' : '';
   const baseHint = state.kind === 'unknown'
     ? '未取得执行状态；索引记录不能证明正在运行或空闲'
-    : `会话状态: ${state.label}`;
+    : state.kind === 'unread'
+      ? '任务已跑完（或已停止），你还没查看；点击打开后标记为已读'
+      : `会话状态: ${state.label}`;
   const hint = baseHint + coverage;
   return `<span class="chip status ${cls}" title="${esc(hint + approval)}"><span class="status-symbol" aria-hidden="true">${state.icon}</span>${esc(state.label)}</span>`;
 }

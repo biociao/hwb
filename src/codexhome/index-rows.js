@@ -20,6 +20,17 @@ function isAutomated(thread) {
   return thread?.automated === true || AUTOMATED.has(thread?.source);
 }
 
+// Codex 的运行态来自 thread_history 的 thread_turns（见 codexhome/reader.js）：
+//   · 最新 turn 在跑且线程 3 分钟内有更新 → 运行中；
+//   · 最新 turn 已收尾（completed/interrupted/failed）→ 空闲（turn 完成 ≠ 会话目标完成，
+//     所以**不映射成「已完成」**，避免把「这一轮跑完了」误导成「这个任务做完了」）；
+//   · 无 turn 记录 / 库缺失 / inProgress 但已陈旧 → 已保存（前端显示「状态未知」，不编造）。
+function statusOf(thread) {
+  if (thread?.turnState === 'running') return { kind: 'running', label: '运行中', subagents: 0 };
+  if (thread?.turnState === 'ended') return { kind: 'idle', label: '空闲', subagents: 0 };
+  return { kind: 'idle', label: '已保存', subagents: 0 };
+}
+
 function sessionRow({ homeId, thread, project, workspaceId, workspaceTitle, generatedAt }) {
   return {
     type: 'session',
@@ -32,8 +43,12 @@ function sessionRow({ homeId, thread, project, workspaceId, workspaceTitle, gene
     // Codex 没有输入/输出/缓存拆分：只写 totalTokens，不伪造成 uncachedInputTokens/outputTokens。
     tokenUsage: Number(thread.tokens) > 0 ? JSON.stringify({ totalTokens: Number(thread.tokens) }) : null,
     contextPressure: null,
-    // 桌面端是否正在跑这条 thread 无法从落盘元数据得知：明确标成「已保存」而不是「运行中」。
-    status: JSON.stringify({ kind: 'idle', label: '已保存', subagents: 0 }),
+    // 运行态/未读都来自 Codex 自己的投影（thread_turns / thread_read_receipts）。
+    status: JSON.stringify(statusOf(thread)),
+    // 1 = Codex 侧还有没看的 turn（thread_read_receipts 有行）；0 = 已读。
+    // 传显式值（而不是 undefined）是契约的一部分：store 见到显式 unread 就以它为准，
+    // 不再用「running → idle」的跃迁推断，避免同一条 Codex 会话被两套逻辑打架。
+    unread: thread?.unread === true ? 1 : 0,
     lastActivity: thread.updatedAt ?? null,
     generatedAt,
   };

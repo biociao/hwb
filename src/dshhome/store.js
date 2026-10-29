@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- 1 = 这行只来自实时 RPC（dsh 的 /api/session/list），文件索引里还没有它。
   -- 用来在「实时列表变成空」时精确清掉这些行，而不会误伤有文件索引支撑的会话。
   liveOnly INTEGER NOT NULL DEFAULT 0,
+  -- 1 = 「跑完了但你还没看」：从 running 落到 idle/completed 时置 1，用户打开会话后清 0。
+  -- 与「空闲」区分开 —— 任务刚跑完和真的闲着是两种状态，前者不该悄悄沉到列表底部。
+  unread INTEGER NOT NULL DEFAULT 0,
+  -- 用户在 hwb 里把这条会话「打开即已读」的时刻（epoch ms）。用于对抗**上游会重复上报的未读**：
+  -- Codex 的 read receipt 在用户点开后可能仍留在库里一段时间（hwb 每 60s 索引一次会把它重新
+  -- 读成 unread=1），于是刚点掉的「未读」又冒出来。只有当线程活动时间超过这个时刻（真的有新
+  -- turn）才允许上游把它重新置为未读。NULL = 没在 hwb 里打开过。
+  viewedAt INTEGER,
   UNIQUE(homeId, sessionId)
 );
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -276,7 +284,49 @@ function hydrateSessionRow(s) {
     tokenUsage: safeJsonParse(s.tokenUsage, null, 'sessions.tokenUsage'),
     contextPressure: safeJsonParse(s.contextPressure, null, 'sessions.contextPressure'),
     status: safeJsonParse(s.status, null, 'sessions.status'),
+    // SQLite 存 0/1；出站统一成布尔，前端 `session.unread === true` 才认。
+    unread: s.unread === 1 || s.unread === true,
   };
+}
+
+// 「未读」状态机（纯函数，便于单测）：
+//   · 上游显式给了 unread（Codex 的 thread_read_receipts）→ 以它为准；
+//   · 否则只认「running → idle/completed」这个跃迁 = 任务刚跑完；
+//   · **区分「真跑完」与「投影冻结后被降级成空闲」**：后者是陈旧闸门（lib/status.js）为了让
+//     几周前的僵尸会话不再显示运行中而做的降级，不是新事件 —— 把它记成未读会让一次重启冒出
+//     几十条假未读（实测 2026-10-28 首次上线时 30 条）。判据：status.observedAt（投影文件 mtime）
+//     陈旧 ⇒ 降级而非完成；没有 observedAt（实时通道）⇒ 按真实完成处理。
+//   · 首次索引的老会话不算未读（迁移基线，否则一升级满屏未读）；
+//   · 一旦置 1 就粘住，直到用户打开（markSessionViewed）或它又跑起来。
+const STATUS_OBSERVED_STALE_MS = 30 * 60_000;   // 与 lib/status.js 的 RUNNING_STALE_MS 同口径
+function looksLikeRealCompletion(nextStatus, now = Date.now()) {
+  const observed = Date.parse(nextStatus?.observedAt ?? '');
+  if (!Number.isFinite(observed)) return true;   // 实时通道：没有 observedAt，完成事件是新鲜的
+  const age = now - observed;
+  return Number.isFinite(age) && age >= 0 && age <= STATUS_OBSERVED_STALE_MS;
+}
+// `nextActivity` 是这一行**上游最近活动时间**（ISO），只有显式未读（Codex receipt）分支用得到：
+// 上游说「还有未读」时，如果用户在 hwb 里点开过、而线程从那之后没有任何新活动，就保持已读。
+// 为什么需要：Codex 的 read receipt 不保证在点开瞬间就消失；hwb 每次索引都会重新读到它，
+// 若无条件以它为准，用户点掉的「未读」会在下一轮索引（≤60s）后原地复活。
+function nextUnread(prev, nextStatus, explicit, now = Date.now(), nextActivity = null) {
+  if (explicit !== undefined && explicit !== null) {
+    if (!explicit) return 0;
+    // 上游重复上报同一次未读：hwb 里已经点开过，且线程活动没有越过那次点击 → 保持已读。
+    const viewedAt = Number(prev?.viewedAt);
+    const activity = Date.parse(nextActivity ?? '');
+    if (prev && prev.unread === false && Number.isFinite(viewedAt) && Number.isFinite(activity) && activity <= viewedAt) {
+      return 0;
+    }
+    return 1;
+  }
+  if (!prev) return 0;
+  const nextKind = nextStatus?.kind ?? null;
+  if (nextKind === 'running') return 0;
+  if (prev.kind === 'running' && (nextKind === 'idle' || nextKind === 'completed')) {
+    return looksLikeRealCompletion(nextStatus, now) ? 1 : 0;
+  }
+  return prev.unread ? 1 : 0;
 }
 
 export class IndexStore {
@@ -353,8 +403,16 @@ export class IndexStore {
       // 已有库里的行都来自文件索引或早期实时合并：默认 0 最保守（不会被空实时列表误删）。
       this.db.exec('ALTER TABLE sessions ADD COLUMN liveOnly INTEGER NOT NULL DEFAULT 0');
     }
+    if (!sess.includes('unread')) {
+      // 老库里的行一律视为「已读」：升级后不该把几百条历史会话一次性标成未读。
+      this.db.exec('ALTER TABLE sessions ADD COLUMN unread INTEGER NOT NULL DEFAULT 0');
+    }
     if (!sess.includes('status')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN status TEXT');
+    }
+    if (!sess.includes('viewedAt')) {
+      // 老库没有「在 hwb 里打开过」的时刻：NULL = 没打开过，语义与旧行为一致（不抑制任何上游未读）。
+      this.db.exec('ALTER TABLE sessions ADD COLUMN viewedAt INTEGER');
     }
     this.#migrateTokenColumns(sess);
     const homes = this.db.prepare("SELECT name FROM pragma_table_info('homes')").all().map((c) => c.name);
@@ -630,6 +688,9 @@ export class IndexStore {
   // 因此：某域降级时**跳过它对应的表的 DELETE**，保留上次成功的行；其余域照常刷新。
   upsertRows(rows) {
     const homeRows = rows.filter((r) => r.type === 'home');
+    // 未读判定要拿「这次写入之前的状态」做对比：upsertRows 是整表替换（先 DELETE 再 INSERT），
+    // 插入时已经读不到上一版。按 home 先记下来。
+    const prevSessionStates = new Map();
     const preservedSessions = new Map(); // homeId -> Map(sessionId -> 上一版的 workspace 归属)
     const preservedLiveStatus = new Map(); // homeId -> [{sessionId,status,lastActivity}]（见下）
     const linkCleanupHomes = new Set();    // 需要清理悬空 workspace 归属的 home（见下）
@@ -645,6 +706,14 @@ export class IndexStore {
         // 「当前会话尚未关联可用的 project 工作区」，保留的 workspace 也变成孤儿。
         // 这里把上一版的归属回填到新行上（workspace 域恢复后会被新数据自然覆盖）。
         // 注意必须在下面的 DELETE **之前**读：workspace 降级时 sessions 本身仍会被替换掉。
+        prevSessionStates.set(home.homeId, new Map(
+          this.db.prepare('SELECT sessionId, status, unread, viewedAt FROM sessions WHERE homeId = ?').all(home.homeId)
+            .map((r) => [r.sessionId, {
+              kind: safeJsonParse(r.status, null, 'sessions.status')?.kind ?? null,
+              unread: r.unread === 1,
+              viewedAt: Number.isFinite(r.viewedAt) ? r.viewedAt : null,
+            }])
+        ));
         if (protectedTables.has('workspaces')) preservedSessions.set(home.homeId, this.#sessionWorkspaceLinks(home.homeId));
         // sessions 被保护（保留旧行）时，旧行里的 workspaceId 可能指向这次刷新后**已消失**的
         // workspace —— 那会让 sessionWorkspace() 返回 null，preview/upload 对完全正常的会话报
@@ -697,8 +766,8 @@ export class IndexStore {
       // 真正有效的做法是在替换前记下实时状态、替换后写回（见 preservedLiveStatus）。
       const insSession = this.db.prepare(
         `INSERT INTO sessions (homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage,
-                               contextPressure, status, lastActivity, generatedAt, liveOnly)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               contextPressure, status, lastActivity, generatedAt, liveOnly, unread, viewedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(homeId, sessionId) DO UPDATE SET
            -- 「文件索引撑起来的行」不能被「只有实时 RPC 支撑的新行」抹掉。
            -- 触发条件：库里这行是 liveOnly=0（有文件索引依据），而这次写入的是 liveOnly=1
@@ -716,6 +785,10 @@ export class IndexStore {
            tokenUsage=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.tokenUsage ELSE excluded.tokenUsage END,
            contextPressure=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN sessions.contextPressure ELSE excluded.contextPressure END,
            status=excluded.status,
+           unread=excluded.unread,
+           -- viewedAt 只由 markSessionViewed 写；冲突更新时保留已有值（excluded 里是回填的同一值，
+           -- 保险起见仍用 COALESCE，避免任何绕过 prevSessionStates 的写入路径把它抹掉）。
+           viewedAt=COALESCE(sessions.viewedAt, excluded.viewedAt),
            lastActivity=excluded.lastActivity, generatedAt=excluded.generatedAt,
            liveOnly=CASE WHEN sessions.liveOnly=0 AND excluded.liveOnly=1 THEN 0 ELSE excluded.liveOnly END`
       );
@@ -761,6 +834,21 @@ export class IndexStore {
             break;
           case 'session': {
             const link = row.workspaceId == null ? preservedSessions.get(row.homeId)?.get(row.sessionId) : null;
+            const prev = prevSessionStates.get(row.homeId)?.get(row.sessionId) ?? null;
+            const nextStatus = safeJsonParse(row.status, null, 'sessions.status');
+            // 只有「外部数据源直接给的行」（没有库内 id 列）才把 unread 当权威。
+            // applyLiveStatus 会把库行复制进 upsertRows，那些行带着旧的 unread —— 不能再当显式值，
+            // 否则跃迁检测在整表替换路径上永远不生效。
+            const explicitUnread = row.id === undefined ? row.unread : undefined;
+            // 「用户看过」的时刻要跨整表替换保留：这一列只由 markSessionViewed 写，
+            // 文件索引没有它，所以从上一版回填（新会话为 null）。
+            const viewedAt = prev?.viewedAt ?? null;
+            const unread = nextUnread(prev, nextStatus, explicitUnread, Date.now(), row.lastActivity);
+            // 可观测性：上游（Codex receipt）在一次「打开即已读」之后仍重复上报未读时，
+            // 这里是抑制点。debug 级别（默认不落盘），排查「未读复活」时有据可查。
+            if (explicitUnread === true && unread === 0 && prev && Number.isFinite(prev.viewedAt)) {
+              log.debug('上游重复上报的未读已被本地「已读」抑制', { homeId: row.homeId, sessionId: row.sessionId });
+            }
             insSession.run(
               row.homeId ?? null, row.sessionId ?? null,
               row.workspaceId ?? link?.workspaceId ?? null,
@@ -769,7 +857,7 @@ export class IndexStore {
               link?.project ?? row.project ?? null,
               row.title ?? null, row.tokenUsage ?? null, row.contextPressure ?? null, row.status ?? null,
               row.lastActivity ?? null, row.generatedAt ?? null,
-              row.liveOnly ? 1 : 0
+              row.liveOnly ? 1 : 0, unread, viewedAt
             );
             break;
           }
@@ -885,6 +973,11 @@ export class IndexStore {
     }
     const rows = this.db.prepare('SELECT * FROM sessions WHERE homeId = ?').all(homeId)
       .map((row) => ({ ...row, type: 'session' }));
+    // 未读跃迁需要「写之前的 kind/未读」（mergeLiveStatus 会原地改这些行）。
+    const beforeStates = new Map(rows.map((r) => [r.sessionId, {
+      kind: safeJsonParse(r.status, null, 'sessions.status')?.kind ?? null,
+      unread: r.unread === 1,
+    }]));
     // 逐行比对「实时通道拥有的那几列」：都没变时**跳过整表写**。
     // 为什么值得：upsertRows 对一个 home 是「整表替换」，代价正比于该实例的**总会话数**
     // （规模审查实测：40k/10 实例时每轮 891ms ≈ 每 3s 一次约 30% 的同步阻塞；单个 home 有
@@ -904,6 +997,15 @@ export class IndexStore {
     const merged = mergeLiveStatus(rows, live, { homeId, generatedAt: new Date().toISOString() });
     const changed = merged.filter((row) => before.get(row.sessionId) !== undefined
       && before.get(row.sessionId) !== JSON.stringify([row.status, row.lastActivity, row.tokenUsage, row.title]));
+    for (const row of changed) {
+      row.unread = nextUnread(
+        beforeStates.get(row.sessionId) ?? null,
+        safeJsonParse(row.status, null, 'sessions.status'),
+        undefined,
+        Date.now(),
+        row.lastActivity,
+      );
+    }
     const newRows = merged.filter((row) => !existing.has(row.sessionId));
     if (!changed.length && !newRows.length && !ghostsDeleted && !clearedStale) {
       log.debug('实时状态与库里完全一致，跳过整表写', { homeId, sessions: rows.length });
@@ -929,19 +1031,30 @@ export class IndexStore {
   // 只更新实时通道拥有的那几列（见 applyLiveStatus 里的等价性论证）。
   #updateLiveRows(homeId, rows) {
     const upd = this.db.prepare(`UPDATE sessions
-      SET status = ?, lastActivity = ?, tokenUsage = ?, title = ?, generatedAt = ?
+      SET status = ?, lastActivity = ?, tokenUsage = ?, title = ?, generatedAt = ?, unread = ?
       WHERE homeId = ? AND sessionId = ?`);
     for (const row of rows) {
       upd.run(row.status ?? null, row.lastActivity ?? null, row.tokenUsage ?? null, row.title ?? null,
-        row.generatedAt ?? null, homeId, row.sessionId);
+        row.generatedAt ?? null, row.unread ?? 0, homeId, row.sessionId);
     }
+  }
+
+  // 用户在 hwb 里打开了这条会话 → 清「未读」。返回是否真的清掉了（供 API 决定要不要广播）。
+  // 只清不建：unread=1 的行才写，避免每次点击都制造一次无意义的写事务与 SSE。
+  markSessionViewed(homeId, sessionId) {
+    if (typeof homeId !== 'string' || !homeId || typeof sessionId !== 'string' || !sessionId) return false;
+    const res = this.db.prepare('UPDATE sessions SET unread = 0, viewedAt = ? WHERE homeId = ? AND sessionId = ? AND unread = 1')
+      .run(Date.now(), homeId, sessionId);
+    const changed = (res?.changes ?? 0) > 0;
+    if (changed) this.#writeVersion++;
+    return changed;
   }
 
   // 每个 home 的「当前项目/当前会话」——取最近活跃（lastActivity 最大）的 session 及其所属 workspace。
   // 这是 hwb 的「当前」语义：与 recentProjects/recentSessions（时间窗内聚合）不同，它是每个实例的单一当前项。
   #currentSession(homeId) {
     const r = this.db.prepare(
-      `SELECT sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
+      `SELECT sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, unread
        FROM sessions WHERE homeId = ?
        ORDER BY (lastActivity IS NULL), lastActivity DESC, rowid DESC LIMIT 1`
     ).get(homeId);
@@ -956,6 +1069,7 @@ export class IndexStore {
       tokenUsage: safeJsonParse(r.tokenUsage, null, 'sessions.tokenUsage'),
       contextPressure: safeJsonParse(r.contextPressure, null, 'sessions.contextPressure'),
       status: safeJsonParse(r.status, null, 'sessions.status'),
+      unread: r.unread === 1,
     };
   }
 
@@ -1096,7 +1210,7 @@ export class IndexStore {
     const where = 'WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?))) AND (? IS NULL OR homeId = ?) AND (? IS NULL OR project = ?)';
     const args = [scope, scope, homeId, homeId, project, project];
     return this.db.prepare(
-      `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
+      `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, unread
        FROM sessions ${where}
        ORDER BY lastActivity DESC NULLS LAST
        LIMIT ${int(limit, 50)}`
@@ -1185,7 +1299,7 @@ export class IndexStore {
     // 会话：标题 / 工作区名 / 所属项目名任一命中即可；字段与 recentSessions 完全同形。
     // project 参数是精确作用域（与 recentSessions 同口径），不参与「命中」判定。
     const sessionRows = this.db.prepare(
-      `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity
+      `SELECT homeId, sessionId, workspaceId, workspaceTitle, project, title, tokenUsage, contextPressure, status, lastActivity, unread
        FROM sessions
        WHERE (? IS NULL OR homeId IN (SELECT value FROM json_each(?)))
          AND (? IS NULL OR project = ?)

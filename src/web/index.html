@@ -295,6 +295,8 @@
     .session-card[data-status="running"] .name { font-weight: 650; }
     .session-card[data-status="running"] .card-rail { background: var(--ok); }
     .session-card[data-status="completed"] .card-rail { background: var(--accent); }
+    /* 未读：跑完了但没看。用强调色竖轨 + 实心 chip，和「空闲」的透明轨区分开。 */
+    .session-card[data-status="unread"] .card-rail { background: var(--accent); opacity: .75; }
     .session-card[data-status="idle"] .card-rail, .session-card[data-status="unknown"] .card-rail { background: transparent; }
     .session-card .meta { align-items: center; gap: 4px 8px; margin-top: 4px; padding-right: 0; }
     /* 会话卡里的实例 chip 降级为「描边弱提示」：项目色 chip 才是这一行要读的身份信息，
@@ -323,6 +325,7 @@
        橙色表达「在等你」，不是失败（--bad 才是失败）；所有颜色都派生自 --warn，
        浅/深两套主题自动跟随，不新增写死的色值。视觉上有三层锚点，保证不会漏看：
          ① 卡片描边 + 竖轨换成 warn；② 状态列最前面那颗 warn chip；③ 列表顶部提示条。 */
+    .chip.status.unread { color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-line); }
     .chip.status.warn.intervention { color: var(--warn);
       background: color-mix(in srgb, var(--warn) 13%, transparent);
       border: 1px solid color-mix(in srgb, var(--warn) 42%, transparent);

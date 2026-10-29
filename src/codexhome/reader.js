@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -128,10 +128,100 @@ function withThreadsDb(dbFile, read) {
   }
 }
 
+// —— 运行态与未读：Codex 自己落盘的两张表 ——
+//
+// threads 表没有「是否在跑」：运行态在 `thread_history_<N>.sqlite` 的 `thread_turns`
+// （每 turn 一行，status ∈ inProgress/completed/interrupted/failed；实测写入延迟 ~1s，
+//  turn 开始/结束几秒内可见）。「未读」在 `state_5.sqlite` 的 `thread_read_receipts`：
+//  Codex 只在**有未读 turn** 时留一行（`first_unread_turn` 非空），用户看过就删 —— 实测
+//  已查看的会话没有行、刚跑完没看的会话有行，两者一一对应。
+// 两处都是 Codex 自己的投影，hwb 只读；缺表/坏库一律降级为「未知」，不影响会话列表。
+const TURN_HISTORY_RE = /^thread_history_(\d+)\.sqlite$/;
+// inProgress 但线程 3 分钟没有任何更新 = 僵尸 turn（Codex 被杀/崩溃后永远不会收尾；实测 15 条、
+// 最老 105 天）。3 分钟 = turn 进行中 updated_at 实测最大刷新间隔（28.75s）的 6 倍。
+const TURN_RUNNING_STALE_MS = 3 * 60_000;
+
+// thread_history 的文件名带版本号，按最大值挑（与 state_5 一样的「版本漂移」风险）。
+function findTurnHistoryDb(home) {
+  try {
+    let best = null;
+    for (const name of readdirSync(home)) {
+      const m = TURN_HISTORY_RE.exec(name);
+      if (!m) continue;
+      const version = Number(m[1]);
+      if (!best || version > best.version) best = { version, file: path.join(home, name) };
+    }
+    return best?.file ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// 每个 thread 的**最新** turn（rollout_ordinal 最大）。只碰 thread_turns 这张小表
+// （实测 1.2 万行、2.5ms），绝不扫 thread_items 的会话正文。
+function loadTurnStates(db) {
+  const map = new Map();
+  try {
+    const rows = db.prepare(`
+      SELECT t.thread_id, t.status, t.started_at, t.completed_at
+        FROM thread_turns t
+        JOIN (SELECT thread_id, MAX(rollout_ordinal) AS m FROM thread_turns GROUP BY thread_id) x
+          ON x.thread_id = t.thread_id AND x.m = t.rollout_ordinal
+    `).all();
+    for (const row of rows) {
+      map.set(String(row.thread_id), {
+        status: String(row.status ?? ''),
+        startedAtMs: toEpochMs(row.started_at, null),
+        completedAtMs: toEpochMs(row.completed_at, null),
+      });
+    }
+  } catch {
+    return null; // schema 不认识 / 表缺失 → 状态未知（不是「空闲」）
+  }
+  return map;
+}
+
+function loadUnreadThreads(db) {
+  try {
+    const rows = db.prepare('SELECT thread_id FROM thread_read_receipts WHERE first_unread_turn IS NOT NULL').all();
+    return new Set(rows.map((r) => String(r.thread_id)));
+  } catch {
+    return new Set(); // 老版本 Codex 没有这张表 = 没有未读概念
+  }
+}
+
+function readTurnStates(home) {
+  const file = findTurnHistoryDb(home);
+  if (!file) return null;
+  try {
+    return withThreadsDb(file, (db) => {
+      db.exec('PRAGMA busy_timeout = 2000');
+      return loadTurnStates(db);
+    });
+  } catch {
+    return null; // 坏库/权限问题：状态降级为「未知」，绝不拖垮会话列表
+  }
+}
+
+// 'running' | 'ended' | null（未知）。新鲜度用 thread 的 updated_at_ms：turn 进行中它每 10–30s
+// 刷新一次；陈旧说明是崩溃残留的 inProgress，不能报「运行中」（实测本机 16 条 inProgress 里
+// 15 条是 7–9 月的僵尸）。
+function deriveTurnState(turn, updatedAtMs, now) {
+  if (!turn) return null;
+  if (turn.status === 'inProgress') {
+    const age = Number.isFinite(updatedAtMs) && updatedAtMs > 0 ? now - updatedAtMs : NaN;
+    // 未来时间戳也按陈旧处理（与 lib/status.js 同一取舍：本机时钟判断不了未来有多新）
+    return Number.isFinite(age) && age >= 0 && age <= TURN_RUNNING_STALE_MS ? 'running' : null;
+  }
+  if (turn.status === 'completed' || turn.status === 'interrupted' || turn.status === 'failed') return 'ended';
+  return null;
+}
+
 function readDbMetadata(dbFile, maxThreads) {
   return withThreadsDb(dbFile, (db) => ({
     threads: loadThreads(db, maxThreads),
     legacyProjects: loadLegacyProjects(db),
+    unreadThreads: loadUnreadThreads(db),
   }));
 }
 
@@ -300,14 +390,25 @@ export function readCodexProjects({
 
   let threads = [];
   let legacyProjects = [];
+  let unreadThreads = new Set();
   try {
     if (existsSync(dbFile)) {
       // readOnly：hwb 绝不写 Codex 的状态库（WAL 由 Codex 自己维护）；桌面端未运行时走 immutable 快照。
       const metadata = readDbMetadata(dbFile, Math.max(1, Math.min(20_000, maxThreads)));
       threads = metadata.threads;
       legacyProjects = metadata.legacyProjects;
+      unreadThreads = metadata.unreadThreads ?? new Set();
     } else {
       reasons.push(`未找到 ${path.basename(dbFile)}（会话列表降级）`);
+    }
+
+    // 运行态 + 未读：两个投影都要挂到 thread 上；缺任何一个都不编造（turnState=null → 状态未知）。
+    const turnStates = readTurnStates(home);
+    for (const thread of threads) {
+      const turn = turnStates?.get(thread.id) ?? null;
+      thread.turnState = deriveTurnState(turn, thread.updatedAtMs, now);
+      thread.turnCompletedAt = turn?.completedAtMs ?? null;
+      thread.unread = unreadThreads.has(thread.id);
     }
 
     const jsonProjects = global && global['local-projects'] && typeof global['local-projects'] === 'object'
