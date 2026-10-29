@@ -1005,8 +1005,16 @@ export class IndexStore {
 
   // Recent projects: cross-instance, active within `days`, ordered by last activity (§7.1).
   // 每个 project 附带"它所属的实例 + 该 project 最新会话"，供点击直接跳转。
-  recentProjects({ days = 7, limit = 20, homeIds = null } = {}) {
-    const since = daysAgoIso(days);
+  //
+  // all=true 是「全部项目」：**不设时间窗**。项目是身份（workspace），不该因为 7 天没活动
+  // 就从列表里消失 —— 本机实测索引里有 532 个项目，最近 7 天有活动的只有 46 个；只提供
+  // 「最近」视图时，想找旧项目只能靠顶栏搜索命中才看得见（与「PUMCH-GPPH 被 LIMIT 20 挤掉」
+  // 是同一类问题，见 CHANGELOG）。排序不变（lastActivity DESC），最近活跃的仍在最前，
+  // 无会话的工作区照旧追加在末尾。
+  // 口径提醒：sessionCount 跟着 since 走 —— 最近视图是**窗口内**会话数，全部视图是项目全部会话数。
+  // 截断不在这里判断（调用方多取一行即可），但这里仍按 limit 收口，避免一次返回整张表。
+  recentProjects({ days = 7, limit = 20, homeIds = null, all = false } = {}) {
+    const since = all ? null : daysAgoIso(days);
     const scope = homeIds === null ? null : JSON.stringify(homeIds);
     const projects = this.db.prepare(
       `WITH visible_sessions AS (
@@ -1027,11 +1035,11 @@ export class IndexStore {
               (SELECT x.workspaceId FROM visible_sessions x WHERE x.project = s.project
                  ORDER BY x.lastActivity DESC, x.id DESC LIMIT 1) AS workspaceId
        FROM visible_sessions s
-       WHERE s.project IS NOT NULL AND s.lastActivity IS NOT NULL AND s.lastActivity >= ?
+       WHERE s.project IS NOT NULL AND s.lastActivity IS NOT NULL AND (? IS NULL OR s.lastActivity >= ?)
        GROUP BY s.project
        ORDER BY s.lastActivity DESC
        LIMIT ${int(limit, 20)}`
-    ).all(scope, scope, since);
+    ).all(scope, scope, since, since);
 
     // Workspaces with no sessions still show up as projects (§4.5) — 跳到其所属实例，
     // 无最新会话，sessionId 为 null。
@@ -1046,7 +1054,7 @@ export class IndexStore {
     ).all(scope, scope);
     const seen = new Set(projects.map((p) => p.project));
     for (const w of orphanWs) {
-      if (!seen.has(w.project)) projects.push(w);
+      if (!seen.has(w.project)) { seen.add(w.project); projects.push(w); }
     }
     return projects.slice(0, int(limit, 20));
   }

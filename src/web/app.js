@@ -2,7 +2,7 @@ import { endpointRow, readEndpoints, endpointSelector } from './components/endpo
 import { downloadFile, uploadFiles, partitionUploads, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES } from './file-ops.js';
 import { api, subscribe, esc, isLocalToolHome, localToolLabel } from './store.js';
 import { renderWorkbench } from './components/workbench.js';
-import { renderRecentProjects } from './components/recent-projects.js';
+import { renderRecentProjects, renderProjectsMore } from './components/recent-projects.js';
 import { renderRecentSessions, renderSessionFilter } from './components/recent-sessions.js';
 import { SESSION_FILTERS, filterSessionState, renderSessionStatusFilter } from './components/session-state.js';
 import { renderSearchResults } from './components/search-results.js';
@@ -75,8 +75,48 @@ const browserStorage = (() => {
 let mutedProjects = readMutedProjects(browserStorage);
 // 「显示已隐藏」只是当前视图的临时开关（不写偏好）：点一次看全部，刷新/恢复默认后仍按默认隐藏。
 let showMutedSessions = false;
+// —— 项目栏的范围偏好：全部项目 / 最近 7 天 ——
+//
+// 背景：项目栏原先固定拉 `/api/projects/recent`（不传 limit → 服务端默认 20），被截断时
+// 界面上没有任何说明，分区头写着 20 就像「项目一共这么多」。本机实测索引里 532 个项目、
+// 最近 7 天活跃 46 个，于是用户只看得见 20 个、还得靠顶栏搜索猜有没有漏（截图反馈就是这个）。
+//
+// **默认「全部」**：这一栏的标题是「项目」而不是「最近项目」，用户要看的是自己的项目全集；
+// 只给最近 7 天等于把「数据被藏起来」当默认，想找旧项目还得先点一下。实测代价很小
+// （本机 2636 条会话 / 535 个项目：查询 8.8ms、拼 HTML 3.2ms），上限 1000 条兜住极端规模；
+// 觉得列表太长就切「最近」—— 偏好持久化，切过一次之后一直按它来。
+//
+// 两个范围的上限分开写：最近视图 200 条（7 天窗口要装得下，本机 46 条，远小于上限），
+// 全部视图 1000 条（本机 532 条）。上限是**响应体**的护栏，不是产品口径：真被截断时
+// 列表底部会明确写「仅显示前 N 个」（见 recent-projects.js 的 renderProjectsMore）。
+const PROJECTS_SCOPE_KEY = 'hwb:projects-scope';
+const PROJECTS_SCOPES = ['recent', 'all'];
+const PROJECTS_RECENT_DAYS = 7;
+const PROJECTS_RECENT_LIMIT = 200;
+const PROJECTS_ALL_LIMIT = 1000;
+// 偏好走 localStorage（与用量筛选同一种语义：跨刷新保留「这一栏装什么」）；
+// 搜索词则不持久化 —— 那是「当下想找什么」，两者不能混。坏值/不可用一律回默认（全部）。
+function readProjectsScope() {
+  try {
+    const value = localStorage.getItem(PROJECTS_SCOPE_KEY);
+    return PROJECTS_SCOPES.includes(value) ? value : 'all';
+  } catch { return 'all'; }
+}
+let projectsScope = readProjectsScope();
+let projectsTruncated = false; // 最近一轮「当前范围」的项目列表是否被 limit 截断（底部据此说明）
+function saveProjectsScope(scope) {
+  try { localStorage.setItem(PROJECTS_SCOPE_KEY, scope); } catch { /* storage 不可用则本次生效 */ }
+}
+// 范围 → 取数地址。all=1 交给服务端去掉 7 天时间窗（见 routes.js 的 /api/projects/recent）。
+function projectsUrl() {
+  return projectsScope === 'all'
+    ? `/api/projects/recent?${new URLSearchParams({ all: '1', limit: String(PROJECTS_ALL_LIMIT) })}`
+    : `/api/projects/recent?${new URLSearchParams({ days: String(PROJECTS_RECENT_DAYS), limit: String(PROJECTS_RECENT_LIMIT) })}`;
+}
 // 「新前端 + 旧后端」混合状态只提示一次（见 renderDashboard 里的 project 兜底过滤）。
 let staleBackendNoted = false;
+// 同上，但针对「全部项目」：旧后端不认识 all 参数，会把「最近 20 个」当成全部返回。
+let staleProjectsScopeNoted = false;
 // 全库补搜的状态（顶栏搜索框的历史部分）。
 //
 // 为什么不能只过滤 lastLists：那两段数据分别是「近 7 天 top 20 项目」和「最近 50 条会话」，
@@ -369,7 +409,7 @@ async function renderDashboard(sequence = refreshSequence) {
   // 与全局最近 50 条是两份数据（后者仍然保留，清掉筛选时立刻能画）。
   const project = projectKey();
   const [projectsRes, sessionsRes, projectSessionsRes, usageRes] = await Promise.allSettled([
-    api('/api/projects/recent'),
+    api(projectsUrl()),
     api('/api/sessions/recent'),
     project ? api(projectSessionsUrl(project)) : Promise.resolve(null),
     fetchUsage(),
@@ -388,6 +428,17 @@ async function renderDashboard(sequence = refreshSequence) {
     note.set(`部分数据加载失败：${failed.join('；')}`);
   }
   const projects = projectsRes.status === 'fulfilled' ? projectsRes.value.projects : [];
+  // 「全部项目」最容易在混合版本下静默出错：旧后端不认识 all 参数，会照常返回「最近 20 个」，
+  // 前端从数字上分辨不出来（用户会以为「全部项目就这些」）。新后端必定回 truncated，
+  // 所以用它判断版本：缺这个字段就提示一次重启，数据照常画，不装作是全部。
+  if (projectsScope === 'all' && projectsRes.status === 'fulfilled'
+      && projectsRes.value?.truncated === undefined && !staleProjectsScopeNoted) {
+    staleProjectsScopeNoted = true;
+    note.set('hwb 后端仍是旧版本（未识别「全部项目」）：当前仍只显示最近的项目。重启 hwb 后即可显示全部。', { sticky: true });
+  }
+  // 当前范围的列表是否被 limit 截断：paintDashboard 据此在列表底部说明「仅显示前 N 个」，
+  // 而不是让分区头的数字看起来像「一共就这么多」（这次反馈的原始症状）。
+  projectsTruncated = projectsRes.status === 'fulfilled' && projectsRes.value?.truncated === true;
   const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value.sessions : [];
   const usage = usageRes.status === 'fulfilled' ? usageRes.value : null;
   if (project) {
@@ -560,6 +611,18 @@ function paintDashboard() {
   // 命中超过上限时明确说一声，避免用户以为「只有这些」；更精确的关键词可以继续缩小。
   const projectsMore = full?.truncated.projects
     ? `<div class="search-more">仅显示最近 ${SEARCH_PROJECT_LIMIT} 个项目，可用更精确的关键词缩小范围</div>` : '';
+  // 项目栏的范围说明（最近/全部被 limit 截断时）：分区头只有一个数字，被截断却不说，
+  // 用户就会把「20」当成「项目总数」——这次反馈的原始症状。搜索态下不画：那时列表是
+  // 「命中」语义，再说「只显示了前 N 个项目」会和命中数混在一起。
+  const projectsScopeNote = filtered.connected && !searching
+    ? renderProjectsMore({
+      scope: projectsScope,
+      truncated: projectsTruncated,
+      recentLimit: PROJECTS_RECENT_LIMIT,
+      allLimit: PROJECTS_ALL_LIMIT,
+      days: PROJECTS_RECENT_DAYS,
+    })
+    : '';
   const sessionsMore = full?.truncated.sessions
     ? `<div class="search-more">仅显示最近 ${SEARCH_SESSION_LIMIT} 条会话，可用更精确的关键词缩小范围</div>` : '';
   // 项目会话被 limit 截断：明确说「只显示了这么多」，并指出继续定位的路径（顶栏搜索会按
@@ -574,11 +637,12 @@ function paintDashboard() {
   const focusedDetailsAction = document.activeElement?.dataset?.action;
   const scrolls = [...dashboardEl.querySelectorAll('.pane > .rows, .session-list')].map((el) => el.scrollTop);
   dashboardEl.innerHTML = renderWorkbench({
-    projects: projectsHtml + projectsMore,
+    projects: projectsHtml + projectsMore + projectsScopeNote,
     sessions: sessionsHtml + projectMore + sessionsMore + mutedNote + mutedIdleNote,
     sessionFilter,
     statusFilter: filtered.connected ? renderSessionStatusFilter(mute.visible, sessionStatusFilter) : '',
     searching,
+    projectScope: projectsScope,
     projectCount: filtered.connected ? count(filtered.projects.length, filtered.totalProjects) : null,
     // 会话计数用「屏上实际可见行数」：默认隐藏的会话数由 mutedNote 单独说明，不从计数里消失得无声无息。
     sessionCount: filtered.connected ? count(shownSessions.length, shownSessions.length) : null,
@@ -1245,6 +1309,18 @@ async function handleAction(e) {
         syncSearchChrome();
         setProjectFilter(null);
         break;
+      case 'projects-scope': {
+        // 项目栏范围切换（最近 7 天 ⇄ 全部项目）。两种范围的数据口径不同（时间窗 + limit），
+        // 前端重算不了，必须重新取数；偏好写 localStorage，刷新后保持用户选的范围。
+        // 不做「先本地重绘」：旧列表是另一个范围的数据，画上去再被替换反而闪一下；一次
+        // /api/projects/recent 往返在局域网/本机都是几十毫秒，等它更诚实。
+        const scope = btn.dataset.scope;
+        if (!PROJECTS_SCOPES.includes(scope) || scope === projectsScope) break;
+        projectsScope = scope;
+        saveProjectsScope(scope);
+        await refresh();
+        break;
+      }
       case 'toggle-mute-project': {
         // 默认静音开关（项目卡上的「隐藏 / 已隐藏」或筛选条里的「默认隐藏 / 取消默认隐藏」）。
         // 持久化到 localStorage，刷新后仍生效。

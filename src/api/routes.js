@@ -972,14 +972,24 @@ export function createRouter({ store, indexer, hub, launcher, monitor, quota, lo
       return;
     }
 
+    // 项目列表（Recent Projects 面板）。
+    //   · 默认「最近 `days` 天」（原语义，limit 默认 20）：渲染路径上的常规查询；
+    //   · `?all=1` = **全部项目**：不设时间窗（项目是身份，不该因为 7 天没活动就消失）。
+    //     「最近」上限 200 条、「全部」上限 2000 条 —— 本机实测 532 个项目，一次取全比
+    //     做分页实在（这是给人看的工作台，不是分页 API）；上限只是防止一次拉爆响应体。
+    //   · 仍然多取 1 行判断 truncated：响应最多 limit 条，前端据此在列表底部明确写
+    //     「仅显示前 N 个」—— 否则分区头的数字看起来就像「一共只有这么多」。
+    // `all` 只认显式真值（1/true/yes）：`?all=0` 不能因为字符串非空就被当成真。
     if (req.method === 'GET' && pathname === '/api/projects/recent') {
-      send(res, 200, {
-        projects: store.recentProjects({
-          homeIds: dataHomeIds(),
-          days: numParam(searchParams.get('days'), 7, 1, 3650),
-          limit: numParam(searchParams.get('limit'), 20, 1, 200),
-        }),
+      const limit = numParam(searchParams.get('limit'), 20, 1, 2000);
+      const all = ['1', 'true', 'yes'].includes(String(searchParams.get('all') ?? '').trim().toLowerCase());
+      const rows = store.recentProjects({
+        homeIds: dataHomeIds(),
+        days: numParam(searchParams.get('days'), 7, 1, 3650),
+        limit: limit + 1,
+        all,
       });
+      send(res, 200, { projects: rows.slice(0, limit), truncated: rows.length > limit });
       return;
     }
     // 项目筛选会话：`?project=` 按项目名**精确**取该项目的全部会话（点 Recent Projects 一行时用）。

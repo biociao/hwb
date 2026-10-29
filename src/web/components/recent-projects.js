@@ -86,3 +86,22 @@ export function renderRecentProjects(projects, homes = [], { selectedProject = n
   }).join('');
   return `<div class="rows">${rows}</div>`;
 }
+
+// 项目栏底部的范围说明：列表被 limit 截断时，必须**在界面上**说清「这不是全部」。
+//
+// 为什么必须有：分区头只有一个数字，被截断却不说，用户就会把「20」当成「项目总数」——
+// 这次反馈（截图里「项目 20」）的原始症状。这条由调用方拼在列表之后、不进 `.rows`
+// 滚动区，所以翻到列表底部也看得见；只在真截断时出现，不截断时列表就是全部，多说一句是噪音。
+//
+// 两种范围的出路不同：
+//   · 「最近」截断 → 给「查看全部项目」按钮（与分区头同一个 action，切到 all 再取一次）；
+//   · 「全部」截断 → 没有更大的档位可切，只能指路顶栏搜索（/api/search 不受这个 limit 限制）。
+export function renderProjectsMore({ scope = 'recent', truncated = false, recentLimit = 200, allLimit = 1000, days = 7 } = {}) {
+  if (!truncated) return '';
+  const num = (n) => esc(String(Number(n) || 0));
+  if (scope === 'all') {
+    return `<div class="pane-note">项目较多，仅显示按最后活动排序的前 ${num(allLimit)} 个；可用顶栏搜索定位更早的项目</div>`;
+  }
+  return `<div class="pane-note">仅显示最近 ${num(days)} 天内最新的 ${num(recentLimit)} 个项目`
+    + '<button type="button" data-action="projects-scope" data-scope="all">查看全部项目</button></div>';
+}

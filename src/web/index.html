@@ -141,6 +141,20 @@
     .pane-count { margin-left: auto; padding: 1px 7px; border-radius: 9px; font-size: 10px;
       color: inherit; background: color-mix(in srgb, currentColor 13%, transparent);
       font-variant-numeric: tabular-nums; letter-spacing: 0; }
+    /* 项目范围切换（最近 / 全部）：分区头里的分段控件（见 workbench.js 的 projectsScopeHtml）。
+       它必须常驻在表头 —— 列表被 7 天窗口/limit 截断时，用户要靠它发现「还有全部项目」；
+       放进列表会随列表滚走，翻到第 300 个项目时反而找不到。 */
+    .pane-scope { display: inline-flex; flex: none; gap: 3px; margin-left: 4px; }
+    .pane-scope-btn { padding: 1px 7px; font-size: 10.5px; line-height: 16px; border-radius: 9px;
+      border: 1px solid var(--border); background: transparent; color: var(--dim);
+      cursor: pointer; transition: background .15s, border-color .15s, color .15s; }
+    .pane-scope-btn:hover { border-color: var(--accent); color: var(--fg); }
+    .pane-scope-btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent);
+      color: var(--on-accent); font-weight: 600; }
+    /* 列表底部的范围说明（「仅显示前 N 个」）：与 muted-note 一样挂在 .rows 之外，
+       列表滚动时它不滚走，所以用户翻到底一定看得到「这不是全部」。 */
+    .pane-note { padding: 8px 10px; border-top: 1px dashed var(--border); color: var(--dim); font-size: 11.5px; }
+    .pane-note button { margin-left: 6px; padding: 0 8px; font-size: 11px; }
     section > h2 button.add { margin-left: auto; float: none; }
     /* 项目筛选条：Recent Sessions 分区头与列表之间的一条状态带（见 recent-sessions.js
        的 renderSessionFilter）。它不在 .rows 滚动区里，筛选中时始终可见。
