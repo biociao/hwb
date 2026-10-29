@@ -6,6 +6,38 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 修复：dsh 里重命名项目后工作台不更新（项目名改按 `workspace.title`）
+
+**问题**：在 dsh 里给项目改名后，工作台的 Recent Projects 仍显示旧名字（截图：把
+`PMAID1.0-Production` 改成 `PMAID-Production`，hwb 卡片依旧 `PMAID1.0-Production`，用户问「是不是
+hwb 只认目录名」）。
+
+**根因**：`project` 名一律取 `basename(workspace.path)`（架构文档 §4.4 的早期口径）。但 dsh 的
+`workspace.rename` 只写 `title`（schema 里 `path` 是 canonical host directory path、`title` 才是
+user-visible title），path 永远不变 —— 所以改名对工作台**永远不可见**。hwb 其实已经把新名字读进
+`workspaces.title` / `sessions.workspaceTitle`，只是没拿它当项目名。连带副作用：同一目录在 Codex
+侧用它的项目名、在 dsh 侧用目录名，会被拆成两张项目卡（本机实测：Codex 的 `PMAID-Production` 与
+dsh 的 `PMAID1.0-Production` 指向同一个目录，会话被拆开、项目筛选也无法合并）。
+
+**改动**：`src/lib/normalize.js` 的 `projectOf()` 改为 **title 优先、`basename(path)` 兜底**（与
+Codex / WorkBuddy 的口径对齐）；title 为空白或缺失时仍回退目录名。NUL 在取名之前剥掉，避免写库时
+`project` 被静默截断。已知取舍：dsh 允许不同目录（甚至跨实例）共用同一个 title，同名即按「跨实例
+同名项目」合并成一张卡 —— 与既有聚合语义一致。
+
+**还差一半的地方**：dsh 的 `workspace.sessionIds` 只记**被 attach 过**的会话，同一目录里用 CLI /
+其它入口跑出来的会话不在里面（本机实测 `PMAID1.0-Production` 那 10 个会话里有 8 个是这种，
+`identity.cwd` 就是工作区目录）。它们若继续按 `basename(cwd)` 取名，改名后工作区行是新名、这批会话
+是旧名 —— 还是两张卡。因此补了第二条回退：未归属会话的 cwd 若**正好等于**某个 `workspace.path`，
+就用那个工作区的项目名（dsh 自己的 attach 判据就是 `cwd === path`，**不是前缀** —— 子目录里的会话
+属于它自己，不能并进父工作区）。这一步只影响项目名：`workspaceId` / `workspaceTitle` 仍以 dsh 的
+`sessionIds` 为准保持 null，归属还被预览 / 下载 / 上传与「打开工作区」使用，不由路径启发式伪造。
+实时通道补插的新会话（`mergeLiveStatus`）走同一口径。
+
+**测试**：`tests/normalize.test.js` 新增「项目名跟 title 走 / 空白或缺 title 回退目录名 / 会话行与
+workspace 行必须同名 / cwd 等于 workspace.path 的未归属会话取工作区项目名但不伪造 workspaceId /
+子目录不算该工作区」用例，并把 NUL 用例扩展到 `project`；`tests/store.test.js`、`tests/
+store-degraded.test.js` 的 normalize 夹具随之对齐（降级用例仍保留 title 与目录名不同的情形）。
+
 ### 修复：Codex 会话标题与 Codex 里显示的不一致
 
 **问题**：RECENT SESSIONS 里 Codex 实例的会话标题是 `# Files mentioned by the user: …` 这种附件清单

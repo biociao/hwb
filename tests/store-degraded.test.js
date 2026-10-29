@@ -144,7 +144,8 @@ test('workspace 降级：保留的会话仍能找回自己的 workspace 归属',
 
   const before = store.recentSessions({ homeId })[0];
   assert.equal(before.workspaceId, 'ws-1');
-  assert.equal(before.project, 'alpha');
+  // 夹具里 title('Alpha') 与目录名('alpha') 故意不同：项目名跟 title 走，这里用来验证归属链路
+  assert.equal(before.project, 'Alpha');
 
   // 只有 workspace 降级：snapshot.workspaces 为空 → normalize 产出的会话行 workspaceId 为 null
   store.upsertRows(snapshotRows(homeId, { wsDegraded: true }));
@@ -153,7 +154,7 @@ test('workspace 降级：保留的会话仍能找回自己的 workspace 归属',
   assert.equal(after.length, 1, '会话表照常按新快照刷新（projcache 未降级）');
   assert.equal(after[0].workspaceId, 'ws-1', 'workspace 降级 → 回填上一版的归属，不能让会话变成孤儿');
   assert.equal(after[0].workspaceTitle, 'Alpha');
-  assert.equal(after[0].project, 'alpha', 'project 不该退化成 basename(cwd)');
+  assert.equal(after[0].project, 'Alpha', 'project 不该退化成 basename(cwd)（那会是小写 alpha）');
   assert.equal(store.listWorkspaces({ homeId }).length, 1, '工作区本身也保留着');
   store.close();
 });
@@ -186,7 +187,7 @@ test('workspace 降级恢复后，归属仍以新数据为准', () => {
   }));
   const row = store.recentSessions({ homeId }).find((s) => s.sessionId === 's1');
   assert.equal(row.workspaceId, 'ws-2', '恢复后必须用新归属覆盖回填值');
-  assert.equal(row.project, 'beta');
+  assert.equal(row.project, 'Beta');
   store.close();
 });
 

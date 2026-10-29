@@ -140,7 +140,9 @@ name（alias || serverId || homePath）
   `basename(cwd)` 归一化（与 dsh/codex 对未归属会话的口径一致）。
 - 时间：`last_activity_at`（毫秒）优先，回退 `updated_at`；ISO 输出。
 - 状态：`completed` → `{kind:'completed', label:'已完成'}`；其余（terminated/error/failed）→
-  `{kind:'idle', label:'已保存'}`。只读元数据无法断言「正在运行」，与 Codex 一致。
+  `{kind:'idle', label:'已保存'}`。WorkBuddy 的元数据里没有运行态，**不对它推断运行中**。
+  （注意 Codex 已不再与之一致：它从 `thread_history_<N>.sqlite` 的 `thread_turns` 推出了
+  运行中/空闲 + 未读，见 README「Codex 作为实例接入」。）
 - token：`session_usage.used/size` 语义是上下文用量，**不**伪装成 input/output；本期
   `tokenUsage`/`contextPressure` 先留 `null`（后续确认口径再加）。
 - 版本：`startup-seed-version.json.appVersion`，回退 `app/renderer-version.json.version`。

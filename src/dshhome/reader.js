@@ -36,12 +36,20 @@ function mergeTokenUsage(existing, liveUsage) {
 //   1. 覆盖：live 里已有的会话覆盖从（可能冻结的）投影缓存推导出的状态/活跃时间/用量/标题；
 //   2. 补插：live 里有、投影缓存里还没有的会话（冻结期间新产生的）补成新的 session 行——
 //      否则这些会话永远不会出现在 Recent Sessions / Projects（实时合并的核心目的）。
-// 补插行的 project 用 basename(cwd) 推导（与 normalize 的无 workspace 会话 fallback 一致）；
+// 补插行的 project 取「cwd 与该工作区 path 完全相同」的工作区项目名（与 normalize 的第二条
+// 回退一致，见 src/lib/normalize.js）；匹配不到才用 basename(cwd)。否则工作区在 dsh 里改名后，
+// 这些实时补插的会话会带着旧目录名进来，把同一个项目拆成两张卡。
 // workspaceId/workspaceTitle/contextPressure 无从得知，置 null。
 // 这是 hwb 读取源的核心扩展：运行中的 dsh 实例优先用实时状态，而不是只吃投影缓存。
 export function mergeLiveStatus(rows, live, { homeId, generatedAt }) {
   if (!live || !Array.isArray(live) || live.length === 0) return rows;
   const bySession = new Map(live.filter((l) => l && l.sessionId).map((l) => [l.sessionId, l]));
+  const projectByPath = new Map();
+  for (const row of rows) {
+    if (row.type !== 'workspace' || typeof row.path !== 'string' || !row.path) continue;
+    const p = row.path.replace(/\/+$/, '');
+    if (p && !projectByPath.has(p)) projectByPath.set(p, row.project);
+  }
   const known = new Set();
   for (const row of rows) {
     if (row.type !== 'session') continue;
@@ -55,13 +63,15 @@ export function mergeLiveStatus(rows, live, { homeId, generatedAt }) {
   }
   for (const l of bySession.values()) {
     if (known.has(l.sessionId)) continue;
+    const cwd = typeof l.cwd === 'string' ? l.cwd : '';
+    const project = cwd ? (projectByPath.get(cwd.replace(/\/+$/, '')) ?? path.basename(cwd)) : 'unknown';
     rows.push({
       type: 'session',
       homeId,
       sessionId: l.sessionId,
       workspaceId: null,
       workspaceTitle: null,
-      project: l.cwd ? path.basename(l.cwd) : 'unknown',
+      project,
       title: l.title ?? null,
       tokenUsage: l.tokenUsage ? JSON.stringify(l.tokenUsage) : null,
       contextPressure: null,

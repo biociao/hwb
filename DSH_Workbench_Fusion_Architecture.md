@@ -167,7 +167,9 @@ HomeSnapshot → Normalizer → IndexedRows[] → SQLite upsert
 
 Normalizer 是纯函数，无副作用：
 - 将 `workspace.json` 的工作区与 `session_projcache.json` 的会话关联
-- 推断 `project` 名（从 workspace path 的目录名提取）
+- 推断 `project` 名（`workspace.title` 优先 —— dsh 里重命名项目即生效；title 空白/缺失时回退
+  `basename(workspace.path)`；未归属会话先看 cwd 是否**正好等于**某个 `workspace.path`（dsh 的
+  attach 判据就是 `cwd === path`，不是前缀），是则取该工作区的项目名，否则按 `basename(cwd)`）
 - 将会话 tokenUsage / contextPressure 序列化为 JSON 存入 SQLite
 - 输出统一行格式：`{ type: 'session'|'workspace'|'provider'|'modelTier', ... }`
 

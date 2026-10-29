@@ -14,8 +14,8 @@ function seed(store) {
     wsVersion: 2,
     pcVersion: 3,
     workspaces: [
-      { workspaceId: 'ws-1', title: 'Alpha', path: '/r/alpha', archived: false, sessionIds: ['s1', 's2'] },
-      { workspaceId: 'ws-2', title: 'Empty', path: '/r/empty-proj', archived: false, sessionIds: [] },
+      { workspaceId: 'ws-1', title: 'alpha', path: '/r/alpha', archived: false, sessionIds: ['s1', 's2'] },
+      { workspaceId: 'ws-2', title: 'empty-proj', path: '/r/empty-proj', archived: false, sessionIds: [] },
     ],
     sessions: [
       { sessionId: 's1', workspaceId: 'ws-1', tokenUsage: { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 }, status: { kind: 'running', label: '运行中', subagents: 1, approval: 'ask' }, lastActivity: iso(30) },
@@ -226,8 +226,8 @@ test('store usageSummary/usageTrend/usageByProject aggregate tokenUsage over win
   store.upsertRows(normalize({
     homeId, homePath: '/mock/home', generatedAt: now, wsVersion: 2, pcVersion: 3,
     workspaces: [
-      { workspaceId: 'ws1', title: 'Alpha', path: '/r/alpha', archived: false, sessionIds: ['s1'] },
-      { workspaceId: 'ws2', title: 'Beta', path: '/r/beta', archived: false, sessionIds: ['s2'] },
+      { workspaceId: 'ws1', title: 'alpha', path: '/r/alpha', archived: false, sessionIds: ['s1'] },
+      { workspaceId: 'ws2', title: 'beta', path: '/r/beta', archived: false, sessionIds: ['s2'] },
     ],
     sessions: [
       { sessionId: 's1', workspaceId: 'ws1', tokenUsage: { uncachedInputTokens: 100, outputTokens: 20, cacheReadTokens: 80, cacheWriteTokens: 40 }, lastActivity: now },
@@ -264,14 +264,14 @@ test('store usageTrendGrouped buckets by dimension (total/project/instance/provi
     providers: [], degraded: [],
   });
   const aRows = rowsOf(a, '/mock/a', 'deepseek', [
-    { workspaceId: 'wa1', title: 'Alpha', path: '/r/alpha', archived: false, sessionIds: ['s1'] },
-    { workspaceId: 'wa2', title: 'Beta', path: '/r/beta', archived: false, sessionIds: ['s2'] },
+    { workspaceId: 'wa1', title: 'alpha', path: '/r/alpha', archived: false, sessionIds: ['s1'] },
+    { workspaceId: 'wa2', title: 'beta', path: '/r/beta', archived: false, sessionIds: ['s2'] },
   ], [
     { sessionId: 's1', workspaceId: 'wa1', tokenUsage: { uncachedInputTokens: 100, outputTokens: 20, cacheReadTokens: 80, cacheWriteTokens: 40 }, lastActivity: recent },
     { sessionId: 's2', workspaceId: 'wa2', tokenUsage: { uncachedInputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 }, lastActivity: recent },
   ]);
   const bRows = rowsOf(b, '/mock/b', 'kimi', [
-    { workspaceId: 'wb1', title: 'Gamma', path: '/r/gamma', archived: false, sessionIds: ['s3'] },
+    { workspaceId: 'wb1', title: 'gamma', path: '/r/gamma', archived: false, sessionIds: ['s3'] },
   ], [
     { sessionId: 's3', workspaceId: 'wb1', tokenUsage: { uncachedInputTokens: 50, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 }, lastActivity: recent },
   ]);
@@ -317,7 +317,7 @@ test('store usageTrendGrouped auto-adjusts bucket granularity by period (hours)'
   const a = store.registerHome({ homePath: '/mock/a' });
   const rows = normalize({
     homeId: a, homePath: '/mock/a', generatedAt: recent, wsVersion: 2, pcVersion: 3,
-    workspaces: [{ workspaceId: 'ws1', title: 'Alpha', path: '/r/alpha', archived: false, sessionIds: ['s1'] }],
+    workspaces: [{ workspaceId: 'ws1', title: 'alpha', path: '/r/alpha', archived: false, sessionIds: ['s1'] }],
     sessions: [{ sessionId: 's1', workspaceId: 'ws1', tokenUsage: { uncachedInputTokens: 100, outputTokens: 20, cacheReadTokens: 10, cacheWriteTokens: 5 }, lastActivity: recent }],
     modelTier: null, providers: [], degraded: [],
   });
