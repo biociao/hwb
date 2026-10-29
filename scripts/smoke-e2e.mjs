@@ -134,8 +134,8 @@ try {
   check('未连接实例时 /api/projects/recent 为空（按设计）', projs.body?.projects?.length === 0, `count=${projs.body?.projects?.length}`);
   const wss = await j(`/api/workspaces?homeId=${homeId}`);
   const ws = wss.body?.workspaces?.[0];
-  // title 来自 workspace.json；project 是 path 的 basename（normalize 反查得到），两者不同名很正常
-  check('GET /api/workspaces 有冒烟项目与会话数', ws?.title === '冒烟项目' && ws?.project === 'proj' && ws?.sessionCount === 3,
+  // 项目名优先使用 workspace.title；目录名仅作标题缺失时的回退（与 normalize 的重命名语义一致）
+  check('GET /api/workspaces 有冒烟项目与会话数', ws?.title === '冒烟项目' && ws?.project === '冒烟项目' && ws?.sessionCount === 3,
     JSON.stringify(ws ?? null).slice(0, 140));
 
   // ④ 用量：默认窗口为空、更宽窗口有数据（空状态那条链）
