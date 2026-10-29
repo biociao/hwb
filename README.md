@@ -3,7 +3,7 @@
 # hwb — harness workbench
 
 [![CI](https://github.com/biociao/hwb/actions/workflows/ci.yml/badge.svg)](https://github.com/biociao/hwb/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.5-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.2.0-blue)](CHANGELOG.md)
 [![milestones](https://img.shields.io/badge/milestones-M1%E2%80%93M7-brightgreen)](DSH_Workbench_Fusion_Architecture.md)
 [![node](https://img.shields.io/badge/node-%E2%89%A522-blue)](package.json)
 [![npm deps](https://img.shields.io/badge/npm_deps-0-blue)](package.json)
@@ -964,7 +964,7 @@ dsh 0.1.5-rc.1 兼容 ✓
 
 ## 已知限制
 
-> 这些是 v0.1.5 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
+> 这些是 v0.2.0 已知的不完整/边界项，非缺陷即**尚未接线**的部分，提前说明以便透明发布。
 - **人工介入提示的时效边界**：`等待审批` / `计划待审` 来自**运行中且已连接**的 dsh 实例的实时通道
   （dsh 0.2.x 的 `/api/remote.mux` → `$events` → `approval/request` / `user-questions/request`）。
   实例没在跑、旧版 dsh 没有这条通道、或 hwb 与实例之间的链路断开时，只能显示**投影来源**的

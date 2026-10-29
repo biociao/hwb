@@ -6,6 +6,8 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-29
+
 ### 修复：点开未读会话后「未读」又冒回来（Codex read receipt 被下一轮索引重新读成未读）
 
 **问题**：在 hwb 里点击一条「未读」会话、跳到对应 App 之后，卡片过一会儿又变回「未读」。
