@@ -69,6 +69,21 @@ export function cleanTitle(raw, fallback = '未命名会话') {
   return text.length > TITLE_MAX ? `${text.slice(0, TITLE_MAX - 1)}…` : text;
 }
 
+// 带附件的首条用户消息由 Codex 拼成：
+//   `# Files mentioned by the user:` → 附件清单 → `## My request:` → 用户真正的问题。
+// 附件清单不是问题，只是信封。只有在拿不到会话名（threads.name）时才会走到这里
+// （旧版库没有 name 列 / 新会话还没生成名字），此时取 `## My request:` 之后的正文；
+// 连正文都没有（纯附件消息）就回退成「未命名会话」，而不是把文件清单当标题。
+const FILES_PREAMBLE_RE = /^#\s*Files mentioned by the user:/i;
+const MY_REQUEST_RE = /^##\s*My request:\s*/im;
+
+function firstMessageTitle(raw) {
+  const text = asString(raw);
+  if (!FILES_PREAMBLE_RE.test(text)) return text;
+  const marker = MY_REQUEST_RE.exec(text);
+  return marker ? text.slice(marker.index + marker[0].length) : '';
+}
+
 // threads.updated_at 是秒级、updated_at_ms 是毫秒级（新行才有）。统一成毫秒，并挡掉明显越界的值
 // （0 / 未来 10 年）—— 否则前端 timeAgo 会渲染出 "2068d ago" 这种噪声。
 function toEpochMs(seconds, millis) {
@@ -120,9 +135,27 @@ function readDbMetadata(dbFile, maxThreads) {
   }));
 }
 
+// Codex 的会话有**两个**标题字段，含义不同：
+//   · `threads.name`  —— 会话名（Codex 自动摘要生成、用户重命名后覆盖），也就是 Codex 桌面端
+//     侧边栏里显示的那一行；它同时被镜像到 `session_index.jsonl` 的 `thread_name`；
+//   · `threads.title` —— 建会话时落盘的**首条用户消息原文**。带附件的会话开头就是
+//     `# Files mentioned by the user:` 附件前言，所以它天然不是标题。
+// 历史实现只读 title，于是 hwb 的会话列表显示成文件清单，而 Codex 里显示的是
+// 「新增PUMCH分支报出解读模块」这类会话名 —— 这就是「标题与实际不符」的来源。
+// 旧版 state_5.sqlite 可能没有 name 列（Codex 后加的），用 PRAGMA 探测后降级，
+// 不让缺列把整个 Codex 快照读崩。
+function hasThreadColumn(db, column) {
+  try {
+    return db.prepare('PRAGMA table_info(threads)').all().some((c) => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
 function loadThreads(db, limits) {
+  const nameColumn = hasThreadColumn(db, 'name') ? 'name' : "'' AS name";
   const stmt = db.prepare(`
-    SELECT id, title, cwd, tokens_used, updated_at, updated_at_ms,
+    SELECT id, ${nameColumn}, title, cwd, tokens_used, updated_at, updated_at_ms,
            archived, is_pinned, git_branch, preview, first_user_message, thread_source
     FROM threads
     ORDER BY CASE WHEN updated_at_ms IS NOT NULL THEN updated_at_ms ELSE updated_at * 1000 END DESC
@@ -132,9 +165,12 @@ function loadThreads(db, limits) {
     const updatedAtMs = toEpochMs(row.updated_at, row.updated_at_ms);
     const tokens = Number(row.tokens_used);
     const source = asString(row.thread_source) || null;
+    // 会话名优先（Codex 自己列表里的那一行）；没有才退回首条用户消息，
+    // 且从附件前言里剥出 `## My request:` 正文。
+    const name = cleanTitle(row.name, '');
     return {
       id: String(row.id),
-      title: cleanTitle(row.title || row.first_user_message || row.preview),
+      title: name || cleanTitle(firstMessageTitle(row.title || row.first_user_message) || row.preview),
       preview: cleanTitle(row.preview || row.first_user_message, ''),
       cwd: asString(row.cwd) || null,
       gitBranch: asString(row.git_branch) || null,

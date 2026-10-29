@@ -6,6 +6,22 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### 修复：Codex 会话标题与 Codex 里显示的不一致
+
+**问题**：RECENT SESSIONS 里 Codex 实例的会话标题是 `# Files mentioned by the user: …` 这种附件清单
+（本机实测 78/421 条），而 Codex 桌面端同一会话显示的是「新增PUMCH分支报出解读模块」这类会话名。
+
+**根因**：`threads` 有两个标题字段，含义不同 —— `title` 是建会话时落盘的首条用户消息**原文**
+（带附件时开头就是 `# Files mentioned by the user:` 附件信封），`name` 才是 Codex 列表里
+显示的会话名（自动摘要 / 用户重命名后覆盖，并镜像到 `session_index.jsonl` 的 `thread_name`）。
+`src/codexhome/reader.js` 只读 `title`，于是把附件信封当成了标题。
+
+- 标题优先取 `threads.name`；旧版库没有该列时用 `PRAGMA table_info` 探测后降级回 `title`，
+  不让缺列把整个 Codex 快照读崩。
+- 拿不到会话名时，若首条消息是附件信封，取 `## My request:` 之后的正文；纯附件消息回退
+  「未命名会话」，不再把文件清单当标题。
+- 影响面（本机实测）：279 条 Codex 会话标题变化，78 条文件清单标题清零。
+
 ### 界面：三栏聚焦、明确会话状态与顶部全局搜索
 
 - 三栏按约 23 / 55 / 22 分配宽度，会话区作为主要内容；项目卡采用中性底色，来源缩为标签，选中项目单独强调。

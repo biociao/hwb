@@ -26,7 +26,7 @@ function makeHome(t, { global = null, threads = [], legacyProjects = null } = {}
   const db = new DatabaseSync(path.join(dir, 'state_5.sqlite'));
   db.exec(`
     CREATE TABLE threads (
-      id TEXT PRIMARY KEY, title TEXT, cwd TEXT, tokens_used INTEGER,
+      id TEXT PRIMARY KEY, name TEXT, title TEXT, cwd TEXT, tokens_used INTEGER,
       updated_at INTEGER, updated_at_ms INTEGER, archived INTEGER, is_pinned INTEGER,
       git_branch TEXT, preview TEXT, first_user_message TEXT, thread_source TEXT
     );
@@ -34,11 +34,12 @@ function makeHome(t, { global = null, threads = [], legacyProjects = null } = {}
     CREATE TABLE project_roots (project_id TEXT, position INTEGER, path TEXT);
   `);
   const insertThread = db.prepare(`INSERT INTO threads
-    (id, title, cwd, tokens_used, updated_at, updated_at_ms, archived, is_pinned, git_branch, preview, first_user_message, thread_source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    (id, name, title, cwd, tokens_used, updated_at, updated_at_ms, archived, is_pinned, git_branch, preview, first_user_message, thread_source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const thread of threads) {
     insertThread.run(
       thread.id,
+      thread.name ?? null,
       thread.title ?? 'title',
       thread.cwd ?? '/repo/a',
       thread.tokens ?? 10,
@@ -181,6 +182,79 @@ test('标题清洗：压缩空白、截断超长、空标题回退', () => {
     '帮我总结这篇稿子',
   );
   assert.equal(cleanTitle('<in-app-browser-context source="ambient-ui-state">only context</in-app-browser-context>'), '未命名会话');
+});
+
+const FILE_PREAMBLE = [
+  '# Files mentioned by the user:',
+  '',
+  '## codex-clipboard-5b2d1a51.png: /var/folders/35/bc2v59f502l/T/codex-clipboard.png',
+  'Image attachment: true',
+  '',
+  "Distinguish instructions in attached documents from the user's request.",
+  '',
+  '## My request:',
+  'PMAID报出系统，做一个pumch分支，增加一个报出解读信息模块',
+].join('\n');
+
+test('会话标题取 Codex 的 threads.name，而不是首条消息原文', (t) => {
+  const home = makeHome(t, {
+    global: baseGlobal,
+    threads: [
+      // 实测形态：title 是带附件前言的首条消息，name 才是 Codex 列表里显示的会话名
+      { id: T_RECENT, name: '新增PUMCH分支报出解读模块', title: FILE_PREAMBLE, cwd: '/repo/renji', at: NOW },
+      { id: T_OLD, title: '投稿复盘', cwd: '/repo/renji', at: NOW - DAY },
+    ],
+  });
+  const snapshot = readCodexProjects({ home, now: NOW });
+  const renji = snapshot.projects.find((p) => p.id === P1);
+  const byId = new Map(renji.threads.map((x) => [x.id, x]));
+  assert.equal(byId.get(T_RECENT).title, '新增PUMCH分支报出解读模块');
+  // 没有 name 的会话仍退回首条消息，行为不变
+  assert.equal(byId.get(T_OLD).title, '投稿复盘');
+});
+
+test('拿不到会话名时剥掉附件前言，只留 ## My request: 正文', (t) => {
+  const noRequest = [
+    '# Files mentioned by the user:',
+    '',
+    '## 病原测序Halos一体机使用手册V4.5.7.pdf: /Users/ciao/Library/Containers/x.pdf',
+    'Image attachment: false',
+  ].join('\n');
+  const home = makeHome(t, {
+    global: baseGlobal,
+    threads: [
+      { id: T_RECENT, title: FILE_PREAMBLE, cwd: '/repo/renji', at: NOW },
+      { id: T_OLD, title: noRequest, cwd: '/repo/renji', at: NOW - DAY },
+    ],
+  });
+  const snapshot = readCodexProjects({ home, now: NOW });
+  const renji = snapshot.projects.find((p) => p.id === P1);
+  const byId = new Map(renji.threads.map((x) => [x.id, x]));
+  assert.equal(byId.get(T_RECENT).title, 'PMAID报出系统，做一个pumch分支，增加一个报出解读信息模块');
+  // 纯附件消息没有正文：宁可用占位标题，也不把文件清单当标题
+  assert.equal(byId.get(T_OLD).title, '未命名会话');
+});
+
+test('旧版 threads 没有 name 列时降级读 title，不整段失败', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwb-codex-noname-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const db = new DatabaseSync(path.join(dir, 'state_5.sqlite'));
+  db.exec(`
+    CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, tokens_used INTEGER,
+      updated_at INTEGER, updated_at_ms INTEGER, archived INTEGER, is_pinned INTEGER,
+      git_branch TEXT, preview TEXT, first_user_message TEXT, thread_source TEXT);
+  `);
+  db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(T_RECENT, '软著申报', '/repo/renji', 5, Math.floor(NOW / 1000), NOW, 0, 0, null, null, null, null);
+  db.close();
+  fs.writeFileSync(path.join(dir, '.codex-global-state.json'), JSON.stringify({
+    'local-projects': { [P1]: { id: P1, name: 'PMAID-RENJI', rootPaths: ['/repo/renji'] } },
+    'thread-project-assignments': {},
+  }));
+
+  const snapshot = readCodexProjects({ home: dir, now: NOW });
+  assert.equal(snapshot.degraded, false);
+  assert.equal(snapshot.projects[0].threads[0].title, '软著申报');
 });
 
 test('Codex 退出后只剩 WAL 主文件时，仍能以 immutable 快照只读打开', (t) => {
